@@ -200,7 +200,7 @@ bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy> bitmap<Key, ContainerSe
     }
 
     detail::heap_vector<key_type> values;
-    values.resize( static_cast<std::size_t>( header.value_count ) );
+    values.resize( static_cast<std::uint32_t>( header.value_count ) );
     if ( !values.empty() ) {
         std::memcpy( values.data(), in.data() + sizeof( serialized_header ), payload_size );
     }

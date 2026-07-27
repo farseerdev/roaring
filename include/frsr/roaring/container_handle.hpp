@@ -1357,7 +1357,7 @@ public:
         for ( std::size_t index{ 0 }; index < words.size(); ++index ) {
             auto const word{ words[ index ] };
             if ( word != 0 ) {
-                return static_cast<low_type>( ( index << 6U ) + std::countr_zero( word ) );
+                return static_cast<low_type>( ( index << 6U ) + static_cast<std::size_t>( std::countr_zero( word ) ) );
             }
         }
         return std::nullopt;
@@ -1378,13 +1378,13 @@ public:
         };
         word &= ~consumed_mask;
         if ( word != 0 ) {
-            return static_cast<low_type>( ( word_index << 6U ) + std::countr_zero( word ) );
+            return static_cast<low_type>( ( word_index << 6U ) + static_cast<std::size_t>( std::countr_zero( word ) ) );
         }
 
         for ( ++word_index; word_index < words.size(); ++word_index ) {
             word = words[ word_index ];
             if ( word != 0 ) {
-                return static_cast<low_type>( ( word_index << 6U ) + std::countr_zero( word ) );
+                return static_cast<low_type>( ( word_index << 6U ) + static_cast<std::size_t>( std::countr_zero( word ) ) );
             }
         }
         return std::nullopt;
@@ -1395,7 +1395,7 @@ public:
         for ( std::size_t index{ 0 }; index < words.size(); ++index ) {
             auto word{ words[ index ] };
             while ( word != 0 ) {
-                auto const bit{ std::countr_zero( word ) };
+                auto const bit{ static_cast<std::size_t>( std::countr_zero( word ) ) };
                 f( static_cast<low_type>( ( index << 6U ) + bit ) );
                 word &= word - 1U;
             }

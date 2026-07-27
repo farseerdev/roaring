@@ -24,14 +24,19 @@ public:
     using chunk_type  = typename Layout::chunk_type;
     using handle_type = container_handle<Layout, CowPolicy>;
 
+    // heap_vector subscripts take a 32-bit size_type; the public API stays in
+    // std::size_t and narrows here (chunk counts are bounded far below 2^32).
+    using index_type = typename heap_vector<chunk_type>::size_type;
+    [[nodiscard]] static constexpr index_type idx( std::size_t const index ) noexcept { return static_cast<index_type>( index ); }
+
     [[nodiscard]] std::size_t size () const noexcept { return keys_.size (); }
     [[nodiscard]] bool        empty() const noexcept { return keys_.empty(); }
 
-    [[nodiscard]] chunk_type key( std::size_t const index ) const noexcept { return keys_[ index ]; }
-    void set_key( std::size_t const index, chunk_type const key ) noexcept { keys_[ index ] = key; }
+    [[nodiscard]] chunk_type key( std::size_t const index ) const noexcept { return keys_[ idx( index ) ]; }
+    void set_key( std::size_t const index, chunk_type const key ) noexcept { keys_[ idx( index ) ] = key; }
 
-    [[nodiscard]] handle_type       & slot( std::size_t const index )       noexcept { return slots_[ index ]; }
-    [[nodiscard]] handle_type const & slot( std::size_t const index ) const noexcept { return slots_[ index ]; }
+    [[nodiscard]] handle_type       & slot( std::size_t const index )       noexcept { return slots_[ idx( index ) ]; }
+    [[nodiscard]] handle_type const & slot( std::size_t const index ) const noexcept { return slots_[ idx( index ) ]; }
 
     [[nodiscard]] std::span<chunk_type  const> keys () const noexcept { return { keys_ .data(), keys_ .size() }; }
     [[nodiscard]] std::span<handle_type      > slots()       noexcept { return { slots_.data(), slots_.size() }; }
@@ -127,15 +132,15 @@ public:
     // they would free are retired instead.
     void move_entry_retiring( std::size_t const to, std::size_t const from ) {
         if ( to != from ) {
-            keys_[ to ] = keys_[ from ];
-            retire( std::move( slots_[ to ] ) );
-            slots_[ to ] = std::move( slots_[ from ] );
+            keys_[ idx( to ) ] = keys_[ idx( from ) ];
+            retire( std::move( slots_[ idx( to ) ] ) );
+            slots_[ idx( to ) ] = std::move( slots_[ idx( from ) ] );
         }
     }
 
     void truncate_retiring( std::size_t const count ) {
         for ( auto i{ count }; i < size(); ++i ) {
-            retire( std::move( slots_[ i ] ) );
+            retire( std::move( slots_[ idx( i ) ] ) );
         }
         truncate( count );
     }
@@ -169,8 +174,8 @@ public:
     // at `from` moves down to `to` (to <= from always holds on those walks).
     void move_entry( std::size_t const to, std::size_t const from ) {
         if ( to != from ) {
-            keys_ [ to ] = keys_[ from ];
-            slots_[ to ] = std::move( slots_[ from ] );
+            keys_ [ idx( to ) ] = keys_[ idx( from ) ];
+            slots_[ idx( to ) ] = std::move( slots_[ idx( from ) ] );
         }
     }
 
@@ -190,10 +195,10 @@ public:
     void erase_slots_if( Pred && pred ) {
         std::size_t out{ 0 };
         for ( std::size_t in{ 0 }; in < size(); ++in ) {
-            if ( !pred( std::as_const( slots_[ in ] ) ) ) {
+            if ( !pred( std::as_const( slots_[ idx( in ) ] ) ) ) {
                 if ( out != in ) {
-                    keys_ [ out ] = keys_[ in ];
-                    slots_[ out ] = std::move( slots_[ in ] );
+                    keys_ [ idx( out ) ] = keys_[ idx( in ) ];
+                    slots_[ idx( out ) ] = std::move( slots_[ idx( in ) ] );
                 }
                 ++out;
             }

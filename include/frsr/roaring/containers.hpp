@@ -47,7 +47,7 @@ using heap_vector = std::vector<T>;
 template <typename T>
 inline void resize_uninitialized( small_array_values<T> & values, std::size_t const new_size ) {
 #ifdef FRSR_ROARING_HAS_PSI_VM
-    values.resize( new_size, psi::vm::no_init );
+    values.resize( static_cast<std::uint32_t>( new_size ), psi::vm::no_init );
 #else
     values.resize( new_size );
 #endif
@@ -576,7 +576,7 @@ template <typename Layout>
     for ( std::size_t index{ 0 }; index < words.size(); ++index ) {
         auto word{ words[ index ] };
         while ( word != 0 ) {
-            auto const bit{ std::countr_zero( word ) };
+            auto const bit{ static_cast<std::size_t>( std::countr_zero( word ) ) };
             result.push_back( static_cast<typename Layout::low_type>( ( index << 6U ) + bit ) );
             word &= word - 1U;
         }
@@ -590,7 +590,7 @@ template <typename Layout, typename CowPolicy = cow_value_semantics>
         words,
         std::size_t{ 0 },
         []( std::size_t const acc, std::uint64_t const word ) noexcept {
-            return acc + std::popcount( word );
+            return acc + static_cast<std::size_t>( std::popcount( word ) );
         }
     ) };
     if ( cardinality == 0 ) {
@@ -611,7 +611,7 @@ template <typename Layout, typename CowPolicy = cow_value_semantics, typename Ru
         words,
         std::size_t{ 0 },
         []( std::size_t const acc, std::uint64_t const word ) noexcept {
-            return acc + std::popcount( word );
+            return acc + static_cast<std::size_t>( std::popcount( word ) );
         }
     ) };
     if ( cardinality == 0 ) {

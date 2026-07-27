@@ -468,7 +468,7 @@ template <typename T, typename OutVector>
         }
     }
     auto const count{ static_cast<std::size_t>( out - result.data() ) };
-    result.resize( count );
+    result.resize( static_cast<std::uint32_t>( count ) );
     return count;
 }
 
@@ -506,7 +506,7 @@ template <typename Layout, typename OutVector, typename CowPolicy = cow_value_se
         }
         out = std::copy( li, li_end, out );
         out = std::copy( ri, ri_end, out );
-        result.resize( static_cast<std::size_t>( out - result.data() ) );
+        result.resize( static_cast<std::uint32_t>( out - result.data() ) );
         return;
     }
 
@@ -534,7 +534,7 @@ template <typename Layout, typename OutVector, typename CowPolicy = cow_value_se
             auto const sb{ rhs.values.size() };
             resize_uninitialized( result, std::min( sa, sb ) + 8U );
             auto const count{ intersect_array_array_sse42( lhs.values.data(), sa, rhs.values.data(), sb, result.data() ) };
-            result.resize( count );
+            result.resize( static_cast<std::uint32_t>( count ) );
             return;
         }
 #elif defined( __ARM_NEON ) && defined( __aarch64__ )
@@ -544,7 +544,7 @@ template <typename Layout, typename OutVector, typename CowPolicy = cow_value_se
             auto const sb{ rhs.values.size() };
             resize_uninitialized( result, std::min( sa, sb ) + 8U );
             auto const count{ intersect_array_array_neon( lhs.values.data(), sa, rhs.values.data(), sb, result.data() ) };
-            result.resize( count );
+            result.resize( static_cast<std::uint32_t>( count ) );
             return;
         }
 #endif
@@ -561,7 +561,7 @@ template <typename Layout, typename OutVector, typename CowPolicy = cow_value_se
                 ++ri;
             }
         }
-        result.resize( static_cast<std::size_t>( out - result.data() ) );
+        result.resize( static_cast<std::uint32_t>( out - result.data() ) );
         return;
     }
 
@@ -578,7 +578,7 @@ template <typename Layout, typename OutVector, typename CowPolicy = cow_value_se
         }
     }
     out = std::copy( li, li_end, out );
-    result.resize( static_cast<std::size_t>( out - result.data() ) );
+    result.resize( static_cast<std::uint32_t>( out - result.data() ) );
 }
 
 template <typename Layout, typename CowPolicy = cow_value_semantics>
@@ -674,7 +674,7 @@ template <typename Layout, typename OutVector, typename CowPolicy = cow_value_se
     }
     out_it = std::copy( li, li_end, out_it );
     out_it = std::copy( ri, ri_end, out_it );
-    out.resize( static_cast<std::size_t>( out_it - out.data() ) );
+    out.resize( static_cast<std::uint32_t>( out_it - out.data() ) );
 }
 
 // Above this result size the in-place intersection stops paying for itself: its
@@ -717,7 +717,7 @@ template <typename Layout, typename CowPolicy = cow_value_semantics>
     std::size_t const sb{ rhs.values.size() };
 
     auto const finish{ [ & ]( std::size_t const count ) {
-        lhs.values.resize( count );
+        lhs.values.resize( static_cast<std::uint32_t>( count ) );
         lhs.sync_header();
     } };
 
@@ -828,7 +828,7 @@ template <typename Layout, typename OutVector, typename CowPolicy = cow_value_se
         }
     }
     out_it = std::copy( li, li_end, out_it );
-    out.resize( static_cast<std::size_t>( out_it - out.data() ) );
+    out.resize( static_cast<std::uint32_t>( out_it - out.data() ) );
 }
 
 // array∩run written directly into caller-supplied output (same OutVector
