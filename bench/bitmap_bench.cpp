@@ -4653,6 +4653,105 @@ static void register_cpp_cold_array_bitset(std::size_t ws_bytes, bool andnot) {
 }
 #endif // FRSR_ROARING_HAS_CROARING
 
+// ---- fixed-cardinality diagnostic variant: same scattered-pair machinery,
+// but every pair uses one fixed array cardinality against a fixed 8192-value
+// bitset operand — isolates WHICH cardinality regime a mixed-band delta
+// comes from.
+static constexpr std::size_t kFixedBitsetCount = 8'192;
+static constexpr std::size_t kFixedWs          = std::size_t{1} << 20;
+
+template <typename State, typename Pair, typename AddArr, typename AddBmp>
+static State *make_fixed_cold_heap(std::size_t acard, std::uint64_t seed, AddArr add_arr, AddBmp add_bmp) {
+    auto *s = new State;
+    std::size_t const n = std::max<std::size_t>(2, kFixedWs / kNominalPairBytes);
+    s->pairs.reserve(n);
+    for (std::size_t i = 0; i < n; ++i) {
+        auto *pair = new Pair;
+        for (std::size_t v = 0; v < kFixedBitsetCount; ++v) {
+            add_bmp(*pair, static_cast<std::uint32_t>(v));
+        }
+        std::size_t const span   = 2 * kFixedBitsetCount;
+        std::size_t const stride = std::max<std::size_t>(1, span / std::max<std::size_t>(acard, 1));
+        for (std::size_t v = 0; v < acard; ++v) {
+            add_arr(*pair, static_cast<std::uint32_t>(v * stride));
+        }
+        s->pairs.push_back(pair);
+    }
+    s->order = make_shuffled_order(n, seed ^ 0x5eed5eedULL);
+    return s;
+}
+
+static void register_frsr_cold_card(std::size_t acard, bool andnot) {
+    Entry e;
+    char buf[128];
+    snprintf(buf, sizeof(buf), "cold_card/frsrColdCard%s/acard=%zu",
+             andnot ? "Andnot" : "Intersect", acard);
+    e.name        = buf;
+    e.description = "fixed-cardinality diagnostic of the cold_heap Andnot/Intersect delta";
+    e.setup       = [acard]() -> void * {
+        return make_fixed_cold_heap<FrsrColdHeapState, FrsrArrayBitsetPair>(
+            acard, 0x9e3779b97f4a7c15ULL ^ acard,
+            [](FrsrArrayBitsetPair &p, std::uint32_t v) { std::ignore = p.arr.add(v); },
+            [](FrsrArrayBitsetPair &p, std::uint32_t v) { std::ignore = p.bmp.add(v); });
+    };
+    e.run         = [andnot](void *sv) -> int64_t {
+        auto *s = static_cast<FrsrColdHeapState *>(sv);
+        std::size_t const n = s->pairs.size();
+        int64_t checksum = 0;
+        for (std::size_t k = 0; k < kOpsPerRun; ++k) {
+            auto *p = s->pairs[s->order[k % n]];
+            TestBitmap32 r = andnot ? (p->arr - p->bmp) : (p->arr & p->bmp);
+            checksum += static_cast<int64_t>(r.size());
+        }
+        return checksum;
+    };
+    e.teardown       = [](void *sv) { free_frsr_cold_heap(static_cast<FrsrColdHeapState *>(sv)); };
+    e.ops_per_run    = static_cast<int64_t>(kOpsPerRun);
+    e.inner_reps     = 200;
+    e.reusable_state = true;
+    g_benchmarks.push_back(std::move(e));
+}
+
+#if FRSR_ROARING_HAS_CROARING
+static void register_cpp_cold_card(std::size_t acard, bool andnot) {
+    Entry e;
+    char buf[128];
+    snprintf(buf, sizeof(buf), "cold_card/cppColdCard%s/acard=%zu",
+             andnot ? "Andnot" : "Intersect", acard);
+    e.name        = buf;
+    e.description = "CRoaring counterpart of the fixed-cardinality cold_heap diagnostic";
+    e.setup       = [acard]() -> void * {
+        return make_fixed_cold_heap<CppColdHeapState, CppArrayBitsetPair>(
+            acard, 0x9e3779b97f4a7c15ULL ^ acard,
+            [](CppArrayBitsetPair &p, std::uint32_t v) {
+                if (p.arr == nullptr) p.arr = roaring_bitmap_create();
+                roaring_bitmap_add(p.arr, v);
+            },
+            [](CppArrayBitsetPair &p, std::uint32_t v) {
+                if (p.bmp == nullptr) p.bmp = roaring_bitmap_create();
+                roaring_bitmap_add(p.bmp, v);
+            });
+    };
+    e.run         = [andnot](void *sv) -> int64_t {
+        auto *s = static_cast<CppColdHeapState *>(sv);
+        std::size_t const n = s->pairs.size();
+        int64_t checksum = 0;
+        for (std::size_t k = 0; k < kOpsPerRun; ++k) {
+            auto *p = s->pairs[s->order[k % n]];
+            auto *r = andnot ? roaring_bitmap_andnot(p->arr, p->bmp) : roaring_bitmap_and(p->arr, p->bmp);
+            checksum += static_cast<int64_t>(roaring_bitmap_get_cardinality(r));
+            roaring_bitmap_free(r);
+        }
+        return checksum;
+    };
+    e.teardown       = [](void *sv) { free_cpp_cold_heap(static_cast<CppColdHeapState *>(sv)); };
+    e.ops_per_run    = static_cast<int64_t>(kOpsPerRun);
+    e.inner_reps     = 200;
+    e.reusable_state = true;
+    g_benchmarks.push_back(std::move(e));
+}
+#endif // FRSR_ROARING_HAS_CROARING
+
 } // namespace cold_heap
 
 // ========================================================================
@@ -5047,6 +5146,16 @@ void register_benchmarks() {
             cold_heap::register_frsr_cold_array_bitset(ws, andnot);
 #if FRSR_ROARING_HAS_CROARING
             cold_heap::register_cpp_cold_array_bitset(ws, andnot);
+#endif
+        }
+    }
+
+    for (std::size_t const acard : { std::size_t{4}, std::size_t{16}, std::size_t{64},
+                                     std::size_t{256}, std::size_t{1024}, std::size_t{4096} }) {
+        for (bool const andnot : { false, true }) {
+            cold_heap::register_frsr_cold_card(acard, andnot);
+#if FRSR_ROARING_HAS_CROARING
+            cold_heap::register_cpp_cold_card(acard, andnot);
 #endif
         }
     }
