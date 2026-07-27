@@ -1020,25 +1020,25 @@ template <typename Layout, typename OutVector, typename CowPolicy = cow_value_se
     // specialize polarity so the inner loop is `+= bit` / `+= 1-bit` with no
     // boolean compare against keep_matches.
     auto const * const words{ rhs.words.begin() };
-    auto * outp{ out };
+    // Indexed survivor cursor, as in filter_array_bitset_inplace — see the note
+    // there for the paired measurement that settled the form.
+    std::size_t kept{ 0 };
     if ( keep_matches ) {
         for ( std::size_t i{ 0 }; i < card; ++i ) {
             auto const value{ keys[ i ] };
-            *outp = value;
-            outp += static_cast<std::ptrdiff_t>(
-                ( words[ static_cast<std::size_t>( value ) >> 6U ] >> ( value & 63U ) ) & 1U
-            );
+            out[ kept ] = value;
+            kept += ( words[ static_cast<std::size_t>( value ) >> 6U ] &
+                      ( std::uint64_t{ 1 } << ( value & 63U ) ) ) != 0;
         }
     } else {
         for ( std::size_t i{ 0 }; i < card; ++i ) {
             auto const value{ keys[ i ] };
-            *outp = value;
-            outp += static_cast<std::ptrdiff_t>(
-                1U - ( ( words[ static_cast<std::size_t>( value ) >> 6U ] >> ( value & 63U ) ) & 1U )
-            );
+            out[ kept ] = value;
+            kept += ( words[ static_cast<std::size_t>( value ) >> 6U ] &
+                      ( std::uint64_t{ 1 } << ( value & 63U ) ) ) == 0;
         }
     }
-    resize_uninitialized( result, static_cast<std::size_t>( outp - out ) );
+    resize_uninitialized( result, kept );
 }
 
 template <typename Layout, typename CowPolicy = cow_value_semantics>
@@ -1076,25 +1076,37 @@ template <typename Layout, typename CowPolicy = cow_value_semantics>
     // probe keeps that window minimal.
     // Polarity specialized + words base hoisted (same as filter_array_bitset_into).
     auto const * const words{ bitset.words.begin() };
-    auto * out{ base };
+    // Indexed survivor cursor (not an advancing output POINTER) plus a mask
+    // membership test (not shift-and-1). Both are load-bearing and they split by
+    // polarity — isolated against each other in a dedicated build, paired and
+    // interleaved with the reference implementation on a pinned core, min-of-runs,
+    // 64-element probe against a dense block (us/op):
+    //   intersect: 0.1061 -> 0.0956 (cursor) -> 0.0939 (both)
+    //   subtract : 0.1143 -> 0.1093 (cursor) -> 0.0942 (both)
+    // The cursor keeps the store address a plain base+index instead of extending
+    // the loop-carried pointer chain, which is what the intersect side was paying;
+    // the mask test drops the subtract side's `1 - bit` negation (bt+setnc against
+    // shift+and+sub), which is what dominates there.
+    // ⛔ Do not re-attribute this to the cursor alone.
+    // [croaring-ref] src/containers/mixed_andnot.c:array_bitset_container_andnot
+    // uses both forms.
+    std::size_t kept{ 0 };
     if ( keep_matches ) {
         for ( std::size_t i{ 0 }; i < card; ++i ) {
             auto const value{ base[ i ] };
-            *out = value;
-            out += static_cast<std::ptrdiff_t>(
-                ( words[ static_cast<std::size_t>( value ) >> 6U ] >> ( value & 63U ) ) & 1U
-            );
+            base[ kept ] = value;
+            kept += ( words[ static_cast<std::size_t>( value ) >> 6U ] &
+                      ( std::uint64_t{ 1 } << ( value & 63U ) ) ) != 0;
         }
     } else {
         for ( std::size_t i{ 0 }; i < card; ++i ) {
             auto const value{ base[ i ] };
-            *out = value;
-            out += static_cast<std::ptrdiff_t>(
-                1U - ( ( words[ static_cast<std::size_t>( value ) >> 6U ] >> ( value & 63U ) ) & 1U )
-            );
+            base[ kept ] = value;
+            kept += ( words[ static_cast<std::size_t>( value ) >> 6U ] &
+                      ( std::uint64_t{ 1 } << ( value & 63U ) ) ) == 0;
         }
     }
-    arr.values.resize_uninitialized( static_cast<std::uint32_t>( out - base ) );
+    arr.values.resize_uninitialized( static_cast<std::uint32_t>( kept ) );
 }
 
 // In-place membership filter of `arr` against a run list — array∩run for
