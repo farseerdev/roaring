@@ -3124,7 +3124,7 @@ private:
                 return bucket.key == chunk;
             } ) };
             if ( it == buckets.end() ) {
-                auto & bucket{ buckets.emplace_back( chunk_bucket{ .key = chunk } ) };
+                auto & bucket{ buckets.emplace_back( chunk_bucket{ .key = chunk, .lows = {} } ) };
                 bucket.lows.reserve( 16U );
                 bucket.lows.push_back( low );
             } else {
