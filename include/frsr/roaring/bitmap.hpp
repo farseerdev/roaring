@@ -1941,6 +1941,26 @@ public:
                     // production fold's sparse shapes (HW-counter A/B vs a downstream
                     // engine's sparse run∩bitset kernel, which croaring-arm ran here).
                     auto const run_cardinality{ detail::container_size( run_side ) };
+                    if ( run_cardinality >= layout_type::low_domain_size - layout_type::low_domain_size / 8U ) {
+                        // Near-full runs (≥ 7/8 of the domain, incl. the full-domain
+                        // run — CRoaring's run_container_is_full short-circuit): clone
+                        // the bitset payload and clear only the gaps, with the
+                        // cardinality maintained by subtraction — cheaper than masking
+                        // all 8 KB through the fill kernel below.
+                        auto container{ detail::intersect_run_bitset_dense_runs<layout_type, CowPolicy>(
+                            std::as_const( run_side ).as_run(),
+                            std::as_const( bitset_side ).as_bitset(),
+                            detail::container_size( bitset_side ),
+                            result_chunks.take_retired( detail::container_kind::bitset )
+                        ) };
+                        if constexpr ( !uses_default_container_set ) {
+                            container = optimize_container_for_policy( std::move( container ) );
+                        }
+                        if ( auto const bitset_size{ detail::container_size( container ) }; bitset_size != 0 ) {
+                            emit( left_key, std::move( container ), bitset_size );
+                        }
+                        return;
+                    }
                     if ( run_cardinality < array_to_bitset_threshold ) {
                         auto container{ detail::intersect_run_bitset_sparse<layout_type, CowPolicy>(
                             run_side.as_run(),

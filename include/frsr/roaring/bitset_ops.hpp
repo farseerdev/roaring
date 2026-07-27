@@ -280,6 +280,73 @@ template <typename Layout, typename CowPolicy = cow_value_semantics>
     return result;
 }
 
+// Near-full run∩bitset: clone the bitset payload wholesale and clear only the
+// inter-run gaps, subtracting each cleared word's popcount from the bitset's
+// known cardinality — no per-run masked rewrite and no full-block popcount.
+// Wins over the masked-fill sibling above when the runs cover almost the whole
+// domain (the fill degenerates to copying every word anyway, but word-by-word
+// with a fused scalar popcount, where this variant pays one straight memcpy plus
+// work proportional to the gap volume only). Callers gate on run coverage.
+// [croaring-ref] deps/croaring/src/containers/mixed_intersection.c:
+// run_bitset_container_intersection (clone + bitset_reset_range per gap, then a
+// full recount — the cardinality delta here replaces that recount)
+template <typename Layout, typename CowPolicy = cow_value_semantics>
+[[nodiscard]] inline container_handle<Layout, CowPolicy> intersect_run_bitset_dense_runs(
+    run_cref<Layout, CowPolicy> const runs,
+    bitset_cref<Layout, CowPolicy> const bitset,
+    std::size_t const bitset_cardinality,
+    container_handle<Layout, CowPolicy> && reuse = {}
+) noexcept {
+    auto result{ reuse.holds_bitset()
+        ? std::move( reuse )
+        : container_handle<Layout, CowPolicy>::make_bitset_uninitialized() };
+    auto result_bitset{ result.as_bitset() };
+    auto const & src{ bitset.words.as_array() };
+    auto       & out{ result_bitset.words.as_array() };
+    std::copy( src.data(), src.data() + src.size(), out.data() );
+    std::size_t removed{ 0 };
+    auto const clear_bits{ [ & ]( std::size_t const begin, std::size_t const end ) { // inclusive
+        auto const first_word{ begin >> 6U };
+        auto const last_word { end   >> 6U };
+        auto const first_mask{ std::numeric_limits<std::uint64_t>::max() << ( begin & 63U ) };
+        auto const last_bit  { static_cast<unsigned>( end & 63U ) };
+        auto const last_mask { ( last_bit == 63U )
+            ? std::numeric_limits<std::uint64_t>::max()
+            : ( std::uint64_t{ 1 } << ( last_bit + 1U ) ) - 1U };
+        if ( first_word == last_word ) {
+            auto const mask{ first_mask & last_mask };
+            removed += static_cast<std::size_t>( std::popcount( out[ first_word ] & mask ) );
+            out[ first_word ] &= ~mask;
+        } else {
+            removed += static_cast<std::size_t>( std::popcount( out[ first_word ] & first_mask ) );
+            out[ first_word ] &= ~first_mask;
+            for ( auto word_index{ first_word + 1U }; word_index < last_word; ++word_index ) {
+                removed += static_cast<std::size_t>( std::popcount( out[ word_index ] ) );
+                out[ word_index ] = 0;
+            }
+            removed += static_cast<std::size_t>( std::popcount( out[ last_word ] & last_mask ) );
+            out[ last_word ] &= ~last_mask;
+        }
+    } };
+    std::size_t next{ 0 }; // first value not yet covered by a processed run
+    for ( auto const & current : runs.runs ) {
+        auto const begin{ static_cast<std::size_t>( current.begin ) };
+        if ( begin > next ) {
+            clear_bits( next, begin - 1U );
+        }
+        next = static_cast<std::size_t>( current.end ) + 1U;
+    }
+    if ( next < Layout::low_domain_size ) {
+        clear_bits( next, Layout::low_domain_size - 1U );
+    }
+    auto const cardinality{ bitset_cardinality - removed };
+    if ( cardinality == 0 ) {
+        return container_handle<Layout, CowPolicy>{};
+    }
+    result.set_cardinality( static_cast<std::uint32_t>( cardinality ) );
+    return result;
+}
+
 // Sparse run∩bitset extracted directly into an array handle: only the words the
 // runs cover are read (masked at run boundaries) and their set bits emitted in
 // order — the bitset-materializing sibling above touches all Layout::word_count
