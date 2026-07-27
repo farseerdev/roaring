@@ -1910,6 +1910,20 @@ public:
                 [ & ] [[ gnu::noinline ]] () {
                     auto const & array_side{ left_is_array ? std::as_const( left_container ) : right_container };
                     auto const & run_side  { left_is_array ? right_container : std::as_const( left_container ) };
+                    // Full-domain run (a storage-optimize()d saturated chunk — the
+                    // common accumulator seed): the intersection IS the array side, so
+                    // share its payload via a CoW handle copy instead of galloping and
+                    // memcpy-ing it into a fresh container (CRoaring clones here; the
+                    // CoW copy is strictly cheaper). Mirrors intersect_run_run's
+                    // is_full fast path.
+                    if ( auto const runs{ run_side.as_run().runs }; runs.size() == 1U &&
+                         runs.front().begin == 0U &&
+                         runs.front().end == std::numeric_limits<typename layout_type::low_type>::max() ) {
+                        if ( auto const count{ static_cast<size_type>( array_side.as_array().values.size() ) }; count != 0 ) {
+                            emit( left_key, handle_type{ array_side }, count );
+                        }
+                        return;
+                    }
                     handle_type result_handle{ result_chunks.take_retired( detail::container_kind::array ) };
                     auto result_array{ result_handle.as_array() };
                     detail::filter_array_run_into<layout_type>( array_side.as_array(), run_side.as_run(), result_array.values );
