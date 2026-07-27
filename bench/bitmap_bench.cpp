@@ -3616,7 +3616,7 @@ static void register_frsr_skewed_intersect(std::size_t repeat) {
                      std::to_string(kSkewedLargeSize / kSkewedSmallSize) +
                      "x), called " + std::to_string(repeat) + " times per timed run — "
                      "reproduces a downstream real-workload array-intersect size shape "
-                     "(differential-VTune finding).";
+                     "(differential-profiling finding).";
     e.setup       = make_state;
     e.run         = [repeat](void *sv) -> int64_t {
         auto *s = static_cast<FrsrSkewedState *>(sv);
@@ -3795,7 +3795,7 @@ static void register_cpp_midskew_intersect(std::size_t repeat) {
 // The Union/Intersection/Difference families above never force a bitset
 // container on one side while keeping an array container on the other — both
 // operands always cross the array_to_bitset_threshold together. Real
-// downstream workloads (a differential-VTune investigation) hit
+// downstream workloads (a differential-profiling investigation) hit
 // exactly this shape at high call volume: a dense dimension/date range
 // (bitset-encoded) intersected against a small selection/filter array. This
 // family pins the array∩bitset membership-test kernel (filter_array_bitset /
@@ -3836,7 +3836,7 @@ static void register_frsr_mixed_array_bitset_intersect(std::size_t repeat) {
                      std::to_string(kMixedBitsetDenseSize) + "-element bitset-encoded operand, "
                      "called " + std::to_string(repeat) + " times per timed run — reproduces a "
                      "downstream real-workload array-vs-bitset intersect shape "
-                     "(differential-VTune finding, filter_array_bitset kernel).";
+                     "(differential-profiling finding, filter_array_bitset kernel).";
     e.setup       = make_state;
     e.run         = [repeat](void *sv) -> int64_t {
         auto *s = static_cast<FrsrMixedArrayBitsetState *>(sv);

@@ -2045,7 +2045,7 @@ public:
     // keys are spliced in, and the tail is appended. cardinality is left STALE (the caller
     // must repair_cardinality()). This avoids the per-fold chunk-store allocation + full
     // chunk-move that union_merge(…, /*lazy*/true) incurs on every one of the K folds — the
-    // VTune-confirmed core-bound / per-call-alloc cost that dominated the N-way union.
+    // profiler-confirmed core-bound / per-call-alloc cost that dominated the N-way union.
     // [croaring-ref] deps/croaring/src/roaring.c:roaring_bitmap_lazy_or_inplace
     [[ gnu::hot ]] void bulk_or_inplace( bitmap const & other ) {
         if constexpr ( kUseSingletonChunkMap ) {
