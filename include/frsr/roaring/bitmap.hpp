@@ -1875,6 +1875,19 @@ public:
                 // combine_containers (the dominant per-pair overhead in profiles).
                 auto const & array_side { left_is_array ? std::as_const( left_container ) : right_container };
                 auto const & bitset_side{ left_is_array ? right_container : std::as_const( left_container ) };
+                // Saturated bitset (its header keeps an exact count, see
+                // bitset_ops.hpp's repair note): the intersection IS the array
+                // side — share it via a CoW handle copy instead of probing every
+                // key against all-ones words (the all-survive regime is the
+                // filter kernel's slowest — store-to-load aliasing on the
+                // coinciding cursors). Same shape as the full-domain-run arm below.
+                if ( detail::container_is_known_full<layout_type, CowPolicy>( bitset_side ) ) {
+                    if ( auto const count{ static_cast<size_type>( array_side.as_array().values.size() ) }; count != 0 ) {
+                        emit( left_key, handle_type{ array_side }, count );
+                    }
+                    ++left;
+                    continue;
+                }
                 handle_type result_handle{ result_chunks.take_retired( detail::container_kind::array ) };
                 auto result_array{ result_handle.as_array() };
                 detail::filter_array_bitset_into<layout_type>(
@@ -1915,10 +1928,8 @@ public:
                     // share its payload via a CoW handle copy instead of galloping and
                     // memcpy-ing it into a fresh container (CRoaring clones here; the
                     // CoW copy is strictly cheaper). Mirrors intersect_run_run's
-                    // is_full fast path.
-                    if ( auto const runs{ run_side.as_run().runs }; runs.size() == 1U &&
-                         runs.front().begin == 0U &&
-                         runs.front().end == std::numeric_limits<typename layout_type::low_type>::max() ) {
+                    // is_full fast path and the saturated-bitset arm above.
+                    if ( detail::container_is_known_full<layout_type, CowPolicy>( run_side ) ) {
                         if ( auto const count{ static_cast<size_type>( array_side.as_array().values.size() ) }; count != 0 ) {
                             emit( left_key, handle_type{ array_side }, count );
                         }
