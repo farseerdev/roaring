@@ -2367,6 +2367,53 @@ public:
         }
     }
 
+    // Selective run-encoding: convert exactly the containers whose mean run length
+    // (cardinality / number of maximal runs) is at least `min_mean_run_length`, and
+    // touch nothing else — no representation re-decision for the other containers
+    // and no payload access beyond a read-only run count (an array is scanned in
+    // place, a bitset is counted from its words, both with the count capped at the
+    // first value that already fails the test). Under a refcounted CowPolicy a
+    // shared payload is therefore never cloned unless it is the one being replaced.
+    // Run containers already satisfy the test and are left as they are.
+    //
+    // This is the maintenance pass for data whose ordinary mutations degrade run
+    // shapes over time: unlike optimize()/optimize_keep_bitsets(), which reconsider
+    // every container by serialized size, only strongly run-shaped containers move
+    // — a marginal run container costs more in consumers' run×array/run×bitset
+    // kernels than it saves in bytes, so the caller sets the bar.
+    void optimize_run_shaped( std::size_t const min_mean_run_length ) {
+        if constexpr ( kUseSingletonChunkMap ) {
+            materialize_singleton_chunks();
+        }
+        for ( auto & slot : chunks_.slots() ) {
+            if ( slot.holds_run() ) {
+                continue;
+            }
+            auto const cardinality{ detail::container_size( slot ) };
+            if ( cardinality == 0 ) {
+                continue;  // lazy-removal tombstone
+            }
+            // runs * min_mean_run_length <= cardinality  ⇔  runs <= cardinality / min_mean_run_length
+            auto const max_runs{ cardinality / min_mean_run_length };
+            auto const runs{
+                slot.holds_array()
+                    ? [ & ] {
+                          auto const values{ std::as_const( slot ).as_array().values };
+                          return detail::run_count_from_sorted_values<layout_type>( { values.data(), values.size() }, max_runs + 1U );
+                      }()
+                    : detail::run_count_from_bitset_words<layout_type>(
+                          std::span<std::uint64_t const>{ std::as_const( slot ).as_bitset().words.as_array() },
+                          max_runs + 1U
+                      )
+            };
+            if ( runs > max_runs ) {
+                continue;
+            }
+            auto const values{ detail::sorted_values_from_container<layout_type>( slot ) };
+            slot = detail::run_handle_from_sorted_values<layout_type, CowPolicy>( { values.data(), values.size() } );
+        }
+    }
+
     void optimize_for_storage() { optimize(); }
     void optimize_for_speed( std::uint16_t const threshold = static_cast<std::uint16_t>( array_to_bitset_threshold ) ) {
         promote_large_arrays( threshold );

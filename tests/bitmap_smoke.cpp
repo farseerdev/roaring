@@ -488,4 +488,90 @@ TEST(FrsrRoaringSmoke, SerializeFrozenViewAndMaterializeRoundTrip) {
     EXPECT_EQ( materialized.to_vector(), baseline );
 }
 
+// optimize_run_shaped() is exercised on a run_selection_lazy instantiation:
+// under the eager policy ordinary construction would already pick run storage
+// for contiguous input, leaving the selective pass nothing to decide.
+using LazyBitmap = frsr::roaring::bitmap<
+    std::uint32_t,
+    frsr::roaring::default_container_set<std::uint32_t>,
+    frsr::roaring::detail::cow_atomic_refcount,
+    frsr::roaring::detail::run_selection_lazy
+>;
+
+// `runs` maximal runs of `run_length` values each, separated by `gap` absent
+// values, all within the chunk at `base`.
+[[nodiscard]] std::vector<std::uint32_t> run_shaped_values(
+    std::uint32_t const base, std::uint32_t const runs, std::uint32_t const run_length, std::uint32_t const gap
+) {
+    std::vector<std::uint32_t> values;
+    for ( std::uint32_t run{ 0U }; run < runs; ++run ) {
+        auto const start{ base + run * ( run_length + gap ) };
+        for ( std::uint32_t offset{ 0U }; offset < run_length; ++offset ) {
+            values.push_back( start + offset );
+        }
+    }
+    return values;
+}
+
+TEST(FrsrRoaringSmoke, OptimizeRunShapedConvertsOnlyContainersAtOrAboveTheMeanRunLength) {
+    constexpr std::uint32_t chunk{ 65'536U };
+    constexpr std::size_t   min_mean_run_length{ 64U };
+
+    // chunk 0: one contiguous block, array-sized          -> converts
+    // chunk 1: one contiguous block, bitset-sized         -> converts
+    // chunk 2: every other value, array-sized             -> stays an array
+    // chunk 3: every other value, bitset-sized            -> stays a bitset
+    // chunk 4: runs of exactly 64 (mean == threshold)     -> converts
+    // chunk 5: runs of 63 (mean just below the threshold) -> stays an array
+    std::vector<std::uint32_t> values;
+    for ( auto const & part : {
+        run_shaped_values( 0U * chunk,     1U,   600U, 0U ),
+        run_shaped_values( 1U * chunk,     1U, 6'000U, 0U ),
+        run_shaped_values( 2U * chunk,   600U,     1U, 1U ),
+        run_shaped_values( 3U * chunk, 6'000U,     1U, 1U ),
+        run_shaped_values( 4U * chunk,    50U,    64U, 1U ),
+        run_shaped_values( 5U * chunk,    50U,    63U, 2U ),
+    } ) {
+        values.insert( values.end(), part.begin(), part.end() );
+    }
+
+    LazyBitmap bitmap{ values };
+    {
+        auto const before{ bitmap.statistics() };
+        EXPECT_EQ( before.run_containers,    0U );
+        EXPECT_EQ( before.array_containers,  4U );
+        EXPECT_EQ( before.bitset_containers, 2U );
+    }
+
+    bitmap.optimize_run_shaped( min_mean_run_length );
+
+    auto const after{ bitmap.statistics() };
+    EXPECT_EQ( after.run_containers,    3U );
+    EXPECT_EQ( after.array_containers,  2U );
+    EXPECT_EQ( after.bitset_containers, 1U );
+    EXPECT_EQ( bitmap.to_vector(), values );
+
+    // Idempotent: run containers already satisfy the test, the rest was rejected once.
+    bitmap.optimize_run_shaped( min_mean_run_length );
+    auto const again{ bitmap.statistics() };
+    EXPECT_EQ( again.run_containers,    3U );
+    EXPECT_EQ( again.array_containers,  2U );
+    EXPECT_EQ( again.bitset_containers, 1U );
+}
+
+TEST(FrsrRoaringSmoke, OptimizeRunShapedOnACopyLeavesTheSharedSourceUntouched) {
+    auto const values{ run_shaped_values( 0U, 1U, 6'000U, 0U ) };  // above the array→bitset threshold
+    LazyBitmap const source{ values };
+    ASSERT_EQ( source.statistics().bitset_containers, 1U );
+
+    LazyBitmap copy{ source };
+    copy.optimize_run_shaped( 64U );
+
+    EXPECT_EQ( copy  .statistics().run_containers,    1U );
+    EXPECT_EQ( source.statistics().bitset_containers, 1U );
+    EXPECT_EQ( source.statistics().run_containers,    0U );
+    EXPECT_EQ( copy  .to_vector(), values );
+    EXPECT_EQ( source.to_vector(), values );
+}
+
 } // namespace
