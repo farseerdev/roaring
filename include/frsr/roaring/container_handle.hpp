@@ -554,6 +554,12 @@ private:
     // fresh born-shared payload and drops this handle's reference to the old
     // one. Under a non-refcounted policy this reduces to the single
     // predictably-never-taken borrowed check.
+    // Only the DECISION lives here: the whole body is on the path of every single-value
+    // mutation (an add through container_add re-acquires the mutable view per value), so
+    // it has to inline into its callers. The clone arms are outlined for exactly that
+    // reason — inline, their allocate + copy + release code exceeds the inliner's budget
+    // and the barrier is emitted as an out-of-line call per mutation, which is how it
+    // came to hold its own line in a downstream profile.
     void make_payload_unique() noexcept( !CowPolicy::refcounted ) {
         if ( owner_ == storage_ownership::borrowed ) [[unlikely]] {
             clone_borrowed_payload();
@@ -563,20 +569,29 @@ private:
             if ( !spilled() ) {
                 return;
             }
-            auto * const old_payload{ spill().data };
-            if ( CowPolicy::rc_load( rc_slot_of( old_payload ) ) == 1 ) {
-                return;
+            if ( CowPolicy::rc_load( rc_slot_of( spill().data ) ) == 1 ) [[likely]] {
+                return;   // sole referent — mutate in place
             }
-#if FRSR_ROARING_PAYLOAD_ALLOC_STATS
-            payload_alloc_stats().cow_clone.fetch_add( 1, std::memory_order_relaxed );
-#endif
-            auto * const fresh{ allocate_payload( std::size_t{ spill().capacity } * element_size() ) };
-            std::memcpy( fresh, old_payload, std::size_t{ count_ } * element_size() );
-            if ( CowPolicy::rc_decrement_is_last( rc_slot_of( old_payload ) ) ) {
-                free_payload( old_payload );
-            }
-            spill().data = fresh;
+            clone_shared_payload();
         }
+    }
+
+    // The co-owned arm of the write barrier: clone to a fresh born-shared payload and
+    // drop this handle's reference to the old one. Cold by construction — a handle is
+    // only co-owned between a copy and the first write through either side.
+    [[gnu::noinline, gnu::cold]] void clone_shared_payload() noexcept( !CowPolicy::refcounted )
+        requires( CowPolicy::refcounted )
+    {
+        auto * const old_payload{ spill().data };
+#if FRSR_ROARING_PAYLOAD_ALLOC_STATS
+        payload_alloc_stats().cow_clone.fetch_add( 1, std::memory_order_relaxed );
+#endif
+        auto * const fresh{ allocate_payload( std::size_t{ spill().capacity } * element_size() ) };
+        std::memcpy( fresh, old_payload, std::size_t{ count_ } * element_size() );
+        if ( CowPolicy::rc_decrement_is_last( rc_slot_of( old_payload ) ) ) {
+            free_payload( old_payload );
+        }
+        spill().data = fresh;
     }
 
     // Clones a borrowed payload into private storage: inline when it fits the
