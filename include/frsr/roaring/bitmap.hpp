@@ -460,6 +460,32 @@ public:
         }
         return total;
     }
+
+    // Administrative charge per chunk in data_byte_size(), fixed at the reference
+    // format's descriptor width rather than at this implementation's handle width.
+    static constexpr size_type chunk_descriptor_bytes{ 8 };
+
+    // Size estimate for ordering a multi-way fold: the set data each chunk holds,
+    // plus one fixed descriptor charge per chunk so that a bitmap made of many
+    // nearly empty chunks is not judged free.
+    //
+    // Deliberately excludes the container handles. A handle is 32 bytes of index
+    // belonging to this implementation — four times the descriptor charge — so
+    // counting it makes a sparse many-chunk bitmap look several times heavier than
+    // the data it actually holds, which reorders a smallest-data-first fold away
+    // from the smallest data. byte_size() answers the other question, how much
+    // memory the bitmap occupies, and is the wrong key for a cost heuristic.
+    [[nodiscard]] size_type data_byte_size() const noexcept {
+        auto total{ chunks_.size() * chunk_descriptor_bytes };
+        for ( auto const & slot : chunks_.slots() ) {
+            total += detail::container_byte_size( slot );
+        }
+        if constexpr ( kUseSingletonChunkMap ) {
+            total += singleton_chunks_.size()
+                   * ( chunk_descriptor_bytes + sizeof( typename layout_type::low_type ) );
+        }
+        return total;
+    }
     [[nodiscard]] std::uint16_t container_count() const noexcept {
         if constexpr ( kUseSingletonChunkMap ) {
             return static_cast<std::uint16_t>( chunks_.size() + singleton_chunks_.size() );
@@ -2247,7 +2273,7 @@ public:
 
     [[ gnu::hot ]] void or_many_sorted_in_place( std::span<bitmap const *> others ) {
         std::ranges::sort( others, []( bitmap const * const lhs, bitmap const * const rhs ) {
-            return lhs->byte_size() > rhs->byte_size();
+            return lhs->data_byte_size() > rhs->data_byte_size();
         } );
         or_many_in_place( { others.data(), others.size() } );
     }
@@ -2258,7 +2284,7 @@ public:
 
     [[ gnu::hot ]] void and_many_sorted_in_place( std::span<bitmap const *> others ) {
         std::ranges::sort( others, []( bitmap const * const lhs, bitmap const * const rhs ) {
-            return lhs->byte_size() < rhs->byte_size();
+            return lhs->data_byte_size() < rhs->data_byte_size();
         } );
         for ( auto const other : others ) {
             if ( other != nullptr ) {
@@ -2275,7 +2301,7 @@ public:
             return {};
         }
         std::ranges::sort( others, []( bitmap const * const lhs, bitmap const * const rhs ) {
-            return lhs->byte_size() < rhs->byte_size();
+            return lhs->data_byte_size() < rhs->data_byte_size();
         } );
         bitmap result{ *others.front() };
         for ( auto index{ std::size_t{ 1 } }; index < others.size(); ++index ) {
