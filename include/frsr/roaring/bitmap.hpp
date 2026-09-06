@@ -2436,9 +2436,14 @@ public:
         return result;
     }
 
-    [[nodiscard]] friend bitmap operator&( bitmap lhs, inverse_proxy const rhs ) {
-        lhs &= rhs;
-        return lhs;
+    // Materializes straight into the result, exactly as the operator- below does
+    // — taking lhs by value would copy the whole bitmap and then mutate the copy,
+    // which under a refcounting CowPolicy also clones every payload the in-place
+    // difference touches, because the copy left them shared.
+    [[nodiscard]] friend bitmap operator&( bitmap const & lhs, inverse_proxy const rhs ) {
+        bitmap result;
+        lhs.difference_into( rhs.bm, result );
+        return result;
     }
 
     [[nodiscard]] friend bitmap operator-( bitmap const & lhs, bitmap const & rhs ) {
