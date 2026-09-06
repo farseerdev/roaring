@@ -116,6 +116,21 @@ if(FRSR_ROARING_USE_PSI_VM)
             BOOST_CONTAINER_NO_LIB
         )
 
+        # BOOST_ENABLE_ASSERT_DEBUG_HANDLER above is what makes this necessary. It
+        # opts into ::boost::assertion_failed[_msg], and Boost 1.92 moved those
+        # declarations ABOVE boost/assert.hpp's own `#include <boost/config.hpp>`
+        # (1.91: include at 44, first BOOST_NORETURN at 50; 1.92: BOOST_NORETURN at
+        # 36, include at 63), so any translation unit reaching <boost/assert.hpp>
+        # first dies with "unknown type name 'BOOST_NORETURN'". psi/vm/align.hpp
+        # does exactly that, and it is on the include path of every header here.
+        # Boost is consumed as an include directory rather than as a Boost:: target
+        # so that this library still configures standalone, which also means it
+        # cannot inherit a superproject's fix — hence the same force-include here.
+        # Remove once upstream orders the include first.
+        target_compile_options(frsr_roaring PUBLIC
+            "$<IF:$<STREQUAL:${CMAKE_CXX_COMPILER_FRONTEND_VARIANT},MSVC>,/FIboost/config.hpp,SHELL:-include boost/config.hpp>"
+        )
+
         # File-mapped serialization + persistent_bitmap (vm_vector map_file):
         # needs the COMPILED psi::vm library, not just its container headers,
         # hence a separate opt-in on top of FRSR_ROARING_USE_PSI_VM. Wired at
