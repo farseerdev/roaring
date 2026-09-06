@@ -2197,13 +2197,18 @@ public:
             slot = optimize_container_for_policy( std::move( slot ) );
         }
     }
+    // Forces the eager run re-decision, exactly as bulk_or_repair_after_lazy()
+    // does for its run slots: a lazily accumulated merge can carry run containers
+    // in verbatim from its operands, and under the ambient lazy policy a run can
+    // never be re-chosen, so every such container would be materialized out and
+    // re-encoded on the caller's next optimize().
     void bulk_or_finish_keep_bitsets() noexcept {
         if constexpr ( kUseSingletonChunkMap ) {
             materialize_singleton_chunks();
         }
         repair_cardinality();  // bulk_or_intermediate left bitset cardinalities stale
         for ( auto & slot : chunks_.slots() ) {
-            slot = optimize_container_keep_bitsets_for_policy( std::move( slot ) );
+            slot = optimize_container_keep_bitsets_for_policy<detail::run_selection_eager>( std::move( slot ) );
         }
     }
 
