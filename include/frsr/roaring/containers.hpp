@@ -337,6 +337,17 @@ template <typename Layout, typename CowPolicy = cow_value_semantics>
 // (which copies the values into the chosen representation) and
 // make_container_from_filled_array (which can keep an already-materialized array
 // handle without a second allocation). Assumes sorted_values is non-empty.
+//
+// bitset_threshold is the cardinality from which the caller wants a bitset: the
+// bitmap's default (array_to_bitset_threshold) sits exactly at the byte-parity
+// point (a bitset is never larger than the array from there on), so the default
+// decision is the pure smallest-form rule. A caller passing a LOWER threshold is
+// asking for bitsets before they pay off in bytes — dense chunks whose consumers
+// are intersection kernels (array∩bitset probes and word-parallel bitset∩bitset
+// are far cheaper than merging two multi-thousand-element arrays) — so the
+// threshold is honored as given rather than being re-gated on byte parity, which
+// would silently reduce it to the default. A run still wins over the bitset when it
+// is the smaller of the two (an explicit threshold trades against arrays only).
 template <typename Layout, typename RunSelectionPolicy = run_selection_eager>
 [[nodiscard]] inline container_kind choose_sorted_container_kind(
     std::span<typename Layout::low_type const> const sorted_values,
@@ -344,21 +355,21 @@ template <typename Layout, typename RunSelectionPolicy = run_selection_eager>
 ) {
     auto const can_consider_run{ RunSelectionPolicy::eager && sorted_values.size() >= 64U };
     auto const array_bytes{ sorted_values.size() * sizeof( typename Layout::low_type ) };
+    auto const bitset_bytes{ Layout::word_count * sizeof( std::uint64_t ) };
     // Only the ORDER of run_bytes against array_bytes/bitset_bytes matters below, so
     // the run scan may stop at the first count that can no longer win — decision-
-    // equivalent, because a capped (hence >= array_bytes) run_bytes fails the run
-    // branch outright, and the bitset branch's own `bitset_bytes <= array_bytes`
-    // conjunct then implies `bitset_bytes <= run_bytes` regardless of the true count.
+    // equivalent, because a capped (hence >= the cap's bound) run_bytes fails both
+    // the `run_bytes < array_bytes` and the `bitset_bytes <= run_bytes` tests
+    // exactly as the true count would.
     constexpr auto run_bytes_per_run{ sizeof( typename run_container<Layout>::run ) };
-    auto const run_count_cap{ array_bytes / run_bytes_per_run + 1U };
+    auto const run_count_cap{ std::max( array_bytes, bitset_bytes ) / run_bytes_per_run + 1U };
     auto const run_bytes{
         can_consider_run
             ? run_count_from_sorted_values<Layout>( sorted_values, run_count_cap ) * run_bytes_per_run
             : std::numeric_limits<std::size_t>::max()
     };
-    auto const bitset_bytes{ Layout::word_count * sizeof( std::uint64_t ) };
 
-    if ( sorted_values.size() >= bitset_threshold && bitset_bytes <= array_bytes && bitset_bytes <= run_bytes ) {
+    if ( sorted_values.size() >= bitset_threshold && bitset_bytes <= run_bytes ) {
         return container_kind::bitset;
     }
     if ( can_consider_run && run_bytes < array_bytes ) {

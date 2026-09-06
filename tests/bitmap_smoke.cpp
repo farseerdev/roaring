@@ -58,6 +58,33 @@ TEST(FrsrRoaringSmoke, SortedBulkMutationsAndPromotionHelpersWork) {
     EXPECT_GT( bitmap.container_count(), 0U );
 }
 
+TEST(FrsrRoaringSmoke, SortedBulkConstructionHonorsAnExplicitBitsetThreshold) {
+    // A chunk between an explicit (lowered) threshold and the byte-parity point:
+    // the default decision keeps it an array (smaller), the explicit threshold
+    // asks for a bitset regardless of bytes.
+    std::vector<std::uint32_t> values;
+    for ( std::uint32_t value{ 0U }; value < 2'048U; ++value ) {
+        values.push_back( value * 3U );
+    }
+    ASSERT_LT( values.size(), TestBitmap::array_to_bitset_threshold );
+
+    TestBitmap by_default;
+    by_default.add_sorted_many( values );
+    EXPECT_EQ( by_default.statistics().array_containers , 1U );
+    EXPECT_EQ( by_default.statistics().bitset_containers, 0U );
+
+    TestBitmap explicit_threshold;
+    explicit_threshold.add_sorted_many( values, 1'024U );
+    EXPECT_EQ( explicit_threshold.statistics().bitset_containers, 1U );
+    EXPECT_EQ( explicit_threshold.statistics().array_containers , 0U );
+    EXPECT_EQ( explicit_threshold.to_vector(), values );
+
+    // Below the explicit threshold the chunk stays an array.
+    TestBitmap under_threshold;
+    under_threshold.add_sorted_many( std::span{ values }.first( 1'000U ), 1'024U );
+    EXPECT_EQ( under_threshold.statistics().array_containers, 1U );
+}
+
 TEST(FrsrRoaringSmoke, PublicContainerTypesAreDirectlyUsable) {
     frsr::roaring::run<std::uint16_t> const segment{ 100U, 140U };
     EXPECT_EQ( segment.begin, 100U );
