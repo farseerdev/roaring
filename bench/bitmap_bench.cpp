@@ -2519,12 +2519,15 @@ static void register_set_binary(std::size_t count, std::size_t offset,
 
 // ========== N-way UnionMany ==========
 
+template <class Arm>
 struct FrsrNWayState {
+    using TestBitmap32 = typename Arm::bitmap;
     std::vector<TestBitmap32>       bitmaps;
     std::vector<TestBitmap32 const *> ptrs;
     TestBitmap32                    accumulator;
 };
 
+template <class Arm>
 struct CppNWayState {
     std::vector<roaring_bitmap_t *> bitmaps;
     std::vector<roaring_bitmap_t const *> ptrs;
@@ -2546,7 +2549,10 @@ struct SetNWayState {
     std::vector<std::set<uint64_t>> bitmaps;
 };
 
-static void register_nway_union(std::size_t count) {
+template <class Arm>
+struct register_nway_union_frsr_registrar {
+    using TestBitmap32 = typename Arm::bitmap;
+    static void run(std::size_t count) {
     char name_buf[64];
     snprintf(name_buf, sizeof(name_buf), "count=%zu", count);
     std::string ptag(name_buf);
@@ -2558,11 +2564,11 @@ static void register_nway_union(std::size_t count) {
     // frsr UnionMany  (or_many_in_place)
     {
         Entry e;
-        e.name        = "set_ops/frsr" "UnionMany/" + ptag;
+        e.name        = std::string("set_ops/") + Arm::label() + "UnionMany/" + ptag;
         e.description = "frsr::roaring::bitmap<uint32_t> or_many_in_place() over K=64 operands. "
                         "[croaring-ref] deps/croaring/benchmarks/benchmark.cpp:TotalUnion";
         e.setup    = [count, shift]() -> void * {
-            auto *s = new FrsrNWayState;
+            auto *s = new FrsrNWayState<Arm>;
             s->bitmaps.resize(kNWayFanout);
             s->ptrs.resize(kNWayFanout);
             for (std::size_t k = 0; k < kNWayFanout; ++k) {
@@ -2574,30 +2580,45 @@ static void register_nway_union(std::size_t count) {
             return s;
         };
         e.run      = [](void *sv) -> int64_t {
-            auto *s = static_cast<FrsrNWayState *>(sv);
+            auto *s = static_cast<FrsrNWayState<Arm> *>(sv);
             s->accumulator = TestBitmap32{};
             s->accumulator.or_many_in_place({ s->ptrs.data(), s->ptrs.size() });
             return static_cast<int64_t>(s->accumulator.size());
         };
-        e.teardown      = [](void *sv) { delete static_cast<FrsrNWayState *>(sv); };
+        e.teardown      = [](void *sv) { delete static_cast<FrsrNWayState<Arm> *>(sv); };
         e.ops_per_run   = static_cast<int64_t>(kNWayFanout);
         e.inner_reps    = kNWayInnerReps;
         e.reusable_state = true;
         g_benchmarks.push_back(std::move(e));
     }
 
+    }
+};
+
+template <class Arm>
+struct register_nway_union_cpp_registrar {
+    static void run(std::size_t count) {
+    char name_buf[64];
+    snprintf(name_buf, sizeof(name_buf), "count=%zu", count);
+    std::string ptag(name_buf);
+
+    // Each bitmap k covers [k*shift, k*shift + count) where shift = count/K.
+    // That gives moderate pairwise overlap (~(K-1)/K unique total = ~(1-1/K)*count*K).
+    std::size_t const shift = std::max(std::size_t{1}, count / kNWayFanout);
+
+
     // cpp UnionMany  (roaring_bitmap_or_many)
     {
         Entry e;
-        e.name        = "set_ops/cpp" "UnionMany/" + ptag;
+        e.name        = std::string("set_ops/") + Arm::label() + "UnionMany/" + ptag;
         e.description = "CRoaring roaring_bitmap_or_many() over K=64 operands. "
                         "[croaring-ref] deps/croaring/benchmarks/benchmark.cpp:TotalUnion";
         e.setup    = [count, shift]() -> void * {
-            auto *s = new CppNWayState;
+            auto *s = new CppNWayState<Arm>;
             s->bitmaps.resize(kNWayFanout);
             s->ptrs.resize(kNWayFanout);
             for (std::size_t k = 0; k < kNWayFanout; ++k) {
-                s->bitmaps[k] = roaring_bitmap_create();
+                s->bitmaps[k] = Arm::create();
                 for (std::size_t i = 0; i < count; ++i) {
                     roaring_bitmap_add(s->bitmaps[k], static_cast<uint32_t>(k * shift + i));
                 }
@@ -2606,18 +2627,36 @@ static void register_nway_union(std::size_t count) {
             return s;
         };
         e.run      = [](void *sv) -> int64_t {
-            auto *s   = static_cast<CppNWayState *>(sv);
+            auto *s   = static_cast<CppNWayState<Arm> *>(sv);
             auto *r   = roaring_bitmap_or_many(kNWayFanout, s->ptrs.data());
             int64_t c = static_cast<int64_t>(roaring_bitmap_get_cardinality(r));
             roaring_bitmap_free(r);
             return c;
         };
-        e.teardown      = [](void *sv) { delete static_cast<CppNWayState *>(sv); };
+        e.teardown      = [](void *sv) { delete static_cast<CppNWayState<Arm> *>(sv); };
         e.ops_per_run   = static_cast<int64_t>(kNWayFanout);
         e.inner_reps    = kNWayInnerReps;
         e.reusable_state = true;
         g_benchmarks.push_back(std::move(e));
     }
+
+    }
+};
+
+static void register_nway_union(std::size_t count) {
+    char name_buf[64];
+    snprintf(name_buf, sizeof(name_buf), "count=%zu", count);
+    std::string ptag(name_buf);
+
+    // Each bitmap k covers [k*shift, k*shift + count) where shift = count/K.
+    // That gives moderate pairwise overlap (~(K-1)/K unique total = ~(1-1/K)*count*K).
+    std::size_t const shift = std::max(std::size_t{1}, count / kNWayFanout);
+
+    arms::for_each_frsr<register_nway_union_frsr_registrar>(count);
+
+#if FRSR_ROARING_HAS_CROARING
+    arms::for_each_croaring<register_nway_union_cpp_registrar>(count);
+#endif
 
     // r64 UnionMany  (successive roaring64_bitmap_or_inplace — no or_many in r64 API)
     {
@@ -2839,7 +2878,10 @@ struct register_cpp_binary_sparse_registrar {
 template <class Arm> static void register_cpp_binary_sparse(std::size_t count, std::size_t b_chunk_offset) { register_cpp_binary_sparse_registrar<Arm>::run(count, b_chunk_offset); }
 
 
-static void register_nway_union_sparse(std::size_t count) {
+template <class Arm>
+struct register_nway_union_sparse_frsr_registrar {
+    using TestBitmap32 = typename Arm::bitmap;
+    static void run(std::size_t count) {
     char name_buf[64];
     snprintf(name_buf, sizeof(name_buf), "count=%zu", count);
     std::string ptag(name_buf);
@@ -2851,11 +2893,11 @@ static void register_nway_union_sparse(std::size_t count) {
 
     {
         Entry e;
-        e.name        = "set_ops/frsr" "UnionManySparse/" + ptag;
+        e.name        = std::string("set_ops/") + Arm::label() + "UnionManySparse/" + ptag;
         e.description = "frsr::roaring::bitmap<uint32_t> or_many_in_place() over K=64 sparse "
                         "(many small array chunk) operands.";
         e.setup    = [count, chunk_shift]() -> void * {
-            auto *s = new FrsrNWayState;
+            auto *s = new FrsrNWayState<Arm>;
             s->bitmaps.resize(kNWayFanout);
             s->ptrs.resize(kNWayFanout);
             for (std::size_t k = 0; k < kNWayFanout; ++k) {
@@ -2867,27 +2909,43 @@ static void register_nway_union_sparse(std::size_t count) {
             return s;
         };
         e.run      = [](void *sv) -> int64_t {
-            auto *s = static_cast<FrsrNWayState *>(sv);
+            auto *s = static_cast<FrsrNWayState<Arm> *>(sv);
             s->accumulator = TestBitmap32{};
             s->accumulator.or_many_in_place({ s->ptrs.data(), s->ptrs.size() });
             return static_cast<int64_t>(s->accumulator.size());
         };
-        e.teardown      = [](void *sv) { delete static_cast<FrsrNWayState *>(sv); };
+        e.teardown      = [](void *sv) { delete static_cast<FrsrNWayState<Arm> *>(sv); };
         e.ops_per_run   = static_cast<int64_t>(kNWayFanout);
         e.inner_reps    = kNWayInnerReps;
         e.reusable_state = true;
         g_benchmarks.push_back(std::move(e));
     }
+    }
+};
+
+template <class Arm>
+struct register_nway_union_sparse_cpp_registrar {
+    static void run(std::size_t count) {
+    char name_buf[64];
+    snprintf(name_buf, sizeof(name_buf), "count=%zu", count);
+    std::string ptag(name_buf);
+
+    // Each operand k covers nchunks chunks starting at chunk k*chunk_shift, kSparsePerChunk
+    // values per chunk — so the K=64 folds interleave across thousands of small array chunks.
+    std::size_t const nchunks     = std::max(std::size_t{ 1 }, count / kSparsePerChunk);
+    std::size_t const chunk_shift = std::max(std::size_t{ 1 }, nchunks / kNWayFanout);
+
+
     {
         Entry e;
-        e.name        = "set_ops/cpp" "UnionManySparse/" + ptag;
+        e.name        = std::string("set_ops/") + Arm::label() + "UnionManySparse/" + ptag;
         e.description = "CRoaring roaring_bitmap_or_many() over K=64 sparse operands.";
         e.setup    = [count, chunk_shift]() -> void * {
-            auto *s = new CppNWayState;
+            auto *s = new CppNWayState<Arm>;
             s->bitmaps.resize(kNWayFanout);
             s->ptrs.resize(kNWayFanout);
             for (std::size_t k = 0; k < kNWayFanout; ++k) {
-                s->bitmaps[k] = roaring_bitmap_create();
+                s->bitmaps[k] = Arm::create();
                 for (std::size_t i = 0; i < count; ++i) {
                     roaring_bitmap_add(s->bitmaps[k], sparse_value(k * chunk_shift, i));
                 }
@@ -2896,18 +2954,37 @@ static void register_nway_union_sparse(std::size_t count) {
             return s;
         };
         e.run      = [](void *sv) -> int64_t {
-            auto *s   = static_cast<CppNWayState *>(sv);
+            auto *s   = static_cast<CppNWayState<Arm> *>(sv);
             auto *r   = roaring_bitmap_or_many(kNWayFanout, s->ptrs.data());
             int64_t c = static_cast<int64_t>(roaring_bitmap_get_cardinality(r));
             roaring_bitmap_free(r);
             return c;
         };
-        e.teardown      = [](void *sv) { delete static_cast<CppNWayState *>(sv); };
+        e.teardown      = [](void *sv) { delete static_cast<CppNWayState<Arm> *>(sv); };
         e.ops_per_run   = static_cast<int64_t>(kNWayFanout);
         e.inner_reps    = kNWayInnerReps;
         e.reusable_state = true;
         g_benchmarks.push_back(std::move(e));
     }
+    }
+};
+
+static void register_nway_union_sparse(std::size_t count) {
+    char name_buf[64];
+    snprintf(name_buf, sizeof(name_buf), "count=%zu", count);
+    std::string ptag(name_buf);
+
+    // Each operand k covers nchunks chunks starting at chunk k*chunk_shift, kSparsePerChunk
+    // values per chunk — so the K=64 folds interleave across thousands of small array chunks.
+    std::size_t const nchunks     = std::max(std::size_t{ 1 }, count / kSparsePerChunk);
+    std::size_t const chunk_shift = std::max(std::size_t{ 1 }, nchunks / kNWayFanout);
+
+    arms::for_each_frsr<register_nway_union_sparse_frsr_registrar>(count);
+
+#if FRSR_ROARING_HAS_CROARING
+    arms::for_each_croaring<register_nway_union_sparse_cpp_registrar>(count);
+#endif
+
 }
 
 // ========================================================================
@@ -3602,12 +3679,15 @@ template <class Arm> static void register_cpp_array_run_and_fold_shared(std::siz
 // iteration (a fold would convert the accumulator to array after step one).
 // ========================================================================
 
+template <class Arm>
 struct FrsrRunAccumState {
+    using TestBitmap32 = typename Arm::bitmap;
     TestBitmap32 seed;      // run-encoded after optimize()
     TestBitmap32 array_op;  // sparse -> array-encoded
     TestBitmap32 bitset_op; // dense  -> bitset-encoded
 };
 
+template <class Arm>
 struct CppRunAccumState {
     roaring_bitmap_t *seed{};
     roaring_bitmap_t *array_op{};
@@ -3620,8 +3700,9 @@ struct CppRunAccumState {
     }
 };
 
+template <class Arm>
 static void *make_frsr_run_accum_state() {
-    auto *s = new FrsrRunAccumState;
+    auto *s = new FrsrRunAccumState<Arm>;
     auto const domain = kArrayRunFoldNumRuns * kArrayRunFoldStride;
     for (std::size_t run = 0; run < kArrayRunFoldNumRuns; ++run) {
         auto const begin = static_cast<std::uint32_t>(run * kArrayRunFoldStride + 7);
@@ -3637,8 +3718,9 @@ static void *make_frsr_run_accum_state() {
     return s;
 }
 
+template <class Arm>
 static void *make_cpp_run_accum_state() {
-    auto *s = new CppRunAccumState;
+    auto *s = new CppRunAccumState<Arm>;
     s->seed      = roaring_bitmap_create();
     s->array_op  = roaring_bitmap_create();
     s->bitset_op = roaring_bitmap_create();
@@ -3658,24 +3740,24 @@ static void *make_cpp_run_accum_state() {
     return s;
 }
 
-template <TestBitmap32 FrsrRunAccumState::*Operand>
+template <class Arm, typename Arm::bitmap FrsrRunAccumState<Arm>::*Operand>
 static int64_t run_frsr_run_accum(void *sv, std::size_t const repeat) {
-    auto *s = static_cast<FrsrRunAccumState *>(sv);
+    auto *s = static_cast<FrsrRunAccumState<Arm> *>(sv);
     int64_t checksum = 0;
     for (std::size_t i = 0; i < repeat; ++i) {
-        TestBitmap32 acc{ s->seed };   // shallow COW copy: run-left, rc > 1
+        typename Arm::bitmap acc{ s->seed };   // shallow COW copy: run-left, rc > 1
         acc &= s->*Operand;
         checksum += static_cast<int64_t>(acc.size());
     }
     return checksum;
 }
 
-template <roaring_bitmap_t *CppRunAccumState::*Operand>
+template <class Arm, roaring_bitmap_t *CppRunAccumState<Arm>::*Operand>
 static int64_t run_cpp_run_accum(void *sv, std::size_t const repeat) {
-    auto *s = static_cast<CppRunAccumState *>(sv);
+    auto *s = static_cast<CppRunAccumState<Arm> *>(sv);
     int64_t checksum = 0;
     for (std::size_t i = 0; i < repeat; ++i) {
-        auto *acc = roaring_bitmap_copy(s->seed);   // COW-shallow
+        auto *acc = Arm::copy(s->seed);   // COW-shallow
         roaring_bitmap_and_inplace(acc, s->*Operand);
         checksum += static_cast<int64_t>(roaring_bitmap_get_cardinality(acc));
         roaring_bitmap_free(acc);
@@ -3683,37 +3765,63 @@ static int64_t run_cpp_run_accum(void *sv, std::size_t const repeat) {
     return checksum;
 }
 
-static void register_run_accum_and(std::size_t repeat) {
-    struct Variant {
-        const char *lib;
-        const char *op;
-        const char *overlap;
-        void *(*setup)();
-        int64_t (*run)(void *, std::size_t);
-        void (*teardown)(void *);
-    };
-    static constexpr auto free_frsr = [](void *sv) { delete static_cast<FrsrRunAccumState *>(sv); };
-    static constexpr auto free_cpp  = [](void *sv) { delete static_cast<CppRunAccumState *>(sv); };
-    Variant const variants[]{
-        { "frsr", "RunArrayAndShared",  "runXarray",  make_frsr_run_accum_state, run_frsr_run_accum<&FrsrRunAccumState::array_op>,  free_frsr },
-        { "frsr", "RunBitsetAndShared", "runXbitset", make_frsr_run_accum_state, run_frsr_run_accum<&FrsrRunAccumState::bitset_op>, free_frsr },
-        { "cpp",  "RunArrayAndShared",  "runXarray",  make_cpp_run_accum_state,  run_cpp_run_accum<&CppRunAccumState::array_op>,   free_cpp  },
-        { "cpp",  "RunBitsetAndShared", "runXbitset", make_cpp_run_accum_state,  run_cpp_run_accum<&CppRunAccumState::bitset_op>,  free_cpp  },
-    };
-    for (auto const &v : variants) {
-        Entry e;
-        e.name        = fmt_so(v.lib, v.op, repeat, v.overlap);
-        e.description = std::string(v.lib) + " single in-place AND per iteration from a shared "
-                         "(COW, rc > 1) run-encoded accumulator — a downstream N-way AND fold seed shape.";
-        e.setup       = v.setup;
-        e.run         = [run = v.run, repeat](void *sv) -> int64_t { return run(sv, repeat); };
-        e.teardown       = v.teardown;
-        e.ops_per_run    = static_cast<int64_t>(repeat);
-        e.inner_reps     = kArrayRunFoldInnerReps;
-        e.reusable_state = true;
-        g_benchmarks.push_back(std::move(e));
+template <class Arm>
+struct register_run_accum_and_frsr_registrar {
+    static void run(std::size_t repeat) {
+        struct Variant { const char *op; const char *overlap; int64_t (*run)(void *, std::size_t); };
+        static constexpr Variant variants[]{
+            { "RunArrayAndShared",  "runXarray",  run_frsr_run_accum<Arm, &FrsrRunAccumState<Arm>::array_op>  },
+            { "RunBitsetAndShared", "runXbitset", run_frsr_run_accum<Arm, &FrsrRunAccumState<Arm>::bitset_op> },
+        };
+        for (auto const &v : variants) {
+            Entry e;
+            e.name        = fmt_so(Arm::label(), v.op, repeat, v.overlap);
+            e.description = std::string(Arm::label()) + " single in-place AND per iteration from a shared "
+                             "(COW, rc > 1) run-encoded accumulator — a downstream N-way AND fold seed shape.";
+            e.setup       = make_frsr_run_accum_state<Arm>;
+            e.run         = [run = v.run, repeat](void *sv) -> int64_t { return run(sv, repeat); };
+            e.teardown    = [](void *sv) { delete static_cast<FrsrRunAccumState<Arm> *>(sv); };
+            e.ops_per_run    = static_cast<int64_t>(repeat);
+            e.inner_reps     = kArrayRunFoldInnerReps;
+            e.reusable_state = true;
+            g_benchmarks.push_back(std::move(e));
+        }
     }
+};
+
+#if FRSR_ROARING_HAS_CROARING
+template <class Arm>
+struct register_run_accum_and_cpp_registrar {
+    static void run(std::size_t repeat) {
+        struct Variant { const char *op; const char *overlap; int64_t (*run)(void *, std::size_t); };
+        static constexpr Variant variants[]{
+            { "RunArrayAndShared",  "runXarray",  run_cpp_run_accum<Arm, &CppRunAccumState<Arm>::array_op>  },
+            { "RunBitsetAndShared", "runXbitset", run_cpp_run_accum<Arm, &CppRunAccumState<Arm>::bitset_op> },
+        };
+        for (auto const &v : variants) {
+            Entry e;
+            e.name        = fmt_so(Arm::label(), v.op, repeat, v.overlap);
+            e.description = std::string(Arm::label()) + " single in-place AND per iteration from a shared "
+                             "(COW, rc > 1) run-encoded accumulator — a downstream N-way AND fold seed shape.";
+            e.setup       = make_cpp_run_accum_state<Arm>;
+            e.run         = [run = v.run, repeat](void *sv) -> int64_t { return run(sv, repeat); };
+            e.teardown    = [](void *sv) { delete static_cast<CppRunAccumState<Arm> *>(sv); };
+            e.ops_per_run    = static_cast<int64_t>(repeat);
+            e.inner_reps     = kArrayRunFoldInnerReps;
+            e.reusable_state = true;
+            g_benchmarks.push_back(std::move(e));
+        }
+    }
+};
+#endif
+
+static void register_run_accum_and(std::size_t repeat) {
+    arms::for_each_frsr<register_run_accum_and_frsr_registrar>(repeat);
+#if FRSR_ROARING_HAS_CROARING
+    arms::for_each_croaring<register_run_accum_and_cpp_registrar>(repeat);
+#endif
 }
+
 
 // ========================================================================
 // Skewed-size repeated intersection
