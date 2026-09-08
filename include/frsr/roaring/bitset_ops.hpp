@@ -110,6 +110,56 @@ inline constexpr auto setbit_decode_table_uint16{ []() {
 }
 #endif
 
+#if FRSR_ROARING_X86_V4
+namespace x86_v4 {
+
+// Density above which the AVX-512 decoder below repays its per-word cost over the
+// byte-table SSE decoder: measured by CRoaring at ~1024 set bits per 8 KB block
+// (1.2x there, 1.4x at the array/bitset boundary).
+inline constexpr std::uint32_t extract_setbits_min_cardinality{ 1024 };
+
+// AVX-512 VBMI2 set-bit decoder for one 8 KB block into 16-bit values: per word,
+// VPCOMPRESSB compacts the byte indices 0..63 named by the word's bits into a
+// vector, which is widened to 16 bits, offset by the word base and masked-stored
+// (two halves when more than 32 bits are set). A zero word costs one add. Masked
+// stores write exactly the decoded count, so `out` needs only popcount slots.
+// [croaring-ref] deps/croaring/src/bitset_util.c:bitset_extract_setbits_avx512_uint16
+FRSR_ROARING_X86_V4_KERNEL
+inline std::size_t extract_setbits_uint16(
+    std::uint64_t const * const words, std::size_t const n, std::uint16_t * out
+) noexcept {
+    alignas( 64 ) static constexpr std::uint8_t index_table[ 64 ]{
+         0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15,
+        16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
+        32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47,
+        48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63
+    };
+    auto const * const start{ out };
+    __m512i       base    { _mm512_setzero_si512() };
+    __m512i const inc64   { _mm512_set1_epi16( 64 ) };
+    __m512i const indices { _mm512_load_si512( index_table ) };
+    for ( std::size_t i{ 0 }; i < n; ++i ) {
+        std::uint64_t const w{ words[ i ] };
+        if ( w != 0 ) {
+            auto const count{ static_cast<unsigned>( std::popcount( w ) ) };
+            __m512i const packed{ _mm512_maskz_compress_epi8( static_cast<__mmask64>( w ), indices ) };
+            std::uint64_t const lanes{ ~std::uint64_t{ 0 } >> ( 64U - count ) };
+            _mm512_mask_storeu_epi16( out, static_cast<__mmask32>( lanes ),
+                _mm512_add_epi16( base, _mm512_cvtepu8_epi16( _mm512_castsi512_si256( packed ) ) ) );
+            if ( count > 32U ) {
+                _mm512_mask_storeu_epi16( out + 32, static_cast<__mmask32>( lanes >> 32U ),
+                    _mm512_add_epi16( base, _mm512_cvtepu8_epi16( _mm512_extracti64x4_epi64( packed, 1 ) ) ) );
+            }
+            out += count;
+        }
+        base = _mm512_add_epi16( base, inc64 );
+    }
+    return static_cast<std::size_t>( out - start );
+}
+
+} // namespace x86_v4
+#endif // FRSR_ROARING_X86_V4
+
 // Extract a low-cardinality bitset result into a fresh array handle.
 template <typename Layout, typename CowPolicy = cow_value_semantics>
 [[nodiscard]] inline container_handle<Layout, CowPolicy> array_from_bitset(
@@ -121,6 +171,16 @@ template <typename Layout, typename CowPolicy = cow_value_semantics>
     auto const & words{ bitset.words.as_array() };
 #if defined( __x86_64__ ) || defined( _M_X64 )
     if constexpr ( std::is_same_v<typename Layout::low_type, std::uint16_t> ) {
+#if FRSR_ROARING_X86_V4
+        if ( cardinality >= x86_v4::extract_setbits_min_cardinality && have_x86_v4() ) {
+            resize_uninitialized( array.values, cardinality );
+            auto const decoded{ x86_v4::extract_setbits_uint16( words.data(), words.size(), array.values.data() ) };
+            assert( decoded == cardinality );
+            array.values.resize( static_cast<std::uint32_t>( decoded ) );
+            array.sync_header();
+            return result;
+        }
+#endif
         resize_uninitialized( array.values, cardinality + 16U );
         auto const decoded{ extract_setbits_sse_uint16( words.data(), words.size(), array.values.data() ) };
         assert( decoded == cardinality );
