@@ -2,11 +2,17 @@
 
 #include <frsr/roaring/containers.hpp>
 #include <frsr/roaring/hw_info.hpp>
+
+#if defined( __x86_64__ ) || defined( _M_X64 )
+#include <immintrin.h>
+#endif
 #include <frsr/roaring/tuning.hpp>
 
 #include <algorithm>
 #include <bit>
 #include <cstddef>
+#include <array>
+#include <cassert>
 #include <cstdint>
 #include <limits>
 
@@ -107,6 +113,50 @@ inline constexpr std::uint32_t bitset_demote_threshold{
     Layout::low_domain_size >= 1024 ? Layout::low_domain_size / 16 : 64
 };
 
+#if defined( __x86_64__ ) || defined( _M_X64 )
+// Set-bit positions of one byte, eight 16-bit lanes, zero padded past the count.
+// [croaring-ref] deps/croaring/src/bitset_util.c:vecDecodeTable_uint16 (0-based here)
+inline constexpr auto setbit_decode_table_uint16{ []() {
+    std::array<std::array<std::uint16_t, 8>, 256> table{};
+    for ( unsigned value{ 0 }; value < 256U; ++value ) {
+        unsigned pos{ 0 };
+        for ( unsigned bit{ 0 }; bit < 8U; ++bit ) {
+            if ( value & ( 1U << bit ) ) { table[ value ][ pos++ ] = static_cast<std::uint16_t>( bit ); }
+        }
+    }
+    return table;
+}() };
+
+// Decode the set bits of `n` words into ascending 16-bit values (bit index from the
+// first word). One table lookup + vector add + vector store per byte; a zero word
+// costs one add. Every byte writes a full 8-lane vector past its true count, so `out`
+// must have popcount + 16 slots — the caller over-allocates and shrinks, as for the
+// array kernels. [croaring-ref] deps/croaring/src/bitset_util.c:bitset_extract_setbits_sse_uint16
+[[ gnu::hot ]] inline std::size_t extract_setbits_sse_uint16(
+    std::uint64_t const * const words, std::size_t const n, std::uint16_t * out
+) noexcept {
+    auto const * const start{ out };
+    __m128i       base { _mm_setzero_si128() };
+    __m128i const inc8 { _mm_set1_epi16( 8  ) };
+    __m128i const inc64{ _mm_set1_epi16( 64 ) };
+    for ( std::size_t i{ 0 }; i < n; ++i ) {
+        std::uint64_t const w{ words[ i ] };
+        if ( w == 0 ) {
+            base = _mm_add_epi16( base, inc64 );
+            continue;
+        }
+        for ( unsigned k{ 0 }; k < 8U; ++k ) {
+            auto const byte{ static_cast<std::uint8_t>( w >> ( 8U * k ) ) };
+            __m128i const positions{ _mm_loadu_si128( reinterpret_cast<__m128i const *>( setbit_decode_table_uint16[ byte ].data() ) ) };
+            _mm_storeu_si128( reinterpret_cast<__m128i *>( out ), _mm_add_epi16( base, positions ) );
+            out  += std::popcount( static_cast<unsigned>( byte ) );
+            base  = _mm_add_epi16( base, inc8 );
+        }
+    }
+    return static_cast<std::size_t>( out - start );
+}
+#endif
+
 // Extract a low-cardinality bitset result into a fresh array handle.
 template <typename Layout, typename CowPolicy = cow_value_semantics>
 [[nodiscard]] inline container_handle<Layout, CowPolicy> array_from_bitset(
@@ -115,9 +165,19 @@ template <typename Layout, typename CowPolicy = cow_value_semantics>
 ) {
     container_handle<Layout, CowPolicy> result;
     auto array{ result.as_array() };
+    auto const & words{ bitset.words.as_array() };
+#if defined( __x86_64__ ) || defined( _M_X64 )
+    if constexpr ( std::is_same_v<typename Layout::low_type, std::uint16_t> ) {
+        resize_uninitialized( array.values, cardinality + 16U );
+        auto const decoded{ extract_setbits_sse_uint16( words.data(), words.size(), array.values.data() ) };
+        assert( decoded == cardinality );
+        array.values.resize( static_cast<std::uint32_t>( decoded ) );
+        array.sync_header();
+        return result;
+    }
+#endif
     resize_uninitialized( array.values, cardinality );
     auto * out{ array.values.data() };
-    auto const & words{ bitset.words.as_array() };
     for ( std::size_t word_index{ 0 }; word_index < words.size(); ++word_index ) {
         auto word{ words[ word_index ] };
         auto const base{ static_cast<std::uint32_t>( word_index ) << 6U };
