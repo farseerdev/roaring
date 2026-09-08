@@ -1618,9 +1618,6 @@ struct Data {
     std::vector<roaring_bitmap_t *> low;
     std::vector<roaring_bitmap_t *> mod;
     std::vector<roaring_bitmap_t *> high;
-    std::vector<TestBitmap32> low_frsr;
-    std::vector<TestBitmap32> mod_frsr;
-    std::vector<TestBitmap32> high_frsr;
     std::vector<uint32_t> cold_queries;
     std::vector<uint32_t> warm_queries;
 
@@ -1657,8 +1654,9 @@ static std::vector<roaring_bitmap_t *> build_bitmaps(double density,
     return out;
 }
 
-static std::vector<TestBitmap32> clone_to_frsr(std::vector<roaring_bitmap_t *> const & src) {
-    std::vector<TestBitmap32> out;
+template <class Arm>
+static std::vector<typename Arm::bitmap> clone_to_frsr(std::vector<roaring_bitmap_t *> const & src) {
+    std::vector<typename Arm::bitmap> out;
     out.reserve(src.size());
     for (auto const * bm : src) {
         auto const card = static_cast<std::size_t>(roaring_bitmap_get_cardinality(bm));
@@ -1680,9 +1678,6 @@ static Data *get_data() {
     g_data->low = build_bitmaps(0.001, 0xC0FFEE0001ULL);
     g_data->mod = build_bitmaps(0.01, 0xC0FFEE0002ULL);
     g_data->high = build_bitmaps(0.1, 0xC0FFEE0003ULL);
-    g_data->low_frsr = clone_to_frsr(g_data->low);
-    g_data->mod_frsr = clone_to_frsr(g_data->mod);
-    g_data->high_frsr = clone_to_frsr(g_data->high);
     std::mt19937_64 rng(0xDEADBEEFULL);
     std::uniform_int_distribution<uint32_t> dist(0, kSyntheticUniverse - 1);
     g_data->cold_queries.resize(kSyntheticCount);
@@ -1692,13 +1687,15 @@ static Data *get_data() {
     return g_data;
 }
 
+static std::vector<void (*)()> g_frsr_releasers;
 static void release_data() {
+    for (auto const release : g_frsr_releasers) { release(); }
+    g_frsr_releasers.clear();
     delete g_data;
     g_data = nullptr;
 }
 
 using Pick = const std::vector<roaring_bitmap_t *> &(*)(Data *);
-using PickFrsr = const std::vector<TestBitmap32> &(*)(Data *);
 
 // ported from deps/croaring/benchmarks/benchmark.cpp:4217-4225
 static const std::vector<roaring_bitmap_t *> &pick_low(Data *d) {
@@ -1710,15 +1707,88 @@ static const std::vector<roaring_bitmap_t *> &pick_mod(Data *d) {
 static const std::vector<roaring_bitmap_t *> &pick_high(Data *d) {
     return d->high;
 }
-static const std::vector<TestBitmap32> &pick_low_frsr(Data *d) {
-    return d->low_frsr;
+enum class Density { Low, Mod, High };
+
+// The frsr side of the shared dataset, one instance per arm, built lazily from
+// the same CRoaring source sets so every arm probes identical bitmaps and the
+// identical query stream.
+template <class Arm>
+struct FrsrData {
+    Data *base{};
+    std::vector<typename Arm::bitmap> low, mod, high;
+    std::vector<typename Arm::bitmap> const &pick(Density const d) const {
+        return d == Density::Low ? low : d == Density::Mod ? mod : high;
+    }
+};
+
+template <class Arm>
+static FrsrData<Arm> *get_frsr_data() {
+    static FrsrData<Arm> *data = nullptr;
+    if (data == nullptr) {
+        data = new FrsrData<Arm>;
+        data->base = get_data();
+        data->low  = clone_to_frsr<Arm>(data->base->low);
+        data->mod  = clone_to_frsr<Arm>(data->base->mod);
+        data->high = clone_to_frsr<Arm>(data->base->high);
+        g_frsr_releasers.push_back([] { delete data; data = nullptr; });
+    }
+    return data;
 }
-static const std::vector<TestBitmap32> &pick_mod_frsr(Data *d) {
-    return d->mod_frsr;
-}
-static const std::vector<TestBitmap32> &pick_high_frsr(Data *d) {
-    return d->high_frsr;
-}
+
+template <class Arm>
+struct add_cold_frsr_registrar {
+    static void run(const char *op, const char *density_label, Density const d) {
+        Entry e;
+        e.name = std::string("synthetic/") + Arm::label() + op;
+        e.description =
+            std::string(Arm::label()) + " variant of ContainsCold at " + density_label +
+            " density over identical pre-generated bitmaps and query stream.";
+        e.setup = []() -> void * { return get_frsr_data<Arm>(); };
+        e.run = [d](void *sv) -> int64_t {
+            auto *fd = static_cast<FrsrData<Arm> *>(sv);
+            auto const &bms = fd->pick(d);
+            int64_t marker = 0;
+            for (size_t i = 0; i < kSyntheticCount; ++i) {
+                marker += bms[i].contains(fd->base->cold_queries[i]) ? 1 : 0;
+            }
+            return marker;
+        };
+        e.teardown = nullptr;
+        e.ops_per_run = static_cast<int64_t>(kSyntheticCount);
+        e.inner_reps = 1;
+        e.reusable_state = true;
+        g_benchmarks.push_back(std::move(e));
+    }
+};
+
+template <class Arm>
+struct add_warm_frsr_registrar {
+    static void run(const char *op, const char *density_label, Density const d) {
+        Entry e;
+        e.name = std::string("synthetic/") + Arm::label() + op;
+        e.description =
+            std::string(Arm::label()) + " variant of ContainsWarm at " + density_label +
+            " density over identical pre-generated bitmaps and query stream.";
+        e.setup = []() -> void * { return get_frsr_data<Arm>(); };
+        e.run = [d](void *sv) -> int64_t {
+            auto *fd = static_cast<FrsrData<Arm> *>(sv);
+            auto const &bms = fd->pick(d);
+            int64_t marker = 0;
+            for (size_t i = 0; i < kWarmBitmaps; ++i) {
+                auto const &b = bms[i];
+                for (size_t r = 0; r < kWarmRepeats; ++r) {
+                    marker += b.contains(fd->base->warm_queries[r]) ? 1 : 0;
+                }
+            }
+            return marker;
+        };
+        e.teardown = nullptr;
+        e.ops_per_run = static_cast<int64_t>(kWarmBitmaps * kWarmRepeats);
+        e.inner_reps = 1;
+        e.reusable_state = true;
+        g_benchmarks.push_back(std::move(e));
+    }
+};
 
 // ported from deps/croaring/benchmarks/benchmark.cpp:4227-4254
 static void add_cold(const char *name, const char *density_label, Pick pick) {
@@ -1781,55 +1851,6 @@ static void add_warm(const char *name, const char *density_label, Pick pick) {
     g_benchmarks.push_back(std::move(e));
 }
 
-static void add_cold_frsr(const char *name, const char *density_label, PickFrsr pick) {
-    Entry e;
-    e.name = name;
-    e.description =
-        std::string("frsr variant of ContainsCold at ") + density_label +
-        " density over identical pre-generated bitmaps and query stream.";
-    e.setup = []() -> void * { return get_data(); };
-    e.run = [pick](void *sv) -> int64_t {
-        auto *d = static_cast<Data *>(sv);
-        auto const &bms = pick(d);
-        int64_t marker = 0;
-        for (size_t i = 0; i < kSyntheticCount; ++i) {
-            marker += bms[i].contains(d->cold_queries[i]) ? 1 : 0;
-        }
-        return marker;
-    };
-    e.teardown = nullptr;
-    e.ops_per_run = static_cast<int64_t>(kSyntheticCount);
-    e.inner_reps = 1;
-    e.reusable_state = true;
-    g_benchmarks.push_back(std::move(e));
-}
-
-static void add_warm_frsr(const char *name, const char *density_label, PickFrsr pick) {
-    Entry e;
-    e.name = name;
-    e.description =
-        std::string("frsr variant of ContainsWarm at ") + density_label +
-        " density over identical pre-generated bitmaps and query stream.";
-    e.setup = []() -> void * { return get_data(); };
-    e.run = [pick](void *sv) -> int64_t {
-        auto *d = static_cast<Data *>(sv);
-        auto const &bms = pick(d);
-        int64_t marker = 0;
-        for (size_t i = 0; i < kWarmBitmaps; ++i) {
-            auto const &b = bms[i];
-            for (size_t r = 0; r < kWarmRepeats; ++r) {
-                marker += b.contains(d->warm_queries[r]) ? 1 : 0;
-            }
-        }
-        return marker;
-    };
-    e.teardown = nullptr;
-    e.ops_per_run = static_cast<int64_t>(kWarmBitmaps * kWarmRepeats);
-    e.inner_reps = 1;
-    e.reusable_state = true;
-    g_benchmarks.push_back(std::move(e));
-}
-
 // ported from deps/croaring/benchmarks/benchmark.cpp:4288-4297
 static void register_benchmarks() {
     add_cold("synthetic/ContainsColdLow", "low (0.001)", pick_low);
@@ -1838,12 +1859,12 @@ static void register_benchmarks() {
     add_warm("synthetic/ContainsWarmLow", "low (0.001)", pick_low);
     add_warm("synthetic/ContainsWarmMod", "moderate (0.01)", pick_mod);
     add_warm("synthetic/ContainsWarmHigh", "high (0.1)", pick_high);
-    add_cold_frsr("synthetic/frsrContainsColdLow", "low (0.001)", pick_low_frsr);
-    add_cold_frsr("synthetic/frsrContainsColdMod", "moderate (0.01)", pick_mod_frsr);
-    add_cold_frsr("synthetic/frsrContainsColdHigh", "high (0.1)", pick_high_frsr);
-    add_warm_frsr("synthetic/frsrContainsWarmLow", "low (0.001)", pick_low_frsr);
-    add_warm_frsr("synthetic/frsrContainsWarmMod", "moderate (0.01)", pick_mod_frsr);
-    add_warm_frsr("synthetic/frsrContainsWarmHigh", "high (0.1)", pick_high_frsr);
+    arms::for_each_frsr<add_cold_frsr_registrar>("ContainsColdLow", "low (0.001)", Density::Low);
+    arms::for_each_frsr<add_cold_frsr_registrar>("ContainsColdMod", "moderate (0.01)", Density::Mod);
+    arms::for_each_frsr<add_cold_frsr_registrar>("ContainsColdHigh", "high (0.1)", Density::High);
+    arms::for_each_frsr<add_warm_frsr_registrar>("ContainsWarmLow", "low (0.001)", Density::Low);
+    arms::for_each_frsr<add_warm_frsr_registrar>("ContainsWarmMod", "moderate (0.01)", Density::Mod);
+    arms::for_each_frsr<add_warm_frsr_registrar>("ContainsWarmHigh", "high (0.1)", Density::High);
     // Patch the last entry with a teardown that frees the shared dataset so its
     // ~96 MB of CRoaring bitmaps are returned to the allocator before the
     // set_ops scenarios (which allocate large working sets) begin.
