@@ -107,8 +107,12 @@ if(FRSR_ROARING_USE_PSI_VM)
                 ${_psiha_root}/build/include
                 ${_psiha_root}/config_ex/include
                 ${_psiha_root}/std_fix/include
-                ${_boost_include_dir}
         )
+        # SYSTEM: a consumer that already reaches Boost through an imported target
+        # gets it as -isystem; a plain -I on the same directory from here would
+        # override that and surface Boost's own warnings under the consumer's
+        # -Werror set (seen with Boost 1.92's sort headers).
+        target_include_directories(frsr_roaring SYSTEM PUBLIC ${_boost_include_dir})
         target_compile_definitions(frsr_roaring PUBLIC FRSR_ROARING_HAS_PSI_VM=1)
         target_compile_definitions(frsr_roaring PUBLIC
             BOOST_EXCEPTION_DISABLE
