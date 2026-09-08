@@ -18,7 +18,7 @@
 
 namespace frsr::roaring::detail {
 
-#if FRSR_ROARING_X86_V4_DISPATCH
+#if FRSR_ROARING_X86_V4
 
 FRSR_ROARING_X86_V4_KERNEL
 [[nodiscard]] inline std::size_t combine_words_into_popcount_v4(
@@ -48,7 +48,7 @@ inline void or_words_inplace_v4( std::uint64_t * const a, std::uint64_t const * 
     for ( std::size_t i{ 0 }; i < n; ++i ) { a[ i ] |= b[ i ]; }
 }
 
-#endif // FRSR_ROARING_X86_V4_DISPATCH
+#endif // FRSR_ROARING_X86_V4
 
 // Cardinality below which a freshly-built bitset result is demoted to an array
 // container. CRoaring demotes at its array/bitset boundary (DEFAULT_MAX_SIZE,
@@ -226,7 +226,7 @@ template <typename Layout, typename CowPolicy = cow_value_semantics>
     // (clang vectorizes the OP store + Mula popcount reduction together —
     // same single-pass shape that won on the in-place combine below).
     // [croaring-ref] deps/croaring/src/containers/bitset.c:bitset_container_{or,and,andnot}
-#if FRSR_ROARING_X86_V4_DISPATCH
+#if FRSR_ROARING_X86_V4
     if ( have_x86_v4() ) [[likely]] {
         auto const v4_cardinality{ combine_words_into_popcount_v4( out.data(), a.data(), b.data(), n, op ) };
         if ( v4_cardinality == 0 ) {
@@ -671,7 +671,7 @@ void or_bitset_bitset_inplace_lazy(
     constexpr std::size_t n{ Layout::word_count };
     constexpr std::size_t lanes{ hw_info::bitset_tile_words };
     constexpr std::size_t tiles{ n / lanes };
-#if FRSR_ROARING_X86_V4_DISPATCH
+#if FRSR_ROARING_X86_V4
     if ( have_x86_v4() ) [[likely]] {
         or_words_inplace_v4( a.data(), b.data(), n );
         lhs.mark_cardinality_stale();
@@ -702,6 +702,21 @@ template <typename Layout, typename CowPolicy = cow_value_semantics>
     bitset_ref<Layout, CowPolicy> lhs,
     bitset_cref<Layout, CowPolicy> const rhs
 ) noexcept {
+#if FRSR_ROARING_X86_V4
+    // Already out of line, so — unlike the spine-inlined in-place combine — the
+    // dispatched kernel costs no extra call here. Same saturated-LHS shortcut as
+    // combine_bitset_bitset_inplace.
+    if ( have_x86_v4() ) [[likely]] {
+        if ( lhs.cardinality == Layout::word_count * 64U ) {
+            return;
+        }
+        auto       * const a{ lhs.words.as_array().data() };
+        auto const * const b{ rhs.words.as_array().data() };
+        lhs.cardinality = static_cast<std::uint32_t>( combine_words_into_popcount_v4( a, a, b, Layout::word_count, set_operation::bit_or ) );
+        lhs.mark_endpoints_stale();
+        return;
+    }
+#endif
     combine_bitset_bitset_inplace<Layout, CowPolicy>( lhs, rhs, set_operation::bit_or );
 }
 
