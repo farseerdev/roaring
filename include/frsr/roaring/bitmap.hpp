@@ -310,11 +310,26 @@ public:
         bitmap const & bm;
     };
 
+    // Caches the chunk a sequence of add_bulk()/contains_bulk() calls is working
+    // on. `payload_private` records that this chunk's payload has already been
+    // made private for this sequence, so the run's remaining adds skip the
+    // copy-on-write barrier - the reference implementation's bulk context does
+    // the same ([croaring-ref] deps/croaring/src/roaring.c:add_bulk_impl adds to
+    // its cached container directly, having unshared it once on the miss path).
+    //
+    // Precondition, shared with that reference: no copy of the bitmap may be
+    // taken while a context on it is alive. A copy is what re-shares a payload,
+    // and a writer that has already made one private would then mutate the
+    // copy's data. Callers already have to guarantee this - a copy taken during
+    // any in-place write sequence would observe a half-applied one anyway - and
+    // in practice it falls out of the lock discipline: writers hold the
+    // exclusive lock, readers copy under a shared one.
     struct bulk_context {
         chunk_type chunk{};
         size_type index{ invalid_index };
+        bool payload_private{ false };
 
-        void reset() noexcept { index = invalid_index; }
+        void reset() noexcept { index = invalid_index; payload_private = false; }
     };
 
     class const_iterator {
@@ -3487,6 +3502,7 @@ private:
                         if ( ctx != nullptr ) {
                             ctx->chunk = chunk;
                             ctx->index = invalid_index;
+                            ctx->payload_private = false;
                         }
                         return true;
                     case singleton_add_result::duplicate:
@@ -3517,6 +3533,7 @@ private:
                 if ( ctx != nullptr ) {
                     ctx->chunk = chunk;
                     ctx->index = sorted_pos;
+                    ctx->payload_private = false;
                 }
                 note_hot_chunk( sorted_pos );
                 ++size_;
@@ -3540,12 +3557,14 @@ private:
                 if ( ctx != nullptr ) {
                     ctx->chunk = chunk;
                     ctx->index = invalid_index;
+                    ctx->payload_private = false;
                 }
                 return true;
             } else {
                 if ( ctx != nullptr ) {
                     ctx->chunk = chunk;
                     ctx->index = sorted_pos;
+                    ctx->payload_private = false;
                 }
                 note_hot_chunk( sorted_pos );
                 bool const was_tombstone{
@@ -3564,6 +3583,7 @@ private:
         size_type pos;
         bool found_existing{ false };
         bool structural_insert{ false };
+        bool ctx_payload_private{ false };
         if (
             ctx != nullptr &&
             ctx->index != invalid_index &&
@@ -3572,6 +3592,7 @@ private:
         ) {
             pos = ctx->index;
             found_existing = true;
+            ctx_payload_private = ctx->payload_private;
         } else if constexpr ( kUseChunkHashMap ) {
             // Fast path for already-added chunks via hash map.
             ensure_chunk_index_map();
@@ -3636,6 +3657,9 @@ private:
         if ( ctx != nullptr ) {
             ctx->chunk = chunk;
             ctx->index = pos;
+            // The add below makes this payload private (or already found it so),
+            // and no copy can intervene before the next call on this context.
+            ctx->payload_private = true;
         }
         note_hot_chunk( pos );
 
@@ -3644,7 +3668,11 @@ private:
             tombstone_count_ != 0 &&
             detail::container_size( chunks_.slot( pos ) ) == 0
         };
-        auto const added{ detail::container_add( chunks_.slot( pos ), low ) };
+        auto const added{
+            ctx_payload_private
+                ? detail::container_add_already_private( chunks_.slot( pos ), low )
+                : detail::container_add               ( chunks_.slot( pos ), low )
+        };
         if ( !added ) { return false; }
 
         ++size_;

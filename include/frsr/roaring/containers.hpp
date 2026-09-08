@@ -106,6 +106,23 @@ template <typename Layout, typename CowPolicy>
     std::unreachable();
 }
 
+// container_add() for a container the caller has already made private in this
+// write sequence: the kind switch stays, the copy-on-write barrier does not run.
+// See as_array_already_private() for the precondition - a bulk_context that has
+// added to this very slot since it resolved it establishes it.
+template <typename Layout, typename CowPolicy>
+[[nodiscard]] inline bool container_add_already_private(
+    container_handle<Layout, CowPolicy> & container,
+    typename Layout::low_type const value
+) {
+    switch ( container.kind() ) {
+        case container_kind::array : return as_array_already_private ( container ).add( value );
+        case container_kind::run   : return as_run_already_private   ( container ).add( value );
+        case container_kind::bitset: return as_bitset_already_private( container ).add( value );
+    }
+    std::unreachable();
+}
+
 // The group form of container_add(): the kind switch and the copy-on-write
 // barrier behind the mutable view are paid once for the whole sorted group,
 // where a value-at-a-time loop pays both per value. `sorted_values` must be

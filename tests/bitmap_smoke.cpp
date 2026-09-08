@@ -656,6 +656,40 @@ TEST(FrsrRoaringSmoke, ShrinkToFitLeavesASharedPayloadAloneAndKeepsBothCopies) {
 }
 
 
+TEST(FrsrRoaringSmoke, BulkContextAddsStillCloneASharedPayloadOnce) {
+    // A bulk context skips the copy-on-write barrier for the run of adds after
+    // the one that made its chunk private - so the FIRST add of a sequence must
+    // still take it, however many values follow, or an outstanding copy would
+    // see them.
+    std::vector<std::uint32_t> values;
+    for ( std::uint32_t value{ 0 }; value < 5'000U; ++value ) { values.push_back( value * 3U ); }
+
+    LazyBitmap original{ std::span<std::uint32_t const>{ values } };
+    LazyBitmap copy    { original };
+
+    LazyBitmap::bulk_context ctx;
+    for ( std::uint32_t i{ 0 }; i < 2'000U; ++i ) {
+        ASSERT_TRUE( original.add_bulk( ctx, 1U + i * 3U ) );  // between the existing values
+    }
+
+    EXPECT_EQ( copy.to_vector(), values );
+    EXPECT_EQ( copy.size(), values.size() );
+    EXPECT_EQ( original.size(), values.size() + 2'000U );
+    EXPECT_TRUE( original.contains( 1U ) );
+    EXPECT_FALSE( copy.contains( 1U ) );
+
+    // A second copy taken now, then a second sequence through a FRESH context:
+    // the same protection has to apply again.
+    LazyBitmap const copy2{ original };
+    auto const copy2_values{ copy2.to_vector() };
+    LazyBitmap::bulk_context ctx2;
+    for ( std::uint32_t i{ 0 }; i < 2'000U; ++i ) {
+        ASSERT_TRUE( original.add_bulk( ctx2, 2U + i * 3U ) );
+    }
+    EXPECT_EQ( copy2.to_vector(), copy2_values );
+    EXPECT_EQ( original.size(), values.size() + 4'000U );
+}
+
 TEST(FrsrRoaringSmoke, AddManySortedIntoASharedPayloadLeavesTheCopyAlone) {
     // The group insert takes the copy-on-write barrier once for the whole group
     // instead of once per value; it still has to take it, so the copy must not

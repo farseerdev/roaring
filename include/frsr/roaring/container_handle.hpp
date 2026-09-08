@@ -1703,6 +1703,24 @@ private:
 
 // ---- deferred container_handle member definitions ---------------------------------
 
+// Mutable views that SKIP the copy-on-write barrier. Only for a caller that has
+// already made this payload private within the current write sequence and knows
+// no copy can have intervened since - which is what a bulk_context is
+// ([croaring-ref] deps/croaring/src/roaring.c:add_bulk_impl caches its container
+// the same way and adds to it directly, unshared once on the miss path).
+template <typename Layout, typename CowPolicy>
+[[nodiscard]] array_ref<Layout, CowPolicy> as_array_already_private( container_handle<Layout, CowPolicy> & handle ) noexcept {
+    return array_ref<Layout, CowPolicy>{ handle };
+}
+template <typename Layout, typename CowPolicy>
+[[nodiscard]] run_ref<Layout, CowPolicy> as_run_already_private( container_handle<Layout, CowPolicy> & handle ) noexcept {
+    return run_ref<Layout, CowPolicy>{ handle };
+}
+template <typename Layout, typename CowPolicy>
+[[nodiscard]] bitset_ref<Layout, CowPolicy> as_bitset_already_private( container_handle<Layout, CowPolicy> & handle ) noexcept {
+    return bitset_ref<Layout, CowPolicy>{ handle };
+}
+
 template <typename Layout, typename CowPolicy>
 array_ref<Layout, CowPolicy> container_handle<Layout, CowPolicy>::as_array() noexcept( !CowPolicy::refcounted ) {
     make_payload_unique();
