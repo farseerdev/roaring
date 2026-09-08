@@ -109,7 +109,9 @@ template <typename Layout, typename CowPolicy>
 // The group form of container_add(): the kind switch and the copy-on-write
 // barrier behind the mutable view are paid once for the whole sorted group,
 // where a value-at-a-time loop pays both per value. `sorted_values` must be
-// sorted and duplicate-free. Returns how many values were actually added.
+// sorted and duplicate-free - bitmap::add_many_sorted's grouping collapses
+// repeats as it builds a group, which is where such input comes from (add_many
+// sorts its input but does not unique it). Returns how many values were added.
 template <typename Layout, typename CowPolicy>
 [[nodiscard]] inline std::size_t container_add_sorted(
     container_handle<Layout, CowPolicy> & container,

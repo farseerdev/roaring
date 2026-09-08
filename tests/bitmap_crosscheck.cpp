@@ -732,6 +732,14 @@ TEST(FrsrRoaringCrosscheck, AddManySortedGroupsMatchCRoaring) {
         { "into a bitset container",      dense_chunk,            { 5U, 6U, 20'001U, 20'002U },   false },
         { "into a run container",         full_block,             { 70'001U, 70'002U },           true  },
         { "run container, interior fill", full_block,             { 1U, 2U, 70'005U },            true  },
+        // add_many() sorts its input but does not unique it, so a group can carry
+        // repeats - of a new value, of an existing one, and at a chunk boundary.
+        { "repeats in the group",         { 1U, 5U, 9U },         { 10U, 10U, 10U, 11U, 11U },    false },
+        { "repeats of existing values",   { 10U, 20U, 30U },      { 10U, 10U, 20U, 20U, 25U },    false },
+        { "repeats below the minimum",    { 100U, 200U },         { 1U, 1U, 2U, 2U, 2U },         false },
+        { "repeats across chunks",        { 65'530U },            { 65'535U, 65'535U, 65'536U, 65'536U, 131'072U }, false },
+        { "repeats into a bitset",        dense_chunk,            { 5U, 5U, 20'001U, 20'001U },   false },
+        { "repeats into a run",           full_block,             { 70'001U, 70'001U, 70'002U },  true  },
     };
 
     for ( auto const & c : cases ) {
@@ -770,7 +778,14 @@ TEST(FrsrRoaringCrosscheck, AddManySortedGroupsMatchCRoaring) {
         auto       theirs{ make_roaring( base ) };
 
         for ( int group_round{ 0 }; group_round < 3; ++group_round ) {
-            auto const group{ sorted_unique( size_dist( rng ) ) };
+            // Every third round keeps the sort but drops the unique, so the group
+            // carries repeats - the shape add_many() hands down.
+            auto group{ sorted_unique( size_dist( rng ) ) };
+            if ( ( round % 3 ) == 0 ) {
+                auto const original{ group };
+                group.insert( group.end(), original.begin(), original.end() );
+                std::sort( group.begin(), group.end() );
+            }
 
             mine.add_many_sorted( { group.data(), group.size() } );
             roaring_bitmap_add_many( theirs.bitmap, group.size(), group.data() );
