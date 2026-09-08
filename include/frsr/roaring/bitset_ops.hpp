@@ -72,22 +72,6 @@ inline void or_words_inplace_v4( std::uint64_t * const a, std::uint64_t const * 
 
 #endif // FRSR_ROARING_X86_V4
 
-// Cardinality below which a freshly-built bitset result is demoted to an array
-// container. CRoaring demotes at its array/bitset boundary (DEFAULT_MAX_SIZE,
-// 4096) so chained folds run array kernels instead of full 8 KB word loops on
-// near-empty bitsets — deferring the re-decision to optimize() cost the
-// fold-heavy witness ~4% (popcount passes on near-empty bitsets). But demoting
-// right at the boundary ping-pongs on workloads whose fold results hover just
-// under it unless the vacated 8 KB payload is retired for scratch reuse —
-// demoting INSIDE the kernel destroyed the adopted retired bitset (breaking the
-// chunk_store scratch cycle) and cost the fold-heavy witness up to +14%.
-// Demotion therefore happens at the combine-spine call sites (bitmap.hpp),
-// which own the chunk_store and retire the vacated bitset payload.
-template <typename Layout>
-inline constexpr std::uint32_t bitset_demote_threshold{
-    Layout::low_domain_size >= 1024 ? Layout::low_domain_size / 16 : 64
-};
-
 #if defined( __x86_64__ ) || defined( _M_X64 )
 // Set-bit positions of one byte, eight 16-bit lanes, zero padded past the count.
 // [croaring-ref] deps/croaring/src/bitset_util.c:vecDecodeTable_uint16 (0-based here)
@@ -418,8 +402,12 @@ template <typename Layout, typename CowPolicy = cow_value_semantics>
 // here the masked words land in the result payload directly with the popcount
 // fused into the fill. Runs are disjoint, so per-(run,word) popcounts of the
 // masked increments sum exactly even when adjacent runs share a boundary word.
-// A low-cardinality result is demoted to array (bitset_demote_threshold),
-// matching CRoaring's mixed-intersection conversion.
+// The result stays a bitset whatever its cardinality: demotion is the combine
+// spine's decision (bitmap.hpp), which owns the chunk_store and can retire the
+// vacated payload for scratch reuse — demoting inside a kernel destroys the
+// adopted retired bitset and measured up to +14% on the fold-heavy workload.
+// The spine demotes ANDNOT results and deliberately does not demote AND ones
+// (an AND fold's accumulator loses its dense arms for every later pair: ~12%).
 // [croaring-ref] deps/croaring/src/containers/mixed_intersection.c:
 // run_bitset_container_intersection (dense-run branch)
 template <typename Layout, typename CowPolicy = cow_value_semantics>
