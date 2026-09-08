@@ -5614,6 +5614,82 @@ static void register_benchmarks() {
 
 } // namespace large_run
 
+// ---- RemoveManySorted: a sorted batch removal against a populated bitmap ------
+// The base holds `count` values strided by 32 (array chunks of 2048, ~49 chunks at
+// 100k); the batch removes every `stride`-th of them (overlap=high: 7 of 8,
+// mid: 1 of 2, low: 1 of 8). The base is rebuilt in setup for every timed rep.
+inline constexpr std::uint32_t kRemoveManyStride = 32;
+static std::vector<std::uint32_t> remove_many_batch(std::size_t count, const char *overlap) {
+    std::size_t keep_every = 2; std::size_t take = 1;   // mid: remove 1 of every 2
+    if (std::string_view{overlap} == "high") { keep_every = 8; take = 7; }
+    if (std::string_view{overlap} == "low")  { keep_every = 8; take = 1; }
+    std::vector<std::uint32_t> batch;
+    for (std::size_t i = 0; i < count; ++i) {
+        if (i % keep_every < take) batch.push_back(static_cast<std::uint32_t>(i) * kRemoveManyStride);
+    }
+    return batch;
+}
+
+template <class Arm>
+struct register_frsr_remove_many_registrar {
+    using TestBitmap32 = typename Arm::bitmap;
+    struct S { TestBitmap32 bm; std::vector<std::uint32_t> batch; };
+    static void run(std::size_t count, const char *overlap) {
+        if (std::string_view{overlap} == "sparse") return;
+        Entry e;
+        e.name        = fmt_so(Arm::label(), "RemoveManySorted", count, overlap);
+        e.description = "frsr::roaring::bitmap<uint32_t> remove_many_sorted() of a sorted batch from a "
+                        "populated bitmap (array chunks). Checksum = remaining cardinality.";
+        e.setup = [count, overlap]() -> void * {
+            auto *s = new S;
+            for (std::size_t i = 0; i < count; ++i) { std::ignore = s->bm.add(static_cast<std::uint32_t>(i) * kRemoveManyStride); }
+            s->batch = remove_many_batch(count, overlap);
+            return s;
+        };
+        e.run = [](void *sv) -> int64_t {
+            auto *s = static_cast<S *>(sv);
+            s->bm.remove_many_sorted(std::span<std::uint32_t const>{s->batch});
+            return static_cast<int64_t>(s->bm.size());
+        };
+        e.teardown       = [](void *sv) { delete static_cast<S *>(sv); };
+        e.ops_per_run    = 1;
+        e.inner_reps     = kBinaryInnerReps;
+        e.reusable_state = false;
+        g_benchmarks.push_back(std::move(e));
+    }
+};
+
+#if FRSR_ROARING_HAS_CROARING
+template <class Arm>
+struct register_cpp_remove_many_registrar {
+    struct S { roaring_bitmap_t *bm{}; std::vector<std::uint32_t> batch; ~S() { if (bm) roaring_bitmap_free(bm); } };
+    static void run(std::size_t count, const char *overlap) {
+        if (std::string_view{overlap} == "sparse") return;
+        Entry e;
+        e.name        = fmt_so(Arm::label(), "RemoveManySorted", count, overlap);
+        e.description = "CRoaring roaring_bitmap_remove_many() of a sorted batch from a populated bitmap "
+                        "(array chunks). Checksum = remaining cardinality.";
+        e.setup = [count, overlap]() -> void * {
+            auto *s = new S;
+            s->bm = Arm::create();
+            for (std::size_t i = 0; i < count; ++i) { roaring_bitmap_add(s->bm, static_cast<std::uint32_t>(i) * kRemoveManyStride); }
+            s->batch = remove_many_batch(count, overlap);
+            return s;
+        };
+        e.run = [](void *sv) -> int64_t {
+            auto *s = static_cast<S *>(sv);
+            roaring_bitmap_remove_many(s->bm, s->batch.size(), s->batch.data());
+            return static_cast<int64_t>(roaring_bitmap_get_cardinality(s->bm));
+        };
+        e.teardown       = [](void *sv) { delete static_cast<S *>(sv); };
+        e.ops_per_run    = 1;
+        e.inner_reps     = kBinaryInnerReps;
+        e.reusable_state = false;
+        g_benchmarks.push_back(std::move(e));
+    }
+};
+#endif
+
 // ========== top-level registration ==========
 
 void register_benchmarks() {
@@ -5623,6 +5699,10 @@ void register_benchmarks() {
             arms::for_each_frsr<register_frsr_binary_registrar>(count, offset, ov.label);
 #if FRSR_ROARING_HAS_CROARING
             arms::for_each_croaring<register_cpp_binary_registrar>(count, offset, ov.label);
+#endif
+            arms::for_each_frsr<register_frsr_remove_many_registrar>(count, ov.label);
+#if FRSR_ROARING_HAS_CROARING
+            arms::for_each_croaring<register_cpp_remove_many_registrar>(count, ov.label);
 #endif
             register_r64_binary(count, offset, ov.label);
             register_set_binary(count, offset, ov.label);

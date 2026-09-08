@@ -1037,6 +1037,35 @@ public:
         return true;
     }
 
+    // Removes every value of the sorted, duplicate-free `sorted_values` that is
+    // present, in one merge walk that compacts the survivors in place: O(card +
+    // removals) instead of a lower_bound + memmove per value. Returns the number
+    // of values actually removed.
+    std::size_t remove_sorted( std::span<low_type const> const sorted_values ) {
+        auto const cardinality{ values.size() };
+        if ( cardinality == 0 || sorted_values.empty() || values.back() < sorted_values.front() ) {
+            return 0;
+        }
+        auto       * const begin{ values.data() };
+        auto       * const end  { begin + static_cast<std::ptrdiff_t>( cardinality ) };
+        auto       * src{ std::lower_bound( begin, end, sorted_values.front() ) };  // prefix below the first removal is untouched
+        auto       * dst{ src };
+        auto const * rm    { sorted_values.data() };
+        auto const * rm_end{ rm + sorted_values.size() };
+        while ( src != end && rm != rm_end ) {
+            if      ( *src < *rm ) { *dst++ = *src++; }
+            else if ( *src == *rm ) { ++src; ++rm; }
+            else                   { ++rm; }  // removal value not present
+        }
+        auto const removed{ static_cast<std::size_t>( src - dst ) };
+        if ( removed != 0 ) {
+            std::memmove( dst, src, static_cast<std::size_t>( end - src ) * sizeof( low_type ) );
+            values.resize_uninitialized( static_cast<std::uint32_t>( cardinality - removed ) );
+            sync_header();
+        }
+        return removed;
+    }
+
     [[nodiscard]] std::size_t size() const noexcept { return values.size(); }
 
     [[nodiscard]] std::optional<low_type> first() const noexcept {

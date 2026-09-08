@@ -933,9 +933,16 @@ public:
 
             auto const pos{ lower_bound( current_chunk ) };
             if ( pos != chunks_.size() && chunks_.key( pos ) == current_chunk ) {
-                for ( auto const low : grouped_values ) {
-                    if ( detail::container_remove( chunks_.slot( pos ), low ) ) {
-                        --size_;
+                auto & slot{ chunks_.slot( pos ) };
+                if ( slot.holds_array() ) {
+                    // One merge walk over the array for the whole group; the
+                    // per-value remove is a lower_bound + memmove each.
+                    size_ -= static_cast<size_type>( slot.as_array().remove_sorted( grouped_values ) );
+                } else {
+                    for ( auto const low : grouped_values ) {
+                        if ( detail::container_remove( slot, low ) ) {
+                            --size_;
+                        }
                     }
                 }
                 if ( detail::container_size( chunks_.slot( pos ) ) == 0 ) {
