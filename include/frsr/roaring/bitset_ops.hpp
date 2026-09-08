@@ -556,10 +556,18 @@ void combine_bitset_bitset_inplace(
     auto       & a{ lhs.words.as_array() };
     auto const & b{ rhs.words.as_array() };
     auto const n{ a.size() };
-    // NO v4 dispatch here (unlike the materializing combine below/above): this
-    // in-place combine inlines into the merge-walk spine, and outlining it into
-    // a dispatched call measurably regressed the bitset-heavy workload (~+4%)
-    // while the microbench showed a win — in-context loss, bisected 2026-07-19.
+#if FRSR_ROARING_X86_V4
+    // Dispatched like the materializing combine. An earlier attempt (2026-07-19)
+    // measured a ~4% in-context loss on the bitset-heavy workload from outlining
+    // this spine-inlined step; re-measured now that the workload runs on AVX-512
+    // silicon, where the baseline tile loop is the 2x-slower half of every
+    // in-place bitset union.
+    if ( have_x86_v4() ) [[likely]] {
+        lhs.cardinality = static_cast<std::uint32_t>( combine_words_into_popcount_v4( a.data(), a.data(), b.data(), n, op ) );
+        lhs.mark_endpoints_stale();
+        return;
+    }
+#endif
     std::size_t cardinality{ 0 };
     switch ( op ) {
         case set_operation::bit_or:
