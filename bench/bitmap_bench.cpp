@@ -5774,6 +5774,116 @@ struct register_cpp_to_array_registrar {
 };
 #endif
 
+// ---- BulkAddRows: the row-insert shape of a bitmap INDEX ----------------------
+// A dimension's bitmap index holds one bitmap per value; inserting a batch of table
+// rows walks the rows in order and adds each row id to its value's bitmap through a
+// bulk context (rama's BitmapIndex insert path). So per bitmap the ids arrive
+// ASCENDING but interleaved with other bitmaps' ids, and every add is a separate
+// call — the shape no batch API can flatten, and the one the mutation-heavy models
+// spend their bitmap time in.
+//
+// `values` bitmaps are pre-populated with `existing` ids each (the index as it stands
+// before the insert), then `fresh` new ids are distributed round-robin over them.
+struct BulkAddShape { char const *label; std::size_t values; std::size_t existing; };
+static constexpr BulkAddShape kBulkAddShapes[]{
+    { "wide",   256,   4'000 },  // many values, arrays and bitsets mixed
+    { "narrow",   8, 100'000 },  // few values, all bitsets
+};
+
+template <class Arm>
+struct register_frsr_bulk_add_registrar {
+    using TestBitmap32 = typename Arm::bitmap;
+    struct S {
+        std::vector<TestBitmap32> index;
+        std::vector<std::uint32_t> fresh;
+        std::size_t values{};
+    };
+    static void run(std::size_t fresh_rows, BulkAddShape const &shape) {
+        Entry e;
+        char buf[160];
+        snprintf(buf, sizeof(buf), "set_ops/%sBulkAddRows/rows=%zu/shape=%s", Arm::label(), fresh_rows, shape.label);
+        e.name        = buf;
+        e.description = "frsr::roaring::bitmap<uint32_t> add_bulk() of ascending row ids into a populated "
+                        "per-value index (one bitmap per value, ids round-robin over them) — the row-insert "
+                        "shape of a bitmap index. Checksum = rows added.";
+        e.setup = [fresh_rows, shape]() -> void * {
+            auto *s = new S;
+            s->values = shape.values;
+            s->index.resize(shape.values);
+            std::uint32_t row = 0;
+            for (std::size_t i = 0; i < shape.existing; ++i) {
+                for (std::size_t v = 0; v < shape.values; ++v) { std::ignore = s->index[v].add(row++); }
+            }
+            s->fresh.reserve(fresh_rows);
+            for (std::size_t i = 0; i < fresh_rows; ++i) { s->fresh.push_back(row++); }
+            return s;
+        };
+        e.run = [](void *sv) -> int64_t {
+            auto *s = static_cast<S *>(sv);
+            std::vector<typename TestBitmap32::bulk_context> ctx(s->values);
+            std::int64_t added = 0;
+            for (std::size_t i = 0; i < s->fresh.size(); ++i) {
+                auto const v = i % s->values;
+                added += s->index[v].add_bulk(ctx[v], s->fresh[i]);
+            }
+            return added;
+        };
+        e.teardown       = [](void *sv) { delete static_cast<S *>(sv); };
+        e.ops_per_run    = 1;
+        e.inner_reps     = kBinaryInnerReps;
+        e.reusable_state = false;   // each rep inserts fresh ids into a fresh index
+        g_benchmarks.push_back(std::move(e));
+    }
+};
+
+#if FRSR_ROARING_HAS_CROARING
+template <class Arm>
+struct register_cpp_bulk_add_registrar {
+    struct S {
+        std::vector<roaring_bitmap_t *> index;
+        std::vector<std::uint32_t> fresh;
+        std::size_t values{};
+        ~S() { for (auto *bm : index) { if (bm) roaring_bitmap_free(bm); } }
+    };
+    static void run(std::size_t fresh_rows, BulkAddShape const &shape) {
+        Entry e;
+        char buf[160];
+        snprintf(buf, sizeof(buf), "set_ops/%sBulkAddRows/rows=%zu/shape=%s", Arm::label(), fresh_rows, shape.label);
+        e.name        = buf;
+        e.description = "CRoaring roaring_bitmap_add_bulk() over the same per-value index. "
+                        "[croaring-ref] deps/croaring/src/roaring.c:add_bulk_impl";
+        e.setup = [fresh_rows, shape]() -> void * {
+            auto *s = new S;
+            s->values = shape.values;
+            s->index.resize(shape.values);
+            for (auto &bm : s->index) { bm = Arm::create(); }
+            std::uint32_t row = 0;
+            for (std::size_t i = 0; i < shape.existing; ++i) {
+                for (std::size_t v = 0; v < shape.values; ++v) { roaring_bitmap_add(s->index[v], row++); }
+            }
+            s->fresh.reserve(fresh_rows);
+            for (std::size_t i = 0; i < fresh_rows; ++i) { s->fresh.push_back(row++); }
+            return s;
+        };
+        e.run = [](void *sv) -> int64_t {
+            auto *s = static_cast<S *>(sv);
+            std::vector<roaring_bulk_context_t> ctx(s->values);
+            for (auto &c : ctx) { c = roaring_bulk_context_t{}; }
+            for (std::size_t i = 0; i < s->fresh.size(); ++i) {
+                auto const v = i % s->values;
+                roaring_bitmap_add_bulk(s->index[v], &ctx[v], s->fresh[i]);
+            }
+            return static_cast<int64_t>(s->fresh.size());
+        };
+        e.teardown       = [](void *sv) { delete static_cast<S *>(sv); };
+        e.ops_per_run    = 1;
+        e.inner_reps     = kBinaryInnerReps;
+        e.reusable_state = false;
+        g_benchmarks.push_back(std::move(e));
+    }
+};
+#endif
+
 // ========== top-level registration ==========
 
 void register_benchmarks() {
@@ -5790,6 +5900,14 @@ void register_benchmarks() {
 #endif
             register_r64_binary(count, offset, ov.label);
             register_set_binary(count, offset, ov.label);
+        }
+        if (count >= 100'000) {
+            for (auto const &shape : kBulkAddShapes) {
+                arms::for_each_frsr<register_frsr_bulk_add_registrar>(std::size_t{ 200'000 }, shape);
+#if FRSR_ROARING_HAS_CROARING
+                arms::for_each_croaring<register_cpp_bulk_add_registrar>(std::size_t{ 200'000 }, shape);
+#endif
+            }
         }
         for (auto const &shape : kToArrayShapes) {
             arms::for_each_frsr<register_frsr_to_array_registrar>(count >= 100'000 ? std::size_t{ 16 } : std::size_t{ 2 }, shape);
