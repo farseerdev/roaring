@@ -182,6 +182,67 @@ inline std::size_t extract_setbits_uint16(
 } // namespace x86_v4
 #endif // FRSR_ROARING_X86_V4
 
+// Set-bit positions of one byte as eight 32-bit lanes, zero padded past the count —
+// the uint32 twin of setbit_decode_table_uint16, kept 0-based (CRoaring's is 1-based
+// with a base-1 accumulator).
+// [croaring-ref] deps/croaring/src/bitset_util.c:vecDecodeTable
+inline constexpr auto setbit_decode_table_uint32{ []() {
+    std::array<std::array<std::uint32_t, 8>, 256> table{};
+    for ( unsigned value{ 0 }; value < 256U; ++value ) {
+        unsigned pos{ 0 };
+        for ( unsigned bit{ 0 }; bit < 8U; ++bit ) {
+            if ( value & ( 1U << bit ) ) { table[ value ][ pos++ ] = bit; }
+        }
+    }
+    return table;
+}() };
+
+// Eight uint32 lanes as one wide gnu vector: clang lowers a load/add/store triple to
+// one AVX2 instruction each, two SSE ones, two NEON ones — no per-ISA duplication.
+typedef std::uint32_t setbit_decode_lane_block
+    __attribute__(( vector_size( 8 * sizeof( std::uint32_t ) ), aligned( 1 ), may_alias ));
+
+// Writes the positions of the set bits of `words`, offset by `base`, as uint32 values
+// into [out, out_end) and returns the end pointer. Byte-table driven: one vector load,
+// add and store per byte, advanced by that byte's popcount, so a set bit costs a
+// fraction of the tzcnt+store chain a scalar decode pays per value. Every byte stores
+// a full 8-lane vector, so the vector loop stops 64 values short of `out_end` and a
+// scalar tail finishes — which keeps an exactly-sized output buffer safe.
+// [croaring-ref] deps/croaring/src/bitset_util.c:bitset_extract_setbits_avx2
+[[ gnu::hot ]] inline std::uint32_t * extract_setbits_uint32(
+    std::uint64_t const * const words, std::size_t const n,
+    std::uint32_t * out, std::uint32_t * const out_end, std::uint32_t const base
+) noexcept {
+    setbit_decode_lane_block base_lanes;
+    for ( unsigned lane{ 0 }; lane < 8U; ++lane ) { base_lanes[ lane ] = base; }
+    setbit_decode_lane_block const eight{ 8, 8, 8, 8, 8, 8, 8, 8 };
+    std::size_t index{ 0 };
+    for ( ; index < n && out + 64 <= out_end; ++index ) {
+        auto word{ words[ index ] };
+        if ( word == 0 ) {
+            for ( unsigned lane{ 0 }; lane < 8U; ++lane ) { base_lanes[ lane ] += 64; }
+            continue;
+        }
+        for ( unsigned byte_index{ 0 }; byte_index < 8U; ++byte_index ) {
+            auto const byte{ static_cast<std::uint8_t>( word >> ( 8U * byte_index ) ) };
+            auto const positions{ *reinterpret_cast<setbit_decode_lane_block const *>( setbit_decode_table_uint32[ byte ].data() ) };
+            *reinterpret_cast<setbit_decode_lane_block *>( out ) = base_lanes + positions;
+            out       += std::popcount( static_cast<unsigned>( byte ) );
+            base_lanes = base_lanes + eight;
+        }
+    }
+    // Scalar tail: the last words, and any layout whose word count is small.
+    auto value_base{ base + static_cast<std::uint32_t>( index * 64 ) };
+    for ( ; index < n && out < out_end; ++index, value_base += 64 ) {
+        auto word{ words[ index ] };
+        while ( word != 0 && out < out_end ) {
+            *out++ = value_base + static_cast<std::uint32_t>( std::countr_zero( word ) );
+            word &= word - 1;
+        }
+    }
+    return out;
+}
+
 // Extract a low-cardinality bitset result into a fresh array handle.
 template <typename Layout, typename CowPolicy = cow_value_semantics>
 [[nodiscard]] inline container_handle<Layout, CowPolicy> array_from_bitset(

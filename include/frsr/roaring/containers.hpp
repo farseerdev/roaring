@@ -53,6 +53,15 @@ inline void resize_uninitialized( small_array_values<T> & values, std::size_t co
 #endif
 }
 
+#ifdef FRSR_ROARING_HAS_PSI_VM
+// Distinct type from small_array_values only under psi::vm; without it both are
+// std::vector and the overload above already covers it.
+template <typename T>
+inline void resize_uninitialized( heap_vector<T> & values, std::size_t const new_size ) {
+    values.resize( static_cast<std::uint32_t>( new_size ), psi::vm::no_init );
+}
+#endif
+
 template <typename Layout, typename E, typename CowPolicy>
 inline void resize_uninitialized( payload_vector<Layout, E, CowPolicy> & values, std::size_t const new_size ) {
     values.resize_uninitialized( static_cast<std::uint32_t>( new_size ) );

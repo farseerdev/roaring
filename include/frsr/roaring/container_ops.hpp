@@ -280,4 +280,66 @@ template <typename Layout, typename CowPolicy = cow_value_semantics>
     }, lhs, rhs );
 }
 
+// Writes every value of `container`, composed with `chunk_key` into the full key
+// space, straight into `out` (which must hold container_size() entries) and
+// returns the end pointer. The equivalent of a for_each with a push_back per value
+// minus the per-value capacity check and size increment: each kind writes through a
+// plain pointer, which is what lets the array kind's widening loop vectorise.
+// [croaring-ref] deps/croaring/src/roaring.c:roaring_bitmap_to_uint32_array
+template <typename Layout, typename CowPolicy>
+[[ gnu::hot ]] inline typename Layout::key_type * container_decode_into(
+    container_handle<Layout, CowPolicy> const & container,
+    typename Layout::chunk_type const chunk_key,
+    typename Layout::key_type * out,
+    typename Layout::key_type * const out_end
+) noexcept {
+    using key_type = typename Layout::key_type;
+    auto const base{ Layout::compose( chunk_key, 0 ) };
+    switch ( container.kind() ) {
+        case container_kind::array: {
+            auto const & values{ container.as_array().values };
+            auto const   count { values.size() };
+            auto const * const source{ values.data() };
+            // Widening add over a contiguous run: clang lowers this to unpack +
+            // add + store (vpmovzxwd/vpaddd on x86, ushll/add on AArch64).
+            for ( std::uint32_t i{ 0 }; i < count; ++i ) {
+                out[ i ] = base + static_cast<key_type>( source[ i ] );
+            }
+            return out + count;
+        }
+        case container_kind::run: {
+            for ( auto const & run : container.as_run().runs ) {
+                auto const first{ base + static_cast<key_type>( run.begin ) };
+                auto const count{ static_cast<std::size_t>( run.end - run.begin ) + 1U };  // end is inclusive
+                // Counted, index-addressed loop (not a pointer-incrementing one):
+                // this is the shape clang vectorises into a broadcast + index-vector
+                // add + store, which a run of thousands of values needs.
+                // [croaring-ref] deps/croaring/src/containers/run.c:run_container_to_uint32_array
+                for ( std::size_t i{ 0 }; i < count; ++i ) {
+                    out[ i ] = first + static_cast<key_type>( i );
+                }
+                out += count;
+            }
+            return out;
+        }
+        case container_kind::bitset: {
+            auto const & words{ container.as_bitset().words.as_array() };
+            if constexpr ( std::is_same_v<key_type, std::uint32_t> ) {
+                return extract_setbits_uint32( words.data(), words.size(), out, out_end, base );
+            } else {
+                for ( std::size_t index{ 0 }; index < words.size(); ++index ) {
+                    auto word{ words[ index ] };
+                    auto const word_base{ base + static_cast<key_type>( index << 6U ) };
+                    while ( word != 0 ) {
+                        *out++ = word_base + static_cast<key_type>( std::countr_zero( word ) );
+                        word &= word - 1;
+                    }
+                }
+                return out;
+            }
+        }
+    }
+    std::unreachable();
+}
+
 } // namespace frsr::roaring::detail

@@ -5690,6 +5690,90 @@ struct register_cpp_remove_many_registrar {
 };
 #endif
 
+// ---- ToArray: decode a whole bitmap into a uint32 buffer -----------------------
+// Three container shapes, since each has its own decode kernel: `array` (a strided
+// set that stays under the array threshold per chunk), `bitset` (dense), `runs`
+// (contiguous ranges). This is the read path rama's callers take (toArray()).
+struct ToArrayShape { char const *label; std::uint32_t stride; std::uint32_t per_chunk; };
+static constexpr ToArrayShape kToArrayShapes[]{
+    { "array",  16, 2'000 },   // 2k values per chunk, strided -> array containers
+    { "bitset",  2, 30'000 },  // 30k per chunk -> bitset containers
+    { "runs",    1, 60'000 },  // contiguous -> run containers after optimize()
+};
+static std::vector<std::uint32_t> to_array_values(ToArrayShape const &shape, std::size_t const chunks) {
+    std::vector<std::uint32_t> values;
+    for (std::size_t c = 0; c < chunks; ++c) {
+        for (std::uint32_t i = 0; i < shape.per_chunk; ++i) {
+            values.push_back(static_cast<std::uint32_t>(c) * 65'536U + i * shape.stride);
+        }
+    }
+    return values;
+}
+
+template <class Arm>
+struct register_frsr_to_array_registrar {
+    using TestBitmap32 = typename Arm::bitmap;
+    struct S { TestBitmap32 bm; std::vector<std::uint32_t> out; };
+    static void run(std::size_t chunks, ToArrayShape const &shape) {
+        Entry e;
+        char buf[128];
+        snprintf(buf, sizeof(buf), "set_ops/%sToArray/chunks=%zu/shape=%s", Arm::label(), chunks, shape.label);
+        e.name        = buf;
+        e.description = "frsr::roaring::bitmap<uint32_t> to_array_into() over a whole bitmap, into a buffer "
+                        "the state owns — as the CRoaring arm does, so the band measures the decode and not "
+                        "the first-touch page faults of a fresh allocation. Checksum = decoded count.";
+        e.setup = [chunks, shape]() -> void * {
+            auto *s = new S;
+            for (auto const value : to_array_values(shape, chunks)) { std::ignore = s->bm.add(value); }
+            if (std::string_view{shape.label} == "runs") { s->bm.optimize(); }
+            s->out.resize(s->bm.size());
+            return s;
+        };
+        e.run = [](void *sv) -> int64_t {
+            auto *s = static_cast<S *>(sv);
+            return static_cast<int64_t>(s->bm.to_array_into({ s->out.data(), s->out.size() }));
+        };
+        e.teardown       = [](void *sv) { delete static_cast<S *>(sv); };
+        e.ops_per_run    = 1;
+        e.inner_reps     = kBinaryInnerReps;
+        e.reusable_state = true;
+        g_benchmarks.push_back(std::move(e));
+    }
+};
+
+#if FRSR_ROARING_HAS_CROARING
+template <class Arm>
+struct register_cpp_to_array_registrar {
+    struct S { roaring_bitmap_t *bm{}; std::vector<std::uint32_t> out; ~S() { if (bm) roaring_bitmap_free(bm); } };
+    static void run(std::size_t chunks, ToArrayShape const &shape) {
+        Entry e;
+        char buf[128];
+        snprintf(buf, sizeof(buf), "set_ops/%sToArray/chunks=%zu/shape=%s", Arm::label(), chunks, shape.label);
+        e.name        = buf;
+        e.description = "CRoaring roaring_bitmap_to_uint32_array() over a whole bitmap. "
+                        "[croaring-ref] deps/croaring/src/roaring.c:roaring_bitmap_to_uint32_array";
+        e.setup = [chunks, shape]() -> void * {
+            auto *s = new S;
+            s->bm = Arm::create();
+            for (auto const value : to_array_values(shape, chunks)) { roaring_bitmap_add(s->bm, value); }
+            if (std::string_view{shape.label} == "runs") { roaring_bitmap_run_optimize(s->bm); }
+            s->out.resize(roaring_bitmap_get_cardinality(s->bm));
+            return s;
+        };
+        e.run = [](void *sv) -> int64_t {
+            auto *s = static_cast<S *>(sv);
+            roaring_bitmap_to_uint32_array(s->bm, s->out.data());
+            return static_cast<int64_t>(s->out.size());
+        };
+        e.teardown       = [](void *sv) { delete static_cast<S *>(sv); };
+        e.ops_per_run    = 1;
+        e.inner_reps     = kBinaryInnerReps;
+        e.reusable_state = true;
+        g_benchmarks.push_back(std::move(e));
+    }
+};
+#endif
+
 // ========== top-level registration ==========
 
 void register_benchmarks() {
@@ -5706,6 +5790,12 @@ void register_benchmarks() {
 #endif
             register_r64_binary(count, offset, ov.label);
             register_set_binary(count, offset, ov.label);
+        }
+        for (auto const &shape : kToArrayShapes) {
+            arms::for_each_frsr<register_frsr_to_array_registrar>(count >= 100'000 ? std::size_t{ 16 } : std::size_t{ 2 }, shape);
+#if FRSR_ROARING_HAS_CROARING
+            arms::for_each_croaring<register_cpp_to_array_registrar>(count >= 100'000 ? std::size_t{ 16 } : std::size_t{ 2 }, shape);
+#endif
         }
         // sparse many-chunk variant: b shifted by ~half the chunk span for ~50% chunk overlap.
         std::size_t const b_chunk_offset = std::max(std::size_t{ 1 }, count / kSparsePerChunk / 2 );

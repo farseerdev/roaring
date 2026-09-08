@@ -1106,10 +1106,31 @@ public:
         }
     }
 
+    // Decodes into a CALLER-OWNED buffer (which must hold size() values) and returns
+    // how many were written. The buffer-owning form is the primitive: a caller that
+    // decodes repeatedly — a read path handing values out to its own consumer — keeps
+    // one buffer instead of paying an allocation and, more expensively, the first-touch
+    // page faults of a fresh one on every call.
+    // [croaring-ref] deps/croaring/src/roaring.c:roaring_bitmap_to_uint32_array
+    [[ gnu::hot ]] std::size_t to_array_into( std::span<key_type> const out ) const {
+        if constexpr ( kUseSingletonChunkMap ) {
+            materialize_singleton_chunks();
+        }
+        assert( out.size() >= size_ );
+        auto * cursor{ out.data() };
+        auto * const end{ out.data() + out.size() };
+        for ( size_type index{ 0 }; index < chunks_.size(); ++index ) {
+            cursor = detail::container_decode_into( chunks_.slot( index ), chunks_.key( index ), cursor, end );
+        }
+        return static_cast<std::size_t>( cursor - out.data() );
+    }
+
     [[nodiscard]] detail::heap_vector<key_type> to_vector() const {
         detail::heap_vector<key_type> result;
-        result.reserve( static_cast<std::uint32_t>( size_ ) );
-        for_each( [&]( key_type const value ) { result.push_back( value ); } );
+        detail::resize_uninitialized( result, static_cast<std::uint32_t>( size_ ) );
+        auto const written{ to_array_into( { result.data(), result.size() } ) };
+        assert( written == size_ );
+        result.resize( static_cast<std::uint32_t>( written ) );
         return result;
     }
     [[nodiscard]] detail::heap_vector<key_type> to_array() const { return to_vector(); }
