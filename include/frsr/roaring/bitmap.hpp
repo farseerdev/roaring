@@ -1518,6 +1518,7 @@ public:
         compact_tombstones();  // Ensure no tombstones in our chunk vector before merge
         detail::chunk_store<layout_type, CowPolicy> merged;
         merged.reserve( chunks_.size() + other.chunks_.size() );
+        detail::small_array_values<low_type> array_union_scratch;
 #if FRSR_ROARING_COMBINE_STATS
         detail::combine_stats().record_call( chunks_.size(), other.chunks_.size() );
 #endif
@@ -1549,18 +1550,52 @@ public:
 #if FRSR_ROARING_COMBINE_STATS
                 detail::combine_stats().record_pair( left_container, right_container, detail::set_operation::bit_or );
 #endif
+                // A shared left payload is not cloned and then mutated: the union is
+                // written straight into a fresh (or retired) payload, as CRoaring's
+                // container_or does for a SHARED container — the clone is a full
+                // read+write of the payload that the materializing combine never pays.
+                // Same rule as the general spine's mutate_left (combine()).
+                bool const mutate_left{ left_container.payload_is_unshared() };
                 if ( left_container.holds_array() && right_container.holds_array() ) {
-                    detail::union_array_array_inplace<layout_type>( left_container.as_array(), right_container.as_array() );
-                    auto container{ make_fast_container( std::move( left_container ) ) };
-                    if ( !lazy ) {
-                        size_ += detail::container_size( container );
+                    if ( mutate_left ) {
+                        detail::union_array_array_inplace<layout_type>( left_container.as_array(), right_container.as_array() );
+                        auto container{ make_fast_container( std::move( left_container ) ) };
+                        if ( !lazy ) {
+                            size_ += detail::container_size( container );
+                        }
+                        merged.push_back( left_key, std::move( container ) );
+                    } else {
+                        detail::union_array_array_to_vector<layout_type>(
+                            std::as_const( left_container ).as_array(),
+                            right_container.as_array(),
+                            array_union_scratch
+                        );
+                        auto container{ make_fast_container_from_scratch_reusing( merged, array_union_scratch ) };
+                        if ( !lazy ) {
+                            size_ += detail::container_size( container );
+                        }
+                        merged.push_back( left_key, std::move( container ) );
                     }
-                    merged.push_back( left_key, std::move( container ) );
                     ++left;
                     ++right;
                     continue;
                 }
                 if ( left_container.holds_bitset() && right_container.holds_bitset() ) {
+                    if ( !mutate_left ) {
+                        auto container{ combine_bitset_bitset_for_policy(
+                            std::as_const( left_container ).as_bitset(),
+                            right_container.as_bitset(),
+                            detail::set_operation::bit_or,
+                            merged.take_retired( detail::container_kind::bitset )
+                        ) };
+                        if ( !lazy ) {
+                            size_ += detail::container_size( container );
+                        }
+                        merged.push_back( left_key, std::move( container ) );
+                        ++left;
+                        ++right;
+                        continue;
+                    }
                     auto left_bitset{ left_container.as_bitset() };
                     if ( lazy ) {
                         detail::or_bitset_bitset_inplace_lazy<layout_type>( left_bitset, right_container.as_bitset() );
