@@ -106,6 +106,23 @@ template <typename Layout, typename CowPolicy>
     std::unreachable();
 }
 
+// The group form of container_add(): the kind switch and the copy-on-write
+// barrier behind the mutable view are paid once for the whole sorted group,
+// where a value-at-a-time loop pays both per value. `sorted_values` must be
+// sorted and duplicate-free. Returns how many values were actually added.
+template <typename Layout, typename CowPolicy>
+[[nodiscard]] inline std::size_t container_add_sorted(
+    container_handle<Layout, CowPolicy> & container,
+    std::span<typename Layout::low_type const> const sorted_values
+) {
+    switch ( container.kind() ) {
+        case container_kind::array : return container.as_array ().add_sorted( sorted_values );
+        case container_kind::run   : return container.as_run   ().add_sorted( sorted_values );
+        case container_kind::bitset: return container.as_bitset().add_sorted( sorted_values );
+    }
+    std::unreachable();
+}
+
 template <typename Layout, typename CowPolicy>
 [[nodiscard]] inline bool container_remove(
     container_handle<Layout, CowPolicy> & container,

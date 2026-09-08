@@ -1067,6 +1067,69 @@ public:
         return true;
     }
 
+    // Adds every value of the sorted, duplicate-free `sorted_values` that is not
+    // already present, resolving the payload ONCE for the whole group instead of
+    // once per value. Returns the number of values actually added.
+    //
+    // The append-only case - every incoming value above the container's maximum,
+    // which is what inserting a batch of ascending table rows looks like - is a
+    // single resize and memcpy. Otherwise the group is merged in place: one pass
+    // counts the additions so the payload grows once, a second merges backward
+    // from the end (both sources are read above the write cursor, so no scratch
+    // buffer is needed).
+    // [croaring-ref] deps/croaring/src/containers/array.c:array_container_append
+    std::size_t add_sorted( std::span<low_type const> const sorted_values ) {
+        if ( sorted_values.empty() ) {
+            return 0;
+        }
+        auto const cardinality{ values.size() };
+        if ( cardinality == 0 || values.back() < sorted_values.front() ) {
+            values.resize_uninitialized( static_cast<std::uint32_t>( cardinality + sorted_values.size() ) );
+            std::memcpy(
+                values.data() + cardinality,
+                sorted_values.data(),
+                sorted_values.size() * sizeof( low_type )
+            );
+            sync_header();
+            return sorted_values.size();
+        }
+
+        std::size_t additions{ 0 };
+        {
+            auto const *       a    { values.data() };
+            auto const * const a_end{ a + cardinality };
+            auto const *       b    { sorted_values.data() };
+            auto const * const b_end{ b + sorted_values.size() };
+            while ( a != a_end && b != b_end ) {
+                if      ( *a < *b ) { ++a; }
+                else if ( *b < *a ) { ++additions; ++b; }
+                else                { ++a; ++b; }
+            }
+            additions += static_cast<std::size_t>( b_end - b );
+        }
+        if ( additions == 0 ) {
+            return 0;
+        }
+
+        values.resize_uninitialized( static_cast<std::uint32_t>( cardinality + additions ) );
+        auto * const data{ values.data() };
+        auto a  { static_cast<std::ptrdiff_t>( cardinality             ) - 1 };
+        auto b  { static_cast<std::ptrdiff_t>( sorted_values.size()    ) - 1 };
+        auto out{ static_cast<std::ptrdiff_t>( cardinality + additions ) - 1 };
+        while ( b >= 0 ) {
+            if ( a >= 0 && sorted_values[ static_cast<std::size_t>( b ) ] < data[ a ] ) {
+                data[ out-- ] = data[ a-- ];
+            } else if ( a >= 0 && data[ a ] == sorted_values[ static_cast<std::size_t>( b ) ] ) {
+                data[ out-- ] = data[ a-- ];
+                --b;
+            } else {
+                data[ out-- ] = sorted_values[ static_cast<std::size_t>( b-- ) ];
+            }
+        }
+        sync_header();
+        return additions;
+    }
+
     // Removes every value of the sorted, duplicate-free `sorted_values` that is
     // present, in one merge walk that compacts the survivors in place: O(card +
     // removals) instead of a lower_bound + memmove per value. Returns the number
@@ -1235,6 +1298,18 @@ public:
         auto const previous_size{ handle_->cardinality() };
         add_closed_range( value, value );
         return handle_->cardinality() != previous_size;
+    }
+
+    // The group form of add(). A run container has no cheaper bulk shape than a
+    // value-at-a-time insert (each value either extends a run, fills a gap or
+    // splits one), so this exists for the payload resolution alone: the group's
+    // write barrier and kind dispatch are paid once by the caller.
+    std::size_t add_sorted( std::span<low_type const> const sorted_values ) {
+        auto const previous_size{ handle_->cardinality() };
+        for ( auto const value : sorted_values ) {
+            add_closed_range( value, value );
+        }
+        return handle_->cardinality() - previous_size;
     }
 
     [[nodiscard]] bool remove( low_type const value ) {
@@ -1533,6 +1608,33 @@ public:
             );
         }
         return true;
+    }
+
+    // The group form of add(): the words are set in one pass and the header's
+    // cardinality and endpoints are written ONCE for the whole group, instead of
+    // a read-modify-write of both per value.
+    std::size_t add_sorted( std::span<low_type const> const sorted_values ) noexcept {
+        std::size_t additions{ 0 };
+        for ( auto const value : sorted_values ) {
+            auto       & word{ words[ static_cast<std::size_t>( value ) >> 6U ] };
+            auto const   mask{ std::uint64_t{ 1 } << ( static_cast<unsigned>( value ) & 63U ) };
+            additions += ( ( word & mask ) == 0 );
+            word |= mask;
+        }
+        if ( additions == 0 ) {
+            return 0;
+        }
+        auto const previous_cardinality{ handle_->cardinality() };
+        handle_->set_cardinality( static_cast<std::uint32_t>( previous_cardinality + additions ) );
+        if ( previous_cardinality == 0 ) {
+            handle_->set_endpoints( sorted_values.front(), sorted_values.back() );
+        } else if ( handle_->endpoints_valid() ) {
+            handle_->set_endpoints(
+                std::min( handle_->min_value(), sorted_values.front() ),
+                std::max( handle_->max_value(), sorted_values.back()  )
+            );
+        }
+        return additions;
     }
 
     [[nodiscard]] bool remove( low_type const value ) noexcept {

@@ -704,4 +704,81 @@ TEST(FrsrRoaringCrosscheck, UnionArraysSimdMatchesCRoaring) {
     }
 }
 
+TEST(FrsrRoaringCrosscheck, AddManySortedGroupsMatchCRoaring) {
+    // A group insert resolves the container once and appends/merges the whole
+    // group, where a value-at-a-time loop resolves it per value. The shapes below
+    // cover every branch of that: the ascending-append fast path, a merge that
+    // shifts an existing tail, a group entirely below the container's minimum, a
+    // group already wholly present, and groups that straddle a chunk boundary -
+    // over array, bitset and run base containers.
+    struct Case {
+        char const *               label;
+        std::vector<std::uint32_t> base;
+        std::vector<std::uint32_t> group;
+        bool                       run_encode;
+    };
+
+    auto const dense_chunk{ make_dense_pattern_values( 0U, 20'000U, 7U, 3U ) };
+    auto const full_block { make_dense_pattern_values( 0U, 70'000U, 1U, 1U ) };  // no holes: run-shaped
+
+    std::vector<Case> const cases{
+        { "append above an array",        { 1U, 5U, 9U },         { 10U, 11U, 4'000U },           false },
+        { "append into an empty bitmap",  {},                     { 3U, 4U, 70'000U },            false },
+        { "merge into an array tail",     { 10U, 20U, 30U, 40U }, { 15U, 25U, 35U },              false },
+        { "group below the minimum",      { 100U, 200U, 300U },   { 1U, 2U, 3U },                 false },
+        { "group already present",        { 10U, 20U, 30U },      { 10U, 20U, 30U },              false },
+        { "group half present",           { 10U, 20U, 30U },      { 20U, 21U, 30U, 31U },         false },
+        { "across a chunk boundary",      { 65'530U, 65'535U },   { 65'536U, 65'537U, 131'072U }, false },
+        { "into a bitset container",      dense_chunk,            { 5U, 6U, 20'001U, 20'002U },   false },
+        { "into a run container",         full_block,             { 70'001U, 70'002U },           true  },
+        { "run container, interior fill", full_block,             { 1U, 2U, 70'005U },            true  },
+    };
+
+    for ( auto const & c : cases ) {
+        TestBitmap mine{ std::span<std::uint32_t const>{ c.base } };
+        auto       theirs{ make_roaring( c.base ) };
+        if ( c.run_encode ) {
+            mine.optimize();
+            roaring_bitmap_run_optimize( theirs.bitmap );
+        }
+
+        mine.add_many_sorted( { c.group.data(), c.group.size() } );
+        roaring_bitmap_add_many( theirs.bitmap, c.group.size(), c.group.data() );
+
+        EXPECT_EQ( mine.to_vector(), to_vector( theirs.bitmap ) ) << c.label;
+        EXPECT_EQ( mine.size(), roaring_bitmap_get_cardinality( theirs.bitmap ) ) << c.label;
+    }
+
+    // Randomized: repeated group inserts into the same growing bitmap, so later
+    // rounds hit containers that earlier rounds promoted.
+    std::mt19937 rng{ 0x9E3779B9U };
+    std::uniform_int_distribution<std::uint32_t> value_dist{ 0U, 200'000U };
+    std::uniform_int_distribution<std::size_t>   size_dist { 0U, 400U };
+
+    auto sorted_unique{ [&]( std::size_t const n ) {
+        std::vector<std::uint32_t> values;
+        for ( auto remaining{ n }; remaining != 0; --remaining ) { values.push_back( value_dist( rng ) ); }
+        std::sort( values.begin(), values.end() );
+        values.erase( std::unique( values.begin(), values.end() ), values.end() );
+        return values;
+    } };
+
+    for ( int round{ 0 }; round < 200; ++round ) {
+        auto const base{ sorted_unique( size_dist( rng ) ) };
+
+        TestBitmap mine{ std::span<std::uint32_t const>{ base } };
+        auto       theirs{ make_roaring( base ) };
+
+        for ( int group_round{ 0 }; group_round < 3; ++group_round ) {
+            auto const group{ sorted_unique( size_dist( rng ) ) };
+
+            mine.add_many_sorted( { group.data(), group.size() } );
+            roaring_bitmap_add_many( theirs.bitmap, group.size(), group.data() );
+
+            ASSERT_EQ( mine.to_vector(), to_vector( theirs.bitmap ) ) << "round " << round << '/' << group_round;
+            ASSERT_EQ( mine.size(), roaring_bitmap_get_cardinality( theirs.bitmap ) ) << "round " << round;
+        }
+    }
+}
+
 } // namespace

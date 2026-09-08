@@ -656,4 +656,28 @@ TEST(FrsrRoaringSmoke, ShrinkToFitLeavesASharedPayloadAloneAndKeepsBothCopies) {
 }
 
 
+TEST(FrsrRoaringSmoke, AddManySortedIntoASharedPayloadLeavesTheCopyAlone) {
+    // The group insert takes the copy-on-write barrier once for the whole group
+    // instead of once per value; it still has to take it, so the copy must not
+    // see the group's values.
+    std::vector<std::uint32_t> values;
+    for ( std::uint32_t value{ 0U }; value <= 20'000U; ++value ) {
+        if ( ( value % 7U ) != 3U ) { values.push_back( value ); }
+    }
+
+    LazyBitmap original{ std::span<std::uint32_t const>{ values } };
+    LazyBitmap copy    { original };
+
+    std::vector<std::uint32_t> const group{ 20'001U, 20'002U, 20'003U, 30'000U };
+    original.add_many_sorted( { group.data(), group.size() } );
+
+    auto expected{ values };
+    expected.insert( expected.end(), group.begin(), group.end() );
+
+    EXPECT_EQ( original.to_vector(), expected );
+    EXPECT_EQ( copy    .to_vector(), values   );
+    EXPECT_EQ( original.size(), expected.size() );
+    EXPECT_EQ( copy    .size(), values  .size() );
+}
+
 } // namespace

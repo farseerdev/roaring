@@ -842,9 +842,9 @@ public:
                     size_ += grouped_values.size();
                 } else {
                     bool const was_tombstone{ kUseLazyTombstoning && tombstone_count_ != 0 && detail::container_size( chunks_.slot( pos ) ) == 0 };
-                    for ( auto const low : grouped_values ) {
-                        if ( detail::container_add( chunks_.slot( pos ), low ) ) { ++size_; }
-                    }
+                    size_ += detail::container_add_sorted(
+                        chunks_.slot( pos ), { grouped_values.data(), grouped_values.size() }
+                    );
                     if ( was_tombstone ) { --tombstone_count_; }
                     promote_if_needed( chunks_.slot( pos ) );
                 }
@@ -858,11 +858,9 @@ public:
                     size_ += grouped_values.size();
                 } else {
                     bool const was_tombstone{ tombstone_count_ != 0 && detail::container_size( chunks_.slot( pos ) ) == 0 };
-                    for ( auto const low : grouped_values ) {
-                        if ( detail::container_add( chunks_.slot( pos ), low ) ) {
-                            ++size_;
-                        }
-                    }
+                    size_ += detail::container_add_sorted(
+                        chunks_.slot( pos ), { grouped_values.data(), grouped_values.size() }
+                    );
                     if ( was_tombstone ) { --tombstone_count_; }
                     promote_if_needed( chunks_.slot( pos ) );
                 }
@@ -873,11 +871,9 @@ public:
                 if ( it != chunk_index_map_().end() ) {
                     pos = it->second;
                     bool const was_tombstone{ tombstone_count_ != 0 && detail::container_size( chunks_.slot( pos ) ) == 0 };
-                    for ( auto const low : grouped_values ) {
-                        if ( detail::container_add( chunks_.slot( pos ), low ) ) {
-                            ++size_;
-                        }
-                    }
+                    size_ += detail::container_add_sorted(
+                        chunks_.slot( pos ), { grouped_values.data(), grouped_values.size() }
+                    );
                     if ( was_tombstone ) { --tombstone_count_; }
                     promote_if_needed( chunks_.slot( pos ) );
                 } else {
