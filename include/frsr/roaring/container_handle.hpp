@@ -358,6 +358,22 @@ public:
         return false; // unreachable
     }
 
+    // True when a mutating accessor would not have to clone: the payload is
+    // inline, uniquely owned, or shared with nobody else left holding it. The
+    // same three checks make_payload_unique() performs, exposed so a caller can
+    // choose to compute a fresh result instead of cloning-then-mutating.
+    [[nodiscard]] bool payload_is_unshared() const noexcept {
+        if ( owner_ == storage_ownership::borrowed ) [[unlikely]] {
+            return false;
+        }
+        if constexpr ( CowPolicy::refcounted ) {
+            if ( spilled() && CowPolicy::rc_load( rc_slot_of( spill().data ) ) != 1 ) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     // Header resets for a payload handed back by take_retired(): the storage
     // (and ownership/refcount word) stays, the logical contents restart empty.
     void reset_for_array_reuse() noexcept {

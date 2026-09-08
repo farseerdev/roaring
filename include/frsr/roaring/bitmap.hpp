@@ -1753,6 +1753,15 @@ public:
 #if FRSR_ROARING_COMBINE_STATS
             detail::combine_stats().record_pair( left_container, right_container, op );
 #endif
+            // A shared left payload is never mutated in place: cloning it only to
+            // overwrite the clone costs a full payload copy on top of the kernel,
+            // where computing straight into a fresh result costs the kernel alone.
+            // So the in-place kernels below run only when we are the sole holder,
+            // and a shared left container takes the materializing arm for its pair —
+            // emitted into our own table exactly as the materializing arms already
+            // do in in-place mode. This is the rule CRoaring applies to a
+            // SHARED_CONTAINER_TYPE operand (container_and rather than container_iand).
+            bool const mutate_left{ in_place && left_container.payload_is_unshared() };
             if ( left_container.holds_array() && right_container.holds_array() ) {
                 // The materializing arm below needs min(|la|,|ra|) + one SIMD vector of
                 // result capacity. When the recycled scratch cannot hold that, it has to
@@ -1769,7 +1778,7 @@ public:
                 // repays the avoided allocation while the blocks are few: measured, it
                 // wins by ~30% at 64-element operands and loses by ~30% at ~1000.
                 auto const intersect_result_count{ std::min( left_container.count(), right_container.count() ) };
-                if ( op == detail::set_operation::bit_and && in_place &&
+                if ( op == detail::set_operation::bit_and && mutate_left &&
                      intersect_result_count <= detail::kInplaceIntersectMaxElements &&
                      result_chunks.retired_capacity( detail::container_kind::array ) < intersect_result_count + 8U ) {
                     detail::intersect_array_array_inplace<layout_type>( left_container.as_array(), right_container.as_array() );
@@ -1801,18 +1810,33 @@ public:
                         auto const count{ static_cast<size_type>( result_array.values.size() ) };
                         emit( left_key, std::move( result_handle ), count );
                     }
-                } else {
+                } else if ( mutate_left ) {
                     detail::difference_array_array_inplace<layout_type>( left_container.as_array(), right_container.as_array() );
                     if ( left_container.count() != 0 ) {
                         auto container{ make_fast_container( std::move( left_container ) ) };
                         emit( left_key, std::move( container ), detail::container_size( container ) );
+                    }
+                } else {
+                    // array \ array with a shared left payload: write the survivors into
+                    // a fresh handle (what difference_into does for every pair).
+                    handle_type result_handle{ result_chunks.take_retired( detail::container_kind::array ) };
+                    auto result_array{ result_handle.as_array() };
+                    detail::difference_array_array_to_vector<layout_type>(
+                        std::as_const( left_container ).as_array(),
+                        right_container.as_array(),
+                        result_array.values
+                    );
+                    if ( !result_array.values.empty() ) {
+                        result_array.sync_header();
+                        auto const count{ static_cast<size_type>( result_array.values.size() ) };
+                        emit( left_key, std::move( result_handle ), count );
                     }
                 }
                 ++left;
                 continue;
             }
             if ( left_container.holds_bitset() && right_container.holds_bitset() ) {
-                if ( in_place ) {
+                if ( mutate_left ) {
                     auto left_bitset{ left_container.as_bitset() };
                     detail::combine_bitset_bitset_inplace<layout_type>( left_bitset, right_container.as_bitset(), op );
                     if ( left_bitset.size() != 0 ) {
@@ -1846,7 +1870,7 @@ public:
                 ++left;
                 continue;
             }
-            if ( in_place && left_container.holds_array() && right_container.holds_bitset() ) {
+            if ( mutate_left && left_container.holds_array() && right_container.holds_bitset() ) {
                 // In-place array∩bitset / array\bitset: the result is a subset of our
                 // own array payload, so filter it in place instead of building a fresh
                 // container through combine_containers. The mutable as_array() write
@@ -1869,7 +1893,7 @@ public:
                 ++left;
                 continue;
             }
-            if ( in_place && left_container.holds_array() && right_container.holds_run() ) {
+            if ( mutate_left && left_container.holds_array() && right_container.holds_run() ) {
                 // In-place array∩run / array\run: same contract as the array-vs-
                 // bitset arm above (result ⊆ our own array payload — compact in
                 // place, alloc-free at rc == 1, always still an array). Without
@@ -1890,9 +1914,10 @@ public:
             }
             bool const left_is_array { left_container.holds_array()  };
             bool const right_is_array{ right_container.holds_array() };
-            if ( op == detail::set_operation::bit_and &&
-                 ( ( left_is_array && right_container.holds_bitset() ) ||
-                   ( left_container.holds_bitset() && right_is_array ) ) ) {
+            if ( ( op == detail::set_operation::bit_and &&
+                   ( ( left_is_array && right_container.holds_bitset() ) ||
+                     ( left_container.holds_bitset() && right_is_array ) ) ) ||
+                 ( op == detail::set_operation::bit_andnot && left_is_array && right_container.holds_bitset() ) ) {
                 // Materializing array∩bitset (either orientation — the in-place
                 // left-array case is already consumed by the alloc-free arm above):
                 // the result is an array ⊆ the array side, so write it inline into a
@@ -1907,7 +1932,7 @@ public:
                 // key against all-ones words (the all-survive regime is the
                 // filter kernel's slowest — store-to-load aliasing on the
                 // coinciding cursors). Same shape as the full-domain-run arm below.
-                if ( detail::container_is_known_full<layout_type, CowPolicy>( bitset_side ) ) {
+                if ( op == detail::set_operation::bit_and && detail::container_is_known_full<layout_type, CowPolicy>( bitset_side ) ) {
                     if ( auto const count{ static_cast<size_type>( array_side.as_array().values.size() ) }; count != 0 ) {
                         emit( left_key, handle_type{ array_side }, count );
                     }
@@ -1919,7 +1944,7 @@ public:
                 detail::filter_array_bitset_into<layout_type>(
                     array_side.as_array(),
                     bitset_side.as_bitset(),
-                    true,
+                    op == detail::set_operation::bit_and,
                     result_array.values
                 );
                 if ( !result_array.values.empty() ) {
@@ -2042,7 +2067,7 @@ public:
                 ++left;
                 continue;
             }
-            if ( in_place && op == detail::set_operation::bit_andnot &&
+            if ( mutate_left && op == detail::set_operation::bit_andnot &&
                  left_container.holds_bitset() && right_container.holds_array() ) {
                 // In-place bitset\array: clear the array's bits from our own 8 KB
                 // block (exact cardinality bookkeeping, no allocation; the mutable
