@@ -904,13 +904,17 @@ template <typename Layout, typename OutVector, typename CowPolicy = cow_value_se
 #if defined( __SSE4_2__ )
     // Same over-allocate-by-one-vector contract as the intersection: the kernel's
     // stores write a full vector past the true count.
+    // Below one vector on either side the kernel is all setup (and the +8 slots are
+    // an over-allocation of the whole result), so those pairs take the scalar merge.
     if constexpr ( kSimdArrayIntersect && std::is_same_v<typename Layout::low_type, std::uint16_t> ) {
         auto const sa{ lhs.values.size() };
         auto const sb{ rhs.values.size() };
-        resize_uninitialized( out, sa + 8U );
-        auto const count{ difference_array_array_sse42( lhs.values.data(), sa, rhs.values.data(), sb, out.data() ) };
-        out.resize( static_cast<std::uint32_t>( count ) );
-        return;
+        if ( sa >= 8U && sb >= 8U ) {
+            resize_uninitialized( out, sa + 8U );
+            auto const count{ difference_array_array_sse42( lhs.values.data(), sa, rhs.values.data(), sb, out.data() ) };
+            out.resize( static_cast<std::uint32_t>( count ) );
+            return;
+        }
     }
 #endif
     resize_uninitialized( out, lhs.values.size() );
