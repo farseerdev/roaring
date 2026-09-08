@@ -179,6 +179,64 @@ inline std::size_t extract_setbits_uint16(
     return static_cast<std::size_t>( out - start );
 }
 
+// AVX-512 VBMI2 set-bit decoder into 32-bit values: the same byte-index compress
+// as the uint16 form, widened to 32 bits in blocks of 16 and masked-stored, so a
+// store writes exactly the values it produced (an exactly-sized output buffer
+// needs no padding) and only the ceil(popcount/16) blocks that carry a value are
+// computed — a bitset container is usually well under half full.
+// [croaring-ref] deps/croaring/src/bitset_util.c:bitset_extract_setbits_avx512
+FRSR_ROARING_X86_V4_KERNEL
+inline std::uint32_t * extract_setbits_uint32(
+    std::uint64_t const * const words, std::size_t const n,
+    std::uint32_t * out, std::uint32_t * const out_end, std::uint32_t const base
+) noexcept {
+    alignas( 64 ) static constexpr std::uint8_t index_table[ 64 ]{
+         0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15,
+        16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
+        32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47,
+        48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63
+    };
+    __m512i       base_lanes{ _mm512_set1_epi32( static_cast<int>( base ) ) };
+    __m512i const inc64     { _mm512_set1_epi32( 64 ) };
+    __m512i const indices   { _mm512_load_si512( index_table ) };
+    std::size_t index{ 0 };
+    for ( ; index < n; ++index ) {
+        auto const word{ words[ index ] };
+        if ( word != 0 ) {
+            auto const count{ static_cast<std::size_t>( std::popcount( word ) ) };
+            if ( out + count > out_end ) { break; }
+            __m512i const packed{ _mm512_maskz_compress_epi8( static_cast<__mmask64>( word ), indices ) };
+            std::uint64_t const lanes{ ~std::uint64_t{ 0 } >> ( 64U - count ) };  // count is 1..64 here
+            _mm512_mask_storeu_epi32( out, static_cast<__mmask16>( lanes ),
+                _mm512_add_epi32( base_lanes, _mm512_cvtepu8_epi32( _mm512_castsi512_si128( packed ) ) ) );
+            if ( count > 16 ) {
+                _mm512_mask_storeu_epi32( out + 16, static_cast<__mmask16>( lanes >> 16 ),
+                    _mm512_add_epi32( base_lanes, _mm512_cvtepu8_epi32( _mm512_extracti32x4_epi32( packed, 1 ) ) ) );
+                if ( count > 32 ) {
+                    _mm512_mask_storeu_epi32( out + 32, static_cast<__mmask16>( lanes >> 32 ),
+                        _mm512_add_epi32( base_lanes, _mm512_cvtepu8_epi32( _mm512_extracti32x4_epi32( packed, 2 ) ) ) );
+                    if ( count > 48 ) {
+                        _mm512_mask_storeu_epi32( out + 48, static_cast<__mmask16>( lanes >> 48 ),
+                            _mm512_add_epi32( base_lanes, _mm512_cvtepu8_epi32( _mm512_extracti32x4_epi32( packed, 3 ) ) ) );
+                    }
+                }
+            }
+            out += count;
+        }
+        base_lanes = _mm512_add_epi32( base_lanes, inc64 );
+    }
+    // Tail: whatever the capacity guard above stopped short of.
+    auto value_base{ base + static_cast<std::uint32_t>( index * 64 ) };
+    for ( ; index < n && out < out_end; ++index, value_base += 64 ) {
+        auto word{ words[ index ] };
+        while ( word != 0 && out < out_end ) {
+            *out++ = value_base + static_cast<std::uint32_t>( std::countr_zero( word ) );
+            word &= word - 1;
+        }
+    }
+    return out;
+}
+
 } // namespace x86_v4
 #endif // FRSR_ROARING_X86_V4
 
@@ -213,6 +271,11 @@ typedef std::uint32_t setbit_decode_lane_block
     std::uint64_t const * const words, std::size_t const n,
     std::uint32_t * out, std::uint32_t * const out_end, std::uint32_t const base
 ) noexcept {
+#if FRSR_ROARING_X86_V4
+    if ( have_x86_v4() ) [[likely]] {
+        return x86_v4::extract_setbits_uint32( words, n, out, out_end, base );
+    }
+#endif
     setbit_decode_lane_block base_lanes;
     for ( unsigned lane{ 0 }; lane < 8U; ++lane ) { base_lanes[ lane ] = base; }
     setbit_decode_lane_block const eight{ 8, 8, 8, 8, 8, 8, 8, 8 };
