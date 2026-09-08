@@ -3458,7 +3458,7 @@ struct register_frsr_and_small_vs_band_registrar {
     using namespace band_fold;
     Entry e;
     char buf[128];
-    snprintf(buf, sizeof(buf), "set_ops/frsrAndSmallVsBand/band=%zu/form=%s",
+    snprintf(buf, sizeof(buf), "set_ops/%sAndSmallVsBand/band=%zu/form=%s", Arm::label(),
              band, as_bitset ? "bitset" : "array");
     e.name        = buf;
     e.description = std::string("frsr small-array ∩ cardinality-") + std::to_string(band) +
@@ -3510,7 +3510,7 @@ struct register_frsr_lazy_union_fold_registrar {
     using namespace band_fold;
     Entry e;
     char buf[128];
-    snprintf(buf, sizeof(buf), "set_ops/frsrLazyUnionFold/band=%zu", band);
+    snprintf(buf, sizeof(buf), "set_ops/%sLazyUnionFold/band=%zu", Arm::label(), band);
     e.name        = buf;
     e.description = "frsr lazy K-way union accumulate (bulk_or_intermediate + "
                     "bulk_or_finish_keep_bitsets) then AND-fold of " + std::to_string(kProbes) +
@@ -3559,7 +3559,7 @@ struct register_frsr_lazy_union_fold_optimized_registrar {
     using namespace band_fold;
     Entry e;
     char buf[128];
-    snprintf(buf, sizeof(buf), "set_ops/frsrLazyUnionFoldOptimize/band=%zu/finish=%s",
+    snprintf(buf, sizeof(buf), "set_ops/%sLazyUnionFoldOptimize/band=%zu/finish=%s", Arm::label(),
              band, keep_bitsets ? "keep_bitsets" : "optimize");
     e.name        = buf;
     e.description = std::string("frsr lazy K-way union accumulate then ") +
@@ -3621,7 +3621,7 @@ struct register_cpp_lazy_union_fold_registrar {
     using namespace band_fold;
     Entry e;
     char buf[128];
-    snprintf(buf, sizeof(buf), "set_ops/cppLazyUnionFold/band=%zu", band);
+    snprintf(buf, sizeof(buf), "set_ops/%sLazyUnionFold/band=%zu", Arm::label(), band);
     e.name        = buf;
     e.description = "CRoaring lazy K-way union accumulate (roaring_bitmap_lazy_or_inplace + "
                     "roaring_bitmap_repair_after_lazy) then AND-fold of " + std::to_string(kProbes) +
@@ -5193,7 +5193,7 @@ struct register_frsr_cold_card_registrar {
     static void run(std::size_t acard, bool andnot) {
     Entry e;
     char buf[128];
-    snprintf(buf, sizeof(buf), "cold_card/frsrColdCard%s/acard=%zu",
+    snprintf(buf, sizeof(buf), "cold_card/%sColdCard%s/acard=%zu", Arm::label(),
              andnot ? "Andnot" : "Intersect", acard);
     e.name        = buf;
     e.description = "fixed-cardinality diagnostic of the cold_heap Andnot/Intersect delta";
@@ -5229,7 +5229,7 @@ struct register_cpp_cold_card_registrar {
     static void run(std::size_t acard, bool andnot) {
     Entry e;
     char buf[128];
-    snprintf(buf, sizeof(buf), "cold_card/cppColdCard%s/acard=%zu",
+    snprintf(buf, sizeof(buf), "cold_card/%sColdCard%s/acard=%zu", Arm::label(),
              andnot ? "Andnot" : "Intersect", acard);
     e.name        = buf;
     e.description = "CRoaring counterpart of the fixed-cardinality cold_heap diagnostic";
@@ -5317,7 +5317,7 @@ struct register_frsr_saturated_registrar {
     static void run(double fill_fraction, const char *tag, bool andnot) {
     Entry e;
     char buf[160];
-    snprintf(buf, sizeof(buf), "set_ops/frsrSaturatedBitset%s/fill=%s",
+    snprintf(buf, sizeof(buf), "set_ops/%sSaturatedBitset%s/fill=%s", Arm::label(),
              andnot ? "Andnot" : "Intersect", tag);
     e.name        = buf;
     e.description = std::string("frsr::roaring::bitmap<uint32_t> ") + (andnot ? "operator-" : "operator&") +
@@ -5368,7 +5368,7 @@ struct register_cpp_saturated_registrar {
     static void run(double fill_fraction, const char *tag, bool andnot) {
     Entry e;
     char buf[160];
-    snprintf(buf, sizeof(buf), "set_ops/cppSaturatedBitset%s/fill=%s",
+    snprintf(buf, sizeof(buf), "set_ops/%sSaturatedBitset%s/fill=%s", Arm::label(),
              andnot ? "Andnot" : "Intersect", tag);
     e.name        = buf;
     e.description = "CRoaring roaring_bitmap_and()/andnot() — apples-to-apples counterpart of the "
@@ -5487,7 +5487,7 @@ struct register_frsr_run_vs_registrar {
     std::size_t const run_length = run_length_full ? kStride : (card / kNumRuns);
     Entry e;
     char buf[160];
-    snprintf(buf, sizeof(buf), "set_ops/frsrRunVs%s/card=%zu%s",
+    snprintf(buf, sizeof(buf), "set_ops/%sRunVs%s/card=%zu%s", Arm::label(),
              vs_bitset ? "Bitset" : "Array", card, run_length_full ? "/full=true" : "");
     e.name        = buf;
     e.description = "frsr::roaring::bitmap<uint32_t> operator& between a run-encoded operand "
@@ -5546,7 +5546,7 @@ struct register_cpp_run_vs_registrar {
     std::size_t const run_length = run_length_full ? kStride : (card / kNumRuns);
     Entry e;
     char buf[160];
-    snprintf(buf, sizeof(buf), "set_ops/cppRunVs%s/card=%zu%s",
+    snprintf(buf, sizeof(buf), "set_ops/%sRunVs%s/card=%zu%s", Arm::label(),
              vs_bitset ? "Bitset" : "Array", card, run_length_full ? "/full=true" : "");
     e.name        = buf;
     e.description = "CRoaring roaring_bitmap_and() — apples-to-apples counterpart of the frsr "
@@ -5865,7 +5865,9 @@ static std::vector<std::uint32_t> make_ascending_probes( std::size_t const chunk
     return probes;
 }
 
+template <class Arm>
 struct FrsrState {
+    using TestBitmap32 = typename Arm::bitmap;
     TestBitmap32 r;
     std::vector<std::uint32_t> probes;
     std::size_t pos{ 0 };
@@ -5878,15 +5880,18 @@ struct R64State {
     ~R64State() { roaring_bitmap_free( r ); }
 };
 
+template <class Arm>
 struct SharedState {
+    using TestBitmap32 = typename Arm::bitmap;
     TestBitmap32 r;                       // probed by every thread at once
     std::vector<TestBitmap32> copies;     // one per thread (the control arm)
     std::vector<std::uint32_t> probes;
     std::size_t threads{ 1 };
 };
 
-static FrsrState * make_frsr_state( std::size_t chunks, bool ascending ) {
-    auto * s{ new FrsrState{} };
+template <class Arm>
+static FrsrState<Arm> * make_frsr_state( std::size_t chunks, bool ascending ) {
+    auto * s{ new FrsrState<Arm>{} };
     for ( auto const v : make_values( chunks ) ) { (void)s->r.add( v ); }
     s->probes = ascending ? make_ascending_probes( chunks, 1U << 16 )
                           : make_scatter_probes  ( chunks, 1U << 16 );
@@ -5901,206 +5906,219 @@ static R64State * make_r64_state( std::size_t chunks, bool ascending ) {
     return s;
 }
 
+template <class Arm>
+struct registrar {
+    using TestBitmap32 = typename Arm::bitmap;
+    static void run() {        // 64 and 256 chunks sit under the 512-chunk adaptive-index threshold (a
+        // downstream workload's bitmaps typically stay well under it too). 1024
+        // crosses it, which is what arms the lazily-built chunk hash map on the
+        // read path.
+        for ( std::size_t const chunks : { std::size_t{ 64 }, std::size_t{ 256 }, std::size_t{ 1024 } } ) {
+            char tag[ 32 ];
+            snprintf( tag, sizeof( tag ), "chunks=%zu", chunks );
+
+            struct Variant {
+                char const * name;
+                bool ascending;
+                char const * what;
+            };
+            for ( auto const & variant : {
+                Variant{ "Scatter",   false, "chunk key jumps every probe (a downstream engine's dominant access pattern)" },
+                Variant{ "Ascending", true,  "monotonically increasing probes (favours an implicit hot-chunk cache)" },
+            } ) {
+                {
+                    Entry e;
+                    e.name = std::string( "chunk_probe/" ) + Arm::label() + variant.name + "/" + tag;
+                    e.description = std::string( "frsr bitmap<uint32_t>::contains() over a precomputed key stream: " ) + variant.what;
+                    e.setup = [chunks, asc = variant.ascending]() -> void * { return make_frsr_state<Arm>( chunks, asc ); };
+                    e.run = []( void * sv ) -> int64_t {
+                        auto * s{ static_cast<FrsrState<Arm> *>( sv ) };
+                        int64_t hits{ 0 };
+                        for ( std::size_t i = 0; i < kProbesPerRun; ++i ) {
+                            auto const v{ s->probes[ s->pos ] };
+                            s->pos = ( s->pos + 1 ) & ( s->probes.size() - 1 );
+                            hits += s->r.contains( v ) ? 1 : 0;
+                        }
+                        return hits;
+                    };
+                    e.teardown = []( void * sv ) { delete static_cast<FrsrState<Arm> *>( sv ); };
+                    e.ops_per_run = kProbesPerRun;
+                    e.inner_reps = 200;
+                    e.reusable_state = true;
+                    g_benchmarks.push_back( std::move( e ) );
+                }
+                if constexpr ( std::is_same_v<Arm, arms::FrsrDefault> ) {  // the reference arm registers once
+                    {
+                        Entry e;
+                        e.name = std::string( "chunk_probe/r64" ) + variant.name + "/" + tag;
+                        e.description = std::string( "CRoaring roaring_bitmap_contains() reference for the same stream: " ) + variant.what;
+                        e.setup = [chunks, asc = variant.ascending]() -> void * { return make_r64_state( chunks, asc ); };
+                        e.run = []( void * sv ) -> int64_t {
+                            auto * s{ static_cast<R64State *>( sv ) };
+                            int64_t hits{ 0 };
+                            for ( std::size_t i = 0; i < kProbesPerRun; ++i ) {
+                                auto const v{ s->probes[ s->pos ] };
+                                s->pos = ( s->pos + 1 ) & ( s->probes.size() - 1 );
+                                hits += roaring_bitmap_contains( s->r, v ) ? 1 : 0;
+                            }
+                            return hits;
+                        };
+                        e.teardown = []( void * sv ) { delete static_cast<R64State *>( sv ); };
+                        e.ops_per_run = kProbesPerRun;
+                        e.inner_reps = 200;
+                        e.reusable_state = true;
+                        g_benchmarks.push_back( std::move( e ) );
+                    }
+                }
+            }
+
+            // Opt-in amortization: the caller owns the cursor. This is the arm that
+            // must recover the ascending-stream win once contains() goes pure.
+            {
+                Entry e;
+                e.name = std::string( "chunk_probe/" ) + Arm::label() + "BulkAscending/" + tag;
+                e.description = "frsr contains_bulk() with a caller-owned bulk_context over an ascending stream.";
+                e.setup = [chunks]() -> void * { return make_frsr_state<Arm>( chunks, true ); };
+                e.run = []( void * sv ) -> int64_t {
+                    auto * s{ static_cast<FrsrState<Arm> *>( sv ) };
+                    TestBitmap32::bulk_context ctx{};
+                    int64_t hits{ 0 };
+                    for ( std::size_t i = 0; i < kProbesPerRun; ++i ) {
+                        auto const v{ s->probes[ s->pos ] };
+                        s->pos = ( s->pos + 1 ) & ( s->probes.size() - 1 );
+                        hits += s->r.contains_bulk( ctx, v ) ? 1 : 0;
+                    }
+                    return hits;
+                };
+                e.teardown = []( void * sv ) { delete static_cast<FrsrState<Arm> *>( sv ); };
+                e.ops_per_run = kProbesPerRun;
+                e.inner_reps = 200;
+                e.reusable_state = true;
+                g_benchmarks.push_back( std::move( e ) );
+            }
+            if constexpr ( std::is_same_v<Arm, arms::FrsrDefault> ) {  // the reference arm registers once
+                {
+                    Entry e;
+                    e.name = std::string( "chunk_probe/r64BulkAscending/" ) + tag;
+                    e.description = "CRoaring roaring_bitmap_contains_bulk() reference over an ascending stream.";
+                    e.setup = [chunks]() -> void * { return make_r64_state( chunks, true ); };
+                    e.run = []( void * sv ) -> int64_t {
+                        auto * s{ static_cast<R64State *>( sv ) };
+                        roaring_bulk_context_t ctx{};
+                        int64_t hits{ 0 };
+                        for ( std::size_t i = 0; i < kProbesPerRun; ++i ) {
+                            auto const v{ s->probes[ s->pos ] };
+                            s->pos = ( s->pos + 1 ) & ( s->probes.size() - 1 );
+                            hits += roaring_bitmap_contains_bulk( s->r, &ctx, v ) ? 1 : 0;
+                        }
+                        return hits;
+                    };
+                    e.teardown = []( void * sv ) { delete static_cast<R64State *>( sv ); };
+                    e.ops_per_run = kProbesPerRun;
+                    e.inner_reps = 200;
+                    e.reusable_state = true;
+                    g_benchmarks.push_back( std::move( e ) );
+                }
+            }
+        }
+
+        // Concurrent readers of ONE bitmap. CRoaring's README guarantees this is
+        // safe on an unmodified bitmap; an implicit cache written by contains()
+        // breaks that guarantee and turns shared reads into cacheline write-sharing.
+        // SharedConst vs PerThreadCopy isolates exactly that: identical work, the
+        // only difference is whether the readers share one object.
+        for ( std::size_t const threads : { std::size_t{ 2 }, std::size_t{ 4 }, std::size_t{ 8 } } ) {
+            char tag[ 32 ];
+            snprintf( tag, sizeof( tag ), "threads=%zu", threads );
+            constexpr std::size_t kChunks{ 256 };
+            constexpr std::size_t kProbesPerThread{ 1U << 14 };
+
+            auto make_shared_state = [threads]() -> void * {
+                auto * s{ new SharedState<Arm>{} };
+                s->threads = threads;
+                for ( auto const v : make_values( kChunks ) ) { (void)s->r.add( v ); }
+                s->probes = make_scatter_probes( kChunks, 1U << 16 );
+                s->copies.assign( threads, s->r ); // copies start with cold caches
+                return s;
+            };
+
+            {
+                Entry e;
+                e.name = std::string( "chunk_probe/" ) + Arm::label() + "SharedConst/" + tag;
+                e.description =
+                    "N threads calling contains() concurrently on ONE shared const bitmap. "
+                    "Pure read in the parity shape; write-sharing on the bitmap header if "
+                    "contains() maintains an implicit hot-chunk cache.";
+                e.setup = make_shared_state;
+                e.run = []( void * sv ) -> int64_t {
+                    auto * s{ static_cast<SharedState<Arm> *>( sv ) };
+                    TestBitmap32 const & shared{ s->r };
+                    std::vector<std::thread> pool;
+                    std::vector<int64_t> hits( s->threads, 0 );
+                    pool.reserve( s->threads );
+                    for ( std::size_t t = 0; t < s->threads; ++t ) {
+                        pool.emplace_back( [&shared, s, t, &hits]() {
+                            std::size_t pos{ ( t * 7919 ) & ( s->probes.size() - 1 ) };
+                            int64_t local{ 0 };
+                            for ( std::size_t i = 0; i < kProbesPerThread; ++i ) {
+                                local += shared.contains( s->probes[ pos ] ) ? 1 : 0;
+                                pos = ( pos + 1 ) & ( s->probes.size() - 1 );
+                            }
+                            hits[ t ] = local;
+                        } );
+                    }
+                    for ( auto & th : pool ) { th.join(); }
+                    return std::accumulate( hits.begin(), hits.end(), int64_t{ 0 } );
+                };
+                e.teardown = []( void * sv ) { delete static_cast<SharedState<Arm> *>( sv ); };
+                e.ops_per_run = static_cast<int64_t>( threads * kProbesPerThread );
+                e.inner_reps = 20;
+                e.reusable_state = true;
+                g_benchmarks.push_back( std::move( e ) );
+            }
+            {
+                Entry e;
+                e.name = std::string( "chunk_probe/" ) + Arm::label() + "PerThreadCopy/" + tag;
+                e.description =
+                    "Control for frsrSharedConst: identical work, but each thread probes its "
+                    "own copy, so no header is shared. The SharedConst/PerThreadCopy ratio is "
+                    "the write-sharing penalty.";
+                e.setup = make_shared_state;
+                e.run = []( void * sv ) -> int64_t {
+                    auto * s{ static_cast<SharedState<Arm> *>( sv ) };
+                    std::vector<std::thread> pool;
+                    std::vector<int64_t> hits( s->threads, 0 );
+                    pool.reserve( s->threads );
+                    for ( std::size_t t = 0; t < s->threads; ++t ) {
+                        pool.emplace_back( [s, t, &hits]() {
+                            auto const & own{ s->copies[ t ] };
+                            std::size_t pos{ ( t * 7919 ) & ( s->probes.size() - 1 ) };
+                            int64_t local{ 0 };
+                            for ( std::size_t i = 0; i < kProbesPerThread; ++i ) {
+                                local += own.contains( s->probes[ pos ] ) ? 1 : 0;
+                                pos = ( pos + 1 ) & ( s->probes.size() - 1 );
+                            }
+                            hits[ t ] = local;
+                        } );
+                    }
+                    for ( auto & th : pool ) { th.join(); }
+                    return std::accumulate( hits.begin(), hits.end(), int64_t{ 0 } );
+                };
+                e.teardown = []( void * sv ) { delete static_cast<SharedState<Arm> *>( sv ); };
+                e.ops_per_run = static_cast<int64_t>( threads * kProbesPerThread );
+                e.inner_reps = 20;
+                e.reusable_state = true;
+                g_benchmarks.push_back( std::move( e ) );
+            }
+        }
+
+    }
+};
+
 static void register_benchmarks() {
-    // 64 and 256 chunks sit under the 512-chunk adaptive-index threshold (a
-    // downstream workload's bitmaps typically stay well under it too). 1024
-    // crosses it, which is what arms the lazily-built chunk hash map on the
-    // read path.
-    for ( std::size_t const chunks : { std::size_t{ 64 }, std::size_t{ 256 }, std::size_t{ 1024 } } ) {
-        char tag[ 32 ];
-        snprintf( tag, sizeof( tag ), "chunks=%zu", chunks );
-
-        struct Variant {
-            char const * name;
-            bool ascending;
-            char const * what;
-        };
-        for ( auto const & variant : {
-            Variant{ "Scatter",   false, "chunk key jumps every probe (a downstream engine's dominant access pattern)" },
-            Variant{ "Ascending", true,  "monotonically increasing probes (favours an implicit hot-chunk cache)" },
-        } ) {
-            {
-                Entry e;
-                e.name = std::string( "chunk_probe/frsr" ) + variant.name + "/" + tag;
-                e.description = std::string( "frsr bitmap<uint32_t>::contains() over a precomputed key stream: " ) + variant.what;
-                e.setup = [chunks, asc = variant.ascending]() -> void * { return make_frsr_state( chunks, asc ); };
-                e.run = []( void * sv ) -> int64_t {
-                    auto * s{ static_cast<FrsrState *>( sv ) };
-                    int64_t hits{ 0 };
-                    for ( std::size_t i = 0; i < kProbesPerRun; ++i ) {
-                        auto const v{ s->probes[ s->pos ] };
-                        s->pos = ( s->pos + 1 ) & ( s->probes.size() - 1 );
-                        hits += s->r.contains( v ) ? 1 : 0;
-                    }
-                    return hits;
-                };
-                e.teardown = []( void * sv ) { delete static_cast<FrsrState *>( sv ); };
-                e.ops_per_run = kProbesPerRun;
-                e.inner_reps = 200;
-                e.reusable_state = true;
-                g_benchmarks.push_back( std::move( e ) );
-            }
-            {
-                Entry e;
-                e.name = std::string( "chunk_probe/r64" ) + variant.name + "/" + tag;
-                e.description = std::string( "CRoaring roaring_bitmap_contains() reference for the same stream: " ) + variant.what;
-                e.setup = [chunks, asc = variant.ascending]() -> void * { return make_r64_state( chunks, asc ); };
-                e.run = []( void * sv ) -> int64_t {
-                    auto * s{ static_cast<R64State *>( sv ) };
-                    int64_t hits{ 0 };
-                    for ( std::size_t i = 0; i < kProbesPerRun; ++i ) {
-                        auto const v{ s->probes[ s->pos ] };
-                        s->pos = ( s->pos + 1 ) & ( s->probes.size() - 1 );
-                        hits += roaring_bitmap_contains( s->r, v ) ? 1 : 0;
-                    }
-                    return hits;
-                };
-                e.teardown = []( void * sv ) { delete static_cast<R64State *>( sv ); };
-                e.ops_per_run = kProbesPerRun;
-                e.inner_reps = 200;
-                e.reusable_state = true;
-                g_benchmarks.push_back( std::move( e ) );
-            }
-        }
-
-        // Opt-in amortization: the caller owns the cursor. This is the arm that
-        // must recover the ascending-stream win once contains() goes pure.
-        {
-            Entry e;
-            e.name = std::string( "chunk_probe/frsrBulkAscending/" ) + tag;
-            e.description = "frsr contains_bulk() with a caller-owned bulk_context over an ascending stream.";
-            e.setup = [chunks]() -> void * { return make_frsr_state( chunks, true ); };
-            e.run = []( void * sv ) -> int64_t {
-                auto * s{ static_cast<FrsrState *>( sv ) };
-                TestBitmap32::bulk_context ctx{};
-                int64_t hits{ 0 };
-                for ( std::size_t i = 0; i < kProbesPerRun; ++i ) {
-                    auto const v{ s->probes[ s->pos ] };
-                    s->pos = ( s->pos + 1 ) & ( s->probes.size() - 1 );
-                    hits += s->r.contains_bulk( ctx, v ) ? 1 : 0;
-                }
-                return hits;
-            };
-            e.teardown = []( void * sv ) { delete static_cast<FrsrState *>( sv ); };
-            e.ops_per_run = kProbesPerRun;
-            e.inner_reps = 200;
-            e.reusable_state = true;
-            g_benchmarks.push_back( std::move( e ) );
-        }
-        {
-            Entry e;
-            e.name = std::string( "chunk_probe/r64BulkAscending/" ) + tag;
-            e.description = "CRoaring roaring_bitmap_contains_bulk() reference over an ascending stream.";
-            e.setup = [chunks]() -> void * { return make_r64_state( chunks, true ); };
-            e.run = []( void * sv ) -> int64_t {
-                auto * s{ static_cast<R64State *>( sv ) };
-                roaring_bulk_context_t ctx{};
-                int64_t hits{ 0 };
-                for ( std::size_t i = 0; i < kProbesPerRun; ++i ) {
-                    auto const v{ s->probes[ s->pos ] };
-                    s->pos = ( s->pos + 1 ) & ( s->probes.size() - 1 );
-                    hits += roaring_bitmap_contains_bulk( s->r, &ctx, v ) ? 1 : 0;
-                }
-                return hits;
-            };
-            e.teardown = []( void * sv ) { delete static_cast<R64State *>( sv ); };
-            e.ops_per_run = kProbesPerRun;
-            e.inner_reps = 200;
-            e.reusable_state = true;
-            g_benchmarks.push_back( std::move( e ) );
-        }
-    }
-
-    // Concurrent readers of ONE bitmap. CRoaring's README guarantees this is
-    // safe on an unmodified bitmap; an implicit cache written by contains()
-    // breaks that guarantee and turns shared reads into cacheline write-sharing.
-    // SharedConst vs PerThreadCopy isolates exactly that: identical work, the
-    // only difference is whether the readers share one object.
-    for ( std::size_t const threads : { std::size_t{ 2 }, std::size_t{ 4 }, std::size_t{ 8 } } ) {
-        char tag[ 32 ];
-        snprintf( tag, sizeof( tag ), "threads=%zu", threads );
-        constexpr std::size_t kChunks{ 256 };
-        constexpr std::size_t kProbesPerThread{ 1U << 14 };
-
-        auto make_shared_state = [threads]() -> void * {
-            auto * s{ new SharedState{} };
-            s->threads = threads;
-            for ( auto const v : make_values( kChunks ) ) { (void)s->r.add( v ); }
-            s->probes = make_scatter_probes( kChunks, 1U << 16 );
-            s->copies.assign( threads, s->r ); // copies start with cold caches
-            return s;
-        };
-
-        {
-            Entry e;
-            e.name = std::string( "chunk_probe/frsrSharedConst/" ) + tag;
-            e.description =
-                "N threads calling contains() concurrently on ONE shared const bitmap. "
-                "Pure read in the parity shape; write-sharing on the bitmap header if "
-                "contains() maintains an implicit hot-chunk cache.";
-            e.setup = make_shared_state;
-            e.run = []( void * sv ) -> int64_t {
-                auto * s{ static_cast<SharedState *>( sv ) };
-                TestBitmap32 const & shared{ s->r };
-                std::vector<std::thread> pool;
-                std::vector<int64_t> hits( s->threads, 0 );
-                pool.reserve( s->threads );
-                for ( std::size_t t = 0; t < s->threads; ++t ) {
-                    pool.emplace_back( [&shared, s, t, &hits]() {
-                        std::size_t pos{ ( t * 7919 ) & ( s->probes.size() - 1 ) };
-                        int64_t local{ 0 };
-                        for ( std::size_t i = 0; i < kProbesPerThread; ++i ) {
-                            local += shared.contains( s->probes[ pos ] ) ? 1 : 0;
-                            pos = ( pos + 1 ) & ( s->probes.size() - 1 );
-                        }
-                        hits[ t ] = local;
-                    } );
-                }
-                for ( auto & th : pool ) { th.join(); }
-                return std::accumulate( hits.begin(), hits.end(), int64_t{ 0 } );
-            };
-            e.teardown = []( void * sv ) { delete static_cast<SharedState *>( sv ); };
-            e.ops_per_run = static_cast<int64_t>( threads * kProbesPerThread );
-            e.inner_reps = 20;
-            e.reusable_state = true;
-            g_benchmarks.push_back( std::move( e ) );
-        }
-        {
-            Entry e;
-            e.name = std::string( "chunk_probe/frsrPerThreadCopy/" ) + tag;
-            e.description =
-                "Control for frsrSharedConst: identical work, but each thread probes its "
-                "own copy, so no header is shared. The SharedConst/PerThreadCopy ratio is "
-                "the write-sharing penalty.";
-            e.setup = make_shared_state;
-            e.run = []( void * sv ) -> int64_t {
-                auto * s{ static_cast<SharedState *>( sv ) };
-                std::vector<std::thread> pool;
-                std::vector<int64_t> hits( s->threads, 0 );
-                pool.reserve( s->threads );
-                for ( std::size_t t = 0; t < s->threads; ++t ) {
-                    pool.emplace_back( [s, t, &hits]() {
-                        auto const & own{ s->copies[ t ] };
-                        std::size_t pos{ ( t * 7919 ) & ( s->probes.size() - 1 ) };
-                        int64_t local{ 0 };
-                        for ( std::size_t i = 0; i < kProbesPerThread; ++i ) {
-                            local += own.contains( s->probes[ pos ] ) ? 1 : 0;
-                            pos = ( pos + 1 ) & ( s->probes.size() - 1 );
-                        }
-                        hits[ t ] = local;
-                    } );
-                }
-                for ( auto & th : pool ) { th.join(); }
-                return std::accumulate( hits.begin(), hits.end(), int64_t{ 0 } );
-            };
-            e.teardown = []( void * sv ) { delete static_cast<SharedState *>( sv ); };
-            e.ops_per_run = static_cast<int64_t>( threads * kProbesPerThread );
-            e.inner_reps = 20;
-            e.reusable_state = true;
-            g_benchmarks.push_back( std::move( e ) );
-        }
-    }
+    arms::for_each_frsr<registrar>();
 }
+
 
 } // namespace chunk_probe
 
