@@ -738,13 +738,13 @@ inline constexpr std::size_t kLazyUnionArrayLowerBound{ 1024 };
 // [croaring-ref] deps/croaring/src/array_util.c:avx512_union_uint16
 namespace x86_v4 {
 
-FRSR_ROARING_X86_V4_KERNEL
+FRSR_ROARING_X86_V4_HELPER
 inline __m512i bitonic_cx16( __m512i const v, __m512i const t, __mmask32 const hi ) noexcept {
     return _mm512_mask_mov_epi16( _mm512_min_epu16( v, t ), hi, _mm512_max_epu16( v, t ) );
 }
 
 // Sort a bitonic 32-lane sequence ascending; every distance has a cheap in-lane shuffle.
-FRSR_ROARING_X86_V4_KERNEL
+FRSR_ROARING_X86_V4_HELPER
 inline __m512i bitonic_sort32( __m512i v ) noexcept {
     v = bitonic_cx16( v, _mm512_shuffle_i64x2( v, v, 0x4E ), 0xFFFF0000U ); // d=16
     v = bitonic_cx16( v, _mm512_shuffle_i64x2( v, v, 0xB1 ), 0xFF00FF00U ); // d=8
@@ -755,7 +755,7 @@ inline __m512i bitonic_sort32( __m512i v ) noexcept {
 }
 
 // Merge two ascending 32-lane vectors: lo ← the 32 smallest, hi ← the 32 largest.
-FRSR_ROARING_X86_V4_KERNEL
+FRSR_ROARING_X86_V4_HELPER
 inline void bitonic_merge32( __m512i const a, __m512i const b, __m512i & lo, __m512i & hi ) noexcept {
     alignas( 64 ) static constexpr std::uint16_t revtab[ 32 ]{
         31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17, 16,
@@ -769,7 +769,7 @@ inline void bitonic_merge32( __m512i const a, __m512i const b, __m512i & lo, __m
 // Store the values of the ascending vector `v` that differ from their predecessor
 // (lane 0's predecessor is `last`) as a full 32-lane vector at `out`; updates
 // `last` to the vector's maximum and returns how many of the stored lanes count.
-FRSR_ROARING_X86_V4_KERNEL
+FRSR_ROARING_X86_V4_HELPER
 inline std::size_t emit_unique16( __m512i const v, std::uint16_t * const out, std::uint16_t & last ) noexcept {
     alignas( 64 ) static constexpr std::uint16_t shift1[ 32 ]{
         32,  0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14,

@@ -111,8 +111,12 @@ template <set_operation Op, typename V>
 
 #if FRSR_ROARING_X86_V4_DISPATCH
 // Attribute set of a dispatched kernel: compiled for the tier, kept out of line so
-// the tier's code never leaks into the baseline caller.
+// the tier's code never leaks into the baseline caller. Its helpers take
+// FRSR_ROARING_X86_V4_HELPER instead: same target, forced inline — a helper with a
+// target attribute is otherwise a real call per use (measured: the bitonic
+// compare-exchange helpers ran as separate functions, 60% of the union kernel).
 #   define FRSR_ROARING_X86_V4_KERNEL [[ using gnu: target( FRSR_ROARING_X86_V4_TARGET ), noinline, hot ]]
+#   define FRSR_ROARING_X86_V4_HELPER [[ using gnu: target( FRSR_ROARING_X86_V4_TARGET ), always_inline ]]
 
 // Detection is hand-rolled cpuid/xgetbv (GNU inline asm — works under clang-cl
 // too, where __builtin_cpu_supports lacks its libgcc-style runtime).
@@ -134,6 +138,7 @@ template <set_operation Op, typename V>
 }
 #else // native
 #   define FRSR_ROARING_X86_V4_KERNEL [[ gnu::hot ]]
+#   define FRSR_ROARING_X86_V4_HELPER [[ gnu::always_inline ]]
 [[nodiscard]] constexpr bool have_x86_v4() noexcept { return true; }
 #endif
 
