@@ -5780,6 +5780,18 @@ static void run_benchmark(const Entry &e) {
     }() };
     int64_t const inner_reps{ e.inner_reps * reps_mult };
 
+    // One untimed pass first: the first execution of a band pays the process's
+    // one-time costs (page faults on freshly allocated payloads, cold code), which
+    // at 20 timed repetitions showed up as 50-100x outliers on whichever band a
+    // filter happened to run first.
+    if (e.reusable_state) {
+        (void)e.run(state);
+    } else {
+        void *warm = e.setup();
+        (void)e.run(warm);
+        if (e.teardown) { e.teardown(warm); }
+    }
+
     for (int64_t rep = 0; rep < inner_reps; ++rep) {
         if (!e.reusable_state) {
             state = e.setup();
