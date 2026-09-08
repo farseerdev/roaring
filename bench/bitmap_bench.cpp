@@ -5836,6 +5836,136 @@ struct register_frsr_bulk_add_registrar {
     }
 };
 
+// ---- BulkAddRowsGrouped: the same insert, handed over in per-value groups -----
+// A bitmap index's insert batch is already grouped by indexed value with the rows
+// ascending inside a group, so the row ids of one group can be handed over as one
+// sorted span instead of one at a time. That resolves the container (kind switch,
+// copy-on-write barrier, header sync) ONCE per group instead of once per value,
+// and keeps one bitmap's payload in cache for the whole group rather than
+// round-robining across every value's bitmap.
+//
+// Same fixture and same total row count as BulkAddRows, so the two bands are
+// directly comparable: the difference is only how the values are handed over.
+static constexpr std::size_t kBulkAddGroup{ 256 };
+
+template <class Arm>
+struct register_frsr_bulk_add_grouped_registrar {
+    using TestBitmap32 = typename Arm::bitmap;
+    struct S {
+        std::vector<TestBitmap32> index;
+        std::vector<std::uint32_t> fresh;
+        std::size_t values{};
+    };
+    static void run(std::size_t fresh_rows, BulkAddShape const &shape) {
+        Entry e;
+        char buf[160];
+        snprintf(buf, sizeof(buf), "set_ops/%sBulkAddRowsGrouped/rows=%zu/shape=%s", Arm::label(), fresh_rows, shape.label);
+        e.name        = buf;
+        e.description = "frsr::roaring::bitmap<uint32_t> add_many_sorted() of ascending row ids into a populated "
+                        "per-value index, handed over in per-value groups of 256 — the grouped form of the "
+                        "row-insert shape. Checksum = rows added.";
+        e.setup = [fresh_rows, shape]() -> void * {
+            auto *s = new S;
+            s->values = shape.values;
+            s->index.resize(shape.values);
+            std::uint32_t row = 0;
+            for (std::size_t i = 0; i < shape.existing; ++i) {
+                for (std::size_t v = 0; v < shape.values; ++v) { std::ignore = s->index[v].add(row++); }
+            }
+            s->fresh.reserve(fresh_rows);
+            for (std::size_t i = 0; i < fresh_rows; ++i) { s->fresh.push_back(row++); }
+            return s;
+        };
+        e.run = [](void *sv) -> int64_t {
+            auto *s = static_cast<S *>(sv);
+            std::vector<std::vector<std::uint32_t>> group(s->values);
+            for (auto &g : group) { g.reserve(kBulkAddGroup); }
+            std::int64_t added = 0;
+            for (std::size_t i = 0; i < s->fresh.size(); ++i) {
+                auto &g = group[i % s->values];
+                g.push_back(s->fresh[i]);
+                if (g.size() == kBulkAddGroup) {
+                    s->index[i % s->values].add_many_sorted({ g.data(), g.size() });
+                    added += static_cast<std::int64_t>(g.size());
+                    g.clear();
+                }
+            }
+            for (std::size_t v = 0; v < s->values; ++v) {
+                if (!group[v].empty()) {
+                    s->index[v].add_many_sorted({ group[v].data(), group[v].size() });
+                    added += static_cast<std::int64_t>(group[v].size());
+                }
+            }
+            return added;
+        };
+        e.teardown       = [](void *sv) { delete static_cast<S *>(sv); };
+        e.ops_per_run    = 1;
+        e.inner_reps     = kBinaryInnerReps;
+        e.reusable_state = false;
+        g_benchmarks.push_back(std::move(e));
+    }
+};
+
+#if FRSR_ROARING_HAS_CROARING
+template <class Arm>
+struct register_cpp_bulk_add_grouped_registrar {
+    struct S {
+        std::vector<roaring_bitmap_t *> index;
+        std::vector<std::uint32_t> fresh;
+        std::size_t values{};
+        ~S() { for (auto *bm : index) { if (bm) roaring_bitmap_free(bm); } }
+    };
+    static void run(std::size_t fresh_rows, BulkAddShape const &shape) {
+        Entry e;
+        char buf[160];
+        snprintf(buf, sizeof(buf), "set_ops/%sBulkAddRowsGrouped/rows=%zu/shape=%s", Arm::label(), fresh_rows, shape.label);
+        e.name        = buf;
+        e.description = "CRoaring roaring_bitmap_add_many() over the same per-value index, same groups of 256. "
+                        "[croaring-ref] deps/croaring/src/roaring.c:roaring_bitmap_add_many";
+        e.setup = [fresh_rows, shape]() -> void * {
+            auto *s = new S;
+            s->values = shape.values;
+            s->index.resize(shape.values);
+            for (auto &bm : s->index) { bm = Arm::create(); }
+            std::uint32_t row = 0;
+            for (std::size_t i = 0; i < shape.existing; ++i) {
+                for (std::size_t v = 0; v < shape.values; ++v) { roaring_bitmap_add(s->index[v], row++); }
+            }
+            s->fresh.reserve(fresh_rows);
+            for (std::size_t i = 0; i < fresh_rows; ++i) { s->fresh.push_back(row++); }
+            return s;
+        };
+        e.run = [](void *sv) -> int64_t {
+            auto *s = static_cast<S *>(sv);
+            std::vector<std::vector<std::uint32_t>> group(s->values);
+            for (auto &g : group) { g.reserve(kBulkAddGroup); }
+            std::int64_t added = 0;
+            for (std::size_t i = 0; i < s->fresh.size(); ++i) {
+                auto &g = group[i % s->values];
+                g.push_back(s->fresh[i]);
+                if (g.size() == kBulkAddGroup) {
+                    roaring_bitmap_add_many(s->index[i % s->values], g.size(), g.data());
+                    added += static_cast<std::int64_t>(g.size());
+                    g.clear();
+                }
+            }
+            for (std::size_t v = 0; v < s->values; ++v) {
+                if (!group[v].empty()) {
+                    roaring_bitmap_add_many(s->index[v], group[v].size(), group[v].data());
+                    added += static_cast<std::int64_t>(group[v].size());
+                }
+            }
+            return added;
+        };
+        e.teardown       = [](void *sv) { delete static_cast<S *>(sv); };
+        e.ops_per_run    = 1;
+        e.inner_reps     = kBinaryInnerReps;
+        e.reusable_state = false;
+        g_benchmarks.push_back(std::move(e));
+    }
+};
+#endif
+
 #if FRSR_ROARING_HAS_CROARING
 template <class Arm>
 struct register_cpp_bulk_add_registrar {
@@ -5906,6 +6036,10 @@ void register_benchmarks() {
                 arms::for_each_frsr<register_frsr_bulk_add_registrar>(std::size_t{ 200'000 }, shape);
 #if FRSR_ROARING_HAS_CROARING
                 arms::for_each_croaring<register_cpp_bulk_add_registrar>(std::size_t{ 200'000 }, shape);
+#endif
+                arms::for_each_frsr<register_frsr_bulk_add_grouped_registrar>(std::size_t{ 200'000 }, shape);
+#if FRSR_ROARING_HAS_CROARING
+                arms::for_each_croaring<register_cpp_bulk_add_grouped_registrar>(std::size_t{ 200'000 }, shape);
 #endif
             }
         }
