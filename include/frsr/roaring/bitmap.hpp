@@ -3788,7 +3788,17 @@ private:
     // Note: kUseLazySort requires kUseChunkHashMap (unsorted chunks need the map).
     static constexpr bool kUseLazySort        = false; // novel: defer chunk sort to set-op paths
     static constexpr bool kUseChunkHashMap    = false; // novel: hash-map chunk lookup vs binary search
-    static constexpr bool kUseLazyTombstoning = false; // novel: mark-erased vs immediate erase
+    // Erasing an emptied chunk memmoves the tail of the chunk array, so removing
+    // many chunks is quadratic in the chunk count. How much that matters depends
+    // entirely on how wide the chunk key is:
+    //   - a 16-bit chunk key (any key type up to 32 bits) bounds the chunk count
+    //     at 65536, and tombstones make every later walk skip dead slots - which
+    //     costs the batch-remove and sparse set-operation bands 1.35-1.75x. Off.
+    //   - a wider chunk key has no such bound, and the quadratic erase dominates:
+    //     measured on a 10 000-chunk remove-all, 6.18 -> 0.031 us per value, i.e.
+    //     ~197x, which also puts it 1.6x ahead of the reference implementation's
+    //     64-bit map instead of ~120x behind it.
+    static constexpr bool kUseLazyTombstoning = ( sizeof( chunk_type ) > 2 ); // mark-erased vs immediate erase
     // Novel: remember the last resolved chunk slot and probe it (plus its two
     // neighbours) before the binary search. CRoaring has no analog on the plain
     // lookup path — it keeps this amortization opt-in via roaring_bulk_context_t
