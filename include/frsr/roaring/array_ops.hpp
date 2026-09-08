@@ -1,6 +1,7 @@
 #pragma once
 
 #include <frsr/roaring/containers.hpp>
+#include <frsr/roaring/hw_info.hpp>
 #include <frsr/roaring/tuning.hpp>
 
 #include <algorithm>
@@ -9,6 +10,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <type_traits>
+#include <utility>
 #if defined(_M_X64) || defined(__x86_64__) || defined(__i386__)
 #include <immintrin.h>
 #endif
@@ -696,6 +699,152 @@ template <typename Layout, typename CowPolicy = cow_value_semantics>
 //               deps/croaring/src/containers/mixed_union.c:array_array_container_lazy_union
 inline constexpr std::size_t kLazyUnionArrayLowerBound{ 1024 };
 
+// Scalar forward merge of two sorted uint16 arrays into `out` (which must not
+// alias the inputs' unread parts and has sa + sb slots). Returns the count.
+// [croaring-ref] deps/croaring/src/array_util.c:union_uint16
+[[ gnu::hot ]] inline std::size_t union_sorted_uint16_scalar(
+    std::uint16_t const * a, std::size_t const sa,
+    std::uint16_t const * b, std::size_t const sb,
+    std::uint16_t * const out
+) noexcept {
+    auto const * const a_end{ a + sa };
+    auto const * const b_end{ b + sb };
+    auto * o{ out };
+    while ( a != a_end && b != b_end ) {
+        if      ( *a < *b ) { *o++ = *a++; }
+        else if ( *b < *a ) { *o++ = *b++; }
+        else                { *o++ = *a++; ++b; }
+    }
+    o = std::copy( a, a_end, o );
+    o = std::copy( b, b_end, o );
+    return static_cast<std::size_t>( o - out );
+}
+
+#if FRSR_ROARING_X86_V4
+// AVX-512 one-pass union of two sorted uint16 arrays: a Batcher bitonic merge of
+// 32-lane blocks (one reverse permute + 5 compare-exchange stages per half), each
+// merged low half deduplicated against its predecessor with a compare + register
+// compress and stored as a FULL vector — so `out` needs sa + sb + 32 slots. The
+// register-compress + plain store is deliberate: the compress-to-memory form is
+// microcoded and slow on Zen 4 class parts, which the shipped workload runs on.
+//
+// Aliasing: an in-place caller may lay lhs out as `out + sb` and pass rhs
+// separately (CRoaring's array_container_union_inplace shape). After consuming
+// p1 + p2 whole blocks this routine has emitted at most 32·(p1 + p2) − 32 values —
+// one merged block is always held back in vmax — so even a full 32-lane store
+// ends at out + 32·(p1 + p2) ≤ out + sb + 32·p1, the first unread lhs value. The
+// bound is exactly tight; emitting vmax sooner or shrinking `pending` breaks
+// aliased callers.
+// [croaring-ref] deps/croaring/src/array_util.c:avx512_union_uint16
+namespace x86_v4 {
+
+FRSR_ROARING_X86_V4_KERNEL
+inline __m512i bitonic_cx16( __m512i const v, __m512i const t, __mmask32 const hi ) noexcept {
+    return _mm512_mask_mov_epi16( _mm512_min_epu16( v, t ), hi, _mm512_max_epu16( v, t ) );
+}
+
+// Sort a bitonic 32-lane sequence ascending; every distance has a cheap in-lane shuffle.
+FRSR_ROARING_X86_V4_KERNEL
+inline __m512i bitonic_sort32( __m512i v ) noexcept {
+    v = bitonic_cx16( v, _mm512_shuffle_i64x2( v, v, 0x4E ), 0xFFFF0000U ); // d=16
+    v = bitonic_cx16( v, _mm512_shuffle_i64x2( v, v, 0xB1 ), 0xFF00FF00U ); // d=8
+    v = bitonic_cx16( v, _mm512_shuffle_epi32( v, 0x4E ),    0xF0F0F0F0U ); // d=4
+    v = bitonic_cx16( v, _mm512_shuffle_epi32( v, 0xB1 ),    0xCCCCCCCCU ); // d=2
+    v = bitonic_cx16( v, _mm512_rol_epi32( v, 16 ),          0xAAAAAAAAU ); // d=1
+    return v;
+}
+
+// Merge two ascending 32-lane vectors: lo ← the 32 smallest, hi ← the 32 largest.
+FRSR_ROARING_X86_V4_KERNEL
+inline void bitonic_merge32( __m512i const a, __m512i const b, __m512i & lo, __m512i & hi ) noexcept {
+    alignas( 64 ) static constexpr std::uint16_t revtab[ 32 ]{
+        31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17, 16,
+        15, 14, 13, 12, 11, 10,  9,  8,  7,  6,  5,  4,  3,  2,  1,  0
+    };
+    __m512i const br{ _mm512_permutexvar_epi16( _mm512_load_si512( revtab ), b ) };
+    lo = bitonic_sort32( _mm512_min_epu16( a, br ) );
+    hi = bitonic_sort32( _mm512_max_epu16( a, br ) );
+}
+
+// Store the values of the ascending vector `v` that differ from their predecessor
+// (lane 0's predecessor is `last`) as a full 32-lane vector at `out`; updates
+// `last` to the vector's maximum and returns how many of the stored lanes count.
+FRSR_ROARING_X86_V4_KERNEL
+inline std::size_t emit_unique16( __m512i const v, std::uint16_t * const out, std::uint16_t & last ) noexcept {
+    alignas( 64 ) static constexpr std::uint16_t shift1[ 32 ]{
+        32,  0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14,
+        15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30
+    };
+    __m512i const prev{ _mm512_permutex2var_epi16( v, _mm512_load_si512( shift1 ), _mm512_set1_epi16( static_cast<short>( last ) ) ) };
+    __mmask32 const keep{ _mm512_cmpneq_epi16_mask( v, prev ) };
+    _mm512_storeu_si512( out, _mm512_maskz_compress_epi16( keep, v ) );
+    last = static_cast<std::uint16_t>( _mm_extract_epi16( _mm512_extracti32x4_epi32( v, 3 ), 7 ) );
+    return static_cast<std::size_t>( std::popcount( static_cast<std::uint32_t>( keep ) ) );
+}
+
+FRSR_ROARING_X86_V4_KERNEL
+inline std::size_t union_sorted_uint16(
+    std::uint16_t const * const a, std::size_t const sa,
+    std::uint16_t const * const b, std::size_t const sb,
+    std::uint16_t       * const out
+) noexcept {
+    constexpr std::size_t W{ 32 };
+    // Both sides need a whole block to start the machine; the caller keeps
+    // shorter inputs on the scalar merge.
+    std::size_t const blocks_a{ sa / W };
+    std::size_t const blocks_b{ sb / W };
+    std::size_t pa{ 1 };
+    std::size_t pb{ 1 };
+    auto * o{ out };
+    __m512i vmin, vmax;
+    bitonic_merge32( _mm512_loadu_si512( a ), _mm512_loadu_si512( b ), vmin, vmax );
+    // Lane 0 of the first block has no predecessor: seed `last` with a value that
+    // differs from it so the first value is kept.
+    std::uint16_t last{ static_cast<std::uint16_t>( _mm_extract_epi16( _mm512_castsi512_si128( vmin ), 0 ) ^ 1 ) };
+    o += emit_unique16( vmin, o, last );
+
+    while ( pa < blocks_a && pb < blocks_b ) {
+        // Which side advances is essentially unpredictable: select without branching.
+        auto const * const na{ a + W * pa };
+        auto const * const nb{ b + W * pb };
+        bool const take_a{ *na <= *nb };
+        __m512i const v{ _mm512_loadu_si512( take_a ? na : nb ) };
+        pa += take_a;
+        pb += !take_a;
+        bitonic_merge32( v, vmax, vmin, vmax );
+        o += emit_unique16( vmin, o, last );
+    }
+
+    // The ragged tail: the block still held in vmax (which may hold a value twice,
+    // once from each input, so it goes through the dedup emit), at most W−1
+    // leftovers of the exhausted side, and the rest of the other side. Two two-way
+    // merges branch-predict far better than one three-way merge. Every remaining
+    // value is >= last and sorted, so only the first of each scalar input can still
+    // duplicate `last`.
+    alignas( 64 ) std::uint16_t pending[ W ];
+    std::uint16_t pending_last{ last };
+    std::size_t const npending{ emit_unique16( vmax, pending, pending_last ) };
+
+    auto const * rest_short{ a + W * pa };   std::size_t nshort{ sa - W * pa };
+    auto const * rest_long { b + W * pb };   std::size_t nlong { sb - W * pb };
+    if ( pa != blocks_a ) { std::swap( rest_short, rest_long ); std::swap( nshort, nlong ); }
+    if ( nshort > 0 && *rest_short == last ) { ++rest_short; --nshort; }
+    if ( nlong  > 0 && *rest_long  == last ) { ++rest_long;  --nlong;  }
+
+    std::uint16_t merged[ 2 * W ];  // <= W pending + (W−1) leftovers
+    std::size_t const nmerged{ union_sorted_uint16_scalar( pending, npending, rest_short, nshort, merged ) };
+    o += union_sorted_uint16_scalar( merged, nmerged, rest_long, nlong, o );
+    return static_cast<std::size_t>( o - out );
+}
+
+// Extra output slots the kernel's full-vector stores need past sa + sb.
+inline constexpr std::size_t union_store_slack{ 32 };
+// Below this per-side size the scalar merge is used (no whole 32-lane block).
+inline constexpr std::size_t union_min_side{ 32 };
+
+} // namespace x86_v4
+#endif // FRSR_ROARING_X86_V4
+
 // True in-place union: grow lhs's payload to the worst-case size and merge
 // BACKWARDS (largest values first, writing down from slot la+lb-1). The write
 // cursor k never catches the read cursor i (k == i + j + dedup_slack, j >= 1
@@ -710,6 +859,23 @@ template <typename Layout, typename CowPolicy = cow_value_semantics>
     auto const la{ lhs.values.size() };
     auto const lb{ rhs.values.size() };
     auto const total{ la + lb };
+    if ( lhs.values.data() == rhs.values.data() ) [[unlikely]] { return; }  // self-union
+#if FRSR_ROARING_X86_V4
+    // The AVX-512 merge cannot run backwards, so it takes CRoaring's in-place shape:
+    // shift lhs up by lb and merge forwards into the vacated front — the kernel's
+    // held-back block keeps the write cursor behind the shifted lhs (see its note).
+    if constexpr ( std::is_same_v<typename Layout::low_type, std::uint16_t> ) {
+        if ( la >= x86_v4::union_min_side && lb >= x86_v4::union_min_side && have_x86_v4() ) {
+            lhs.values.resize_uninitialized( total );
+            auto * const a{ lhs.values.data() };
+            std::memmove( a + lb, a, la * sizeof( *a ) );
+            auto const n{ x86_v4::union_sorted_uint16( a + lb, la, rhs.values.data(), lb, a ) };
+            lhs.values.resize_uninitialized( n );
+            lhs.sync_header();
+            return;
+        }
+    }
+#endif
     lhs.values.resize_uninitialized( total );
     auto       * const a{ lhs.values.data() };
     auto const * const b{ rhs.values.data() };
@@ -745,6 +911,18 @@ template <typename Layout, typename OutVector, typename CowPolicy = cow_value_se
     array_cref<Layout, CowPolicy> const rhs,
     OutVector & out
 ) {
+#if FRSR_ROARING_X86_V4
+    if constexpr ( std::is_same_v<typename Layout::low_type, std::uint16_t> ) {
+        auto const sa{ lhs.values.size() };
+        auto const sb{ rhs.values.size() };
+        if ( sa >= x86_v4::union_min_side && sb >= x86_v4::union_min_side && have_x86_v4() ) {
+            resize_uninitialized( out, sa + sb + x86_v4::union_store_slack );
+            auto const n{ x86_v4::union_sorted_uint16( lhs.values.data(), sa, rhs.values.data(), sb, out.data() ) };
+            out.resize( static_cast<std::uint32_t>( n ) );
+            return;
+        }
+    }
+#endif
     resize_uninitialized( out, lhs.values.size() + rhs.values.size() );
 
     auto const * li{ lhs.values.data() };

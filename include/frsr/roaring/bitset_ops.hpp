@@ -18,56 +18,9 @@
 
 namespace frsr::roaring::detail {
 
-// ---- x86 runtime dispatch (function multi-versioning) ----------------------
-// The shipped baselines are AVX-512-less (-march=skylake class) while current
-// server silicon has AVX-512 incl. VPOPCNTDQ, which roughly halves the 8 KB
-// bitset word loops (512-bit ops + native vector popcount; measured: it erases
-// the whole remaining frsr-vs-CRoaring gap on the bitset-heavy workload, and
-// CRoaring itself runtime-dispatches its AVX-512 kernels). clang does not allow
-// target attributes on templates, so the dispatchable kernels are plain
-// functions over raw word spans; the templated entry points funnel into them
-// when the CPU qualifies. Compiled out when the whole TU already targets
-// AVX-512 (-march=native builds) or off x86.
-//
-// ⚠ Site selection is MEASURED, not uniform (bisected on an AVX-512 x86 server, 2026-07-19):
-// only the MATERIALIZING combine (fused with its popcount) and the lazy bulk-OR
-// carry dispatch. Dispatching the in-place combine — which inlines into the
-// merge-walk spine — regressed the bitset-heavy workload ~4% in context despite
-// winning its microbench (outlining cost inside the spine), and the
-// repair_cardinality popcount dispatch measured neutral-to-negative. Don't add
-// sites without an in-context full-scale A/B.
-#if ( defined( __x86_64__ ) || defined( _M_X64 ) ) && defined( __clang__ ) && !defined( __AVX512VPOPCNTDQ__ )
-#   define FRSR_ROARING_X86_V4_DISPATCH 1
-#else
-#   define FRSR_ROARING_X86_V4_DISPATCH 0
-#endif
-
 #if FRSR_ROARING_X86_V4_DISPATCH
 
-// The dispatched kernels ask for AVX-512 F/BW/DQ/CD/VL (the x86-64-v4 set) PLUS
-// VPOPCNTDQ — the vector popcount is where most of the win is, and every AVX-512
-// CPU still in service that matters (Ice Lake+, Zen 4+) has it. Detection is
-// hand-rolled cpuid/xgetbv (GNU inline asm — works under clang-cl too, where
-// __builtin_cpu_supports lacks its libgcc-style runtime).
-#define FRSR_ROARING_X86_V4_TARGET "avx512f,avx512bw,avx512dq,avx512cd,avx512vl,avx512vpopcntdq"
-
-[[nodiscard]] inline bool have_x86_v4() noexcept {
-    static bool const value{ []() noexcept {
-        std::uint32_t eax, ebx, ecx, edx;
-        __asm__ volatile ( "cpuid" : "=a"( eax ), "=b"( ebx ), "=c"( ecx ), "=d"( edx ) : "a"( 1U ), "c"( 0U ) );
-        if ( !( ecx & ( 1U << 27 ) ) ) { return false; }  // OSXSAVE
-        std::uint32_t xlo, xhi;
-        __asm__ volatile ( "xgetbv" : "=a"( xlo ), "=d"( xhi ) : "c"( 0U ) );
-        if ( ( xlo & 0xE6U ) != 0xE6U ) { return false; }  // XMM+YMM+opmask+ZMM state enabled by the OS
-        __asm__ volatile ( "cpuid" : "=a"( eax ), "=b"( ebx ), "=c"( ecx ), "=d"( edx ) : "a"( 7U ), "c"( 0U ) );
-        constexpr std::uint32_t ebx_need{ ( 1U << 16 ) | ( 1U << 17 ) | ( 1U << 28 ) | ( 1U << 30 ) | ( 1U << 31 ) };  // F, DQ, CD, BW, VL
-        if ( ( ebx & ebx_need ) != ebx_need ) { return false; }
-        return ( ecx & ( 1U << 14 ) ) != 0;  // VPOPCNTDQ
-    }() };
-    return value;
-}
-
-[[ using gnu: target( FRSR_ROARING_X86_V4_TARGET ), noinline, hot ]]
+FRSR_ROARING_X86_V4_KERNEL
 [[nodiscard]] inline std::size_t combine_words_into_popcount_v4(
     std::uint64_t * const out, std::uint64_t const * const a, std::uint64_t const * const b,
     std::size_t const n, set_operation const op
@@ -90,7 +43,7 @@ namespace frsr::roaring::detail {
     return cardinality;
 }
 
-[[ using gnu: target( FRSR_ROARING_X86_V4_TARGET ), noinline, hot ]]
+FRSR_ROARING_X86_V4_KERNEL
 inline void or_words_inplace_v4( std::uint64_t * const a, std::uint64_t const * const b, std::size_t const n ) noexcept {
     for ( std::size_t i{ 0 }; i < n; ++i ) { a[ i ] |= b[ i ]; }
 }

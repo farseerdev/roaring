@@ -614,5 +614,94 @@ TEST(FrsrRoaringCrosscheck, IntersectArraysSimdMatchesCRoaring) {
     check( sparse_a, sparse_b );
 }
 
-} // namespace
+TEST(FrsrRoaringCrosscheck, UnionArraysSimdMatchesCRoaring) {
+    // Exercises the AVX-512 array×array union (x86_v4::union_sorted_uint16, when the CPU
+    // has the tier) through every entry point that reaches it — the materialising
+    // operator|, the in-place operator|= (CRoaring's shift-then-merge-forward aliasing
+    // shape) and the lazy bulk-OR fold — against CRoaring's roaring_bitmap_or, across the
+    // kernel's edge cases: both sides at least one 32-lane block, ragged tails on either
+    // side, a value present in both operands at a block boundary, the value 0 and the
+    // chunk's last value 65535, identical and disjoint operands, and one side too short
+    // for the vector path. The arrays stay below the bitset threshold so both chunks
+    // remain array containers (or the merged result may legitimately promote, which
+    // CRoaring's result decides too).
+    auto check{ []( std::vector<std::uint32_t> const & lhs_values,
+                    std::vector<std::uint32_t> const & rhs_values ) {
+        auto const lhs{ make_bitmap( lhs_values ) };
+        auto const rhs{ make_bitmap( rhs_values ) };
+        auto const lhs_roaring{ make_roaring( lhs_values ) };
+        auto const rhs_roaring{ make_roaring( rhs_values ) };
+        roaring_bitmap_holder const expected{ roaring_bitmap_or( lhs_roaring.bitmap, rhs_roaring.bitmap ) };
+        auto const expected_values{ to_vector( expected.bitmap ) };
+        EXPECT_EQ( ( lhs | rhs ).to_vector(), expected_values );
+        EXPECT_EQ( ( rhs | lhs ).to_vector(), expected_values );
+        {
+            auto accumulator{ make_bitmap( lhs_values ) };
+            accumulator |= rhs;
+            EXPECT_EQ( accumulator.to_vector(), expected_values );
+        }
+        {
+            auto accumulator{ make_bitmap( rhs_values ) };
+            accumulator |= lhs;
+            EXPECT_EQ( accumulator.to_vector(), expected_values );
+        }
+        {
+            auto accumulator{ make_bitmap( lhs_values ) };
+            accumulator.bulk_or_intermediate( rhs );
+            accumulator.bulk_or_finish();
+            EXPECT_EQ( accumulator.to_vector(), expected_values );
+        }
+    } };
 
+    auto const range{ []( std::uint32_t const begin, std::uint32_t const end, std::uint32_t const stride = 1U ) {
+        std::vector<std::uint32_t> values;
+        for ( std::uint32_t value{ begin }; value < end; value += stride ) {
+            values.push_back( value );
+        }
+        return values;
+    } };
+
+    check( range( 0U, 1000U ), range( 250U, 1250U ) );          // high overlap, contains 0, ragged tails
+    check( range( 0U, 1024U ), range( 512U, 1536U ) );          // whole blocks only, shared value at a block boundary
+    check( range( 0U, 1003U ), range( 7U, 1011U ) );            // odd sizes on both sides
+    check( range( 0U, 800U ), range( 720U, 1520U ) );           // low overlap
+    check( range( 0U, 2000U, 2U ), range( 1U, 2000U, 2U ) );    // disjoint interleaved (evens vs odds)
+    check( range( 0U, 64U ), range( 4000U, 4064U ) );           // disjoint, one side entirely before the other
+    check( range( 0U, 500U ), range( 0U, 500U ) );              // identical
+    check( range( 0U, 40U ), range( 20U, 1500U ) );             // small side just over one block, big remainder
+    check( range( 0U, 33U ), range( 32U, 65U ) );               // one block + 1 each, shared value 32
+    check( range( 0U, 31U ), range( 0U, 1000U ) );              // one side below the vector path
+    check( range( 65536U - 600U, 65536U ), range( 65536U - 1200U, 65536U - 300U ) );  // ends at the chunk's last value 65535
+    check( range( 0U, 64U ), {} );                              // empty rhs
+    check( {}, range( 0U, 64U ) );                              // empty lhs
+
+    // Scattered arrays with many equal values at irregular positions.
+    std::vector<std::uint32_t> sparse_a, sparse_b;
+    for ( std::uint32_t i{ 0U }; i < 700U; ++i ) { sparse_a.push_back( i * 5U ); }
+    for ( std::uint32_t i{ 0U }; i < 700U; ++i ) { sparse_b.push_back( i * 3U ); }
+    check( sparse_a, sparse_b );
+
+    // Randomised sizes around the block boundaries, several chunks at once.
+    std::mt19937 rng{ 20260908U };
+    for ( int round{ 0 }; round < 200; ++round ) {
+        auto const draw{ [ &rng ]( std::uint32_t const chunk, std::uint32_t const count ) {
+            std::vector<std::uint32_t> values;
+            std::uniform_int_distribution<std::uint32_t> low{ 0U, 65535U };
+            for ( std::uint32_t i{ 0U }; i < count; ++i ) { values.push_back( chunk * 65536U + low( rng ) ); }
+            std::sort( values.begin(), values.end() );
+            values.erase( std::unique( values.begin(), values.end() ), values.end() );
+            return values;
+        } };
+        std::uniform_int_distribution<std::uint32_t> size{ 1U, 2100U };
+        std::vector<std::uint32_t> a, b;
+        for ( std::uint32_t chunk{ 0U }; chunk < 3U; ++chunk ) {
+            auto const ca{ draw( chunk, size( rng ) ) };
+            auto const cb{ draw( chunk, size( rng ) ) };
+            a.insert( a.end(), ca.begin(), ca.end() );
+            b.insert( b.end(), cb.begin(), cb.end() );
+        }
+        check( a, b );
+    }
+}
+
+} // namespace
