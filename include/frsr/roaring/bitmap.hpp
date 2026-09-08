@@ -1582,6 +1582,17 @@ public:
                 }
                 if ( left_container.holds_bitset() && right_container.holds_bitset() ) {
                     if ( !mutate_left ) {
+                        // A saturated left is the result: share it (a refcount bump), the
+                        // O(1) analog of the in-place arm's full-bitset shortcut.
+                        if ( left_container.cardinality() == layout_type::word_count * 64U ) {
+                            if ( !lazy ) {
+                                size_ += left_container.cardinality();
+                            }
+                            merged.push_back( left_key, left_container );
+                            ++left;
+                            ++right;
+                            continue;
+                        }
                         auto container{ combine_bitset_bitset_for_policy(
                             std::as_const( left_container ).as_bitset(),
                             right_container.as_bitset(),
