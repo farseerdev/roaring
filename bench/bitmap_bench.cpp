@@ -62,6 +62,24 @@ struct Frsr {
     }
 };
 
+template <class CowPolicy, class RunPolicy>
+struct Frsr64 {
+    using bitmap = frsr::roaring::bitmap<std::uint64_t, frsr::roaring::default_container_set<std::uint64_t>, CowPolicy, RunPolicy>;
+    static char const * label() {
+        static std::string const l = std::string( "frsr" ) + cow_tag<CowPolicy>::value + run_tag<RunPolicy>::value;
+        return l.c_str();
+    }
+};
+template <template <class> class Registrar, class... Args>
+void for_each_frsr64( Args &&... args ) {
+    Registrar<Frsr64<frsr::roaring::detail::cow_value_semantics,         frsr::roaring::detail::run_selection_eager>>::run( args... );
+    Registrar<Frsr64<frsr::roaring::detail::cow_value_semantics,         frsr::roaring::detail::run_selection_lazy >>::run( args... );
+    Registrar<Frsr64<frsr::roaring::detail::cow_atomic_refcount,         frsr::roaring::detail::run_selection_eager>>::run( args... );
+    Registrar<Frsr64<frsr::roaring::detail::cow_atomic_refcount,         frsr::roaring::detail::run_selection_lazy >>::run( args... );
+    Registrar<Frsr64<frsr::roaring::detail::cow_unsynchronized_refcount, frsr::roaring::detail::run_selection_eager>>::run( args... );
+    Registrar<Frsr64<frsr::roaring::detail::cow_unsynchronized_refcount, frsr::roaring::detail::run_selection_lazy >>::run( args... );
+}
+
 using FrsrDefault = Frsr<frsr::roaring::detail::cow_value_semantics,         frsr::roaring::detail::run_selection_eager>;
 using FrsrShipped = Frsr<frsr::roaring::detail::cow_atomic_refcount,         frsr::roaring::detail::run_selection_lazy >;
 
@@ -298,11 +316,81 @@ struct setHitState {
     size_t i;
 };
 
+template <class Arm>
 struct frsrHitState {
+    using TestBitmap64 = typename Arm::bitmap;
     TestBitmap64 r;
     size_t count;
     uint64_t step;
     size_t i;
+};
+
+template <class Arm>
+struct synthetic_frsr_ContainsHit_registrar {
+    using TestBitmap64 = typename Arm::bitmap;
+    static void run(std::size_t count, std::uint64_t step, std::string const &ptag) {
+        // ported from deps/croaring/benchmarks/benchmark.cpp:3272-3301
+        {
+            Entry e;
+            e.name = std::string("synthetic/") + Arm::label() + "ContainsHit/" + ptag;
+            e.description =
+                "frsr variant of r64ContainsHit using "
+                "frsr::roaring::bitmap<uint64_t>::contains().";
+            e.setup = [count, step]() -> void * {
+                auto *s = new frsrHitState<Arm>{ TestBitmap64{}, count, step, 0 };
+                for (size_t i = 0; i < count; ++i) {
+                    s->r.add(i * step);
+                }
+                return s;
+            };
+            e.run = [](void *sv) -> int64_t {
+                auto *s = static_cast<frsrHitState<Arm> *>(sv);
+                uint64_t v = s->i * s->step;
+                s->i = (s->i + 1) % s->count;
+                return s->r.contains(v) ? 1 : 0;
+            };
+            e.teardown = [](void *sv) { delete static_cast<frsrHitState<Arm> *>(sv); };
+            e.ops_per_run = 1;
+            e.inner_reps = 10000;
+            e.reusable_state = true;
+            g_benchmarks.push_back(std::move(e));
+        }
+
+    }
+};
+
+template <class Arm>
+struct synthetic_frsr_ContainsMiss_registrar {
+    using TestBitmap64 = typename Arm::bitmap;
+    static void run(std::size_t count, std::uint64_t step, std::string const &ptag) {
+        // ported from deps/croaring/benchmarks/benchmark.cpp:3365-3392
+        {
+            Entry e;
+            e.name = std::string("synthetic/") + Arm::label() + "ContainsMiss/" + ptag;
+            e.description =
+                "frsr variant of r64ContainsMiss using "
+                "frsr::roaring::bitmap<uint64_t>::contains() miss path.";
+            e.setup = [count, step]() -> void * {
+                auto *s = new frsrHitState<Arm>{ TestBitmap64{}, count, step, 0 };
+                for (size_t i = 0; i < count; ++i) {
+                    s->r.add(i * step);
+                }
+                return s;
+            };
+            e.run = [](void *sv) -> int64_t {
+                auto *s = static_cast<frsrHitState<Arm> *>(sv);
+                uint64_t v = ( ( s->i + 1 ) * s->step ) - 1;
+                s->i = (s->i + 1) % s->count;
+                return s->r.contains(v) ? 1 : 0;
+            };
+            e.teardown = [](void *sv) { delete static_cast<frsrHitState<Arm> *>(sv); };
+            e.ops_per_run = 1;
+            e.inner_reps = 10000;
+            e.reusable_state = true;
+            g_benchmarks.push_back(std::move(e));
+        }
+
+    }
 };
 
 static void register_contains_variants() {
@@ -347,32 +435,7 @@ static void register_contains_variants() {
             }
 
             // cppContainsHit
-            // ported from deps/croaring/benchmarks/benchmark.cpp:3272-3301
-            {
-                Entry e;
-                e.name = "synthetic/frsrContainsHit/" + ptag;
-                e.description =
-                    "frsr variant of r64ContainsHit using "
-                    "frsr::roaring::bitmap<uint64_t>::contains().";
-                e.setup = [count, step]() -> void * {
-                    auto *s = new frsrHitState{ TestBitmap64{}, count, step, 0 };
-                    for (size_t i = 0; i < count; ++i) {
-                        s->r.add(i * step);
-                    }
-                    return s;
-                };
-                e.run = [](void *sv) -> int64_t {
-                    auto *s = static_cast<frsrHitState *>(sv);
-                    uint64_t v = s->i * s->step;
-                    s->i = (s->i + 1) % s->count;
-                    return s->r.contains(v) ? 1 : 0;
-                };
-                e.teardown = [](void *sv) { delete static_cast<frsrHitState *>(sv); };
-                e.ops_per_run = 1;
-                e.inner_reps = 10000;
-                e.reusable_state = true;
-                g_benchmarks.push_back(std::move(e));
-            }
+            arms::for_each_frsr64<synthetic_frsr_ContainsHit_registrar>(count, step, ptag);
 
             // cppContainsHit
             // ported from deps/croaring/benchmarks/benchmark.cpp:3272-3301
@@ -473,32 +536,7 @@ static void register_contains_variants() {
             }
 
             // cppContainsMiss
-            // ported from deps/croaring/benchmarks/benchmark.cpp:3365-3392
-            {
-                Entry e;
-                e.name = "synthetic/frsrContainsMiss/" + ptag;
-                e.description =
-                    "frsr variant of r64ContainsMiss using "
-                    "frsr::roaring::bitmap<uint64_t>::contains() miss path.";
-                e.setup = [count, step]() -> void * {
-                    auto *s = new frsrHitState{ TestBitmap64{}, count, step, 0 };
-                    for (size_t i = 0; i < count; ++i) {
-                        s->r.add(i * step);
-                    }
-                    return s;
-                };
-                e.run = [](void *sv) -> int64_t {
-                    auto *s = static_cast<frsrHitState *>(sv);
-                    uint64_t v = ( ( s->i + 1 ) * s->step ) - 1;
-                    s->i = (s->i + 1) % s->count;
-                    return s->r.contains(v) ? 1 : 0;
-                };
-                e.teardown = [](void *sv) { delete static_cast<frsrHitState *>(sv); };
-                e.ops_per_run = 1;
-                e.inner_reps = 10000;
-                e.reusable_state = true;
-                g_benchmarks.push_back(std::move(e));
-            }
+            arms::for_each_frsr64<synthetic_frsr_ContainsMiss_registrar>(count, step, ptag);
 
             // cppContainsMiss
             // ported from deps/croaring/benchmarks/benchmark.cpp:3365-3392
@@ -590,10 +628,84 @@ struct setRandState {
     std::mt19937_64 rng;
 };
 
+template <class Arm>
 struct frsrRandState {
+    using TestBitmap64 = typename Arm::bitmap;
     TestBitmap64 r;
     uint64_t bitmask;
     std::mt19937_64 rng;
+};
+
+template <class Arm>
+struct synthetic_frsr_ContainsRandom_registrar {
+    using TestBitmap64 = typename Arm::bitmap;
+    static void run(std::uint64_t mask, std::string const &tag) {
+        // ported from deps/croaring/benchmarks/benchmark.cpp:3482-3511
+        {
+            Entry e;
+            e.name = std::string(std::string("synthetic/") + Arm::label() + "ContainsRandom/") + tag;
+            e.description =
+                "frsr variant of r64ContainsRandom using "
+                "frsr::roaring::bitmap<uint64_t>::contains().";
+            e.setup = [mask]() -> void * {
+                auto *s =
+                    new frsrRandState<Arm>{TestBitmap64{}, mask,
+                                     std::mt19937_64(0xdeadbeefULL + mask)};
+                for (size_t i = 0; i < kRandomPreload; ++i) {
+                    s->r.add(rand_u64(s->rng) & mask);
+                }
+                return s;
+            };
+            e.run = [](void *sv) -> int64_t {
+                auto *s = static_cast<frsrRandState<Arm> *>(sv);
+                uint64_t v = rand_u64(s->rng) & s->bitmask;
+                return s->r.contains(v) ? 1 : 0;
+            };
+            e.teardown = [](void *sv) { delete static_cast<frsrRandState<Arm> *>(sv); };
+            e.ops_per_run = 1;
+            e.inner_reps = 10000;
+            e.reusable_state = true;
+            g_benchmarks.push_back(std::move(e));
+        }
+
+    }
+};
+
+template <class Arm>
+struct synthetic_frsr_InsertRemoveRandom_registrar {
+    using TestBitmap64 = typename Arm::bitmap;
+    static void run(std::uint64_t mask, std::string const &tag) {
+        // ported from deps/croaring/benchmarks/benchmark.cpp:3578-3609
+        {
+            Entry e;
+            e.name = std::string(std::string("synthetic/") + Arm::label() + "InsertRemoveRandom/") + tag;
+            e.description =
+                "frsr variant of r64InsertRemoveRandom using paired add/remove.";
+            e.setup = [mask]() -> void * {
+                auto *s =
+                    new frsrRandState<Arm>{TestBitmap64{}, mask,
+                                     std::mt19937_64(0xdeadbeefULL + mask)};
+                for (size_t i = 0; i < kRandomPreload; ++i) {
+                    s->r.add(rand_u64(s->rng) & mask);
+                }
+                return s;
+            };
+            e.run = [](void *sv) -> int64_t {
+                auto *s = static_cast<frsrRandState<Arm> *>(sv);
+                uint64_t a = rand_u64(s->rng) & s->bitmask;
+                uint64_t r = rand_u64(s->rng) & s->bitmask;
+                s->r.add(a);
+                s->r.remove(r);
+                return 0;
+            };
+            e.teardown = [](void *sv) { delete static_cast<frsrRandState<Arm> *>(sv); };
+            e.ops_per_run = 2;
+            e.inner_reps = 5000;
+            e.reusable_state = true;
+            g_benchmarks.push_back(std::move(e));
+        }
+
+    }
 };
 
 static void register_random_variants() {
@@ -638,33 +750,7 @@ static void register_random_variants() {
         }
 
         // cppContainsRandom
-        // ported from deps/croaring/benchmarks/benchmark.cpp:3482-3511
-        {
-            Entry e;
-            e.name = std::string("synthetic/frsrContainsRandom/") + tag;
-            e.description =
-                "frsr variant of r64ContainsRandom using "
-                "frsr::roaring::bitmap<uint64_t>::contains().";
-            e.setup = [mask]() -> void * {
-                auto *s =
-                    new frsrRandState{TestBitmap64{}, mask,
-                                     std::mt19937_64(0xdeadbeefULL + mask)};
-                for (size_t i = 0; i < kRandomPreload; ++i) {
-                    s->r.add(rand_u64(s->rng) & mask);
-                }
-                return s;
-            };
-            e.run = [](void *sv) -> int64_t {
-                auto *s = static_cast<frsrRandState *>(sv);
-                uint64_t v = rand_u64(s->rng) & s->bitmask;
-                return s->r.contains(v) ? 1 : 0;
-            };
-            e.teardown = [](void *sv) { delete static_cast<frsrRandState *>(sv); };
-            e.ops_per_run = 1;
-            e.inner_reps = 10000;
-            e.reusable_state = true;
-            g_benchmarks.push_back(std::move(e));
-        }
+        arms::for_each_frsr64<synthetic_frsr_ContainsRandom_registrar>(mask, tag);
 
         // cppContainsRandom
         // ported from deps/croaring/benchmarks/benchmark.cpp:3482-3511
@@ -768,35 +854,7 @@ static void register_random_variants() {
         }
 
         // cppInsertRemoveRandom
-        // ported from deps/croaring/benchmarks/benchmark.cpp:3578-3609
-        {
-            Entry e;
-            e.name = std::string("synthetic/frsrInsertRemoveRandom/") + tag;
-            e.description =
-                "frsr variant of r64InsertRemoveRandom using paired add/remove.";
-            e.setup = [mask]() -> void * {
-                auto *s =
-                    new frsrRandState{TestBitmap64{}, mask,
-                                     std::mt19937_64(0xdeadbeefULL + mask)};
-                for (size_t i = 0; i < kRandomPreload; ++i) {
-                    s->r.add(rand_u64(s->rng) & mask);
-                }
-                return s;
-            };
-            e.run = [](void *sv) -> int64_t {
-                auto *s = static_cast<frsrRandState *>(sv);
-                uint64_t a = rand_u64(s->rng) & s->bitmask;
-                uint64_t r = rand_u64(s->rng) & s->bitmask;
-                s->r.add(a);
-                s->r.remove(r);
-                return 0;
-            };
-            e.teardown = [](void *sv) { delete static_cast<frsrRandState *>(sv); };
-            e.ops_per_run = 2;
-            e.inner_reps = 5000;
-            e.reusable_state = true;
-            g_benchmarks.push_back(std::move(e));
-        }
+        arms::for_each_frsr64<synthetic_frsr_InsertRemoveRandom_registrar>(mask, tag);
 
         // cppInsertRemoveRandom
         // ported from deps/croaring/benchmarks/benchmark.cpp:3578-3609
@@ -882,6 +940,79 @@ struct insertParams {
     uint64_t step;
 };
 
+template <class Arm>
+struct synthetic_frsr_Insert_registrar {
+    using TestBitmap64 = typename Arm::bitmap;
+    static void run(std::size_t count, std::uint64_t step, std::string const &ptag) {
+        // ported from deps/croaring/benchmarks/benchmark.cpp:3687-3708
+        {
+            Entry e;
+            e.name = std::string("synthetic/") + Arm::label() + "Insert/" + ptag;
+            e.description =
+                "frsr variant of r64Insert: build-from-scratch "
+                "with bitmap<uint64_t> and sequential add().";
+            e.setup = [count, step]() -> void * {
+                return new insertParams{count, step};
+            };
+            e.run = [](void *sv) -> int64_t {
+                auto *p = static_cast<insertParams *>(sv);
+                TestBitmap64 r;
+                for (size_t i = 0; i < p->count; ++i) {
+                    r.add(i * p->step);
+                }
+                return static_cast<int64_t>(r.size());
+            };
+            e.teardown = [](void *sv) {
+                delete static_cast<insertParams *>(sv);
+            };
+            e.ops_per_run = static_cast<int64_t>(count);
+            e.reusable_state = true;
+            g_benchmarks.push_back(std::move(e));
+        }
+
+    }
+};
+
+template <class Arm>
+struct synthetic_frsr_Remove_registrar {
+    using TestBitmap64 = typename Arm::bitmap;
+    static void run(std::size_t count, std::uint64_t step, std::string const &ptag) {
+        // ported from deps/croaring/benchmarks/benchmark.cpp:3773-3803
+        {
+            Entry e;
+            e.name = std::string("synthetic/") + Arm::label() + "Remove/" + ptag;
+            e.description =
+                "frsr variant of r64Remove: remove-all with setup "
+                "rebuilding populated bitmap before each iteration.";
+            struct S {
+                size_t count;
+                uint64_t step;
+                TestBitmap64 r;
+            };
+            e.setup = [count, step]() -> void * {
+                auto *s = new S{count, step, TestBitmap64{}};
+                for (size_t i = 0; i < count; ++i) {
+                    s->r.add(i * step);
+                }
+                return s;
+            };
+            e.run = [](void *sv) -> int64_t {
+                auto *s = static_cast<S *>(sv);
+                for (size_t i = 0; i < s->count; ++i) {
+                    s->r.remove(i * s->step);
+                }
+                return static_cast<int64_t>(s->r.size());
+            };
+            e.teardown = [](void *sv) {
+                delete static_cast<S *>(sv);
+            };
+            e.ops_per_run = static_cast<int64_t>(count);
+            g_benchmarks.push_back(std::move(e));
+        }
+
+    }
+};
+
 static void register_insert_remove() {
     for (size_t count : kCounts) {
         for (uint64_t step : kSteps) {
@@ -920,31 +1051,7 @@ static void register_insert_remove() {
             }
 
             // cppInsert
-            // ported from deps/croaring/benchmarks/benchmark.cpp:3687-3708
-            {
-                Entry e;
-                e.name = "synthetic/frsrInsert/" + ptag;
-                e.description =
-                    "frsr variant of r64Insert: build-from-scratch "
-                    "with bitmap<uint64_t> and sequential add().";
-                e.setup = [count, step]() -> void * {
-                    return new insertParams{count, step};
-                };
-                e.run = [](void *sv) -> int64_t {
-                    auto *p = static_cast<insertParams *>(sv);
-                    TestBitmap64 r;
-                    for (size_t i = 0; i < p->count; ++i) {
-                        r.add(i * p->step);
-                    }
-                    return static_cast<int64_t>(r.size());
-                };
-                e.teardown = [](void *sv) {
-                    delete static_cast<insertParams *>(sv);
-                };
-                e.ops_per_run = static_cast<int64_t>(count);
-                e.reusable_state = true;
-                g_benchmarks.push_back(std::move(e));
-            }
+            arms::for_each_frsr64<synthetic_frsr_Insert_registrar>(count, step, ptag);
 
             // cppInsert
             // ported from deps/croaring/benchmarks/benchmark.cpp:3687-3708
@@ -1037,38 +1144,7 @@ static void register_insert_remove() {
             }
 
             // cppRemove
-            // ported from deps/croaring/benchmarks/benchmark.cpp:3773-3803
-            {
-                Entry e;
-                e.name = "synthetic/frsrRemove/" + ptag;
-                e.description =
-                    "frsr variant of r64Remove: remove-all with setup "
-                    "rebuilding populated bitmap before each iteration.";
-                struct S {
-                    size_t count;
-                    uint64_t step;
-                    TestBitmap64 r;
-                };
-                e.setup = [count, step]() -> void * {
-                    auto *s = new S{count, step, TestBitmap64{}};
-                    for (size_t i = 0; i < count; ++i) {
-                        s->r.add(i * step);
-                    }
-                    return s;
-                };
-                e.run = [](void *sv) -> int64_t {
-                    auto *s = static_cast<S *>(sv);
-                    for (size_t i = 0; i < s->count; ++i) {
-                        s->r.remove(i * s->step);
-                    }
-                    return static_cast<int64_t>(s->r.size());
-                };
-                e.teardown = [](void *sv) {
-                    delete static_cast<S *>(sv);
-                };
-                e.ops_per_run = static_cast<int64_t>(count);
-                g_benchmarks.push_back(std::move(e));
-            }
+            arms::for_each_frsr64<synthetic_frsr_Remove_registrar>(count, step, ptag);
 
             // cppRemove
             // ported from deps/croaring/benchmarks/benchmark.cpp:3773-3803
@@ -1170,13 +1246,162 @@ struct serStateCppFrozen {
     size_t size;
 };
 
+template <class Arm>
 struct serStateFrsr {
+    using TestBitmap64 = typename Arm::bitmap;
     TestBitmap64 r;
 #ifdef FRSR_ROARING_HAS_PSI_VM
     TestBitmap64::serialized_byte_vector serialized;
 #else
     std::vector<std::byte> serialized;
 #endif
+};
+
+template <class Arm>
+struct synthetic_frsr_PortableSerialize_registrar {
+    using TestBitmap64 = typename Arm::bitmap;
+    static void run(std::size_t count, std::uint64_t step, std::string const &ptag) {
+        // frsrPortableSerialize
+        {
+            Entry e;
+            e.name = std::string("synthetic/") + Arm::label() + "PortableSerialize/" + ptag;
+            e.description =
+                "frsr portable serialize: materialize native vm-backed "
+                "wire format into a vm_vector<byte>.";
+            e.setup = [count, step]() -> void * {
+                auto *s = new serStateFrsr<Arm>;
+                for (size_t i = 0; i < count; ++i) {
+                    auto const v = static_cast<std::uint64_t>(i) * step;
+                    s->r.add(v);
+                }
+                s->r.optimize_for_storage();
+                return s;
+            };
+            e.run = [](void *sv) -> int64_t {
+                auto *s = static_cast<serStateFrsr<Arm> *>(sv);
+                s->r.serialize_to_vm_vector(s->serialized);
+                return static_cast<int64_t>(s->serialized.size());
+            };
+            e.teardown = [](void *sv) {
+                delete static_cast<serStateFrsr<Arm> *>(sv);
+            };
+            e.ops_per_run = static_cast<int64_t>(count);
+            e.inner_reps = 5;
+            e.reusable_state = true;
+            g_benchmarks.push_back(std::move(e));
+        }
+
+    }
+};
+
+template <class Arm>
+struct synthetic_frsr_FrozenSerialize_registrar {
+    using TestBitmap64 = typename Arm::bitmap;
+    static void run(std::size_t count, std::uint64_t step, std::string const &ptag) {
+        // frsrFrozenSerialize
+        {
+            Entry e;
+            e.name = std::string("synthetic/") + Arm::label() + "FrozenSerialize/" + ptag;
+            e.description =
+                "frsr frozen serialize into the native indexed frozen "
+                "wire format.";
+            e.setup = [count, step]() -> void * {
+                auto *s = new serStateFrsr<Arm>;
+                for (size_t i = 0; i < count; ++i) {
+                    auto const v = static_cast<std::uint64_t>(i) * step;
+                    s->r.add(v);
+                }
+                return s;
+            };
+            e.run = [](void *sv) -> int64_t {
+                auto *s = static_cast<serStateFrsr<Arm> *>(sv);
+                s->r.serialize_frozen_to_vm_vector(s->serialized);
+                return static_cast<int64_t>(s->serialized.size());
+            };
+            e.teardown = [](void *sv) {
+                delete static_cast<serStateFrsr<Arm> *>(sv);
+            };
+            e.ops_per_run = static_cast<int64_t>(count);
+            e.inner_reps = 5;
+            e.reusable_state = true;
+            g_benchmarks.push_back(std::move(e));
+        }
+
+    }
+};
+
+template <class Arm>
+struct synthetic_frsr_PortableDeserialize_registrar {
+    using TestBitmap64 = typename Arm::bitmap;
+    static void run(std::size_t count, std::uint64_t step, std::string const &ptag) {
+        // frsrPortableDeserialize
+        {
+            Entry e;
+            e.name = std::string("synthetic/") + Arm::label() + "PortableDeserialize/" + ptag;
+            e.description =
+                "frsr portable deserialize from native vm-backed wire "
+                "format prepared once in setup.";
+            e.setup = [count, step]() -> void * {
+                auto *s = new serStateFrsr<Arm>;
+                for (size_t i = 0; i < count; ++i) {
+                    s->r.add(static_cast<std::uint64_t>(i) * step);
+                }
+                s->r.serialize_to_vm_vector(s->serialized);
+                return s;
+            };
+            e.run = [](void *sv) -> int64_t {
+                auto *s = static_cast<serStateFrsr<Arm> *>(sv);
+                TestBitmap64 roundtrip =
+                    TestBitmap64::deserialize_from_vm_vector(s->serialized);
+                return static_cast<int64_t>(roundtrip.size());
+            };
+            e.teardown = [](void *sv) {
+                delete static_cast<serStateFrsr<Arm> *>(sv);
+            };
+            e.ops_per_run = static_cast<int64_t>(count);
+            e.inner_reps = 3;
+            e.reusable_state = true;
+            g_benchmarks.push_back(std::move(e));
+        }
+
+    }
+};
+
+template <class Arm>
+struct synthetic_frsr_FrozenDeserialize_registrar {
+    using TestBitmap64 = typename Arm::bitmap;
+    static void run(std::size_t count, std::uint64_t step, std::string const &ptag) {
+        // frsrFrozenDeserialize
+        {
+            Entry e;
+            e.name = std::string("synthetic/") + Arm::label() + "FrozenDeserialize/" + ptag;
+            e.description =
+                "frsr frozen view construction over the native indexed "
+                "frozen wire format.";
+            e.setup = [count, step]() -> void * {
+                auto *s = new serStateFrsr<Arm>;
+                for (size_t i = 0; i < count; ++i) {
+                    s->r.add(static_cast<std::uint64_t>(i) * step);
+                }
+                s->r.optimize_for_storage();
+                s->r.serialize_frozen_to_vm_vector(s->serialized);
+                return s;
+            };
+            e.run = [](void *sv) -> int64_t {
+                auto *s = static_cast<serStateFrsr<Arm> *>(sv);
+                auto view = TestBitmap64::frozen_view_from_vm_vector(s->serialized);
+                return static_cast<int64_t>(view.size());
+            };
+            e.teardown = [](void *sv) {
+                delete static_cast<serStateFrsr<Arm> *>(sv);
+            };
+            e.ops_per_run = static_cast<int64_t>(count);
+            e.inner_reps = 3;
+            e.reusable_state = true;
+            g_benchmarks.push_back(std::move(e));
+        }
+
+    }
 };
 
 static void register_ser_deser() {
@@ -1255,64 +1480,9 @@ static void register_ser_deser() {
                 g_benchmarks.push_back(std::move(e));
             }
 
-            // frsrPortableSerialize
-            {
-                Entry e;
-                e.name = "synthetic/frsrPortableSerialize/" + ptag;
-                e.description =
-                    "frsr portable serialize: materialize native vm-backed "
-                    "wire format into a vm_vector<byte>.";
-                e.setup = [count, step]() -> void * {
-                    auto *s = new serStateFrsr;
-                    for (size_t i = 0; i < count; ++i) {
-                        auto const v = static_cast<std::uint64_t>(i) * step;
-                        s->r.add(v);
-                    }
-                    s->r.optimize_for_storage();
-                    return s;
-                };
-                e.run = [](void *sv) -> int64_t {
-                    auto *s = static_cast<serStateFrsr *>(sv);
-                    s->r.serialize_to_vm_vector(s->serialized);
-                    return static_cast<int64_t>(s->serialized.size());
-                };
-                e.teardown = [](void *sv) {
-                    delete static_cast<serStateFrsr *>(sv);
-                };
-                e.ops_per_run = static_cast<int64_t>(count);
-                e.inner_reps = 5;
-                e.reusable_state = true;
-                g_benchmarks.push_back(std::move(e));
-            }
+            arms::for_each_frsr64<synthetic_frsr_PortableSerialize_registrar>(count, step, ptag);
 
-            // frsrFrozenSerialize
-            {
-                Entry e;
-                e.name = "synthetic/frsrFrozenSerialize/" + ptag;
-                e.description =
-                    "frsr frozen serialize into the native indexed frozen "
-                    "wire format.";
-                e.setup = [count, step]() -> void * {
-                    auto *s = new serStateFrsr;
-                    for (size_t i = 0; i < count; ++i) {
-                        auto const v = static_cast<std::uint64_t>(i) * step;
-                        s->r.add(v);
-                    }
-                    return s;
-                };
-                e.run = [](void *sv) -> int64_t {
-                    auto *s = static_cast<serStateFrsr *>(sv);
-                    s->r.serialize_frozen_to_vm_vector(s->serialized);
-                    return static_cast<int64_t>(s->serialized.size());
-                };
-                e.teardown = [](void *sv) {
-                    delete static_cast<serStateFrsr *>(sv);
-                };
-                e.ops_per_run = static_cast<int64_t>(count);
-                e.inner_reps = 5;
-                e.reusable_state = true;
-                g_benchmarks.push_back(std::move(e));
-            }
+            arms::for_each_frsr64<synthetic_frsr_FrozenSerialize_registrar>(count, step, ptag);
 
             // cppPortableSerialize
             // ported from deps/croaring/benchmarks/benchmark.cpp:3933-3963
@@ -1464,65 +1634,9 @@ static void register_ser_deser() {
                 g_benchmarks.push_back(std::move(e));
             }
 
-            // frsrPortableDeserialize
-            {
-                Entry e;
-                e.name = "synthetic/frsrPortableDeserialize/" + ptag;
-                e.description =
-                    "frsr portable deserialize from native vm-backed wire "
-                    "format prepared once in setup.";
-                e.setup = [count, step]() -> void * {
-                    auto *s = new serStateFrsr;
-                    for (size_t i = 0; i < count; ++i) {
-                        s->r.add(static_cast<std::uint64_t>(i) * step);
-                    }
-                    s->r.serialize_to_vm_vector(s->serialized);
-                    return s;
-                };
-                e.run = [](void *sv) -> int64_t {
-                    auto *s = static_cast<serStateFrsr *>(sv);
-                    TestBitmap64 roundtrip =
-                        TestBitmap64::deserialize_from_vm_vector(s->serialized);
-                    return static_cast<int64_t>(roundtrip.size());
-                };
-                e.teardown = [](void *sv) {
-                    delete static_cast<serStateFrsr *>(sv);
-                };
-                e.ops_per_run = static_cast<int64_t>(count);
-                e.inner_reps = 3;
-                e.reusable_state = true;
-                g_benchmarks.push_back(std::move(e));
-            }
+            arms::for_each_frsr64<synthetic_frsr_PortableDeserialize_registrar>(count, step, ptag);
 
-            // frsrFrozenDeserialize
-            {
-                Entry e;
-                e.name = "synthetic/frsrFrozenDeserialize/" + ptag;
-                e.description =
-                    "frsr frozen view construction over the native indexed "
-                    "frozen wire format.";
-                e.setup = [count, step]() -> void * {
-                    auto *s = new serStateFrsr;
-                    for (size_t i = 0; i < count; ++i) {
-                        s->r.add(static_cast<std::uint64_t>(i) * step);
-                    }
-                    s->r.optimize_for_storage();
-                    s->r.serialize_frozen_to_vm_vector(s->serialized);
-                    return s;
-                };
-                e.run = [](void *sv) -> int64_t {
-                    auto *s = static_cast<serStateFrsr *>(sv);
-                    auto view = TestBitmap64::frozen_view_from_vm_vector(s->serialized);
-                    return static_cast<int64_t>(view.size());
-                };
-                e.teardown = [](void *sv) {
-                    delete static_cast<serStateFrsr *>(sv);
-                };
-                e.ops_per_run = static_cast<int64_t>(count);
-                e.inner_reps = 3;
-                e.reusable_state = true;
-                g_benchmarks.push_back(std::move(e));
-            }
+            arms::for_each_frsr64<synthetic_frsr_FrozenDeserialize_registrar>(count, step, ptag);
 
             // cppPortableDeserialize
             // ported from deps/croaring/benchmarks/benchmark.cpp:4075-4107
