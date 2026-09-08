@@ -43,6 +43,28 @@ FRSR_ROARING_X86_V4_KERNEL
     return cardinality;
 }
 
+// In-place form: a[i] = a[i] OP b[i]. Not the materializing kernel with out == a —
+// clang versions that loop on an out/a overlap check, and the aliasing call
+// takes the scalar fallback (measured 1.6x slower than the baseline tile loop).
+FRSR_ROARING_X86_V4_KERNEL
+[[nodiscard]] inline std::size_t combine_words_inplace_popcount_v4(
+    std::uint64_t * const a, std::uint64_t const * const b, std::size_t const n, set_operation const op
+) noexcept {
+    std::size_t cardinality{ 0 };
+    switch ( op ) {
+        case set_operation::bit_or:
+            for ( std::size_t i{ 0 }; i < n; ++i ) { a[ i ] |=  b[ i ]; cardinality += static_cast<std::size_t>( std::popcount( a[ i ] ) ); }
+            break;
+        case set_operation::bit_and:
+            for ( std::size_t i{ 0 }; i < n; ++i ) { a[ i ] &=  b[ i ]; cardinality += static_cast<std::size_t>( std::popcount( a[ i ] ) ); }
+            break;
+        case set_operation::bit_andnot:
+            for ( std::size_t i{ 0 }; i < n; ++i ) { a[ i ] &= ~b[ i ]; cardinality += static_cast<std::size_t>( std::popcount( a[ i ] ) ); }
+            break;
+    }
+    return cardinality;
+}
+
 FRSR_ROARING_X86_V4_KERNEL
 inline void or_words_inplace_v4( std::uint64_t * const a, std::uint64_t const * const b, std::size_t const n ) noexcept {
     for ( std::size_t i{ 0 }; i < n; ++i ) { a[ i ] |= b[ i ]; }
@@ -563,7 +585,7 @@ void combine_bitset_bitset_inplace(
     // silicon, where the baseline tile loop is the 2x-slower half of every
     // in-place bitset union.
     if ( have_x86_v4() ) [[likely]] {
-        lhs.cardinality = static_cast<std::uint32_t>( combine_words_into_popcount_v4( a.data(), a.data(), b.data(), n, op ) );
+        lhs.cardinality = static_cast<std::uint32_t>( combine_words_inplace_popcount_v4( a.data(), b.data(), n, op ) );
         lhs.mark_endpoints_stale();
         return;
     }
@@ -720,7 +742,7 @@ template <typename Layout, typename CowPolicy = cow_value_semantics>
         }
         auto       * const a{ lhs.words.as_array().data() };
         auto const * const b{ rhs.words.as_array().data() };
-        lhs.cardinality = static_cast<std::uint32_t>( combine_words_into_popcount_v4( a, a, b, Layout::word_count, set_operation::bit_or ) );
+        lhs.cardinality = static_cast<std::uint32_t>( combine_words_inplace_popcount_v4( a, b, Layout::word_count, set_operation::bit_or ) );
         lhs.mark_endpoints_stale();
         return;
     }
