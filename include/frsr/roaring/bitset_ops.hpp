@@ -249,7 +249,9 @@ typedef std::uint32_t setbit_decode_lane_block
 // add and store per byte, advanced by that byte's popcount, so a set bit costs a
 // fraction of the tzcnt+store chain a scalar decode pays per value. Every byte stores
 // a full 8-lane vector, so the vector loop stops 64 values short of `out_end` and a
-// scalar tail finishes — which keeps an exactly-sized output buffer safe.
+// scalar tail finishes — which is what keeps an EXACTLY-sized output buffer safe.
+// `out_end` is that slack guard, not a capacity clamp: the caller still owes room
+// for every value the words hold.
 // [croaring-ref] deps/croaring/src/bitset_util.c:bitset_extract_setbits_avx2
 [[ gnu::hot ]] inline std::uint32_t * extract_setbits_uint32(
     std::uint64_t const * const words, std::size_t const n,

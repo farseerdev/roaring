@@ -281,8 +281,9 @@ template <typename Layout, typename CowPolicy = cow_value_semantics>
 }
 
 // Writes every value of `container`, composed with `chunk_key` into the full key
-// space, straight into `out` (which must hold container_size() entries) and
-// returns the end pointer. The equivalent of a for_each with a push_back per value
+// space, straight into `out` (which MUST hold container_size() entries — the
+// contract is the reference's, and `out_end` is a slack guard for the vector
+// stores, not a bounds check) and returns the end pointer. The equivalent of a for_each with a push_back per value
 // minus the per-value capacity check and size increment: each kind writes through a
 // plain pointer, which is what lets the array kind's widening loop vectorise.
 // [croaring-ref] deps/croaring/src/roaring.c:roaring_bitmap_to_uint32_array
