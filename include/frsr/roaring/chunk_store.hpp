@@ -47,6 +47,22 @@ public:
         return size() * ( sizeof( chunk_type ) + sizeof( handle_type ) );
     }
 
+    // Compaction (bitmap::shrink_to_fit): releases the parked scratch payloads
+    // and the parallel arrays' spare capacity. Scratch reuse repopulates on the
+    // next combine, so this is a footprint/throughput trade the CALLER asked for
+    // — never call it from a set operation.
+    //
+    // The capacity guards skip the call entirely when there is nothing to give
+    // back — the common case for a bitmap that never ran a combine, whose
+    // retired_slots_ was never allocated.
+    void shrink_to_fit() {
+        retired_slots_.clear();
+        retired_array_next_ = retired_bitset_next_ = 0;
+        if ( retired_slots_.capacity() != 0 ) { retired_slots_.shrink_to_fit(); }
+        if ( keys_         .capacity() != 0 ) { keys_         .shrink_to_fit(); }
+        if ( slots_        .capacity() != 0 ) { slots_        .shrink_to_fit(); }
+    }
+
     void reserve( std::size_t const capacity ) {
         keys_ .reserve( static_cast<std::uint32_t>( capacity ) );
         slots_.reserve( static_cast<std::uint32_t>( capacity ) );

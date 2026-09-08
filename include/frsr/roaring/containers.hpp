@@ -130,6 +130,19 @@ inline void container_for_each( container_handle<Layout, CowPolicy> const & cont
     container.visit( [&]( auto const & current ) { current.for_each( std::forward<F>( f ) ); } );
 }
 
+// Gives the container's payload slack back to the allocator, returning the bytes
+// freed. A bitset payload is exactly one word_count block, so it has no slack.
+// [croaring-ref] deps/croaring/include/roaring/containers/containers.h:container_shrink_to_fit
+template <typename Layout, typename CowPolicy>
+inline std::size_t container_shrink_to_fit( container_handle<Layout, CowPolicy> & container ) {
+    switch ( container.kind() ) {
+        case container_kind::array : return container.template shrink_payload_to_fit<typename Layout::low_type>();
+        case container_kind::run   : return container.template shrink_payload_to_fit<::frsr::roaring::run<typename Layout::low_type>>();
+        case container_kind::bitset: return 0;
+    }
+    std::unreachable();
+}
+
 template <typename Layout, typename CowPolicy>
 [[nodiscard]] inline std::size_t container_byte_size( container_handle<Layout, CowPolicy> const & container ) noexcept {
     switch ( container.kind() ) {

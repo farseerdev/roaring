@@ -2393,6 +2393,22 @@ public:
         return result;
     }
 
+    // Gives back every byte the bitmap holds beyond its contents: each container's
+    // payload slack, the parked scratch payloads, and the chunk arrays' spare
+    // capacity. Returns the bytes freed. Explicit and cold — the growth slack and
+    // the scratch pool are what make the mutation paths cheap, so this belongs
+    // next to a caller-requested compaction (optimize()) or before a long idle
+    // period, never inside a set operation.
+    // [croaring-ref] deps/croaring/src/roaring.c:roaring_bitmap_shrink_to_fit
+    [[ gnu::cold ]] std::size_t shrink_to_fit() {
+        std::size_t freed{ 0 };
+        for ( auto & slot : chunks_.slots() ) {
+            freed += detail::container_shrink_to_fit( slot );
+        }
+        chunks_.shrink_to_fit();
+        return freed;
+    }
+
     void promote_large_arrays( std::uint16_t const threshold = static_cast<std::uint16_t>( array_to_bitset_threshold ) ) {
         if constexpr ( kUseSingletonChunkMap ) {
             materialize_singleton_chunks();

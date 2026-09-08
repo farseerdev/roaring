@@ -416,6 +416,36 @@ public:
         grow_payload_capacity<E>( required );
     }
 
+    // Returns the payload to the allocator at its actual size, for the explicit
+    // compaction call (bitmap::shrink_to_fit) — never on a mutation path, which
+    // wants the slack it grew. Returns the bytes given back.
+    //
+    // Only a SOLE-OWNED spilled payload shrinks: reallocating a shared one would
+    // clone it (more memory, not less) and leave the other owners on the old
+    // block. Doubling leaves a payload up to 2x oversized, so the guard is that
+    // the smaller block at least halves the allocation — a marginal shrink
+    // reallocates within the same allocator size class and returns nothing.
+    template <typename E>
+    [[using gnu: cold, noinline]] std::size_t shrink_payload_to_fit() {
+        if ( !spilled() || count_ == 0 || !payload_is_unshared() ) {
+            return 0;
+        }
+        auto const capacity{ spill().capacity };
+        if ( count_ >= capacity ) {
+            return 0;
+        }
+        auto const old_bytes{ rc_prefix_bytes + std::size_t{ capacity } * sizeof( E ) };
+        auto const new_bytes{ rc_prefix_bytes + std::size_t{ count_   } * sizeof( E ) };
+        if ( new_bytes * 2 > old_bytes ) {
+            return 0;
+        }
+        auto * const fresh{ allocate_payload( std::size_t{ count_ } * sizeof( E ) ) };
+        std::memcpy( fresh, payload_data_raw(), std::size_t{ count_ } * sizeof( E ) );
+        free_payload( spill().data );
+        spill_to( fresh, count_ );
+        return old_bytes - new_bytes;
+    }
+
     template <typename E>
     [[using gnu: cold, noinline]] void grow_payload_capacity( std::uint32_t const required ) {
 #if FRSR_ROARING_PAYLOAD_ALLOC_STATS

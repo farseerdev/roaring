@@ -601,4 +601,59 @@ TEST(FrsrRoaringSmoke, OptimizeRunShapedOnACopyLeavesTheSharedSourceUntouched) {
     EXPECT_EQ( source.to_vector(), values );
 }
 
+TEST(FrsrRoaringSmoke, ShrinkToFitReturnsPayloadSlackAndKeepsContents) {
+    // Array payloads grow by doubling, so a chunk that grew to N and then lost
+    // most of its values sits on an oversized block. shrink_to_fit gives that
+    // slack back without changing what the bitmap holds.
+    constexpr std::uint32_t chunk{ 1U << 16 };
+    std::vector<std::uint32_t> values;
+    for ( std::uint32_t c{ 0U }; c < 4U; ++c ) {
+        for ( std::uint32_t i{ 0U }; i < 3'000U; ++i ) { values.push_back( c * chunk + i * 5U ); }
+    }
+    TestBitmap bitmap;
+    for ( auto const value : values ) { std::ignore = bitmap.add( value ); }
+
+    std::vector<std::uint32_t> survivors;
+    for ( std::size_t i{ 0 }; i < values.size(); ++i ) {
+        if ( i % 16 == 0 ) { survivors.push_back( values[ i ] ); } else { std::ignore = bitmap.remove( values[ i ] ); }
+    }
+    ASSERT_EQ( bitmap.to_vector(), survivors );
+
+    auto const freed{ bitmap.shrink_to_fit() };
+    EXPECT_GT( freed, 0U );                       // the doubled blocks were at least halved
+    EXPECT_EQ( bitmap.to_vector(), survivors );   // and the contents are untouched
+    EXPECT_EQ( bitmap.shrink_to_fit(), 0U );      // idempotent: nothing left to give back
+
+    // Still a normal bitmap afterwards: it grows, unions and intersects as before.
+    std::ignore = bitmap.add( 7U * chunk + 1U );
+    EXPECT_TRUE( bitmap.contains( 7U * chunk + 1U ) );
+    TestBitmap other;
+    for ( auto const value : survivors ) { std::ignore = other.add( value ); }
+    EXPECT_EQ( ( bitmap & other ).to_vector(), survivors );
+}
+
+TEST(FrsrRoaringSmoke, ShrinkToFitLeavesASharedPayloadAloneAndKeepsBothCopies) {
+    // A shared payload cannot shrink — reallocating it would clone rather than
+    // release — so a bitmap sharing its containers keeps them, and both copies
+    // still read correctly.
+    constexpr std::uint32_t chunk{ 1U << 16 };
+    std::vector<std::uint32_t> values;
+    for ( std::uint32_t i{ 0U }; i < 3'000U; ++i ) { values.push_back( i * 5U ); }
+    for ( std::uint32_t i{ 0U }; i < 3'000U; ++i ) { values.push_back( chunk + i * 5U ); }
+
+    LazyBitmap source;
+    for ( auto const value : values ) { std::ignore = source.add( value ); }
+    for ( std::size_t i{ 1 }; i < values.size(); i += 2 ) { std::ignore = source.remove( values[ i ] ); }
+    std::vector<std::uint32_t> survivors;
+    for ( std::size_t i{ 0 }; i < values.size(); i += 2 ) { survivors.push_back( values[ i ] ); }
+    std::ranges::sort( survivors );
+    ASSERT_EQ( source.to_vector(), survivors );
+
+    LazyBitmap copy{ source };
+    EXPECT_EQ( copy.shrink_to_fit(), 0U );  // every payload is shared with `source`
+    EXPECT_EQ( copy  .to_vector(), survivors );
+    EXPECT_EQ( source.to_vector(), survivors );
+}
+
+
 } // namespace
