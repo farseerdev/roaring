@@ -5771,7 +5771,16 @@ static void run_benchmark(const Entry &e) {
         state = e.setup();
     }
 
-    for (int64_t rep = 0; rep < e.inner_reps; ++rep) {
+    // FRSR_BENCH_REPS_MULT scales every band's repetition count. Meant for
+    // profiling: with the default reps a single band's process is dominated by
+    // fixture construction and startup, not by the operation being timed.
+    static const int64_t reps_mult{ []{
+        if (char const *s = std::getenv("FRSR_BENCH_REPS_MULT")) { return std::max<int64_t>(1, std::strtoll(s, nullptr, 10)); }
+        return int64_t{ 1 };
+    }() };
+    int64_t const inner_reps{ e.inner_reps * reps_mult };
+
+    for (int64_t rep = 0; rep < inner_reps; ++rep) {
         if (!e.reusable_state) {
             state = e.setup();
         }
@@ -5794,7 +5803,7 @@ static void run_benchmark(const Entry &e) {
     }
 
     // Report results
-    double time_per_op_us = static_cast<double>(total_time_ns) / (e.inner_reps * e.ops_per_run * 1000.0);
+    double time_per_op_us = static_cast<double>(total_time_ns) / (inner_reps * e.ops_per_run * 1000.0);
     // 4 decimals: point-lookup cases land around 0.005-0.03 us/op, where %.2f
     // quantises every result to 0.01 and hides the effect being measured.
     printf("%s\t%.4f us/op\tchecksum=%ld\n", e.name.c_str(), time_per_op_us, (long)total_checksum);
@@ -5981,7 +5990,7 @@ struct registrar {
                 e.setup = [chunks]() -> void * { return make_frsr_state<Arm>( chunks, true ); };
                 e.run = []( void * sv ) -> int64_t {
                     auto * s{ static_cast<FrsrState<Arm> *>( sv ) };
-                    TestBitmap32::bulk_context ctx{};
+                    typename TestBitmap32::bulk_context ctx{};
                     int64_t hits{ 0 };
                     for ( std::size_t i = 0; i < kProbesPerRun; ++i ) {
                         auto const v{ s->probes[ s->pos ] };
