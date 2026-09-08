@@ -28,6 +28,81 @@ using Clock = std::chrono::steady_clock;
 using TestBitmap32 = frsr::roaring::bitmap<std::uint32_t>;
 using TestBitmap64 = frsr::roaring::bitmap<std::uint64_t>;
 
+// ========================================================================
+// Arms: every policy combination the library offers, benchmarked through ONE
+// templated body. A downstream wrapper does not use the defaults — it ships
+// cow_atomic_refcount + run_selection_lazy — and the CRoaring side of a fair
+// comparison runs with copy_on_write enabled, as that wrapper did. Bands that
+// only ever measured bitmap<uint32_t> against a bare roaring_bitmap_create()
+// compared two configurations nobody ships.
+// ========================================================================
+namespace arms {
+
+template <class CowPolicy> struct cow_tag;
+template <> struct cow_tag<frsr::roaring::detail::cow_value_semantics>        { static constexpr char const * value = "";      };
+template <> struct cow_tag<frsr::roaring::detail::cow_atomic_refcount>        { static constexpr char const * value = "-rc";   };
+template <> struct cow_tag<frsr::roaring::detail::cow_unsynchronized_refcount>{ static constexpr char const * value = "-urc";  };
+template <class RunPolicy> struct run_tag;
+template <> struct run_tag<frsr::roaring::detail::run_selection_eager>{ static constexpr char const * value = "";      };
+template <> struct run_tag<frsr::roaring::detail::run_selection_lazy> { static constexpr char const * value = "-lazy"; };
+
+template <class CowPolicy, class RunPolicy>
+struct Frsr {
+    using bitmap = frsr::roaring::bitmap<
+        std::uint32_t,
+        frsr::roaring::default_container_set<std::uint32_t>,
+        CowPolicy,
+        RunPolicy
+    >;
+    // "frsr" is the library default; the suffixes name the deviation from it, so
+    // the shipped downstream configuration reads "frsr-rc-lazy".
+    static char const * label() {
+        static std::string const l = std::string( "frsr" ) + cow_tag<CowPolicy>::value + run_tag<RunPolicy>::value;
+        return l.c_str();
+    }
+};
+
+using FrsrDefault = Frsr<frsr::roaring::detail::cow_value_semantics,         frsr::roaring::detail::run_selection_eager>;
+using FrsrShipped = Frsr<frsr::roaring::detail::cow_atomic_refcount,         frsr::roaring::detail::run_selection_lazy >;
+
+// Register a band body for every frsr policy combination.
+template <template <class> class Registrar, class... Args>
+void for_each_frsr( Args &&... args ) {
+    Registrar<Frsr<frsr::roaring::detail::cow_value_semantics,         frsr::roaring::detail::run_selection_eager>>::run( args... );
+    Registrar<Frsr<frsr::roaring::detail::cow_value_semantics,         frsr::roaring::detail::run_selection_lazy >>::run( args... );
+    Registrar<Frsr<frsr::roaring::detail::cow_atomic_refcount,         frsr::roaring::detail::run_selection_eager>>::run( args... );
+    Registrar<Frsr<frsr::roaring::detail::cow_atomic_refcount,         frsr::roaring::detail::run_selection_lazy >>::run( args... );
+    Registrar<Frsr<frsr::roaring::detail::cow_unsynchronized_refcount, frsr::roaring::detail::run_selection_eager>>::run( args... );
+    Registrar<Frsr<frsr::roaring::detail::cow_unsynchronized_refcount, frsr::roaring::detail::run_selection_lazy >>::run( args... );
+}
+
+#if FRSR_ROARING_HAS_CROARING
+// CRoaring arm: with and without copy-on-write. Every bitmap the arm creates
+// goes through create() so the flag is set once, at birth.
+template <bool Cow>
+struct Croaring {
+    static constexpr bool cow = Cow;
+    static char const * label() { return Cow ? "cpp-cow" : "cpp"; }
+    static roaring_bitmap_t * create() {
+        auto * const bm = roaring_bitmap_create();
+        roaring_bitmap_set_copy_on_write( bm, Cow );
+        return bm;
+    }
+    static roaring_bitmap_t * copy( roaring_bitmap_t const * const src ) {
+        auto * const bm = roaring_bitmap_copy( src );
+        roaring_bitmap_set_copy_on_write( bm, Cow );
+        return bm;
+    }
+};
+template <template <class> class Registrar, class... Args>
+void for_each_croaring( Args &&... args ) {
+    Registrar<Croaring<false>>::run( args... );
+    Registrar<Croaring<true >>::run( args... );
+}
+#endif
+
+} // namespace arms
+
 static inline std::uint64_t rand_u64( std::mt19937_64 & rng ) {
     return std::uniform_int_distribution<std::uint64_t>(
         std::numeric_limits<std::uint64_t>::min(),
@@ -1833,32 +1908,37 @@ static std::string fmt_so(const char *lib, const char *op,
 
 // ========== frsr (32-bit) binary ops ==========
 
+template <class Arm>
 struct FrsrBinaryState {
+    using TestBitmap32 = typename Arm::bitmap;
     TestBitmap32 a;
     TestBitmap32 b;
     TestBitmap32 scratch;
 };
 
-static void register_frsr_binary(std::size_t count, std::size_t offset,
+template <class Arm>
+struct register_frsr_binary_registrar {
+    using TestBitmap32 = typename Arm::bitmap;
+    static void run(std::size_t count, std::size_t offset,
                                   const char *overlap) {
     // setup shared across the six frsr binary variants for this (count,overlap)
     auto make_state = [count, offset]() -> void * {
-        auto *s = new FrsrBinaryState;
+        auto *s = new FrsrBinaryState<Arm>;
         for (std::size_t i = 0; i < count; ++i) { std::ignore = s->a.add(static_cast<std::uint32_t>(i)); }
         for (std::size_t i = 0; i < count; ++i) { std::ignore = s->b.add(static_cast<std::uint32_t>(i + offset)); }
         return s;
     };
-    auto free_state = [](void *sv) { delete static_cast<FrsrBinaryState *>(sv); };
+    auto free_state = [](void *sv) { delete static_cast<FrsrBinaryState<Arm> *>(sv); };
 
     // frsr Union  (operator|)
     {
         Entry e;
-        e.name        = fmt_so("frsr", "Union", count, overlap);
+        e.name        = fmt_so(Arm::label(), "Union", count, overlap);
         e.description = "frsr::roaring::bitmap<uint32_t> operator| (materialised union). "
                         "Checksum = result cardinality.";
         e.setup    = make_state;
         e.run      = [](void *sv) -> int64_t {
-            auto *s = static_cast<FrsrBinaryState *>(sv);
+            auto *s = static_cast<FrsrBinaryState<Arm> *>(sv);
             TestBitmap32 r = s->a | s->b;
             return static_cast<int64_t>(r.size());
         };
@@ -1872,11 +1952,11 @@ static void register_frsr_binary(std::size_t count, std::size_t offset,
     // frsr Intersection  (operator&)
     {
         Entry e;
-        e.name        = fmt_so("frsr", "Intersection", count, overlap);
+        e.name        = fmt_so(Arm::label(), "Intersection", count, overlap);
         e.description = "frsr::roaring::bitmap<uint32_t> operator& (materialised intersection).";
         e.setup    = make_state;
         e.run      = [](void *sv) -> int64_t {
-            auto *s = static_cast<FrsrBinaryState *>(sv);
+            auto *s = static_cast<FrsrBinaryState<Arm> *>(sv);
             TestBitmap32 r = s->a & s->b;
             return static_cast<int64_t>(r.size());
         };
@@ -1890,11 +1970,11 @@ static void register_frsr_binary(std::size_t count, std::size_t offset,
     // frsr Difference  (operator-)
     {
         Entry e;
-        e.name        = fmt_so("frsr", "Difference", count, overlap);
+        e.name        = fmt_so(Arm::label(), "Difference", count, overlap);
         e.description = "frsr::roaring::bitmap<uint32_t> operator- (materialised difference a\\b).";
         e.setup    = make_state;
         e.run      = [](void *sv) -> int64_t {
-            auto *s = static_cast<FrsrBinaryState *>(sv);
+            auto *s = static_cast<FrsrBinaryState<Arm> *>(sv);
             TestBitmap32 r = s->a - s->b;
             return static_cast<int64_t>(r.size());
         };
@@ -1908,11 +1988,11 @@ static void register_frsr_binary(std::size_t count, std::size_t offset,
     // frsr UnionInplace  (operator|=)
     {
         Entry e;
-        e.name        = fmt_so("frsr", "UnionInplace", count, overlap);
+        e.name        = fmt_so(Arm::label(), "UnionInplace", count, overlap);
         e.description = "frsr::roaring::bitmap<uint32_t> operator|= (in-place union, copies a first).";
         e.setup    = make_state;
         e.run      = [](void *sv) -> int64_t {
-            auto *s = static_cast<FrsrBinaryState *>(sv);
+            auto *s = static_cast<FrsrBinaryState<Arm> *>(sv);
             TestBitmap32 tmp = s->a;
             tmp |= s->b;
             return static_cast<int64_t>(tmp.size());
@@ -1927,11 +2007,11 @@ static void register_frsr_binary(std::size_t count, std::size_t offset,
     // frsr IntersectionInplace  (operator&=)
     {
         Entry e;
-        e.name        = fmt_so("frsr", "IntersectionInplace", count, overlap);
+        e.name        = fmt_so(Arm::label(), "IntersectionInplace", count, overlap);
         e.description = "frsr::roaring::bitmap<uint32_t> operator&= (in-place intersection, copies a first).";
         e.setup    = make_state;
         e.run      = [](void *sv) -> int64_t {
-            auto *s = static_cast<FrsrBinaryState *>(sv);
+            auto *s = static_cast<FrsrBinaryState<Arm> *>(sv);
             TestBitmap32 tmp = s->a;
             tmp &= s->b;
             return static_cast<int64_t>(tmp.size());
@@ -1946,11 +2026,11 @@ static void register_frsr_binary(std::size_t count, std::size_t offset,
     // frsr DifferenceInplace  (operator-=)
     {
         Entry e;
-        e.name        = fmt_so("frsr", "DifferenceInplace", count, overlap);
+        e.name        = fmt_so(Arm::label(), "DifferenceInplace", count, overlap);
         e.description = "frsr::roaring::bitmap<uint32_t> operator-= (in-place difference, copies a first).";
         e.setup    = make_state;
         e.run      = [](void *sv) -> int64_t {
-            auto *s = static_cast<FrsrBinaryState *>(sv);
+            auto *s = static_cast<FrsrBinaryState<Arm> *>(sv);
             TestBitmap32 tmp = s->a;
             tmp -= s->b;
             return static_cast<int64_t>(tmp.size());
@@ -1965,14 +2045,14 @@ static void register_frsr_binary(std::size_t count, std::size_t offset,
     // frsr UnionScratch  (union_into — allocation-free path)
     {
         Entry e;
-        e.name        = fmt_so("frsr", "UnionScratch", count, overlap);
+        e.name        = fmt_so(Arm::label(), "UnionScratch", count, overlap);
         e.description = "frsr::roaring::bitmap<uint32_t> union_into(b, scratch) — "
                         "reuses scratch storage to avoid allocations per call. "
                         "frsr-only: no backend twin. "
                         "Checksum = result cardinality.";
         e.setup    = make_state;
         e.run      = [](void *sv) -> int64_t {
-            auto *s = static_cast<FrsrBinaryState *>(sv);
+            auto *s = static_cast<FrsrBinaryState<Arm> *>(sv);
             s->a.union_into(s->b, s->scratch);
             return static_cast<int64_t>(s->scratch.size());
         };
@@ -1982,10 +2062,14 @@ static void register_frsr_binary(std::size_t count, std::size_t offset,
         e.reusable_state = true;
         g_benchmarks.push_back(std::move(e));
     }
-}
+}};
+template <class Arm> static void register_frsr_binary(std::size_t count, std::size_t offset,
+                                  const char *overlap) { register_frsr_binary_registrar<Arm>::run(count, offset, overlap); }
+
 
 // ========== cpp (CRoaring 32-bit C API) binary ops ==========
 
+template <class Arm>
 struct CppBinaryState {
     roaring_bitmap_t *a{};
     roaring_bitmap_t *b{};
@@ -1996,26 +2080,28 @@ struct CppBinaryState {
     }
 };
 
-static void register_cpp_binary(std::size_t count, std::size_t offset,
+template <class Arm>
+struct register_cpp_binary_registrar {
+    static void run(std::size_t count, std::size_t offset,
                                   const char *overlap) {
     auto make_state = [count, offset]() -> void * {
-        auto *s = new CppBinaryState;
-        s->a = roaring_bitmap_create();
-        s->b = roaring_bitmap_create();
+        auto *s = new CppBinaryState<Arm>;
+        s->a = Arm::create();
+        s->b = Arm::create();
         for (std::size_t i = 0; i < count; ++i) { roaring_bitmap_add(s->a, static_cast<uint32_t>(i)); }
         for (std::size_t i = 0; i < count; ++i) { roaring_bitmap_add(s->b, static_cast<uint32_t>(i + offset)); }
         return s;
     };
-    auto free_state = [](void *sv) { delete static_cast<CppBinaryState *>(sv); };
+    auto free_state = [](void *sv) { delete static_cast<CppBinaryState<Arm> *>(sv); };
 
     // cpp Union
     {
         Entry e;
-        e.name        = fmt_so("cpp", "Union", count, overlap);
+        e.name        = fmt_so(Arm::label(), "Union", count, overlap);
         e.description = "CRoaring roaring_bitmap_or() (materialised union). Checksum = cardinality.";
         e.setup    = make_state;
         e.run      = [](void *sv) -> int64_t {
-            auto *s   = static_cast<CppBinaryState *>(sv);
+            auto *s   = static_cast<CppBinaryState<Arm> *>(sv);
             auto *r   = roaring_bitmap_or(s->a, s->b);
             int64_t c = static_cast<int64_t>(roaring_bitmap_get_cardinality(r));
             roaring_bitmap_free(r);
@@ -2031,11 +2117,11 @@ static void register_cpp_binary(std::size_t count, std::size_t offset,
     // cpp Intersection
     {
         Entry e;
-        e.name        = fmt_so("cpp", "Intersection", count, overlap);
+        e.name        = fmt_so(Arm::label(), "Intersection", count, overlap);
         e.description = "CRoaring roaring_bitmap_and() (materialised intersection).";
         e.setup    = make_state;
         e.run      = [](void *sv) -> int64_t {
-            auto *s   = static_cast<CppBinaryState *>(sv);
+            auto *s   = static_cast<CppBinaryState<Arm> *>(sv);
             auto *r   = roaring_bitmap_and(s->a, s->b);
             int64_t c = static_cast<int64_t>(roaring_bitmap_get_cardinality(r));
             roaring_bitmap_free(r);
@@ -2051,11 +2137,11 @@ static void register_cpp_binary(std::size_t count, std::size_t offset,
     // cpp Difference
     {
         Entry e;
-        e.name        = fmt_so("cpp", "Difference", count, overlap);
+        e.name        = fmt_so(Arm::label(), "Difference", count, overlap);
         e.description = "CRoaring roaring_bitmap_andnot() (materialised difference a\\b).";
         e.setup    = make_state;
         e.run      = [](void *sv) -> int64_t {
-            auto *s   = static_cast<CppBinaryState *>(sv);
+            auto *s   = static_cast<CppBinaryState<Arm> *>(sv);
             auto *r   = roaring_bitmap_andnot(s->a, s->b);
             int64_t c = static_cast<int64_t>(roaring_bitmap_get_cardinality(r));
             roaring_bitmap_free(r);
@@ -2071,12 +2157,12 @@ static void register_cpp_binary(std::size_t count, std::size_t offset,
     // cpp UnionInplace
     {
         Entry e;
-        e.name        = fmt_so("cpp", "UnionInplace", count, overlap);
+        e.name        = fmt_so(Arm::label(), "UnionInplace", count, overlap);
         e.description = "CRoaring roaring_bitmap_or_inplace() (copies a first, then |= b).";
         e.setup    = make_state;
         e.run      = [](void *sv) -> int64_t {
-            auto *s = static_cast<CppBinaryState *>(sv);
-            auto *tmp = roaring_bitmap_copy(s->a);
+            auto *s = static_cast<CppBinaryState<Arm> *>(sv);
+            auto *tmp = Arm::copy(s->a);
             roaring_bitmap_or_inplace(tmp, s->b);
             int64_t c = static_cast<int64_t>(roaring_bitmap_get_cardinality(tmp));
             roaring_bitmap_free(tmp);
@@ -2092,12 +2178,12 @@ static void register_cpp_binary(std::size_t count, std::size_t offset,
     // cpp IntersectionInplace
     {
         Entry e;
-        e.name        = fmt_so("cpp", "IntersectionInplace", count, overlap);
+        e.name        = fmt_so(Arm::label(), "IntersectionInplace", count, overlap);
         e.description = "CRoaring roaring_bitmap_and_inplace() (copies a first, then &= b).";
         e.setup    = make_state;
         e.run      = [](void *sv) -> int64_t {
-            auto *s = static_cast<CppBinaryState *>(sv);
-            auto *tmp = roaring_bitmap_copy(s->a);
+            auto *s = static_cast<CppBinaryState<Arm> *>(sv);
+            auto *tmp = Arm::copy(s->a);
             roaring_bitmap_and_inplace(tmp, s->b);
             int64_t c = static_cast<int64_t>(roaring_bitmap_get_cardinality(tmp));
             roaring_bitmap_free(tmp);
@@ -2113,12 +2199,12 @@ static void register_cpp_binary(std::size_t count, std::size_t offset,
     // cpp DifferenceInplace
     {
         Entry e;
-        e.name        = fmt_so("cpp", "DifferenceInplace", count, overlap);
+        e.name        = fmt_so(Arm::label(), "DifferenceInplace", count, overlap);
         e.description = "CRoaring roaring_bitmap_andnot_inplace() (copies a first, then -= b).";
         e.setup    = make_state;
         e.run      = [](void *sv) -> int64_t {
-            auto *s = static_cast<CppBinaryState *>(sv);
-            auto *tmp = roaring_bitmap_copy(s->a);
+            auto *s = static_cast<CppBinaryState<Arm> *>(sv);
+            auto *tmp = Arm::copy(s->a);
             roaring_bitmap_andnot_inplace(tmp, s->b);
             int64_t c = static_cast<int64_t>(roaring_bitmap_get_cardinality(tmp));
             roaring_bitmap_free(tmp);
@@ -2130,7 +2216,10 @@ static void register_cpp_binary(std::size_t count, std::size_t offset,
         e.reusable_state = true;
         g_benchmarks.push_back(std::move(e));
     }
-}
+}};
+template <class Arm> static void register_cpp_binary(std::size_t count, std::size_t offset,
+                                  const char *overlap) { register_cpp_binary_registrar<Arm>::run(count, offset, overlap); }
+
 
 // ========== r64 (CRoaring 64-bit C API) binary ops ==========
 // Values widened to uint64_t (same numeric range, just stored 64-bit).
@@ -2615,22 +2704,25 @@ static inline std::uint32_t sparse_value(std::size_t chunk_base, std::size_t i) 
     return static_cast<std::uint32_t>(chunk * std::size_t{ 65536 } + low);
 }
 
-static void register_frsr_binary_sparse(std::size_t count, std::size_t b_chunk_offset) {
+template <class Arm>
+struct register_frsr_binary_sparse_registrar {
+    using TestBitmap32 = typename Arm::bitmap;
+    static void run(std::size_t count, std::size_t b_chunk_offset) {
     auto make_state = [count, b_chunk_offset]() -> void * {
-        auto *s = new FrsrBinaryState;
+        auto *s = new FrsrBinaryState<Arm>;
         for (std::size_t i = 0; i < count; ++i) { std::ignore = s->a.add(sparse_value(0,             i)); }
         for (std::size_t i = 0; i < count; ++i) { std::ignore = s->b.add(sparse_value(b_chunk_offset, i)); }
         return s;
     };
-    auto free_state = [](void *sv) { delete static_cast<FrsrBinaryState *>(sv); };
+    auto free_state = [](void *sv) { delete static_cast<FrsrBinaryState<Arm> *>(sv); };
 
     {
         Entry e;
-        e.name        = fmt_so("frsr", "Union", count, "sparse");
+        e.name        = fmt_so(Arm::label(), "Union", count, "sparse");
         e.description  = "frsr::roaring::bitmap<uint32_t> operator| over many small array chunks.";
         e.setup        = make_state;
         e.run          = [](void *sv) -> int64_t {
-            auto *s = static_cast<FrsrBinaryState *>(sv);
+            auto *s = static_cast<FrsrBinaryState<Arm> *>(sv);
             TestBitmap32 r = s->a | s->b;
             return static_cast<int64_t>(r.size());
         };
@@ -2642,11 +2734,11 @@ static void register_frsr_binary_sparse(std::size_t count, std::size_t b_chunk_o
     }
     {
         Entry e;
-        e.name        = fmt_so("frsr", "Intersection", count, "sparse");
+        e.name        = fmt_so(Arm::label(), "Intersection", count, "sparse");
         e.description  = "frsr::roaring::bitmap<uint32_t> operator& over many small array chunks.";
         e.setup        = make_state;
         e.run          = [](void *sv) -> int64_t {
-            auto *s = static_cast<FrsrBinaryState *>(sv);
+            auto *s = static_cast<FrsrBinaryState<Arm> *>(sv);
             TestBitmap32 r = s->a & s->b;
             return static_cast<int64_t>(r.size());
         };
@@ -2658,11 +2750,11 @@ static void register_frsr_binary_sparse(std::size_t count, std::size_t b_chunk_o
     }
     {
         Entry e;
-        e.name        = fmt_so("frsr", "Difference", count, "sparse");
+        e.name        = fmt_so(Arm::label(), "Difference", count, "sparse");
         e.description  = "frsr::roaring::bitmap<uint32_t> operator- over many small array chunks.";
         e.setup        = make_state;
         e.run          = [](void *sv) -> int64_t {
-            auto *s = static_cast<FrsrBinaryState *>(sv);
+            auto *s = static_cast<FrsrBinaryState<Arm> *>(sv);
             TestBitmap32 r = s->a - s->b;
             return static_cast<int64_t>(r.size());
         };
@@ -2672,26 +2764,30 @@ static void register_frsr_binary_sparse(std::size_t count, std::size_t b_chunk_o
         e.reusable_state = true;
         g_benchmarks.push_back(std::move(e));
     }
-}
+}};
+template <class Arm> static void register_frsr_binary_sparse(std::size_t count, std::size_t b_chunk_offset) { register_frsr_binary_sparse_registrar<Arm>::run(count, b_chunk_offset); }
 
-static void register_cpp_binary_sparse(std::size_t count, std::size_t b_chunk_offset) {
+
+template <class Arm>
+struct register_cpp_binary_sparse_registrar {
+    static void run(std::size_t count, std::size_t b_chunk_offset) {
     auto make_state = [count, b_chunk_offset]() -> void * {
-        auto *s = new CppBinaryState;
-        s->a = roaring_bitmap_create();
-        s->b = roaring_bitmap_create();
+        auto *s = new CppBinaryState<Arm>;
+        s->a = Arm::create();
+        s->b = Arm::create();
         for (std::size_t i = 0; i < count; ++i) { roaring_bitmap_add(s->a, sparse_value(0,             i)); }
         for (std::size_t i = 0; i < count; ++i) { roaring_bitmap_add(s->b, sparse_value(b_chunk_offset, i)); }
         return s;
     };
-    auto free_state = [](void *sv) { delete static_cast<CppBinaryState *>(sv); };
+    auto free_state = [](void *sv) { delete static_cast<CppBinaryState<Arm> *>(sv); };
 
     {
         Entry e;
-        e.name        = fmt_so("cpp", "Union", count, "sparse");
+        e.name        = fmt_so(Arm::label(), "Union", count, "sparse");
         e.description  = "CRoaring roaring_bitmap_or() over many small array containers.";
         e.setup        = make_state;
         e.run          = [](void *sv) -> int64_t {
-            auto *s   = static_cast<CppBinaryState *>(sv);
+            auto *s   = static_cast<CppBinaryState<Arm> *>(sv);
             auto *r   = roaring_bitmap_or(s->a, s->b);
             int64_t c = static_cast<int64_t>(roaring_bitmap_get_cardinality(r));
             roaring_bitmap_free(r);
@@ -2705,11 +2801,11 @@ static void register_cpp_binary_sparse(std::size_t count, std::size_t b_chunk_of
     }
     {
         Entry e;
-        e.name        = fmt_so("cpp", "Intersection", count, "sparse");
+        e.name        = fmt_so(Arm::label(), "Intersection", count, "sparse");
         e.description  = "CRoaring roaring_bitmap_and() over many small array containers.";
         e.setup        = make_state;
         e.run          = [](void *sv) -> int64_t {
-            auto *s   = static_cast<CppBinaryState *>(sv);
+            auto *s   = static_cast<CppBinaryState<Arm> *>(sv);
             auto *r   = roaring_bitmap_and(s->a, s->b);
             int64_t c = static_cast<int64_t>(roaring_bitmap_get_cardinality(r));
             roaring_bitmap_free(r);
@@ -2723,11 +2819,11 @@ static void register_cpp_binary_sparse(std::size_t count, std::size_t b_chunk_of
     }
     {
         Entry e;
-        e.name        = fmt_so("cpp", "Difference", count, "sparse");
+        e.name        = fmt_so(Arm::label(), "Difference", count, "sparse");
         e.description  = "CRoaring roaring_bitmap_andnot() over many small array containers.";
         e.setup        = make_state;
         e.run          = [](void *sv) -> int64_t {
-            auto *s   = static_cast<CppBinaryState *>(sv);
+            auto *s   = static_cast<CppBinaryState<Arm> *>(sv);
             auto *r   = roaring_bitmap_andnot(s->a, s->b);
             int64_t c = static_cast<int64_t>(roaring_bitmap_get_cardinality(r));
             roaring_bitmap_free(r);
@@ -2739,7 +2835,9 @@ static void register_cpp_binary_sparse(std::size_t count, std::size_t b_chunk_of
         e.reusable_state = true;
         g_benchmarks.push_back(std::move(e));
     }
-}
+}};
+template <class Arm> static void register_cpp_binary_sparse(std::size_t count, std::size_t b_chunk_offset) { register_cpp_binary_sparse_registrar<Arm>::run(count, b_chunk_offset); }
+
 
 static void register_nway_union_sparse(std::size_t count) {
     char name_buf[64];
@@ -2841,7 +2939,8 @@ static constexpr std::size_t kRunHeavyRunLength = 30;
 static constexpr std::size_t kRunHeavyStride    = 60;
 static constexpr int         kRunHeavyInnerReps = 5;
 
-static void add_run_heavy_ranges_frsr(TestBitmap32 &bitmap, std::size_t start_offset) {
+template <class BM>
+static void add_run_heavy_ranges_frsr(BM &bitmap, std::size_t start_offset) {
     for (std::size_t run = 0; run < kRunHeavyNumRuns; ++run) {
         auto const begin = static_cast<std::uint32_t>(start_offset + run * kRunHeavyStride);
         auto const end   = static_cast<std::uint32_t>(begin + kRunHeavyRunLength - 1);
@@ -2857,14 +2956,19 @@ static void add_run_heavy_ranges_cpp(roaring_bitmap_t *bitmap, std::size_t start
     }
 }
 
+template <class Arm>
 struct FrsrRunHeavyState {
+    using TestBitmap32 = typename Arm::bitmap;
     TestBitmap32 a;
     TestBitmap32 b;
 };
 
-static void register_frsr_run_heavy(std::size_t repeat) {
+template <class Arm>
+struct register_frsr_run_heavy_registrar {
+    using TestBitmap32 = typename Arm::bitmap;
+    static void run(std::size_t repeat) {
     auto make_state = []() -> void * {
-        auto *s = new FrsrRunHeavyState;
+        auto *s = new FrsrRunHeavyState<Arm>;
         add_run_heavy_ranges_frsr(s->a, 0);
         // Offset by half the RUN LENGTH (not half the stride — the gap between
         // consecutive runs is stride - run_length, so a half-stride shift lands
@@ -2875,17 +2979,17 @@ static void register_frsr_run_heavy(std::size_t repeat) {
         s->b.optimize();
         return s;
     };
-    auto free_state = [](void *sv) { delete static_cast<FrsrRunHeavyState *>(sv); };
+    auto free_state = [](void *sv) { delete static_cast<FrsrRunHeavyState<Arm> *>(sv); };
 
     Entry e;
-    e.name        = fmt_so("frsr", "RunHeavyIntersect", repeat, "runs");
+    e.name        = fmt_so(Arm::label(), "RunHeavyIntersect", repeat, "runs");
     e.description = "frsr::roaring::bitmap<uint32_t> operator& over run-encoded, disjoint-range "
                      "operands (" + std::to_string(kRunHeavyNumRuns) + " runs/operand), called " +
                      std::to_string(repeat) + " times per timed run — reproduces the "
                      "intersect_run_run repeated-payload-pointer-derivation regression (2026-07-12).";
     e.setup       = make_state;
     e.run         = [repeat](void *sv) -> int64_t {
-        auto *s = static_cast<FrsrRunHeavyState *>(sv);
+        auto *s = static_cast<FrsrRunHeavyState<Arm> *>(sv);
         int64_t checksum = 0;
         for (std::size_t i = 0; i < repeat; ++i) {
             TestBitmap32 r = s->a & s->b;
@@ -2898,8 +3002,11 @@ static void register_frsr_run_heavy(std::size_t repeat) {
     e.inner_reps     = kRunHeavyInnerReps;
     e.reusable_state = true;
     g_benchmarks.push_back(std::move(e));
-}
+}};
+template <class Arm> static void register_frsr_run_heavy(std::size_t repeat) { register_frsr_run_heavy_registrar<Arm>::run(repeat); }
 
+
+template <class Arm>
 struct CppRunHeavyState {
     roaring_bitmap_t *a{};
     roaring_bitmap_t *b{};
@@ -2910,26 +3017,28 @@ struct CppRunHeavyState {
     }
 };
 
-static void register_cpp_run_heavy(std::size_t repeat) {
+template <class Arm>
+struct register_cpp_run_heavy_registrar {
+    static void run(std::size_t repeat) {
     auto make_state = []() -> void * {
-        auto *s = new CppRunHeavyState;
-        s->a = roaring_bitmap_create();
-        s->b = roaring_bitmap_create();
+        auto *s = new CppRunHeavyState<Arm>;
+        s->a = Arm::create();
+        s->b = Arm::create();
         add_run_heavy_ranges_cpp(s->a, 0);
         add_run_heavy_ranges_cpp(s->b, kRunHeavyRunLength / 2);
         roaring_bitmap_run_optimize(s->a);
         roaring_bitmap_run_optimize(s->b);
         return s;
     };
-    auto free_state = [](void *sv) { delete static_cast<CppRunHeavyState *>(sv); };
+    auto free_state = [](void *sv) { delete static_cast<CppRunHeavyState<Arm> *>(sv); };
 
     Entry e;
-    e.name        = fmt_so("cpp", "RunHeavyIntersect", repeat, "runs");
+    e.name        = fmt_so(Arm::label(), "RunHeavyIntersect", repeat, "runs");
     e.description = "CRoaring roaring_bitmap_and() over run-encoded, disjoint-range operands — "
                      "apples-to-apples counterpart of the frsr RunHeavyIntersect scenario.";
     e.setup       = make_state;
     e.run         = [repeat](void *sv) -> int64_t {
-        auto *s = static_cast<CppRunHeavyState *>(sv);
+        auto *s = static_cast<CppRunHeavyState<Arm> *>(sv);
         int64_t checksum = 0;
         for (std::size_t i = 0; i < repeat; ++i) {
             auto *r = roaring_bitmap_and(s->a, s->b);
@@ -2943,7 +3052,9 @@ static void register_cpp_run_heavy(std::size_t repeat) {
     e.inner_reps     = kRunHeavyInnerReps;
     e.reusable_state = true;
     g_benchmarks.push_back(std::move(e));
-}
+}};
+template <class Arm> static void register_cpp_run_heavy(std::size_t repeat) { register_cpp_run_heavy_registrar<Arm>::run(repeat); }
+
 
 // ========================================================================
 // Run-heavy N-way AND fold (array accumulator ∩ run operands)
@@ -2981,11 +3092,14 @@ static constexpr std::size_t kArrayRunFoldOperands  = 4;
 static constexpr std::size_t kArrayRunFoldOpShift   = 7;    // per-operand run offset
 static constexpr int         kArrayRunFoldInnerReps = 5;
 
+template <class Arm>
 struct FrsrArrayRunFoldState {
+    using TestBitmap32 = typename Arm::bitmap;
     TestBitmap32 seed;
     TestBitmap32 ops[kArrayRunFoldOperands];
 };
 
+template <class Arm>
 struct CppArrayRunFoldState {
     roaring_bitmap_t *seed{};
     roaring_bitmap_t *ops[kArrayRunFoldOperands]{};
@@ -2998,8 +3112,9 @@ struct CppArrayRunFoldState {
     }
 };
 
+template <class Arm>
 static void *make_frsr_array_run_fold_state() {
-    auto *s = new FrsrArrayRunFoldState;
+    auto *s = new FrsrArrayRunFoldState<Arm>;
     auto const domain = kArrayRunFoldNumRuns * kArrayRunFoldStride;
     for (std::size_t v = 0; v < domain; v += kArrayRunFoldSeedStep) {
         (void)s->seed.add(static_cast<std::uint32_t>(v));   // individual adds keep array encoding
@@ -3014,8 +3129,9 @@ static void *make_frsr_array_run_fold_state() {
     return s;
 }
 
+template <class Arm>
 static void *make_cpp_array_run_fold_state() {
-    auto *s = new CppArrayRunFoldState;
+    auto *s = new CppArrayRunFoldState<Arm>;
     s->seed = roaring_bitmap_create();
     auto const domain = kArrayRunFoldNumRuns * kArrayRunFoldStride;
     for (std::size_t v = 0; v < domain; v += kArrayRunFoldSeedStep) {
@@ -3079,7 +3195,9 @@ static std::uint32_t band_value(std::size_t chunk, std::size_t band, std::size_t
     return static_cast<std::uint32_t>(chunk) * 65536U + static_cast<std::uint32_t>(index) * stride;
 }
 
+template <class Arm>
 struct FrsrState {
+    using TestBitmap32 = typename Arm::bitmap;
     std::vector<TestBitmap32> sources;
     std::vector<TestBitmap32> probes;
     TestBitmap32              target;   // AndSmallVsBand only: the pre-built band container
@@ -3087,7 +3205,8 @@ struct FrsrState {
 
 // Source k owns every kOperands-th element of the band, so the K-way union
 // covers the band exactly and each individual operand stays sparse.
-static void fill_frsr_sources(FrsrState &s, std::size_t band) {
+template <class Arm>
+static void fill_frsr_sources(FrsrState<Arm> &s, std::size_t band) {
     s.sources.resize(kOperands);
     for (std::size_t k = 0; k < kOperands; ++k) {
         for (std::size_t c = 0; c < kChunks; ++c) {
@@ -3100,7 +3219,8 @@ static void fill_frsr_sources(FrsrState &s, std::size_t band) {
 
 // Probes hit elements that are present in the union, so the intersection is
 // non-degenerate; each probe picks a different offset into the band.
-static void fill_frsr_probes(FrsrState &s, std::size_t band) {
+template <class Arm>
+static void fill_frsr_probes(FrsrState<Arm> &s, std::size_t band) {
     s.probes.resize(kProbes);
     auto const step = std::max<std::size_t>(1, band / kProbeCard);
     for (std::size_t p = 0; p < kProbes; ++p) {
@@ -3119,7 +3239,10 @@ static void fill_frsr_probes(FrsrState &s, std::size_t band) {
 // right-hand operand is held as an array or as a bitset. `as_bitset` forces the
 // promotion explicitly via promote_large_arrays(), isolating the form's cost from
 // any question of which build path would choose it.
-static void register_frsr_and_small_vs_band(std::size_t band, bool as_bitset) {
+template <class Arm>
+struct register_frsr_and_small_vs_band_registrar {
+    using TestBitmap32 = typename Arm::bitmap;
+    static void run(std::size_t band, bool as_bitset) {
     using namespace band_fold;
     Entry e;
     char buf[128];
@@ -3132,7 +3255,7 @@ static void register_frsr_and_small_vs_band(std::size_t band, bool as_bitset) {
                     "([croaring-ref] deps/croaring/src/containers/mixed_union.c:"
                     "array_array_container_lazy_union, ARRAY_LAZY_LOWERBOUND).";
     e.setup       = [band, as_bitset]() -> void * {
-        auto *s = new FrsrState;
+        auto *s = new FrsrState<Arm>;
         for (std::size_t c = 0; c < kChunks; ++c) {
             for (std::size_t i = 0; i < band; ++i) {
                 std::ignore = s->target.add(band_value(c, band, i));
@@ -3145,7 +3268,7 @@ static void register_frsr_and_small_vs_band(std::size_t band, bool as_bitset) {
         return s;
     };
     e.run         = [](void *sv) -> int64_t {
-        auto *s = static_cast<FrsrState *>(sv);
+        auto *s = static_cast<FrsrState<Arm> *>(sv);
         int64_t checksum = 0;
         for (std::size_t p = 0; p < kProbes; ++p) {
             TestBitmap32 probe = s->probes[p];
@@ -3154,19 +3277,24 @@ static void register_frsr_and_small_vs_band(std::size_t band, bool as_bitset) {
         }
         return checksum;
     };
-    e.teardown       = [](void *sv) { delete static_cast<FrsrState *>(sv); };
+    e.teardown       = [](void *sv) { delete static_cast<FrsrState<Arm> *>(sv); };
     e.ops_per_run    = static_cast<int64_t>(kProbes * kChunks);
     e.inner_reps     = kInnerReps;
     e.reusable_state = true;
     g_benchmarks.push_back(std::move(e));
-}
+}};
+template <class Arm> static void register_frsr_and_small_vs_band(std::size_t band, bool as_bitset) { register_frsr_and_small_vs_band_registrar<Arm>::run(band, as_bitset); }
+
 
 // --- B: the end-to-end shape --------------------------------------------
 // Lazily accumulate a K-way union, then fold small operands against it — the
 // shape whose form decision the promotion threshold governs. Measured
 // end-to-end on purpose: the union phase pays for the promotion and the fold
 // phase collects on it, and only their sum says whether it was worth it.
-static void register_frsr_lazy_union_fold(std::size_t band) {
+template <class Arm>
+struct register_frsr_lazy_union_fold_registrar {
+    using TestBitmap32 = typename Arm::bitmap;
+    static void run(std::size_t band) {
     using namespace band_fold;
     Entry e;
     char buf[128];
@@ -3176,13 +3304,13 @@ static void register_frsr_lazy_union_fold(std::size_t band) {
                     "bulk_or_finish_keep_bitsets) then AND-fold of " + std::to_string(kProbes) +
                     " small operands, per-chunk union cardinality ~" + std::to_string(band) + ".";
     e.setup       = [band]() -> void * {
-        auto *s = new FrsrState;
+        auto *s = new FrsrState<Arm>;
         fill_frsr_sources(*s, band);
         fill_frsr_probes (*s, band);
         return s;
     };
     e.run         = [](void *sv) -> int64_t {
-        auto *s = static_cast<FrsrState *>(sv);
+        auto *s = static_cast<FrsrState<Arm> *>(sv);
         TestBitmap32 acc;
         for (auto const &src : s->sources) {
             acc.bulk_or_intermediate(src);
@@ -3196,12 +3324,14 @@ static void register_frsr_lazy_union_fold(std::size_t band) {
         }
         return checksum;
     };
-    e.teardown       = [](void *sv) { delete static_cast<FrsrState *>(sv); };
+    e.teardown       = [](void *sv) { delete static_cast<FrsrState<Arm> *>(sv); };
     e.ops_per_run    = static_cast<int64_t>((kOperands + kProbes) * kChunks);
     e.inner_reps     = kInnerReps;
     e.reusable_state = true;
     g_benchmarks.push_back(std::move(e));
-}
+}};
+template <class Arm> static void register_frsr_lazy_union_fold(std::size_t band) { register_frsr_lazy_union_fold_registrar<Arm>::run(band); }
+
 
 // Same shape, but finishing through optimize() — the finish an index-building
 // caller actually performs. optimize() re-decides array-vs-bitset at
@@ -3210,7 +3340,10 @@ static void register_frsr_lazy_union_fold(std::size_t band) {
 // This variant, not the one above, is the regression guard: it should track
 // the keep-bitsets variant, and any divergence at band=2048 while the 512 and
 // 8192 controls stay level is that down-conversion coming back.
-static void register_frsr_lazy_union_fold_optimized(std::size_t band, bool keep_bitsets) {
+template <class Arm>
+struct register_frsr_lazy_union_fold_optimized_registrar {
+    using TestBitmap32 = typename Arm::bitmap;
+    static void run(std::size_t band, bool keep_bitsets) {
     using namespace band_fold;
     Entry e;
     char buf[128];
@@ -3223,13 +3356,13 @@ static void register_frsr_lazy_union_fold_optimized(std::size_t band, bool keep_
                     " small operands, per-chunk union cardinality ~" + std::to_string(band) +
                     " — the index-build finish path.";
     e.setup       = [band]() -> void * {
-        auto *s = new FrsrState;
+        auto *s = new FrsrState<Arm>;
         fill_frsr_sources(*s, band);
         fill_frsr_probes (*s, band);
         return s;
     };
     e.run         = [keep_bitsets](void *sv) -> int64_t {
-        auto *s = static_cast<FrsrState *>(sv);
+        auto *s = static_cast<FrsrState<Arm> *>(sv);
         TestBitmap32 acc;
         for (auto const &src : s->sources) {
             acc.bulk_or_intermediate(src);
@@ -3244,14 +3377,17 @@ static void register_frsr_lazy_union_fold_optimized(std::size_t band, bool keep_
         }
         return checksum;
     };
-    e.teardown       = [](void *sv) { delete static_cast<FrsrState *>(sv); };
+    e.teardown       = [](void *sv) { delete static_cast<FrsrState<Arm> *>(sv); };
     e.ops_per_run    = static_cast<int64_t>((kOperands + kProbes) * kChunks);
     e.inner_reps     = kInnerReps;
     e.reusable_state = true;
     g_benchmarks.push_back(std::move(e));
-}
+}};
+template <class Arm> static void register_frsr_lazy_union_fold_optimized(std::size_t band, bool keep_bitsets) { register_frsr_lazy_union_fold_optimized_registrar<Arm>::run(band, keep_bitsets); }
+
 
 #if FRSR_ROARING_HAS_CROARING
+template <class Arm>
 struct CppBandState {
     std::vector<roaring_bitmap_t *> sources;
     std::vector<roaring_bitmap_t *> probes;
@@ -3267,7 +3403,9 @@ struct CppBandState {
 // lazy promotion at finish time; frsr's bulk_or_finish_keep_bitsets() does
 // not. The comparison is therefore between each library's natural bulk-union
 // idiom, which is what a caller actually gets.
-static void register_cpp_lazy_union_fold(std::size_t band) {
+template <class Arm>
+struct register_cpp_lazy_union_fold_registrar {
+    static void run(std::size_t band) {
     using namespace band_fold;
     Entry e;
     char buf[128];
@@ -3277,10 +3415,10 @@ static void register_cpp_lazy_union_fold(std::size_t band) {
                     "roaring_bitmap_repair_after_lazy) then AND-fold of " + std::to_string(kProbes) +
                     " small operands, per-chunk union cardinality ~" + std::to_string(band) + ".";
     e.setup       = [band]() -> void * {
-        auto *s = new CppBandState;
+        auto *s = new CppBandState<Arm>;
         s->sources.resize(kOperands);
         for (std::size_t k = 0; k < kOperands; ++k) {
-            s->sources[k] = roaring_bitmap_create();
+            s->sources[k] = Arm::create();
             for (std::size_t c = 0; c < kChunks; ++c) {
                 for (std::size_t i = k; i < band; i += kOperands) {
                     roaring_bitmap_add(s->sources[k], band_value(c, band, i));
@@ -3290,7 +3428,7 @@ static void register_cpp_lazy_union_fold(std::size_t band) {
         s->probes.resize(kProbes);
         auto const step = std::max<std::size_t>(1, band / kProbeCard);
         for (std::size_t p = 0; p < kProbes; ++p) {
-            s->probes[p] = roaring_bitmap_create();
+            s->probes[p] = Arm::create();
             for (std::size_t c = 0; c < kChunks; ++c) {
                 for (std::size_t j = 0; j < kProbeCard; ++j) {
                     roaring_bitmap_add(s->probes[p], band_value(c, band, (j * step + p) % band));
@@ -3300,15 +3438,15 @@ static void register_cpp_lazy_union_fold(std::size_t band) {
         return s;
     };
     e.run         = [](void *sv) -> int64_t {
-        auto *s   = static_cast<CppBandState *>(sv);
-        auto *acc = roaring_bitmap_create();
+        auto *s   = static_cast<CppBandState<Arm> *>(sv);
+        auto *acc = Arm::create();
         for (auto *src : s->sources) {
             roaring_bitmap_lazy_or_inplace(acc, src, true /* bitset conversion */);
         }
         roaring_bitmap_repair_after_lazy(acc);
         int64_t checksum = static_cast<int64_t>(roaring_bitmap_get_cardinality(acc));
         for (std::size_t p = 0; p < kProbes; ++p) {
-            auto *probe = roaring_bitmap_copy(s->probes[p]);
+            auto *probe = Arm::copy(s->probes[p]);
             roaring_bitmap_and_inplace(probe, acc);
             checksum += static_cast<int64_t>(roaring_bitmap_get_cardinality(probe));
             roaring_bitmap_free(probe);
@@ -3316,23 +3454,28 @@ static void register_cpp_lazy_union_fold(std::size_t band) {
         roaring_bitmap_free(acc);
         return checksum;
     };
-    e.teardown       = [](void *sv) { delete static_cast<CppBandState *>(sv); };
+    e.teardown       = [](void *sv) { delete static_cast<CppBandState<Arm> *>(sv); };
     e.ops_per_run    = static_cast<int64_t>((kOperands + kProbes) * kChunks);
     e.inner_reps     = kInnerReps;
     e.reusable_state = true;
     g_benchmarks.push_back(std::move(e));
-}
+}};
+template <class Arm> static void register_cpp_lazy_union_fold(std::size_t band) { register_cpp_lazy_union_fold_registrar<Arm>::run(band); }
+
 #endif // FRSR_ROARING_HAS_CROARING
 
-static void register_frsr_array_run_and_fold(std::size_t repeat) {
+template <class Arm>
+struct register_frsr_array_run_and_fold_registrar {
+    using TestBitmap32 = typename Arm::bitmap;
+    static void run(std::size_t repeat) {
     Entry e;
-    e.name        = fmt_so("frsr", "ArrayRunAndFold", repeat, "arrayXruns");
+    e.name        = fmt_so(Arm::label(), "ArrayRunAndFold", repeat, "arrayXruns");
     e.description = "frsr N-way AND fold: array-encoded accumulator &= " +
                      std::to_string(kArrayRunFoldOperands) + " run-encoded operands "
                      "(clustered ranges), sole-owned accumulator — a downstream N-way AND fold shape.";
-    e.setup       = make_frsr_array_run_fold_state;
+    e.setup       = make_frsr_array_run_fold_state<Arm>;
     e.run         = [repeat](void *sv) -> int64_t {
-        auto *s = static_cast<FrsrArrayRunFoldState *>(sv);
+        auto *s = static_cast<FrsrArrayRunFoldState<Arm> *>(sv);
         int64_t checksum = 0;
         for (std::size_t i = 0; i < repeat; ++i) {
             TestBitmap32 acc = s->seed & s->ops[0];
@@ -3343,22 +3486,27 @@ static void register_frsr_array_run_and_fold(std::size_t repeat) {
         }
         return checksum;
     };
-    e.teardown       = [](void *sv) { delete static_cast<FrsrArrayRunFoldState *>(sv); };
+    e.teardown       = [](void *sv) { delete static_cast<FrsrArrayRunFoldState<Arm> *>(sv); };
     e.ops_per_run    = static_cast<int64_t>(repeat * kArrayRunFoldOperands);
     e.inner_reps     = kArrayRunFoldInnerReps;
     e.reusable_state = true;
     g_benchmarks.push_back(std::move(e));
-}
+}};
+template <class Arm> static void register_frsr_array_run_and_fold(std::size_t repeat) { register_frsr_array_run_and_fold_registrar<Arm>::run(repeat); }
 
-static void register_frsr_array_run_and_fold_shared(std::size_t repeat) {
+
+template <class Arm>
+struct register_frsr_array_run_and_fold_shared_registrar {
+    using TestBitmap32 = typename Arm::bitmap;
+    static void run(std::size_t repeat) {
     Entry e;
-    e.name        = fmt_so("frsr", "ArrayRunAndFoldShared", repeat, "arrayXruns");
+    e.name        = fmt_so(Arm::label(), "ArrayRunAndFoldShared", repeat, "arrayXruns");
     e.description = "frsr N-way AND fold over a SHARED accumulator: shallow copy-on-write "
                      "copy of a persistent bitmap (rc > 1), first &= pays the write "
                      "barrier/clone — a downstream engine's fold-from-copied-first-operand shape.";
-    e.setup       = make_frsr_array_run_fold_state;
+    e.setup       = make_frsr_array_run_fold_state<Arm>;
     e.run         = [repeat](void *sv) -> int64_t {
-        auto *s = static_cast<FrsrArrayRunFoldState *>(sv);
+        auto *s = static_cast<FrsrArrayRunFoldState<Arm> *>(sv);
         int64_t checksum = 0;
         for (std::size_t i = 0; i < repeat; ++i) {
             TestBitmap32 acc{ s->seed };   // shallow COW copy, containers shared
@@ -3369,21 +3517,25 @@ static void register_frsr_array_run_and_fold_shared(std::size_t repeat) {
         }
         return checksum;
     };
-    e.teardown       = [](void *sv) { delete static_cast<FrsrArrayRunFoldState *>(sv); };
+    e.teardown       = [](void *sv) { delete static_cast<FrsrArrayRunFoldState<Arm> *>(sv); };
     e.ops_per_run    = static_cast<int64_t>(repeat * kArrayRunFoldOperands);
     e.inner_reps     = kArrayRunFoldInnerReps;
     e.reusable_state = true;
     g_benchmarks.push_back(std::move(e));
-}
+}};
+template <class Arm> static void register_frsr_array_run_and_fold_shared(std::size_t repeat) { register_frsr_array_run_and_fold_shared_registrar<Arm>::run(repeat); }
 
-static void register_cpp_array_run_and_fold(std::size_t repeat) {
+
+template <class Arm>
+struct register_cpp_array_run_and_fold_registrar {
+    static void run(std::size_t repeat) {
     Entry e;
-    e.name        = fmt_so("cpp", "ArrayRunAndFold", repeat, "arrayXruns");
+    e.name        = fmt_so(Arm::label(), "ArrayRunAndFold", repeat, "arrayXruns");
     e.description = "CRoaring apples-to-apples counterpart of the frsr ArrayRunAndFold "
                      "scenario (roaring_bitmap_and + and_inplace fold).";
-    e.setup       = make_cpp_array_run_fold_state;
+    e.setup       = make_cpp_array_run_fold_state<Arm>;
     e.run         = [repeat](void *sv) -> int64_t {
-        auto *s = static_cast<CppArrayRunFoldState *>(sv);
+        auto *s = static_cast<CppArrayRunFoldState<Arm> *>(sv);
         int64_t checksum = 0;
         for (std::size_t i = 0; i < repeat; ++i) {
             auto *acc = roaring_bitmap_and(s->seed, s->ops[0]);
@@ -3395,28 +3547,32 @@ static void register_cpp_array_run_and_fold(std::size_t repeat) {
         }
         return checksum;
     };
-    e.teardown       = [](void *sv) { delete static_cast<CppArrayRunFoldState *>(sv); };
+    e.teardown       = [](void *sv) { delete static_cast<CppArrayRunFoldState<Arm> *>(sv); };
     e.ops_per_run    = static_cast<int64_t>(repeat * kArrayRunFoldOperands);
     e.inner_reps     = kArrayRunFoldInnerReps;
     e.reusable_state = true;
     g_benchmarks.push_back(std::move(e));
-}
+}};
+template <class Arm> static void register_cpp_array_run_and_fold(std::size_t repeat) { register_cpp_array_run_and_fold_registrar<Arm>::run(repeat); }
 
-static void register_cpp_array_run_and_fold_shared(std::size_t repeat) {
+
+template <class Arm>
+struct register_cpp_array_run_and_fold_shared_registrar {
+    static void run(std::size_t repeat) {
     Entry e;
-    e.name        = fmt_so("cpp", "ArrayRunAndFoldShared", repeat, "arrayXruns");
+    e.name        = fmt_so(Arm::label(), "ArrayRunAndFoldShared", repeat, "arrayXruns");
     e.description = "CRoaring counterpart of ArrayRunAndFoldShared: copy_on_write enabled, "
                      "accumulator = roaring_bitmap_copy (shallow), and_inplace fold.";
     e.setup       = []() -> void * {
-        auto *s = static_cast<CppArrayRunFoldState *>(make_cpp_array_run_fold_state());
+        auto *s = static_cast<CppArrayRunFoldState<Arm> *>(make_cpp_array_run_fold_state<Arm>());
         roaring_bitmap_set_copy_on_write(s->seed, true);
         return s;
     };
     e.run         = [repeat](void *sv) -> int64_t {
-        auto *s = static_cast<CppArrayRunFoldState *>(sv);
+        auto *s = static_cast<CppArrayRunFoldState<Arm> *>(sv);
         int64_t checksum = 0;
         for (std::size_t i = 0; i < repeat; ++i) {
-            auto *acc = roaring_bitmap_copy(s->seed);   // COW-shallow
+            auto *acc = Arm::copy(s->seed);   // COW-shallow
             for (std::size_t k = 0; k < kArrayRunFoldOperands; ++k) {
                 roaring_bitmap_and_inplace(acc, s->ops[k]);
             }
@@ -3425,12 +3581,14 @@ static void register_cpp_array_run_and_fold_shared(std::size_t repeat) {
         }
         return checksum;
     };
-    e.teardown       = [](void *sv) { delete static_cast<CppArrayRunFoldState *>(sv); };
+    e.teardown       = [](void *sv) { delete static_cast<CppArrayRunFoldState<Arm> *>(sv); };
     e.ops_per_run    = static_cast<int64_t>(repeat * kArrayRunFoldOperands);
     e.inner_reps     = kArrayRunFoldInnerReps;
     e.reusable_state = true;
     g_benchmarks.push_back(std::move(e));
-}
+}};
+template <class Arm> static void register_cpp_array_run_and_fold_shared(std::size_t repeat) { register_cpp_array_run_and_fold_shared_registrar<Arm>::run(repeat); }
+
 
 // ========================================================================
 // Shared run-encoded accumulator, single AND (run∩array / run∩bitset)
@@ -3589,14 +3747,19 @@ static constexpr std::size_t kSkewedLargeSize  = 4'000;   // just under the 4096
 static constexpr std::size_t kSkewedSmallSize  = 40;      // ratio = 100, well above the 64 skew gate
 static constexpr int         kSkewedInnerReps  = 5;
 
+template <class Arm>
 struct FrsrSkewedState {
+    using TestBitmap32 = typename Arm::bitmap;
     TestBitmap32 large;
     TestBitmap32 small;
 };
 
-static void register_frsr_skewed_intersect(std::size_t repeat) {
+template <class Arm>
+struct register_frsr_skewed_intersect_registrar {
+    using TestBitmap32 = typename Arm::bitmap;
+    static void run(std::size_t repeat) {
     auto make_state = []() -> void * {
-        auto *s = new FrsrSkewedState;
+        auto *s = new FrsrSkewedState<Arm>;
         for (std::size_t i = 0; i < kSkewedLargeSize; ++i) {
             std::ignore = s->large.add(static_cast<std::uint32_t>(i));
         }
@@ -3606,10 +3769,10 @@ static void register_frsr_skewed_intersect(std::size_t repeat) {
         }
         return s;
     };
-    auto free_state = [](void *sv) { delete static_cast<FrsrSkewedState *>(sv); };
+    auto free_state = [](void *sv) { delete static_cast<FrsrSkewedState<Arm> *>(sv); };
 
     Entry e;
-    e.name        = fmt_so("frsr", "SkewedIntersect", repeat, "skew100x");
+    e.name        = fmt_so(Arm::label(), "SkewedIntersect", repeat, "skew100x");
     e.description = "frsr::roaring::bitmap<uint32_t> operator& between a " +
                      std::to_string(kSkewedLargeSize) + "-element array and a " +
                      std::to_string(kSkewedSmallSize) + "-element array (ratio " +
@@ -3619,7 +3782,7 @@ static void register_frsr_skewed_intersect(std::size_t repeat) {
                      "(differential-profiling finding).";
     e.setup       = make_state;
     e.run         = [repeat](void *sv) -> int64_t {
-        auto *s = static_cast<FrsrSkewedState *>(sv);
+        auto *s = static_cast<FrsrSkewedState<Arm> *>(sv);
         int64_t checksum = 0;
         for (std::size_t i = 0; i < repeat; ++i) {
             TestBitmap32 r = s->small & s->large;
@@ -3632,9 +3795,12 @@ static void register_frsr_skewed_intersect(std::size_t repeat) {
     e.inner_reps     = kSkewedInnerReps;
     e.reusable_state = true;
     g_benchmarks.push_back(std::move(e));
-}
+}};
+template <class Arm> static void register_frsr_skewed_intersect(std::size_t repeat) { register_frsr_skewed_intersect_registrar<Arm>::run(repeat); }
+
 
 #if FRSR_ROARING_HAS_CROARING
+template <class Arm>
 struct CppSkewedState {
     roaring_bitmap_t *large{};
     roaring_bitmap_t *small{};
@@ -3645,11 +3811,13 @@ struct CppSkewedState {
     }
 };
 
-static void register_cpp_skewed_intersect(std::size_t repeat) {
+template <class Arm>
+struct register_cpp_skewed_intersect_registrar {
+    static void run(std::size_t repeat) {
     auto make_state = []() -> void * {
-        auto *s = new CppSkewedState;
-        s->large = roaring_bitmap_create();
-        s->small = roaring_bitmap_create();
+        auto *s = new CppSkewedState<Arm>;
+        s->large = Arm::create();
+        s->small = Arm::create();
         // Individual adds, NOT add_range_closed: add_range materializes a RUN
         // container, which routes roaring_bitmap_and through the trivial
         // run∩array path instead of the skewed array∩array kernel this bench
@@ -3665,16 +3833,16 @@ static void register_cpp_skewed_intersect(std::size_t repeat) {
         }
         return s;
     };
-    auto free_state = [](void *sv) { delete static_cast<CppSkewedState *>(sv); };
+    auto free_state = [](void *sv) { delete static_cast<CppSkewedState<Arm> *>(sv); };
 
     Entry e;
-    e.name        = fmt_so("cpp", "SkewedIntersect", repeat, "skew100x");
+    e.name        = fmt_so(Arm::label(), "SkewedIntersect", repeat, "skew100x");
     e.description = "CRoaring roaring_bitmap_and() — apples-to-apples counterpart of the "
                      "frsr SkewedIntersect scenario (exercises CRoaring's own "
                      "array_container_intersection skewed/binary-search gate).";
     e.setup       = make_state;
     e.run         = [repeat](void *sv) -> int64_t {
-        auto *s = static_cast<CppSkewedState *>(sv);
+        auto *s = static_cast<CppSkewedState<Arm> *>(sv);
         int64_t checksum = 0;
         for (std::size_t i = 0; i < repeat; ++i) {
             auto *r = roaring_bitmap_and(s->small, s->large);
@@ -3688,7 +3856,9 @@ static void register_cpp_skewed_intersect(std::size_t repeat) {
     e.inner_reps     = kSkewedInnerReps;
     e.reusable_state = true;
     g_benchmarks.push_back(std::move(e));
-}
+}};
+template <class Arm> static void register_cpp_skewed_intersect(std::size_t repeat) { register_cpp_skewed_intersect_registrar<Arm>::run(repeat); }
+
 #endif // FRSR_ROARING_HAS_CROARING
 
 // ========================================================================
@@ -3709,9 +3879,12 @@ static constexpr std::size_t kMidSkewLargeSize = 1'600;
 static constexpr std::size_t kMidSkewSmallSize = 600;    // ratio ~2.7, well below the 64 skew gate
 static constexpr int         kMidSkewInnerReps = 5;
 
-static void register_frsr_midskew_intersect(std::size_t repeat) {
+template <class Arm>
+struct register_frsr_midskew_intersect_registrar {
+    using TestBitmap32 = typename Arm::bitmap;
+    static void run(std::size_t repeat) {
     auto make_state = []() -> void * {
-        auto *s = new FrsrSkewedState;
+        auto *s = new FrsrSkewedState<Arm>;
         for (std::size_t i = 0; i < kMidSkewLargeSize; ++i) {
             std::ignore = s->large.add(static_cast<std::uint32_t>(i * 2));  // strided: array-encoded, not run-friendly
         }
@@ -3721,10 +3894,10 @@ static void register_frsr_midskew_intersect(std::size_t repeat) {
         }
         return s;
     };
-    auto free_state = [](void *sv) { delete static_cast<FrsrSkewedState *>(sv); };
+    auto free_state = [](void *sv) { delete static_cast<FrsrSkewedState<Arm> *>(sv); };
 
     Entry e;
-    e.name        = fmt_so("frsr", "MidSkewIntersect", repeat, "skew3x");
+    e.name        = fmt_so(Arm::label(), "MidSkewIntersect", repeat, "skew3x");
     e.description = "frsr::roaring::bitmap<uint32_t> operator& between a " +
                      std::to_string(kMidSkewLargeSize) + "-element array and a " +
                      std::to_string(kMidSkewSmallSize) + "-element array (ratio ~3x, below the "
@@ -3733,7 +3906,7 @@ static void register_frsr_midskew_intersect(std::size_t repeat) {
                      "downstream array-intersect shape.";
     e.setup       = make_state;
     e.run         = [repeat](void *sv) -> int64_t {
-        auto *s = static_cast<FrsrSkewedState *>(sv);
+        auto *s = static_cast<FrsrSkewedState<Arm> *>(sv);
         int64_t checksum = 0;
         for (std::size_t i = 0; i < repeat; ++i) {
             TestBitmap32 r = s->small & s->large;
@@ -3746,14 +3919,18 @@ static void register_frsr_midskew_intersect(std::size_t repeat) {
     e.inner_reps     = kMidSkewInnerReps;
     e.reusable_state = true;
     g_benchmarks.push_back(std::move(e));
-}
+}};
+template <class Arm> static void register_frsr_midskew_intersect(std::size_t repeat) { register_frsr_midskew_intersect_registrar<Arm>::run(repeat); }
+
 
 #if FRSR_ROARING_HAS_CROARING
-static void register_cpp_midskew_intersect(std::size_t repeat) {
+template <class Arm>
+struct register_cpp_midskew_intersect_registrar {
+    static void run(std::size_t repeat) {
     auto make_state = []() -> void * {
-        auto *s = new CppSkewedState;
-        s->large = roaring_bitmap_create();
-        s->small = roaring_bitmap_create();
+        auto *s = new CppSkewedState<Arm>;
+        s->large = Arm::create();
+        s->small = Arm::create();
         for (std::size_t i = 0; i < kMidSkewLargeSize; ++i) {
             roaring_bitmap_add(s->large, static_cast<std::uint32_t>(i * 2));
         }
@@ -3763,16 +3940,16 @@ static void register_cpp_midskew_intersect(std::size_t repeat) {
         }
         return s;
     };
-    auto free_state = [](void *sv) { delete static_cast<CppSkewedState *>(sv); };
+    auto free_state = [](void *sv) { delete static_cast<CppSkewedState<Arm> *>(sv); };
 
     Entry e;
-    e.name        = fmt_so("cpp", "MidSkewIntersect", repeat, "skew3x");
+    e.name        = fmt_so(Arm::label(), "MidSkewIntersect", repeat, "skew3x");
     e.description = "CRoaring roaring_bitmap_and() — apples-to-apples counterpart of the "
                      "frsr MidSkewIntersect scenario (CRoaring routes it through its "
                      "intersect_vector16 SIMD kernel).";
     e.setup       = make_state;
     e.run         = [repeat](void *sv) -> int64_t {
-        auto *s = static_cast<CppSkewedState *>(sv);
+        auto *s = static_cast<CppSkewedState<Arm> *>(sv);
         int64_t checksum = 0;
         for (std::size_t i = 0; i < repeat; ++i) {
             auto *r = roaring_bitmap_and(s->small, s->large);
@@ -3786,7 +3963,9 @@ static void register_cpp_midskew_intersect(std::size_t repeat) {
     e.inner_reps     = kMidSkewInnerReps;
     e.reusable_state = true;
     g_benchmarks.push_back(std::move(e));
-}
+}};
+template <class Arm> static void register_cpp_midskew_intersect(std::size_t repeat) { register_cpp_midskew_intersect_registrar<Arm>::run(repeat); }
+
 #endif // FRSR_ROARING_HAS_CROARING
 
 // ========================================================================
@@ -3810,14 +3989,19 @@ static constexpr std::size_t kMixedBitsetDenseSize = 32'768;  // half of a 65536
 static constexpr std::size_t kMixedArraySmallSize  = 64;      // stays array-encoded; strided across the dense range for an unpredictable hit/miss pattern
 static constexpr int         kMixedInnerReps       = 5;
 
+template <class Arm>
 struct FrsrMixedArrayBitsetState {
+    using TestBitmap32 = typename Arm::bitmap;
     TestBitmap32 dense;
     TestBitmap32 sparse;
 };
 
-static void register_frsr_mixed_array_bitset_intersect(std::size_t repeat) {
+template <class Arm>
+struct register_frsr_mixed_array_bitset_intersect_registrar {
+    using TestBitmap32 = typename Arm::bitmap;
+    static void run(std::size_t repeat) {
     auto make_state = []() -> void * {
-        auto *s = new FrsrMixedArrayBitsetState;
+        auto *s = new FrsrMixedArrayBitsetState<Arm>;
         for (std::size_t i = 0; i < kMixedBitsetDenseSize; ++i) {
             std::ignore = s->dense.add(static_cast<std::uint32_t>(2 * i));  // every other value -> bitset container, ~50% hit rate for the array side
         }
@@ -3827,10 +4011,10 @@ static void register_frsr_mixed_array_bitset_intersect(std::size_t repeat) {
         }
         return s;
     };
-    auto free_state = [](void *sv) { delete static_cast<FrsrMixedArrayBitsetState *>(sv); };
+    auto free_state = [](void *sv) { delete static_cast<FrsrMixedArrayBitsetState<Arm> *>(sv); };
 
     Entry e;
-    e.name        = fmt_so("frsr", "MixedArrayBitsetIntersect", repeat, "arrayXbitset");
+    e.name        = fmt_so(Arm::label(), "MixedArrayBitsetIntersect", repeat, "arrayXbitset");
     e.description = "frsr::roaring::bitmap<uint32_t> operator& between a " +
                      std::to_string(kMixedArraySmallSize) + "-element array and a " +
                      std::to_string(kMixedBitsetDenseSize) + "-element bitset-encoded operand, "
@@ -3839,7 +4023,7 @@ static void register_frsr_mixed_array_bitset_intersect(std::size_t repeat) {
                      "(differential-profiling finding, filter_array_bitset kernel).";
     e.setup       = make_state;
     e.run         = [repeat](void *sv) -> int64_t {
-        auto *s = static_cast<FrsrMixedArrayBitsetState *>(sv);
+        auto *s = static_cast<FrsrMixedArrayBitsetState<Arm> *>(sv);
         int64_t checksum = 0;
         for (std::size_t i = 0; i < repeat; ++i) {
             TestBitmap32 r = s->sparse & s->dense;
@@ -3852,7 +4036,9 @@ static void register_frsr_mixed_array_bitset_intersect(std::size_t repeat) {
     e.inner_reps     = kMixedInnerReps;
     e.reusable_state = true;
     g_benchmarks.push_back(std::move(e));
-}
+}};
+template <class Arm> static void register_frsr_mixed_array_bitset_intersect(std::size_t repeat) { register_frsr_mixed_array_bitset_intersect_registrar<Arm>::run(repeat); }
+
 
 // Clustered counterpart of the intersect scenario above: the strided 64-key shape
 // has exactly one key per 64-bit bitset word (zero word reuse — worst case for the
@@ -3863,9 +4049,12 @@ static void register_frsr_mixed_array_bitset_intersect(std::size_t repeat) {
 // empty (zero words -> bulk-skip shortcut).
 static constexpr std::size_t kMixedClusteredArraySize = 4'096;
 
-static void register_frsr_mixed_array_bitset_intersect_clustered(std::size_t repeat) {
+template <class Arm>
+struct register_frsr_mixed_array_bitset_intersect_clustered_registrar {
+    using TestBitmap32 = typename Arm::bitmap;
+    static void run(std::size_t repeat) {
     auto make_state = []() -> void * {
-        auto *s = new FrsrMixedArrayBitsetState;
+        auto *s = new FrsrMixedArrayBitsetState<Arm>;
         for (std::size_t i = 0; i < kMixedBitsetDenseSize; ++i) {
             std::ignore = s->dense.add(static_cast<std::uint32_t>(i));  // solid [0, 32768) -> all-ones words below, zero words above
         }
@@ -3874,17 +4063,17 @@ static void register_frsr_mixed_array_bitset_intersect_clustered(std::size_t rep
         }
         return s;
     };
-    auto free_state = [](void *sv) { delete static_cast<FrsrMixedArrayBitsetState *>(sv); };
+    auto free_state = [](void *sv) { delete static_cast<FrsrMixedArrayBitsetState<Arm> *>(sv); };
 
     Entry e;
-    e.name        = fmt_so("frsr", "MixedArrayBitsetIntersectClustered", repeat, "wordreuse");
+    e.name        = fmt_so(Arm::label(), "MixedArrayBitsetIntersectClustered", repeat, "wordreuse");
     e.description = "frsr::roaring::bitmap<uint32_t> operator& between a " +
                      std::to_string(kMixedClusteredArraySize) + "-element stride-16 array and a "
                      "solid-range bitset-encoded operand — word-reuse + all-ones/zero-word "
                      "shortcut shape of the word-cached array-vs-bitset filter kernel.";
     e.setup       = make_state;
     e.run         = [repeat](void *sv) -> int64_t {
-        auto *s = static_cast<FrsrMixedArrayBitsetState *>(sv);
+        auto *s = static_cast<FrsrMixedArrayBitsetState<Arm> *>(sv);
         int64_t checksum = 0;
         for (std::size_t i = 0; i < repeat; ++i) {
             TestBitmap32 r = s->sparse & s->dense;
@@ -3897,7 +4086,9 @@ static void register_frsr_mixed_array_bitset_intersect_clustered(std::size_t rep
     e.inner_reps     = kMixedInnerReps;
     e.reusable_state = true;
     g_benchmarks.push_back(std::move(e));
-}
+}};
+template <class Arm> static void register_frsr_mixed_array_bitset_intersect_clustered(std::size_t repeat) { register_frsr_mixed_array_bitset_intersect_clustered_registrar<Arm>::run(repeat); }
+
 
 // Small-run ∩ bitset: a run-encoded operand of modest cardinality against a
 // bitset-encoded operand — pins the extract_small_run_bitset ctz-walk arm of
@@ -3907,9 +4098,12 @@ static constexpr std::size_t kRunBitsetNumRuns   = 64;
 static constexpr std::size_t kRunBitsetRunLength = 32;   // 64 runs x 32 = 2048 values, well under the 4096 array threshold
 static constexpr std::size_t kRunBitsetStride    = 1'024; // spans [0, 65536) — one chunk
 
-static void register_frsr_run_bitset_intersect(std::size_t repeat) {
+template <class Arm>
+struct register_frsr_run_bitset_intersect_registrar {
+    using TestBitmap32 = typename Arm::bitmap;
+    static void run(std::size_t repeat) {
     auto make_state = []() -> void * {
-        auto *s = new FrsrMixedArrayBitsetState;
+        auto *s = new FrsrMixedArrayBitsetState<Arm>;
         for (std::size_t i = 0; i < kMixedBitsetDenseSize; ++i) {
             std::ignore = s->dense.add(static_cast<std::uint32_t>(i));  // solid [0, 32768) -> bitset container
         }
@@ -3920,10 +4114,10 @@ static void register_frsr_run_bitset_intersect(std::size_t repeat) {
         s->sparse.optimize();  // force run encoding
         return s;
     };
-    auto free_state = [](void *sv) { delete static_cast<FrsrMixedArrayBitsetState *>(sv); };
+    auto free_state = [](void *sv) { delete static_cast<FrsrMixedArrayBitsetState<Arm> *>(sv); };
 
     Entry e;
-    e.name        = fmt_so("frsr", "RunBitsetIntersect", repeat, "runXbitset");
+    e.name        = fmt_so(Arm::label(), "RunBitsetIntersect", repeat, "runXbitset");
     e.description = "frsr::roaring::bitmap<uint32_t> operator& between a run-encoded operand "
                      "(" + std::to_string(kRunBitsetNumRuns) + " runs x " +
                      std::to_string(kRunBitsetRunLength) + " values) and a " +
@@ -3931,7 +4125,7 @@ static void register_frsr_run_bitset_intersect(std::size_t repeat) {
                      "small-run-vs-bitset combine arm (array-result ctz extraction).";
     e.setup       = make_state;
     e.run         = [repeat](void *sv) -> int64_t {
-        auto *s = static_cast<FrsrMixedArrayBitsetState *>(sv);
+        auto *s = static_cast<FrsrMixedArrayBitsetState<Arm> *>(sv);
         int64_t checksum = 0;
         for (std::size_t i = 0; i < repeat; ++i) {
             TestBitmap32 r = s->sparse & s->dense;
@@ -3944,15 +4138,20 @@ static void register_frsr_run_bitset_intersect(std::size_t repeat) {
     e.inner_reps     = kMixedInnerReps;
     e.reusable_state = true;
     g_benchmarks.push_back(std::move(e));
-}
+}};
+template <class Arm> static void register_frsr_run_bitset_intersect(std::size_t repeat) { register_frsr_run_bitset_intersect_registrar<Arm>::run(repeat); }
+
 
 // array\bitset (andnot) counterpart of the intersect scenario above: same operands,
 // same combine_containers array∩bitset arm, but keep_matches == false — pins the
 // difference route of the D2a direct-fill path (filter_array_bitset_into into the
 // result payload, no scratch + no scratch→payload copy).
-static void register_frsr_mixed_array_bitset_andnot(std::size_t repeat) {
+template <class Arm>
+struct register_frsr_mixed_array_bitset_andnot_registrar {
+    using TestBitmap32 = typename Arm::bitmap;
+    static void run(std::size_t repeat) {
     auto make_state = []() -> void * {
-        auto *s = new FrsrMixedArrayBitsetState;
+        auto *s = new FrsrMixedArrayBitsetState<Arm>;
         for (std::size_t i = 0; i < kMixedBitsetDenseSize; ++i) {
             std::ignore = s->dense.add(static_cast<std::uint32_t>(2 * i));
         }
@@ -3962,10 +4161,10 @@ static void register_frsr_mixed_array_bitset_andnot(std::size_t repeat) {
         }
         return s;
     };
-    auto free_state = [](void *sv) { delete static_cast<FrsrMixedArrayBitsetState *>(sv); };
+    auto free_state = [](void *sv) { delete static_cast<FrsrMixedArrayBitsetState<Arm> *>(sv); };
 
     Entry e;
-    e.name        = fmt_so("frsr", "MixedArrayBitsetAndnot", repeat, "arrayXbitset");
+    e.name        = fmt_so(Arm::label(), "MixedArrayBitsetAndnot", repeat, "arrayXbitset");
     e.description = "frsr::roaring::bitmap<uint32_t> operator- (array \\ bitset) between a " +
                      std::to_string(kMixedArraySmallSize) + "-element array and a " +
                      std::to_string(kMixedBitsetDenseSize) + "-element bitset-encoded operand, "
@@ -3973,7 +4172,7 @@ static void register_frsr_mixed_array_bitset_andnot(std::size_t repeat) {
                      "of the D2a array∩bitset direct-fill combine arm.";
     e.setup       = make_state;
     e.run         = [repeat](void *sv) -> int64_t {
-        auto *s = static_cast<FrsrMixedArrayBitsetState *>(sv);
+        auto *s = static_cast<FrsrMixedArrayBitsetState<Arm> *>(sv);
         int64_t checksum = 0;
         for (std::size_t i = 0; i < repeat; ++i) {
             TestBitmap32 r = s->sparse - s->dense;
@@ -3986,14 +4185,19 @@ static void register_frsr_mixed_array_bitset_andnot(std::size_t repeat) {
     e.inner_reps     = kMixedInnerReps;
     e.reusable_state = true;
     g_benchmarks.push_back(std::move(e));
-}
+}};
+template <class Arm> static void register_frsr_mixed_array_bitset_andnot(std::size_t repeat) { register_frsr_mixed_array_bitset_andnot_registrar<Arm>::run(repeat); }
+
 
 // In-place operator&= counterpart: exercises the same array∩bitset combine arm via
 // the bitmap's in-place intersect fallthrough (combine_containers_for_policy), the
 // other live caller of the D2a path in real downstream filtering.
-static void register_frsr_mixed_array_bitset_intersect_inplace(std::size_t repeat) {
+template <class Arm>
+struct register_frsr_mixed_array_bitset_intersect_inplace_registrar {
+    using TestBitmap32 = typename Arm::bitmap;
+    static void run(std::size_t repeat) {
     auto make_state = []() -> void * {
-        auto *s = new FrsrMixedArrayBitsetState;
+        auto *s = new FrsrMixedArrayBitsetState<Arm>;
         for (std::size_t i = 0; i < kMixedBitsetDenseSize; ++i) {
             std::ignore = s->dense.add(static_cast<std::uint32_t>(2 * i));
         }
@@ -4003,17 +4207,17 @@ static void register_frsr_mixed_array_bitset_intersect_inplace(std::size_t repea
         }
         return s;
     };
-    auto free_state = [](void *sv) { delete static_cast<FrsrMixedArrayBitsetState *>(sv); };
+    auto free_state = [](void *sv) { delete static_cast<FrsrMixedArrayBitsetState<Arm> *>(sv); };
 
     Entry e;
-    e.name        = fmt_so("frsr", "MixedArrayBitsetIntersectInplace", repeat, "arrayXbitset");
+    e.name        = fmt_so(Arm::label(), "MixedArrayBitsetIntersectInplace", repeat, "arrayXbitset");
     e.description = "frsr::roaring::bitmap<uint32_t> operator&= (in-place array∩bitset) — copies "
                      "the sparse array operand then intersects the dense bitset in place, " +
                      std::to_string(repeat) + " times per timed run; pins the operator&= "
                      "fallthrough route of the D2a array∩bitset combine arm.";
     e.setup       = make_state;
     e.run         = [repeat](void *sv) -> int64_t {
-        auto *s = static_cast<FrsrMixedArrayBitsetState *>(sv);
+        auto *s = static_cast<FrsrMixedArrayBitsetState<Arm> *>(sv);
         int64_t checksum = 0;
         for (std::size_t i = 0; i < repeat; ++i) {
             TestBitmap32 r = s->sparse;
@@ -4027,16 +4231,21 @@ static void register_frsr_mixed_array_bitset_intersect_inplace(std::size_t repea
     e.inner_reps     = kMixedInnerReps;
     e.reusable_state = true;
     g_benchmarks.push_back(std::move(e));
-}
+}};
+template <class Arm> static void register_frsr_mixed_array_bitset_intersect_inplace(std::size_t repeat) { register_frsr_mixed_array_bitset_intersect_inplace_registrar<Arm>::run(repeat); }
+
 
 // Sole-referent (rc==1) in-place array\bitset — the operator-= twin of the D1a
 // fast path below. The sparse array sits on ODD values while the dense bitset
 // holds EVEN ones, so `sparse -= dense` removes nothing: idempotent, repeatable,
 // and alloc-free on the rc==1 branch while still walking the full filter kernel
 // with keep_matches == false.
-static void register_frsr_mixed_array_bitset_subtract_unique_inplace(std::size_t repeat) {
+template <class Arm>
+struct register_frsr_mixed_array_bitset_subtract_unique_inplace_registrar {
+    using TestBitmap32 = typename Arm::bitmap;
+    static void run(std::size_t repeat) {
     auto make_state = []() -> void * {
-        auto *s = new FrsrMixedArrayBitsetState;
+        auto *s = new FrsrMixedArrayBitsetState<Arm>;
         for (std::size_t i = 0; i < kMixedBitsetDenseSize; ++i) {
             std::ignore = s->dense.add(static_cast<std::uint32_t>(2 * i));
         }
@@ -4046,10 +4255,10 @@ static void register_frsr_mixed_array_bitset_subtract_unique_inplace(std::size_t
         }
         return s;
     };
-    auto free_state = [](void *sv) { delete static_cast<FrsrMixedArrayBitsetState *>(sv); };
+    auto free_state = [](void *sv) { delete static_cast<FrsrMixedArrayBitsetState<Arm> *>(sv); };
 
     Entry e;
-    e.name        = fmt_so("frsr", "MixedArrayBitsetSubtractUniqueInplace", repeat, "arrayXbitset");
+    e.name        = fmt_so(Arm::label(), "MixedArrayBitsetSubtractUniqueInplace", repeat, "arrayXbitset");
     e.description = "frsr::roaring::bitmap<uint32_t> operator-= on a UNIQUELY-OWNED (rc==1) " +
                      std::to_string(kMixedArraySmallSize) + "-element array minus a " +
                      std::to_string(kMixedBitsetDenseSize) + "-element bitset (disjoint, idempotent), " +
@@ -4057,7 +4266,7 @@ static void register_frsr_mixed_array_bitset_subtract_unique_inplace(std::size_t
                      "in-place array\\bitset filter (zero allocation, no fresh container_handle).";
     e.setup       = make_state;
     e.run         = [repeat](void *sv) -> int64_t {
-        auto *s = static_cast<FrsrMixedArrayBitsetState *>(sv);
+        auto *s = static_cast<FrsrMixedArrayBitsetState<Arm> *>(sv);
         int64_t checksum = 0;
         for (std::size_t i = 0; i < repeat; ++i) {
             s->sparse -= s->dense;  // sole-owned, disjoint → rc==1 in-place, alloc-free
@@ -4070,16 +4279,21 @@ static void register_frsr_mixed_array_bitset_subtract_unique_inplace(std::size_t
     e.inner_reps     = kMixedInnerReps;
     e.reusable_state = true;
     g_benchmarks.push_back(std::move(e));
-}
+}};
+template <class Arm> static void register_frsr_mixed_array_bitset_subtract_unique_inplace(std::size_t repeat) { register_frsr_mixed_array_bitset_subtract_unique_inplace_registrar<Arm>::run(repeat); }
+
 
 // Sole-referent (rc==1) in-place array∩bitset — the D1a fast path. The array is
 // uniquely owned (never copied ⇒ no CoW clone) and sparse ⊂ dense, so `sparse &=
 // dense` is idempotent and compacts in place with ZERO allocation, repeatable
 // across reps. Contrast MixedArrayBitsetIntersectInplace above, whose `r = sparse`
 // shares the payload (rc==2) and forces the one-time clone-on-write path.
-static void register_frsr_mixed_array_bitset_filter_unique_inplace(std::size_t repeat) {
+template <class Arm>
+struct register_frsr_mixed_array_bitset_filter_unique_inplace_registrar {
+    using TestBitmap32 = typename Arm::bitmap;
+    static void run(std::size_t repeat) {
     auto make_state = []() -> void * {
-        auto *s = new FrsrMixedArrayBitsetState;
+        auto *s = new FrsrMixedArrayBitsetState<Arm>;
         for (std::size_t i = 0; i < kMixedBitsetDenseSize; ++i) {
             std::ignore = s->dense.add(static_cast<std::uint32_t>(2 * i));
         }
@@ -4089,10 +4303,10 @@ static void register_frsr_mixed_array_bitset_filter_unique_inplace(std::size_t r
         }
         return s;
     };
-    auto free_state = [](void *sv) { delete static_cast<FrsrMixedArrayBitsetState *>(sv); };
+    auto free_state = [](void *sv) { delete static_cast<FrsrMixedArrayBitsetState<Arm> *>(sv); };
 
     Entry e;
-    e.name        = fmt_so("frsr", "MixedArrayBitsetFilterUniqueInplace", repeat, "arrayXbitset");
+    e.name        = fmt_so(Arm::label(), "MixedArrayBitsetFilterUniqueInplace", repeat, "arrayXbitset");
     e.description = "frsr::roaring::bitmap<uint32_t> operator&= on a UNIQUELY-OWNED (rc==1) " +
                      std::to_string(kMixedArraySmallSize) + "-element array intersected with a " +
                      std::to_string(kMixedBitsetDenseSize) + "-element bitset (sparse ⊂ dense, "
@@ -4100,7 +4314,7 @@ static void register_frsr_mixed_array_bitset_filter_unique_inplace(std::size_t r
                      "D1a sole-referent in-place filter (zero allocation, no fresh container_handle).";
     e.setup       = make_state;
     e.run         = [repeat](void *sv) -> int64_t {
-        auto *s = static_cast<FrsrMixedArrayBitsetState *>(sv);
+        auto *s = static_cast<FrsrMixedArrayBitsetState<Arm> *>(sv);
         int64_t checksum = 0;
         for (std::size_t i = 0; i < repeat; ++i) {
             s->sparse &= s->dense;  // sole-owned, idempotent → rc==1 in-place, alloc-free
@@ -4113,9 +4327,12 @@ static void register_frsr_mixed_array_bitset_filter_unique_inplace(std::size_t r
     e.inner_reps     = kMixedInnerReps;
     e.reusable_state = true;
     g_benchmarks.push_back(std::move(e));
-}
+}};
+template <class Arm> static void register_frsr_mixed_array_bitset_filter_unique_inplace(std::size_t repeat) { register_frsr_mixed_array_bitset_filter_unique_inplace_registrar<Arm>::run(repeat); }
+
 
 #if FRSR_ROARING_HAS_CROARING
+template <class Arm>
 struct CppMixedArrayBitsetState {
     roaring_bitmap_t *dense{};
     roaring_bitmap_t *sparse{};
@@ -4126,11 +4343,13 @@ struct CppMixedArrayBitsetState {
     }
 };
 
-static void register_cpp_mixed_array_bitset_intersect_clustered(std::size_t repeat) {
+template <class Arm>
+struct register_cpp_mixed_array_bitset_intersect_clustered_registrar {
+    static void run(std::size_t repeat) {
     auto make_state = []() -> void * {
-        auto *s = new CppMixedArrayBitsetState;
-        s->dense  = roaring_bitmap_create();
-        s->sparse = roaring_bitmap_create();
+        auto *s = new CppMixedArrayBitsetState<Arm>;
+        s->dense  = Arm::create();
+        s->sparse = Arm::create();
         for (std::size_t i = 0; i < kMixedBitsetDenseSize; ++i) {
             roaring_bitmap_add(s->dense, static_cast<std::uint32_t>(i));
         }
@@ -4139,15 +4358,15 @@ static void register_cpp_mixed_array_bitset_intersect_clustered(std::size_t repe
         }
         return s;
     };
-    auto free_state = [](void *sv) { delete static_cast<CppMixedArrayBitsetState *>(sv); };
+    auto free_state = [](void *sv) { delete static_cast<CppMixedArrayBitsetState<Arm> *>(sv); };
 
     Entry e;
-    e.name        = fmt_so("cpp", "MixedArrayBitsetIntersectClustered", repeat, "wordreuse");
+    e.name        = fmt_so(Arm::label(), "MixedArrayBitsetIntersectClustered", repeat, "wordreuse");
     e.description = "CRoaring roaring_bitmap_and() — apples-to-apples counterpart of the "
                      "frsr MixedArrayBitsetIntersectClustered scenario.";
     e.setup       = make_state;
     e.run         = [repeat](void *sv) -> int64_t {
-        auto *s = static_cast<CppMixedArrayBitsetState *>(sv);
+        auto *s = static_cast<CppMixedArrayBitsetState<Arm> *>(sv);
         int64_t checksum = 0;
         for (std::size_t i = 0; i < repeat; ++i) {
             auto *r = roaring_bitmap_and(s->sparse, s->dense);
@@ -4161,13 +4380,17 @@ static void register_cpp_mixed_array_bitset_intersect_clustered(std::size_t repe
     e.inner_reps     = kMixedInnerReps;
     e.reusable_state = true;
     g_benchmarks.push_back(std::move(e));
-}
+}};
+template <class Arm> static void register_cpp_mixed_array_bitset_intersect_clustered(std::size_t repeat) { register_cpp_mixed_array_bitset_intersect_clustered_registrar<Arm>::run(repeat); }
 
-static void register_cpp_run_bitset_intersect(std::size_t repeat) {
+
+template <class Arm>
+struct register_cpp_run_bitset_intersect_registrar {
+    static void run(std::size_t repeat) {
     auto make_state = []() -> void * {
-        auto *s = new CppMixedArrayBitsetState;
-        s->dense  = roaring_bitmap_create();
-        s->sparse = roaring_bitmap_create();
+        auto *s = new CppMixedArrayBitsetState<Arm>;
+        s->dense  = Arm::create();
+        s->sparse = Arm::create();
         for (std::size_t i = 0; i < kMixedBitsetDenseSize; ++i) {
             roaring_bitmap_add(s->dense, static_cast<std::uint32_t>(i));
         }
@@ -4178,15 +4401,15 @@ static void register_cpp_run_bitset_intersect(std::size_t repeat) {
         roaring_bitmap_run_optimize(s->sparse);
         return s;
     };
-    auto free_state = [](void *sv) { delete static_cast<CppMixedArrayBitsetState *>(sv); };
+    auto free_state = [](void *sv) { delete static_cast<CppMixedArrayBitsetState<Arm> *>(sv); };
 
     Entry e;
-    e.name        = fmt_so("cpp", "RunBitsetIntersect", repeat, "runXbitset");
+    e.name        = fmt_so(Arm::label(), "RunBitsetIntersect", repeat, "runXbitset");
     e.description = "CRoaring roaring_bitmap_and() — apples-to-apples counterpart of the "
                      "frsr RunBitsetIntersect scenario.";
     e.setup       = make_state;
     e.run         = [repeat](void *sv) -> int64_t {
-        auto *s = static_cast<CppMixedArrayBitsetState *>(sv);
+        auto *s = static_cast<CppMixedArrayBitsetState<Arm> *>(sv);
         int64_t checksum = 0;
         for (std::size_t i = 0; i < repeat; ++i) {
             auto *r = roaring_bitmap_and(s->sparse, s->dense);
@@ -4200,13 +4423,17 @@ static void register_cpp_run_bitset_intersect(std::size_t repeat) {
     e.inner_reps     = kMixedInnerReps;
     e.reusable_state = true;
     g_benchmarks.push_back(std::move(e));
-}
+}};
+template <class Arm> static void register_cpp_run_bitset_intersect(std::size_t repeat) { register_cpp_run_bitset_intersect_registrar<Arm>::run(repeat); }
 
-static void register_cpp_mixed_array_bitset_intersect(std::size_t repeat) {
+
+template <class Arm>
+struct register_cpp_mixed_array_bitset_intersect_registrar {
+    static void run(std::size_t repeat) {
     auto make_state = []() -> void * {
-        auto *s = new CppMixedArrayBitsetState;
-        s->dense  = roaring_bitmap_create();
-        s->sparse = roaring_bitmap_create();
+        auto *s = new CppMixedArrayBitsetState<Arm>;
+        s->dense  = Arm::create();
+        s->sparse = Arm::create();
         for (std::size_t i = 0; i < kMixedBitsetDenseSize; ++i) {
             roaring_bitmap_add(s->dense, static_cast<std::uint32_t>(2 * i));
         }
@@ -4217,16 +4444,16 @@ static void register_cpp_mixed_array_bitset_intersect(std::size_t repeat) {
         }
         return s;
     };
-    auto free_state = [](void *sv) { delete static_cast<CppMixedArrayBitsetState *>(sv); };
+    auto free_state = [](void *sv) { delete static_cast<CppMixedArrayBitsetState<Arm> *>(sv); };
 
     Entry e;
-    e.name        = fmt_so("cpp", "MixedArrayBitsetIntersect", repeat, "arrayXbitset");
+    e.name        = fmt_so(Arm::label(), "MixedArrayBitsetIntersect", repeat, "arrayXbitset");
     e.description = "CRoaring roaring_bitmap_and() — apples-to-apples counterpart of the "
                      "frsr MixedArrayBitsetIntersect scenario (exercises CRoaring's own "
                      "array_bitset_container_intersection kernel).";
     e.setup       = make_state;
     e.run         = [repeat](void *sv) -> int64_t {
-        auto *s = static_cast<CppMixedArrayBitsetState *>(sv);
+        auto *s = static_cast<CppMixedArrayBitsetState<Arm> *>(sv);
         int64_t checksum = 0;
         for (std::size_t i = 0; i < repeat; ++i) {
             auto *r = roaring_bitmap_and(s->sparse, s->dense);
@@ -4240,13 +4467,17 @@ static void register_cpp_mixed_array_bitset_intersect(std::size_t repeat) {
     e.inner_reps     = kMixedInnerReps;
     e.reusable_state = true;
     g_benchmarks.push_back(std::move(e));
-}
+}};
+template <class Arm> static void register_cpp_mixed_array_bitset_intersect(std::size_t repeat) { register_cpp_mixed_array_bitset_intersect_registrar<Arm>::run(repeat); }
 
-static void register_cpp_mixed_array_bitset_andnot(std::size_t repeat) {
+
+template <class Arm>
+struct register_cpp_mixed_array_bitset_andnot_registrar {
+    static void run(std::size_t repeat) {
     auto make_state = []() -> void * {
-        auto *s = new CppMixedArrayBitsetState;
-        s->dense  = roaring_bitmap_create();
-        s->sparse = roaring_bitmap_create();
+        auto *s = new CppMixedArrayBitsetState<Arm>;
+        s->dense  = Arm::create();
+        s->sparse = Arm::create();
         for (std::size_t i = 0; i < kMixedBitsetDenseSize; ++i) {
             roaring_bitmap_add(s->dense, static_cast<std::uint32_t>(2 * i));
         }
@@ -4257,15 +4488,15 @@ static void register_cpp_mixed_array_bitset_andnot(std::size_t repeat) {
         }
         return s;
     };
-    auto free_state = [](void *sv) { delete static_cast<CppMixedArrayBitsetState *>(sv); };
+    auto free_state = [](void *sv) { delete static_cast<CppMixedArrayBitsetState<Arm> *>(sv); };
 
     Entry e;
-    e.name        = fmt_so("cpp", "MixedArrayBitsetAndnot", repeat, "arrayXbitset");
+    e.name        = fmt_so(Arm::label(), "MixedArrayBitsetAndnot", repeat, "arrayXbitset");
     e.description = "CRoaring roaring_bitmap_andnot() — apples-to-apples counterpart of the "
                      "frsr MixedArrayBitsetAndnot scenario.";
     e.setup       = make_state;
     e.run         = [repeat](void *sv) -> int64_t {
-        auto *s = static_cast<CppMixedArrayBitsetState *>(sv);
+        auto *s = static_cast<CppMixedArrayBitsetState<Arm> *>(sv);
         int64_t checksum = 0;
         for (std::size_t i = 0; i < repeat; ++i) {
             auto *r = roaring_bitmap_andnot(s->sparse, s->dense);
@@ -4279,13 +4510,17 @@ static void register_cpp_mixed_array_bitset_andnot(std::size_t repeat) {
     e.inner_reps     = kMixedInnerReps;
     e.reusable_state = true;
     g_benchmarks.push_back(std::move(e));
-}
+}};
+template <class Arm> static void register_cpp_mixed_array_bitset_andnot(std::size_t repeat) { register_cpp_mixed_array_bitset_andnot_registrar<Arm>::run(repeat); }
 
-static void register_cpp_mixed_array_bitset_intersect_inplace(std::size_t repeat) {
+
+template <class Arm>
+struct register_cpp_mixed_array_bitset_intersect_inplace_registrar {
+    static void run(std::size_t repeat) {
     auto make_state = []() -> void * {
-        auto *s = new CppMixedArrayBitsetState;
-        s->dense  = roaring_bitmap_create();
-        s->sparse = roaring_bitmap_create();
+        auto *s = new CppMixedArrayBitsetState<Arm>;
+        s->dense  = Arm::create();
+        s->sparse = Arm::create();
         for (std::size_t i = 0; i < kMixedBitsetDenseSize; ++i) {
             roaring_bitmap_add(s->dense, static_cast<std::uint32_t>(2 * i));
         }
@@ -4296,18 +4531,18 @@ static void register_cpp_mixed_array_bitset_intersect_inplace(std::size_t repeat
         }
         return s;
     };
-    auto free_state = [](void *sv) { delete static_cast<CppMixedArrayBitsetState *>(sv); };
+    auto free_state = [](void *sv) { delete static_cast<CppMixedArrayBitsetState<Arm> *>(sv); };
 
     Entry e;
-    e.name        = fmt_so("cpp", "MixedArrayBitsetIntersectInplace", repeat, "arrayXbitset");
+    e.name        = fmt_so(Arm::label(), "MixedArrayBitsetIntersectInplace", repeat, "arrayXbitset");
     e.description = "CRoaring roaring_bitmap_and_inplace() on a copy of the sparse array — "
                      "apples-to-apples counterpart of the frsr MixedArrayBitsetIntersectInplace scenario.";
     e.setup       = make_state;
     e.run         = [repeat](void *sv) -> int64_t {
-        auto *s = static_cast<CppMixedArrayBitsetState *>(sv);
+        auto *s = static_cast<CppMixedArrayBitsetState<Arm> *>(sv);
         int64_t checksum = 0;
         for (std::size_t i = 0; i < repeat; ++i) {
-            auto *r = roaring_bitmap_copy(s->sparse);
+            auto *r = Arm::copy(s->sparse);
             roaring_bitmap_and_inplace(r, s->dense);
             checksum += static_cast<int64_t>(roaring_bitmap_get_cardinality(r));
             roaring_bitmap_free(r);
@@ -4319,13 +4554,17 @@ static void register_cpp_mixed_array_bitset_intersect_inplace(std::size_t repeat
     e.inner_reps     = kMixedInnerReps;
     e.reusable_state = true;
     g_benchmarks.push_back(std::move(e));
-}
+}};
+template <class Arm> static void register_cpp_mixed_array_bitset_intersect_inplace(std::size_t repeat) { register_cpp_mixed_array_bitset_intersect_inplace_registrar<Arm>::run(repeat); }
 
-static void register_cpp_mixed_array_bitset_subtract_unique_inplace(std::size_t repeat) {
+
+template <class Arm>
+struct register_cpp_mixed_array_bitset_subtract_unique_inplace_registrar {
+    static void run(std::size_t repeat) {
     auto make_state = []() -> void * {
-        auto *s = new CppMixedArrayBitsetState;
-        s->dense  = roaring_bitmap_create();
-        s->sparse = roaring_bitmap_create();
+        auto *s = new CppMixedArrayBitsetState<Arm>;
+        s->dense  = Arm::create();
+        s->sparse = Arm::create();
         for (std::size_t i = 0; i < kMixedBitsetDenseSize; ++i) {
             roaring_bitmap_add(s->dense, static_cast<std::uint32_t>(2 * i));
         }
@@ -4336,16 +4575,16 @@ static void register_cpp_mixed_array_bitset_subtract_unique_inplace(std::size_t 
         }
         return s;
     };
-    auto free_state = [](void *sv) { delete static_cast<CppMixedArrayBitsetState *>(sv); };
+    auto free_state = [](void *sv) { delete static_cast<CppMixedArrayBitsetState<Arm> *>(sv); };
 
     Entry e;
-    e.name        = fmt_so("cpp", "MixedArrayBitsetSubtractUniqueInplace", repeat, "arrayXbitset");
+    e.name        = fmt_so(Arm::label(), "MixedArrayBitsetSubtractUniqueInplace", repeat, "arrayXbitset");
     e.description = "CRoaring roaring_bitmap_andnot_inplace() on a sole-owned sparse array (idempotent, "
                      "sparse disjoint from dense) — apples-to-apples counterpart of the frsr "
                      "MixedArrayBitsetSubtractUniqueInplace scenario.";
     e.setup       = make_state;
     e.run         = [repeat](void *sv) -> int64_t {
-        auto *s = static_cast<CppMixedArrayBitsetState *>(sv);
+        auto *s = static_cast<CppMixedArrayBitsetState<Arm> *>(sv);
         int64_t checksum = 0;
         for (std::size_t i = 0; i < repeat; ++i) {
             roaring_bitmap_andnot_inplace(s->sparse, s->dense);
@@ -4358,13 +4597,17 @@ static void register_cpp_mixed_array_bitset_subtract_unique_inplace(std::size_t 
     e.inner_reps     = kMixedInnerReps;
     e.reusable_state = true;
     g_benchmarks.push_back(std::move(e));
-}
+}};
+template <class Arm> static void register_cpp_mixed_array_bitset_subtract_unique_inplace(std::size_t repeat) { register_cpp_mixed_array_bitset_subtract_unique_inplace_registrar<Arm>::run(repeat); }
 
-static void register_cpp_mixed_array_bitset_filter_unique_inplace(std::size_t repeat) {
+
+template <class Arm>
+struct register_cpp_mixed_array_bitset_filter_unique_inplace_registrar {
+    static void run(std::size_t repeat) {
     auto make_state = []() -> void * {
-        auto *s = new CppMixedArrayBitsetState;
-        s->dense  = roaring_bitmap_create();
-        s->sparse = roaring_bitmap_create();
+        auto *s = new CppMixedArrayBitsetState<Arm>;
+        s->dense  = Arm::create();
+        s->sparse = Arm::create();
         for (std::size_t i = 0; i < kMixedBitsetDenseSize; ++i) {
             roaring_bitmap_add(s->dense, static_cast<std::uint32_t>(2 * i));
         }
@@ -4375,16 +4618,16 @@ static void register_cpp_mixed_array_bitset_filter_unique_inplace(std::size_t re
         }
         return s;
     };
-    auto free_state = [](void *sv) { delete static_cast<CppMixedArrayBitsetState *>(sv); };
+    auto free_state = [](void *sv) { delete static_cast<CppMixedArrayBitsetState<Arm> *>(sv); };
 
     Entry e;
-    e.name        = fmt_so("cpp", "MixedArrayBitsetFilterUniqueInplace", repeat, "arrayXbitset");
+    e.name        = fmt_so(Arm::label(), "MixedArrayBitsetFilterUniqueInplace", repeat, "arrayXbitset");
     e.description = "CRoaring roaring_bitmap_and_inplace() on a sole-owned sparse array (idempotent, "
                      "sparse ⊂ dense) — apples-to-apples counterpart of the frsr "
                      "MixedArrayBitsetFilterUniqueInplace scenario.";
     e.setup       = make_state;
     e.run         = [repeat](void *sv) -> int64_t {
-        auto *s = static_cast<CppMixedArrayBitsetState *>(sv);
+        auto *s = static_cast<CppMixedArrayBitsetState<Arm> *>(sv);
         int64_t checksum = 0;
         for (std::size_t i = 0; i < repeat; ++i) {
             roaring_bitmap_and_inplace(s->sparse, s->dense);
@@ -4397,7 +4640,9 @@ static void register_cpp_mixed_array_bitset_filter_unique_inplace(std::size_t re
     e.inner_reps     = kMixedInnerReps;
     e.reusable_state = true;
     g_benchmarks.push_back(std::move(e));
-}
+}};
+template <class Arm> static void register_cpp_mixed_array_bitset_filter_unique_inplace(std::size_t repeat) { register_cpp_mixed_array_bitset_filter_unique_inplace_registrar<Arm>::run(repeat); }
+
 #endif // FRSR_ROARING_HAS_CROARING
 
 // ========================================================================
@@ -4487,23 +4732,28 @@ static std::vector<std::uint32_t> make_shuffled_order(std::size_t n, std::uint64
     return order;
 }
 
+template <class Arm>
 struct FrsrArrayBitsetPair {
+    using TestBitmap32 = typename Arm::bitmap;
     TestBitmap32 arr;   // small, skewed-cardinality operand (stays array-encoded)
     TestBitmap32 bmp;   // dense operand (bitset-encoded)
 };
 
+template <class Arm>
 struct FrsrColdHeapState {
-    std::vector<FrsrArrayBitsetPair *> pairs;   // individually-allocated: NOT one contiguous vector<Pair>
+    using TestBitmap32 = typename Arm::bitmap;
+    std::vector<FrsrArrayBitsetPair<Arm> *> pairs;   // individually-allocated: NOT one contiguous vector<Pair>
     std::vector<std::uint32_t>         order;
 };
 
-static FrsrColdHeapState *make_frsr_cold_heap(std::size_t working_set_bytes, std::uint64_t seed) {
-    auto *s = new FrsrColdHeapState;
+template <class Arm>
+static FrsrColdHeapState<Arm> *make_frsr_cold_heap(std::size_t working_set_bytes, std::uint64_t seed) {
+    auto *s = new FrsrColdHeapState<Arm>;
     std::size_t const n = std::max<std::size_t>(2, working_set_bytes / kNominalPairBytes);
     s->pairs.reserve(n);
     std::mt19937_64 rng(seed);
     for (std::size_t i = 0; i < n; ++i) {
-        auto *pair = new FrsrArrayBitsetPair;   // scattered heap allocation, not a slab
+        auto *pair = new FrsrArrayBitsetPair<Arm>;   // scattered heap allocation, not a slab
         std::size_t const bcount = sample_bucket(rng, kBitsetBuckets);
         for (std::size_t v = 0; v < bcount; ++v) {
             std::ignore = pair->bmp.add(static_cast<std::uint32_t>(v));
@@ -4523,7 +4773,8 @@ static FrsrColdHeapState *make_frsr_cold_heap(std::size_t working_set_bytes, std
     return s;
 }
 
-static void free_frsr_cold_heap(FrsrColdHeapState *s) {
+template <class Arm>
+static void free_frsr_cold_heap(FrsrColdHeapState<Arm> *s) {
     for (auto *p : s->pairs) delete p;
     delete s;
 }
@@ -4539,13 +4790,15 @@ struct CppArrayBitsetPair {
     }
 };
 
+template <class Arm>
 struct CppColdHeapState {
     std::vector<CppArrayBitsetPair *> pairs;
     std::vector<std::uint32_t>        order;
 };
 
-static CppColdHeapState *make_cpp_cold_heap(std::size_t working_set_bytes, std::uint64_t seed) {
-    auto *s = new CppColdHeapState;
+template <class Arm>
+static CppColdHeapState<Arm> *make_cpp_cold_heap(std::size_t working_set_bytes, std::uint64_t seed) {
+    auto *s = new CppColdHeapState<Arm>;
     std::size_t const n = std::max<std::size_t>(2, working_set_bytes / kNominalPairBytes);
     s->pairs.reserve(n);
     std::mt19937_64 rng(seed);
@@ -4569,7 +4822,8 @@ static CppColdHeapState *make_cpp_cold_heap(std::size_t working_set_bytes, std::
     return s;
 }
 
-static void free_cpp_cold_heap(CppColdHeapState *s) {
+template <class Arm>
+static void free_cpp_cold_heap(CppColdHeapState<Arm> *s) {
     for (auto *p : s->pairs) delete p;
     delete s;
 }
@@ -4587,14 +4841,17 @@ static std::string fmt_cold(const char *lib, const char *op, std::size_t ws_byte
     return buf;
 }
 
-static void register_frsr_cold_array_bitset(std::size_t ws_bytes, bool andnot) {
+template <class Arm>
+struct register_frsr_cold_array_bitset_registrar {
+    using TestBitmap32 = typename Arm::bitmap;
+    static void run(std::size_t ws_bytes, bool andnot) {
     auto make_state = [ws_bytes]() -> void * {
-        return make_frsr_cold_heap(ws_bytes, 0x9e3779b97f4a7c15ULL ^ ws_bytes);
+        return make_frsr_cold_heap<Arm>(ws_bytes, 0x9e3779b97f4a7c15ULL ^ ws_bytes);
     };
-    auto free_state = [](void *sv) { free_frsr_cold_heap(static_cast<FrsrColdHeapState *>(sv)); };
+    auto free_state = [](void *sv) { free_frsr_cold_heap(static_cast<FrsrColdHeapState<Arm> *>(sv)); };
 
     Entry e;
-    e.name        = fmt_cold("frsr", andnot ? "ColdArrayBitsetAndnot" : "ColdArrayBitsetIntersect", ws_bytes);
+    e.name        = fmt_cold(Arm::label(), andnot ? "ColdArrayBitsetAndnot" : "ColdArrayBitsetIntersect", ws_bytes);
     e.description = std::string("frsr::roaring::bitmap<uint32_t> array ") + (andnot ? "\\" : "&") +
                      " bitset over a working set of individually heap-allocated operand pairs "
                      "spread across ~" + std::to_string(ws_bytes >> 20) + " MiB total, visited in a "
@@ -4604,7 +4861,7 @@ static void register_frsr_cold_array_bitset(std::size_t ws_bytes, bool andnot) {
                      "hot-loop bands above.";
     e.setup       = make_state;
     e.run         = [andnot](void *sv) -> int64_t {
-        auto *s = static_cast<FrsrColdHeapState *>(sv);
+        auto *s = static_cast<FrsrColdHeapState<Arm> *>(sv);
         std::size_t const n = s->pairs.size();
         int64_t checksum = 0;
         for (std::size_t k = 0; k < kOpsPerRun; ++k) {
@@ -4619,22 +4876,26 @@ static void register_frsr_cold_array_bitset(std::size_t ws_bytes, bool andnot) {
     e.inner_reps     = kInnerReps;
     e.reusable_state = true;
     g_benchmarks.push_back(std::move(e));
-}
+}};
+template <class Arm> static void register_frsr_cold_array_bitset(std::size_t ws_bytes, bool andnot) { register_frsr_cold_array_bitset_registrar<Arm>::run(ws_bytes, andnot); }
+
 
 #if FRSR_ROARING_HAS_CROARING
-static void register_cpp_cold_array_bitset(std::size_t ws_bytes, bool andnot) {
+template <class Arm>
+struct register_cpp_cold_array_bitset_registrar {
+    static void run(std::size_t ws_bytes, bool andnot) {
     auto make_state = [ws_bytes]() -> void * {
-        return make_cpp_cold_heap(ws_bytes, 0x9e3779b97f4a7c15ULL ^ ws_bytes);
+        return make_cpp_cold_heap<Arm>(ws_bytes, 0x9e3779b97f4a7c15ULL ^ ws_bytes);
     };
-    auto free_state = [](void *sv) { free_cpp_cold_heap(static_cast<CppColdHeapState *>(sv)); };
+    auto free_state = [](void *sv) { free_cpp_cold_heap(static_cast<CppColdHeapState<Arm> *>(sv)); };
 
     Entry e;
-    e.name        = fmt_cold("cpp", andnot ? "ColdArrayBitsetAndnot" : "ColdArrayBitsetIntersect", ws_bytes);
+    e.name        = fmt_cold(Arm::label(), andnot ? "ColdArrayBitsetAndnot" : "ColdArrayBitsetIntersect", ws_bytes);
     e.description = "CRoaring roaring_bitmap_and()/andnot() — apples-to-apples counterpart of the "
                      "frsr ColdArrayBitset scenario over the same scattered, heap-scale working set.";
     e.setup       = make_state;
     e.run         = [andnot](void *sv) -> int64_t {
-        auto *s = static_cast<CppColdHeapState *>(sv);
+        auto *s = static_cast<CppColdHeapState<Arm> *>(sv);
         std::size_t const n = s->pairs.size();
         int64_t checksum = 0;
         for (std::size_t k = 0; k < kOpsPerRun; ++k) {
@@ -4650,7 +4911,9 @@ static void register_cpp_cold_array_bitset(std::size_t ws_bytes, bool andnot) {
     e.inner_reps     = kInnerReps;
     e.reusable_state = true;
     g_benchmarks.push_back(std::move(e));
-}
+}};
+template <class Arm> static void register_cpp_cold_array_bitset(std::size_t ws_bytes, bool andnot) { register_cpp_cold_array_bitset_registrar<Arm>::run(ws_bytes, andnot); }
+
 #endif // FRSR_ROARING_HAS_CROARING
 
 // ---- fixed-cardinality diagnostic variant: same scattered-pair machinery,
@@ -4681,7 +4944,10 @@ static State *make_fixed_cold_heap(std::size_t acard, std::uint64_t seed, AddArr
     return s;
 }
 
-static void register_frsr_cold_card(std::size_t acard, bool andnot) {
+template <class Arm>
+struct register_frsr_cold_card_registrar {
+    using TestBitmap32 = typename Arm::bitmap;
+    static void run(std::size_t acard, bool andnot) {
     Entry e;
     char buf[128];
     snprintf(buf, sizeof(buf), "cold_card/frsrColdCard%s/acard=%zu",
@@ -4689,13 +4955,13 @@ static void register_frsr_cold_card(std::size_t acard, bool andnot) {
     e.name        = buf;
     e.description = "fixed-cardinality diagnostic of the cold_heap Andnot/Intersect delta";
     e.setup       = [acard]() -> void * {
-        return make_fixed_cold_heap<FrsrColdHeapState, FrsrArrayBitsetPair>(
+        return make_fixed_cold_heap<FrsrColdHeapState<Arm>, FrsrArrayBitsetPair<Arm>>(
             acard, 0x9e3779b97f4a7c15ULL ^ acard,
-            [](FrsrArrayBitsetPair &p, std::uint32_t v) { std::ignore = p.arr.add(v); },
-            [](FrsrArrayBitsetPair &p, std::uint32_t v) { std::ignore = p.bmp.add(v); });
+            [](FrsrArrayBitsetPair<Arm> &p, std::uint32_t v) { std::ignore = p.arr.add(v); },
+            [](FrsrArrayBitsetPair<Arm> &p, std::uint32_t v) { std::ignore = p.bmp.add(v); });
     };
     e.run         = [andnot](void *sv) -> int64_t {
-        auto *s = static_cast<FrsrColdHeapState *>(sv);
+        auto *s = static_cast<FrsrColdHeapState<Arm> *>(sv);
         std::size_t const n = s->pairs.size();
         int64_t checksum = 0;
         for (std::size_t k = 0; k < kOpsPerRun; ++k) {
@@ -4705,15 +4971,19 @@ static void register_frsr_cold_card(std::size_t acard, bool andnot) {
         }
         return checksum;
     };
-    e.teardown       = [](void *sv) { free_frsr_cold_heap(static_cast<FrsrColdHeapState *>(sv)); };
+    e.teardown       = [](void *sv) { free_frsr_cold_heap(static_cast<FrsrColdHeapState<Arm> *>(sv)); };
     e.ops_per_run    = static_cast<int64_t>(kOpsPerRun);
     e.inner_reps     = 200;
     e.reusable_state = true;
     g_benchmarks.push_back(std::move(e));
-}
+}};
+template <class Arm> static void register_frsr_cold_card(std::size_t acard, bool andnot) { register_frsr_cold_card_registrar<Arm>::run(acard, andnot); }
+
 
 #if FRSR_ROARING_HAS_CROARING
-static void register_cpp_cold_card(std::size_t acard, bool andnot) {
+template <class Arm>
+struct register_cpp_cold_card_registrar {
+    static void run(std::size_t acard, bool andnot) {
     Entry e;
     char buf[128];
     snprintf(buf, sizeof(buf), "cold_card/cppColdCard%s/acard=%zu",
@@ -4721,19 +4991,19 @@ static void register_cpp_cold_card(std::size_t acard, bool andnot) {
     e.name        = buf;
     e.description = "CRoaring counterpart of the fixed-cardinality cold_heap diagnostic";
     e.setup       = [acard]() -> void * {
-        return make_fixed_cold_heap<CppColdHeapState, CppArrayBitsetPair>(
+        return make_fixed_cold_heap<CppColdHeapState<Arm>, CppArrayBitsetPair>(
             acard, 0x9e3779b97f4a7c15ULL ^ acard,
             [](CppArrayBitsetPair &p, std::uint32_t v) {
-                if (p.arr == nullptr) p.arr = roaring_bitmap_create();
+                if (p.arr == nullptr) p.arr = Arm::create();
                 roaring_bitmap_add(p.arr, v);
             },
             [](CppArrayBitsetPair &p, std::uint32_t v) {
-                if (p.bmp == nullptr) p.bmp = roaring_bitmap_create();
+                if (p.bmp == nullptr) p.bmp = Arm::create();
                 roaring_bitmap_add(p.bmp, v);
             });
     };
     e.run         = [andnot](void *sv) -> int64_t {
-        auto *s = static_cast<CppColdHeapState *>(sv);
+        auto *s = static_cast<CppColdHeapState<Arm> *>(sv);
         std::size_t const n = s->pairs.size();
         int64_t checksum = 0;
         for (std::size_t k = 0; k < kOpsPerRun; ++k) {
@@ -4744,12 +5014,14 @@ static void register_cpp_cold_card(std::size_t acard, bool andnot) {
         }
         return checksum;
     };
-    e.teardown       = [](void *sv) { free_cpp_cold_heap(static_cast<CppColdHeapState *>(sv)); };
+    e.teardown       = [](void *sv) { free_cpp_cold_heap(static_cast<CppColdHeapState<Arm> *>(sv)); };
     e.ops_per_run    = static_cast<int64_t>(kOpsPerRun);
     e.inner_reps     = 200;
     e.reusable_state = true;
     g_benchmarks.push_back(std::move(e));
-}
+}};
+template <class Arm> static void register_cpp_cold_card(std::size_t acard, bool andnot) { register_cpp_cold_card_registrar<Arm>::run(acard, andnot); }
+
 #endif // FRSR_ROARING_HAS_CROARING
 
 } // namespace cold_heap
@@ -4771,20 +5043,24 @@ static constexpr std::size_t kArraySize     = 64;      // stays array-encoded
 static constexpr std::size_t kRepeat        = 100'000;
 static constexpr int         kInnerReps     = 5;
 
+template <class Arm>
 struct FrsrState {
+    using TestBitmap32 = typename Arm::bitmap;
     TestBitmap32 dense;    // saturated / near-saturated bitset operand
     TestBitmap32 sparse;   // small array probe
 };
 
 // fill_fraction in (0, 1]: 1.0 == fully saturated (all 65536 bits).
-static void fill_dense_frsr(TestBitmap32 &dense, double fill_fraction) {
+template <class BM>
+static void fill_dense_frsr(BM &dense, double fill_fraction) {
     auto const count = static_cast<std::size_t>(static_cast<double>(kChunkDomain) * fill_fraction);
     for (std::size_t i = 0; i < count; ++i) {
         std::ignore = dense.add(static_cast<std::uint32_t>(i));
     }
 }
 
-static void fill_sparse_frsr(TestBitmap32 &sparse) {
+template <class BM>
+static void fill_sparse_frsr(BM &sparse) {
     // Strided across TWICE the domain so roughly half the probe hits.
     std::size_t const stride = std::max<std::size_t>(1, (2 * kChunkDomain) / kArraySize);
     for (std::size_t i = 0; i < kArraySize; ++i) {
@@ -4792,7 +5068,10 @@ static void fill_sparse_frsr(TestBitmap32 &sparse) {
     }
 }
 
-static void register_frsr_saturated(double fill_fraction, const char *tag, bool andnot) {
+template <class Arm>
+struct register_frsr_saturated_registrar {
+    using TestBitmap32 = typename Arm::bitmap;
+    static void run(double fill_fraction, const char *tag, bool andnot) {
     Entry e;
     char buf[160];
     snprintf(buf, sizeof(buf), "set_ops/frsrSaturatedBitset%s/fill=%s",
@@ -4806,13 +5085,13 @@ static void register_frsr_saturated(double fill_fraction, const char *tag, bool 
                      "operands are occasionally saturated or near-saturated, a density this suite's "
                      "other bands (which top out at 50% full) never reach.";
     e.setup       = [fill_fraction]() -> void * {
-        auto *s = new FrsrState;
+        auto *s = new FrsrState<Arm>;
         fill_dense_frsr(s->dense, fill_fraction);
         fill_sparse_frsr(s->sparse);
         return s;
     };
     e.run         = [andnot](void *sv) -> int64_t {
-        auto *s = static_cast<FrsrState *>(sv);
+        auto *s = static_cast<FrsrState<Arm> *>(sv);
         int64_t checksum = 0;
         for (std::size_t i = 0; i < kRepeat; ++i) {
             TestBitmap32 r = andnot ? (s->sparse - s->dense) : (s->sparse & s->dense);
@@ -4820,14 +5099,17 @@ static void register_frsr_saturated(double fill_fraction, const char *tag, bool 
         }
         return checksum;
     };
-    e.teardown       = [](void *sv) { delete static_cast<FrsrState *>(sv); };
+    e.teardown       = [](void *sv) { delete static_cast<FrsrState<Arm> *>(sv); };
     e.ops_per_run    = static_cast<int64_t>(kRepeat);
     e.inner_reps     = kInnerReps;
     e.reusable_state = true;
     g_benchmarks.push_back(std::move(e));
-}
+}};
+template <class Arm> static void register_frsr_saturated(double fill_fraction, const char *tag, bool andnot) { register_frsr_saturated_registrar<Arm>::run(fill_fraction, tag, andnot); }
+
 
 #if FRSR_ROARING_HAS_CROARING
+template <class Arm>
 struct CppState {
     roaring_bitmap_t *dense{};
     roaring_bitmap_t *sparse{};
@@ -4838,7 +5120,9 @@ struct CppState {
     }
 };
 
-static void register_cpp_saturated(double fill_fraction, const char *tag, bool andnot) {
+template <class Arm>
+struct register_cpp_saturated_registrar {
+    static void run(double fill_fraction, const char *tag, bool andnot) {
     Entry e;
     char buf[160];
     snprintf(buf, sizeof(buf), "set_ops/cppSaturatedBitset%s/fill=%s",
@@ -4847,9 +5131,9 @@ static void register_cpp_saturated(double fill_fraction, const char *tag, bool a
     e.description = "CRoaring roaring_bitmap_and()/andnot() — apples-to-apples counterpart of the "
                      "frsr SaturatedBitset scenario (plain bitset operand, no run_optimize).";
     e.setup       = [fill_fraction]() -> void * {
-        auto *s = new CppState;
-        s->dense  = roaring_bitmap_create();
-        s->sparse = roaring_bitmap_create();
+        auto *s = new CppState<Arm>;
+        s->dense  = Arm::create();
+        s->sparse = Arm::create();
         auto const count = static_cast<std::size_t>(static_cast<double>(kChunkDomain) * fill_fraction);
         for (std::size_t i = 0; i < count; ++i) {
             roaring_bitmap_add(s->dense, static_cast<std::uint32_t>(i));
@@ -4861,7 +5145,7 @@ static void register_cpp_saturated(double fill_fraction, const char *tag, bool a
         return s;
     };
     e.run         = [andnot](void *sv) -> int64_t {
-        auto *s = static_cast<CppState *>(sv);
+        auto *s = static_cast<CppState<Arm> *>(sv);
         int64_t checksum = 0;
         for (std::size_t i = 0; i < kRepeat; ++i) {
             auto *r = andnot ? roaring_bitmap_andnot(s->sparse, s->dense) : roaring_bitmap_and(s->sparse, s->dense);
@@ -4870,12 +5154,14 @@ static void register_cpp_saturated(double fill_fraction, const char *tag, bool a
         }
         return checksum;
     };
-    e.teardown       = [](void *sv) { delete static_cast<CppState *>(sv); };
+    e.teardown       = [](void *sv) { delete static_cast<CppState<Arm> *>(sv); };
     e.ops_per_run    = static_cast<int64_t>(kRepeat);
     e.inner_reps     = kInnerReps;
     e.reusable_state = true;
     g_benchmarks.push_back(std::move(e));
-}
+}};
+template <class Arm> static void register_cpp_saturated(double fill_fraction, const char *tag, bool andnot) { register_cpp_saturated_registrar<Arm>::run(fill_fraction, tag, andnot); }
+
 #endif // FRSR_ROARING_HAS_CROARING
 
 static void register_benchmarks() {
@@ -4887,9 +5173,11 @@ static void register_benchmarks() {
     };
     for (auto const &[fraction, tag] : kFills) {
         for (bool const andnot : { false, true }) {
-            register_frsr_saturated(fraction, tag, andnot);
+            arms::for_each_frsr<register_frsr_saturated_registrar>(fraction, tag, andnot);
 #if FRSR_ROARING_HAS_CROARING
-            register_cpp_saturated(fraction, tag, andnot);
+#if FRSR_ROARING_HAS_CROARING
+            arms::for_each_croaring<register_cpp_saturated_registrar>(fraction, tag, andnot);
+#endif
 #endif
         }
     }
@@ -4923,7 +5211,8 @@ static constexpr std::size_t kBitsetSize = 32'768;
 static constexpr std::size_t kRepeat     = 100'000;
 static constexpr int         kInnerReps  = 5;
 
-static void add_runs_frsr(TestBitmap32 &b, std::size_t run_length) {
+template <class BM>
+static void add_runs_frsr(BM &b, std::size_t run_length) {
     for (std::size_t run = 0; run < kNumRuns; ++run) {
         auto const begin = static_cast<std::uint32_t>(run * kStride);
         auto const end   = static_cast<std::uint32_t>(begin + run_length - 1);
@@ -4941,12 +5230,17 @@ static void add_runs_cpp(roaring_bitmap_t *b, std::size_t run_length) {
     roaring_bitmap_run_optimize(b);
 }
 
+template <class Arm>
 struct FrsrState {
+    using TestBitmap32 = typename Arm::bitmap;
     TestBitmap32 run_op;
     TestBitmap32 other;   // array or bitset operand
 };
 
-static void register_frsr_run_vs(std::size_t card, bool run_length_full, bool vs_bitset) {
+template <class Arm>
+struct register_frsr_run_vs_registrar {
+    using TestBitmap32 = typename Arm::bitmap;
+    static void run(std::size_t card, bool run_length_full, bool vs_bitset) {
     std::size_t const run_length = run_length_full ? kStride : (card / kNumRuns);
     Entry e;
     char buf[160];
@@ -4959,7 +5253,7 @@ static void register_frsr_run_vs(std::size_t card, bool run_length_full, bool vs
                      std::to_string(kRepeat) + " times per timed run — sweeps run-operand "
                      "cardinality well past the existing fixed-2048 RunBitsetIntersect band.";
     e.setup       = [run_length, vs_bitset]() -> void * {
-        auto *s = new FrsrState;
+        auto *s = new FrsrState<Arm>;
         add_runs_frsr(s->run_op, run_length);
         if (vs_bitset) {
             for (std::size_t i = 0; i < kBitsetSize; ++i) {
@@ -4974,7 +5268,7 @@ static void register_frsr_run_vs(std::size_t card, bool run_length_full, bool vs
         return s;
     };
     e.run         = [](void *sv) -> int64_t {
-        auto *s = static_cast<FrsrState *>(sv);
+        auto *s = static_cast<FrsrState<Arm> *>(sv);
         int64_t checksum = 0;
         for (std::size_t i = 0; i < kRepeat; ++i) {
             TestBitmap32 r = s->run_op & s->other;
@@ -4982,14 +5276,17 @@ static void register_frsr_run_vs(std::size_t card, bool run_length_full, bool vs
         }
         return checksum;
     };
-    e.teardown       = [](void *sv) { delete static_cast<FrsrState *>(sv); };
+    e.teardown       = [](void *sv) { delete static_cast<FrsrState<Arm> *>(sv); };
     e.ops_per_run    = static_cast<int64_t>(kRepeat);
     e.inner_reps     = kInnerReps;
     e.reusable_state = true;
     g_benchmarks.push_back(std::move(e));
-}
+}};
+template <class Arm> static void register_frsr_run_vs(std::size_t card, bool run_length_full, bool vs_bitset) { register_frsr_run_vs_registrar<Arm>::run(card, run_length_full, vs_bitset); }
+
 
 #if FRSR_ROARING_HAS_CROARING
+template <class Arm>
 struct CppState {
     roaring_bitmap_t *run_op{};
     roaring_bitmap_t *other{};
@@ -5000,7 +5297,9 @@ struct CppState {
     }
 };
 
-static void register_cpp_run_vs(std::size_t card, bool run_length_full, bool vs_bitset) {
+template <class Arm>
+struct register_cpp_run_vs_registrar {
+    static void run(std::size_t card, bool run_length_full, bool vs_bitset) {
     std::size_t const run_length = run_length_full ? kStride : (card / kNumRuns);
     Entry e;
     char buf[160];
@@ -5010,9 +5309,9 @@ static void register_cpp_run_vs(std::size_t card, bool run_length_full, bool vs_
     e.description = "CRoaring roaring_bitmap_and() — apples-to-apples counterpart of the frsr "
                      "RunVs" + std::string(vs_bitset ? "Bitset" : "Array") + " scenario.";
     e.setup       = [run_length, vs_bitset]() -> void * {
-        auto *s = new CppState;
-        s->run_op = roaring_bitmap_create();
-        s->other  = roaring_bitmap_create();
+        auto *s = new CppState<Arm>;
+        s->run_op = Arm::create();
+        s->other  = Arm::create();
         add_runs_cpp(s->run_op, run_length);
         if (vs_bitset) {
             for (std::size_t i = 0; i < kBitsetSize; ++i) {
@@ -5027,7 +5326,7 @@ static void register_cpp_run_vs(std::size_t card, bool run_length_full, bool vs_
         return s;
     };
     e.run         = [](void *sv) -> int64_t {
-        auto *s = static_cast<CppState *>(sv);
+        auto *s = static_cast<CppState<Arm> *>(sv);
         int64_t checksum = 0;
         for (std::size_t i = 0; i < kRepeat; ++i) {
             auto *r = roaring_bitmap_and(s->run_op, s->other);
@@ -5036,30 +5335,36 @@ static void register_cpp_run_vs(std::size_t card, bool run_length_full, bool vs_
         }
         return checksum;
     };
-    e.teardown       = [](void *sv) { delete static_cast<CppState *>(sv); };
+    e.teardown       = [](void *sv) { delete static_cast<CppState<Arm> *>(sv); };
     e.ops_per_run    = static_cast<int64_t>(kRepeat);
     e.inner_reps     = kInnerReps;
     e.reusable_state = true;
     g_benchmarks.push_back(std::move(e));
-}
+}};
+template <class Arm> static void register_cpp_run_vs(std::size_t card, bool run_length_full, bool vs_bitset) { register_cpp_run_vs_registrar<Arm>::run(card, run_length_full, vs_bitset); }
+
 #endif // FRSR_ROARING_HAS_CROARING
 
 static void register_benchmarks() {
     static constexpr std::size_t kCards[] = { 4'096, 8'192, 16'384, 32'768, 65'024 };
     for (std::size_t const card : kCards) {
         for (bool const vs_bitset : { false, true }) {
-            register_frsr_run_vs(card, /*run_length_full=*/false, vs_bitset);
+            arms::for_each_frsr<register_frsr_run_vs_registrar>(card, /*run_length_full=*/false, vs_bitset);
 #if FRSR_ROARING_HAS_CROARING
-            register_cpp_run_vs(card, /*run_length_full=*/false, vs_bitset);
+#if FRSR_ROARING_HAS_CROARING
+            arms::for_each_croaring<register_cpp_run_vs_registrar>(card, /*run_length_full=*/false, vs_bitset);
+#endif
 #endif
         }
     }
     // Separately-named, genuinely-full-domain point (single [0,65535] run) —
     // NOT part of the sweep above; see the namespace comment.
     for (bool const vs_bitset : { false, true }) {
-        register_frsr_run_vs(65'536, /*run_length_full=*/true, vs_bitset);
+        arms::for_each_frsr<register_frsr_run_vs_registrar>(65'536, /*run_length_full=*/true, vs_bitset);
 #if FRSR_ROARING_HAS_CROARING
-        register_cpp_run_vs(65'536, /*run_length_full=*/true, vs_bitset);
+#if FRSR_ROARING_HAS_CROARING
+        arms::for_each_croaring<register_cpp_run_vs_registrar>(65'536, /*run_length_full=*/true, vs_bitset);
+#endif
 #endif
     }
 }
@@ -5072,80 +5377,114 @@ void register_benchmarks() {
     for (std::size_t count : kCounts) {
         for (auto const &ov : kOverlaps) {
             std::size_t const offset = count * ov.num / ov.den;
-            register_frsr_binary(count, offset, ov.label);
-            register_cpp_binary(count, offset, ov.label);
+            arms::for_each_frsr<register_frsr_binary_registrar>(count, offset, ov.label);
+#if FRSR_ROARING_HAS_CROARING
+            arms::for_each_croaring<register_cpp_binary_registrar>(count, offset, ov.label);
+#endif
             register_r64_binary(count, offset, ov.label);
             register_set_binary(count, offset, ov.label);
         }
         // sparse many-chunk variant: b shifted by ~half the chunk span for ~50% chunk overlap.
         std::size_t const b_chunk_offset = std::max(std::size_t{ 1 }, count / kSparsePerChunk / 2 );
-        register_frsr_binary_sparse(count, b_chunk_offset);
-        register_cpp_binary_sparse (count, b_chunk_offset);
+        arms::for_each_frsr<register_frsr_binary_sparse_registrar>(count, b_chunk_offset);
+#if FRSR_ROARING_HAS_CROARING
+        arms::for_each_croaring<register_cpp_binary_sparse_registrar>(count, b_chunk_offset);
+#endif
     }
     for (std::size_t count : kCounts) {
         register_nway_union(count);
         register_nway_union_sparse(count);
-        register_frsr_run_heavy(count);
-        register_cpp_run_heavy(count);
+        arms::for_each_frsr<register_frsr_run_heavy_registrar>(count);
+#if FRSR_ROARING_HAS_CROARING
+        arms::for_each_croaring<register_cpp_run_heavy_registrar>(count);
+#endif
     }
     // Promotion-band sweep: 512 and 8192 are controls (both libraries agree on
     // the form there); 2048 is the window where the policies diverge.
     for (std::size_t band : { std::size_t{512}, std::size_t{2048}, std::size_t{8192} }) {
-        register_frsr_and_small_vs_band(band, /*as_bitset=*/false);
-        register_frsr_and_small_vs_band(band, /*as_bitset=*/true );
-        register_frsr_lazy_union_fold(band);
-        register_frsr_lazy_union_fold_optimized(band, /*keep_bitsets=*/false);
-        register_frsr_lazy_union_fold_optimized(band, /*keep_bitsets=*/true );
+        arms::for_each_frsr<register_frsr_and_small_vs_band_registrar>(band, /*as_bitset=*/false);
+        arms::for_each_frsr<register_frsr_and_small_vs_band_registrar>(band, /*as_bitset=*/true );
+        arms::for_each_frsr<register_frsr_lazy_union_fold_registrar>(band);
+        arms::for_each_frsr<register_frsr_lazy_union_fold_optimized_registrar>(band, /*keep_bitsets=*/false);
+        arms::for_each_frsr<register_frsr_lazy_union_fold_optimized_registrar>(band, /*keep_bitsets=*/true );
 #if FRSR_ROARING_HAS_CROARING
-        register_cpp_lazy_union_fold(band);
+#if FRSR_ROARING_HAS_CROARING
+        arms::for_each_croaring<register_cpp_lazy_union_fold_registrar>(band);
+#endif
 #endif
     }
     // High-cardinality extension of the same fold shape: a downstream
     // workload's dominant OR shape is bitset x array with the bitset side
     // mostly in 16385-65536, well past the 512/2048/8192 sweep above.
     for (std::size_t band : { std::size_t{16384}, std::size_t{32768}, std::size_t{65536} }) {
-        register_frsr_lazy_union_fold(band);
+        arms::for_each_frsr<register_frsr_lazy_union_fold_registrar>(band);
 #if FRSR_ROARING_HAS_CROARING
-        register_cpp_lazy_union_fold(band);
+#if FRSR_ROARING_HAS_CROARING
+        arms::for_each_croaring<register_cpp_lazy_union_fold_registrar>(band);
+#endif
 #endif
     }
 
     register_run_accum_and(20'000);
-    register_frsr_array_run_and_fold(20'000);
-    register_frsr_array_run_and_fold_shared(20'000);
-    register_cpp_array_run_and_fold(20'000);
-    register_cpp_array_run_and_fold_shared(20'000);
+    arms::for_each_frsr<register_frsr_array_run_and_fold_registrar>(20'000);
+    arms::for_each_frsr<register_frsr_array_run_and_fold_shared_registrar>(20'000);
+#if FRSR_ROARING_HAS_CROARING
+    arms::for_each_croaring<register_cpp_array_run_and_fold_registrar>(20'000);
+#endif
+#if FRSR_ROARING_HAS_CROARING
+    arms::for_each_croaring<register_cpp_array_run_and_fold_shared_registrar>(20'000);
+#endif
 
-    register_frsr_skewed_intersect(100'000);
+    arms::for_each_frsr<register_frsr_skewed_intersect_registrar>(100'000);
 #if FRSR_ROARING_HAS_CROARING
-    register_cpp_skewed_intersect(100'000);
+#if FRSR_ROARING_HAS_CROARING
+    arms::for_each_croaring<register_cpp_skewed_intersect_registrar>(100'000);
 #endif
-    register_frsr_midskew_intersect(100'000);
-#if FRSR_ROARING_HAS_CROARING
-    register_cpp_midskew_intersect(100'000);
 #endif
-    register_frsr_mixed_array_bitset_intersect(100'000);
-    register_frsr_mixed_array_bitset_intersect_clustered(100'000);
-    register_frsr_run_bitset_intersect(100'000);
-    register_frsr_mixed_array_bitset_andnot(100'000);
-    register_frsr_mixed_array_bitset_intersect_inplace(100'000);
-    register_frsr_mixed_array_bitset_filter_unique_inplace(100'000);
-    register_frsr_mixed_array_bitset_subtract_unique_inplace(100'000);
+    arms::for_each_frsr<register_frsr_midskew_intersect_registrar>(100'000);
 #if FRSR_ROARING_HAS_CROARING
-    register_cpp_mixed_array_bitset_intersect(100'000);
-    register_cpp_mixed_array_bitset_intersect_clustered(100'000);
-    register_cpp_run_bitset_intersect(100'000);
-    register_cpp_mixed_array_bitset_andnot(100'000);
-    register_cpp_mixed_array_bitset_intersect_inplace(100'000);
-    register_cpp_mixed_array_bitset_filter_unique_inplace(100'000);
-    register_cpp_mixed_array_bitset_subtract_unique_inplace(100'000);
+#if FRSR_ROARING_HAS_CROARING
+    arms::for_each_croaring<register_cpp_midskew_intersect_registrar>(100'000);
+#endif
+#endif
+    arms::for_each_frsr<register_frsr_mixed_array_bitset_intersect_registrar>(100'000);
+    arms::for_each_frsr<register_frsr_mixed_array_bitset_intersect_clustered_registrar>(100'000);
+    arms::for_each_frsr<register_frsr_run_bitset_intersect_registrar>(100'000);
+    arms::for_each_frsr<register_frsr_mixed_array_bitset_andnot_registrar>(100'000);
+    arms::for_each_frsr<register_frsr_mixed_array_bitset_intersect_inplace_registrar>(100'000);
+    arms::for_each_frsr<register_frsr_mixed_array_bitset_filter_unique_inplace_registrar>(100'000);
+    arms::for_each_frsr<register_frsr_mixed_array_bitset_subtract_unique_inplace_registrar>(100'000);
+#if FRSR_ROARING_HAS_CROARING
+#if FRSR_ROARING_HAS_CROARING
+    arms::for_each_croaring<register_cpp_mixed_array_bitset_intersect_registrar>(100'000);
+#endif
+#if FRSR_ROARING_HAS_CROARING
+    arms::for_each_croaring<register_cpp_mixed_array_bitset_intersect_clustered_registrar>(100'000);
+#endif
+#if FRSR_ROARING_HAS_CROARING
+    arms::for_each_croaring<register_cpp_run_bitset_intersect_registrar>(100'000);
+#endif
+#if FRSR_ROARING_HAS_CROARING
+    arms::for_each_croaring<register_cpp_mixed_array_bitset_andnot_registrar>(100'000);
+#endif
+#if FRSR_ROARING_HAS_CROARING
+    arms::for_each_croaring<register_cpp_mixed_array_bitset_intersect_inplace_registrar>(100'000);
+#endif
+#if FRSR_ROARING_HAS_CROARING
+    arms::for_each_croaring<register_cpp_mixed_array_bitset_filter_unique_inplace_registrar>(100'000);
+#endif
+#if FRSR_ROARING_HAS_CROARING
+    arms::for_each_croaring<register_cpp_mixed_array_bitset_subtract_unique_inplace_registrar>(100'000);
+#endif
 #endif
 
     for (std::size_t const ws : cold_heap::kWorkingSetSizes) {
         for (bool const andnot : { false, true }) {
-            cold_heap::register_frsr_cold_array_bitset(ws, andnot);
+            arms::for_each_frsr<cold_heap::register_frsr_cold_array_bitset_registrar>(ws, andnot);
 #if FRSR_ROARING_HAS_CROARING
-            cold_heap::register_cpp_cold_array_bitset(ws, andnot);
+#if FRSR_ROARING_HAS_CROARING
+            arms::for_each_croaring<cold_heap::register_cpp_cold_array_bitset_registrar>(ws, andnot);
+#endif
 #endif
         }
     }
@@ -5153,9 +5492,11 @@ void register_benchmarks() {
     for (std::size_t const acard : { std::size_t{4}, std::size_t{16}, std::size_t{64},
                                      std::size_t{256}, std::size_t{1024}, std::size_t{4096} }) {
         for (bool const andnot : { false, true }) {
-            cold_heap::register_frsr_cold_card(acard, andnot);
+            arms::for_each_frsr<cold_heap::register_frsr_cold_card_registrar>(acard, andnot);
 #if FRSR_ROARING_HAS_CROARING
-            cold_heap::register_cpp_cold_card(acard, andnot);
+#if FRSR_ROARING_HAS_CROARING
+            arms::for_each_croaring<cold_heap::register_cpp_cold_card_registrar>(acard, andnot);
+#endif
 #endif
         }
     }
