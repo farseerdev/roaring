@@ -142,6 +142,98 @@ inline constexpr std::array<std::array<std::uint8_t, 16>, 256> array_intersect_c
 // handled CRoaring-style: matches are staged in a 2-vector on-stack buffer and
 // flushed to a[count] only when the read cursor has advanced past the flush
 // window. [croaring-ref] deps/croaring/src/array_util.c:intersect_vector16_inplace
+// SSE4.2 sorted-array difference a \ b — a port of CRoaring's difference_vector16 in the
+// shape of the intersection kernel above. PCMPISTRM ("equal any", 8 uint16 vs 8 uint16)
+// marks the lanes of the current A block that occur in the current B block; the marks
+// accumulate while B advances under that block, and once no further B value can match it
+// (a_max <= b_max) the UNMARKED lanes are compacted to the front and stored. Each store
+// writes a full 8-lane vector, so `out` must have sa + 8 slots.
+// Zeros: PCMPISTRM treats a zero lane as a terminator, so while either current block holds
+// one (sorted input puts it in lane 0 of the first block only) the explicit-length
+// PCMPESTRM is used, exactly as the intersection kernel does. B's sub-vector remainder is
+// applied to the last pending A block through a zero-padded, explicit-length compare.
+// [croaring-ref] deps/croaring/src/array_util.c:difference_vector16
+[[ gnu::hot ]] inline std::size_t difference_array_array_sse42(
+    std::uint16_t const * const a, std::size_t const sa,
+    std::uint16_t const * const b, std::size_t const sb,
+    std::uint16_t       * const out
+) noexcept {
+    constexpr std::size_t vl{ 8 };
+    constexpr int flags{ _SIDD_UWORD_OPS | _SIDD_CMP_EQUAL_ANY | _SIDD_BIT_MASK };
+    if ( sb == 0 ) {
+        std::memcpy( out, a, sa * sizeof( *a ) );
+        return sa;
+    }
+    std::size_t const sta{ ( sa / vl ) * vl };
+    std::size_t const stb{ ( sb / vl ) * vl };
+    std::size_t ia{ 0 }, ib{ 0 }, count{ 0 };
+
+    // Keep (compact + store) the lanes of `va_raw` whose bit in `keep` is set.
+    auto const compact_store{ [ & ]( __m128i const va_raw, unsigned const keep ) {
+        __m128i const ctrl{ _mm_lddqu_si128( reinterpret_cast<__m128i const *>( array_intersect_compact_table[ keep ].data() ) ) };
+        _mm_storeu_si128( reinterpret_cast<__m128i *>( out + count ), _mm_shuffle_epi8( va_raw, ctrl ) );
+        count += static_cast<std::size_t>( std::popcount( keep ) );
+    } };
+    auto const unmarked{ []( __m128i const found ) {
+        return static_cast<unsigned>( _mm_extract_epi32( found, 0 ) ^ 0xFF ) & 0xFFU;
+    } };
+
+    if ( ia < sta && ib < stb ) {
+        __m128i va{ _mm_lddqu_si128( reinterpret_cast<__m128i const *>( a + ia ) ) };
+        __m128i vb{ _mm_lddqu_si128( reinterpret_cast<__m128i const *>( b + ib ) ) };
+        __m128i found{ _mm_setzero_si128() };
+        while ( true ) {
+            __m128i const res{ ( a[ ia ] == 0 || b[ ib ] == 0 )
+                ? _mm_cmpestrm( vb, vl, va, vl, flags )
+                : _mm_cmpistrm( vb, va, flags ) };
+            found = _mm_or_si128( found, res );
+            std::uint16_t const amax{ a[ ia + vl - 1 ] };
+            std::uint16_t const bmax{ b[ ib + vl - 1 ] };
+            if ( amax <= bmax ) {
+                compact_store( va, unmarked( found ) );
+                ia += vl;
+                if ( ia == sta ) { break; }
+                found = _mm_setzero_si128();
+                va = _mm_lddqu_si128( reinterpret_cast<__m128i const *>( a + ia ) );
+            }
+            if ( bmax <= amax ) {
+                ib += vl;
+                if ( ib == stb ) { break; }
+                vb = _mm_lddqu_si128( reinterpret_cast<__m128i const *>( b + ib ) );
+            }
+        }
+        if ( ia < sta ) {
+            // B's vector blocks ran out under the current A block: finish that block
+            // against B's remainder, zero-padded, with the true length made explicit.
+            alignas( 16 ) std::uint16_t tail[ vl ]{};
+            std::memcpy( tail, b + ib, ( sb - ib ) * sizeof( *b ) );
+            vb = _mm_load_si128( reinterpret_cast<__m128i const *>( tail ) );
+            found = _mm_or_si128( found, _mm_cmpestrm( vb, static_cast<int>( sb - ib ), va, vl, flags ) );
+            compact_store( va, unmarked( found ) );
+            ia += vl;
+        }
+    }
+    // Scalar tail for the sub-vector remainders, then whatever is left of A survives.
+    while ( ia < sa && ib < sb ) {
+        std::uint16_t const av{ a[ ia ] };
+        std::uint16_t const bv{ b[ ib ] };
+        if ( av < bv ) {
+            out[ count++ ] = av;
+            ++ia;
+        } else if ( bv < av ) {
+            ++ib;
+        } else {
+            ++ia;
+            ++ib;
+        }
+    }
+    if ( ia < sa ) {
+        std::memcpy( out + count, a + ia, ( sa - ia ) * sizeof( *a ) );
+        count += sa - ia;
+    }
+    return count;
+}
+
 [[ gnu::hot ]] inline std::size_t intersect_array_array_inplace_sse42(
     std::uint16_t       * const a, std::size_t const sa,
     std::uint16_t const * const b, std::size_t const sb
@@ -809,6 +901,18 @@ template <typename Layout, typename OutVector, typename CowPolicy = cow_value_se
     array_cref<Layout, CowPolicy> const rhs,
     OutVector & out
 ) {
+#if defined( __SSE4_2__ )
+    // Same over-allocate-by-one-vector contract as the intersection: the kernel's
+    // stores write a full vector past the true count.
+    if constexpr ( kSimdArrayIntersect && std::is_same_v<typename Layout::low_type, std::uint16_t> ) {
+        auto const sa{ lhs.values.size() };
+        auto const sb{ rhs.values.size() };
+        resize_uninitialized( out, sa + 8U );
+        auto const count{ difference_array_array_sse42( lhs.values.data(), sa, rhs.values.data(), sb, out.data() ) };
+        out.resize( static_cast<std::uint32_t>( count ) );
+        return;
+    }
+#endif
     resize_uninitialized( out, lhs.values.size() );
 
     auto const * li{ lhs.values.data() };
