@@ -3786,8 +3786,18 @@ private:
     // the parity baseline — frsr must match CRoaring here before any of the novel
     // optimizations below are enabled to try to beat it.
     // Note: kUseLazySort requires kUseChunkHashMap (unsorted chunks need the map).
-    static constexpr bool kUseLazySort        = false; // novel: defer chunk sort to set-op paths
-    static constexpr bool kUseChunkHashMap    = false; // novel: hash-map chunk lookup vs binary search
+    // Same split as kUseLazyTombstoning below, for the other half of the flat
+    // chunk map's O(n) per chunk: INSERTING a chunk in the middle of a sorted
+    // array memmoves its tail. Append-then-defer-the-sort with a hash-map lookup
+    // removes that, at the cost of a hash probe per chunk lookup and a sort at
+    // the first ordered walk - which for a 16-bit chunk key (bounded at 65536
+    // chunks, and the ordered walks are the hot path) is the wrong trade, and
+    // for a wider key is decisive: an insert/remove mix over a wide key space
+    // goes 5.55 -> 0.024 us per value, and 100k scattered inserts 0.031 ->
+    // 0.017, i.e. 14x AHEAD of the reference implementation's 64-bit map where
+    // the flat array was 16x behind it.
+    static constexpr bool kUseLazySort        = ( sizeof( chunk_type ) > 2 ); // defer chunk sort to set-op paths
+    static constexpr bool kUseChunkHashMap    = ( sizeof( chunk_type ) > 2 ); // hash-map chunk lookup vs binary search
     // Erasing an emptied chunk memmoves the tail of the chunk array, so removing
     // many chunks is quadratic in the chunk count. How much that matters depends
     // entirely on how wide the chunk key is:
