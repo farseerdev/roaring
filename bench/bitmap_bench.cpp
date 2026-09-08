@@ -5836,6 +5836,107 @@ struct register_frsr_bulk_add_registrar {
     }
 };
 
+// ---- CopyAndDrop: what one copy-on-write copy of a whole bitmap costs ---------
+// A bitmap index is copied wholesale on every read that needs a stable snapshot
+// (an aggregate cache scratchpad, a race-free reader copy), so the per-copy cost
+// scales with the chunk count and not with the cardinality. The two engines pay
+// for it differently: a refcounted container set takes one atomic increment per
+// chunk, while a shared-flag design marks the containers shared and copies a
+// smaller descriptor with no atomics. This band prices exactly that difference.
+//
+// Timed region: copy, read the cardinality (so the copy cannot be elided) and
+// destroy - the destructor is half the cost and belongs in the measurement.
+struct CopyShape { char const *label; std::size_t chunks; std::size_t per_chunk; };
+static constexpr CopyShape kCopyShapes[]{
+    { "sparse-64",    64, 16 },   // few chunks, array containers
+    { "sparse-4096",  4096, 16 }, // an index-sized chunk count
+    { "dense-1024",   1024, 8192 },// bitset containers: same descriptor, big payloads
+};
+static constexpr std::size_t kCopyReps{ 64 };
+
+template <class Arm>
+struct register_frsr_copy_registrar {
+    using TestBitmap32 = typename Arm::bitmap;
+    struct S { TestBitmap32 src; };
+    static void run(CopyShape const &shape) {
+        Entry e;
+        char buf[160];
+        snprintf(buf, sizeof(buf), "set_ops/%sCopyAndDrop/shape=%s", Arm::label(), shape.label);
+        e.name        = buf;
+        e.description = "frsr::roaring::bitmap<uint32_t> copy + cardinality read + destroy, 64 times, of a bitmap "
+                        "with a fixed chunk count — the per-copy cost a read-side snapshot pays. Checksum = "
+                        "cardinality sum.";
+        e.setup = [shape]() -> void * {
+            auto *s = new S;
+            for (std::size_t c = 0; c < shape.chunks; ++c) {
+                auto const base = static_cast<std::uint32_t>(c * 65536u);
+                for (std::size_t i = 0; i < shape.per_chunk; ++i) {
+                    std::ignore = s->src.add(base + static_cast<std::uint32_t>(i * 7u));
+                }
+            }
+            return s;
+        };
+        e.run = [](void *sv) -> int64_t {
+            auto *s = static_cast<S *>(sv);
+            std::int64_t sum = 0;
+            for (std::size_t i = 0; i < kCopyReps; ++i) {
+                TestBitmap32 const copy{ s->src };
+                sum += static_cast<std::int64_t>(copy.size());
+            }
+            return sum;
+        };
+        e.teardown       = [](void *sv) { delete static_cast<S *>(sv); };
+        e.ops_per_run    = 1;
+        e.inner_reps     = kBinaryInnerReps;
+        e.reusable_state = true;
+        g_benchmarks.push_back(std::move(e));
+    }
+};
+
+#if FRSR_ROARING_HAS_CROARING
+template <class Arm>
+struct register_cpp_copy_registrar {
+    struct S {
+        roaring_bitmap_t *src{};
+        ~S() { if (src) roaring_bitmap_free(src); }
+    };
+    static void run(CopyShape const &shape) {
+        Entry e;
+        char buf[160];
+        snprintf(buf, sizeof(buf), "set_ops/%sCopyAndDrop/shape=%s", Arm::label(), shape.label);
+        e.name        = buf;
+        e.description = "CRoaring roaring_bitmap_copy() + cardinality read + free, 64 times, over the same bitmap. "
+                        "[croaring-ref] deps/croaring/src/roaring.c:roaring_bitmap_copy";
+        e.setup = [shape]() -> void * {
+            auto *s = new S;
+            s->src = Arm::create();
+            for (std::size_t c = 0; c < shape.chunks; ++c) {
+                auto const base = static_cast<std::uint32_t>(c * 65536u);
+                for (std::size_t i = 0; i < shape.per_chunk; ++i) {
+                    roaring_bitmap_add(s->src, base + static_cast<std::uint32_t>(i * 7u));
+                }
+            }
+            return s;
+        };
+        e.run = [](void *sv) -> int64_t {
+            auto *s = static_cast<S *>(sv);
+            std::int64_t sum = 0;
+            for (std::size_t i = 0; i < kCopyReps; ++i) {
+                roaring_bitmap_t *copy = roaring_bitmap_copy(s->src);
+                sum += static_cast<std::int64_t>(roaring_bitmap_get_cardinality(copy));
+                roaring_bitmap_free(copy);
+            }
+            return sum;
+        };
+        e.teardown       = [](void *sv) { delete static_cast<S *>(sv); };
+        e.ops_per_run    = 1;
+        e.inner_reps     = kBinaryInnerReps;
+        e.reusable_state = true;
+        g_benchmarks.push_back(std::move(e));
+    }
+};
+#endif
+
 // ---- BulkAddRowsGrouped: the same insert, handed over in per-value groups -----
 // A bitmap index's insert batch is already grouped by indexed value with the rows
 // ascending inside a group, so the row ids of one group can be handed over as one
@@ -6032,6 +6133,12 @@ void register_benchmarks() {
             register_set_binary(count, offset, ov.label);
         }
         if (count >= 100'000) {
+            for (auto const &shape : kCopyShapes) {
+                arms::for_each_frsr<register_frsr_copy_registrar>(shape);
+#if FRSR_ROARING_HAS_CROARING
+                arms::for_each_croaring<register_cpp_copy_registrar>(shape);
+#endif
+            }
             for (auto const &shape : kBulkAddShapes) {
                 arms::for_each_frsr<register_frsr_bulk_add_registrar>(std::size_t{ 200'000 }, shape);
 #if FRSR_ROARING_HAS_CROARING
