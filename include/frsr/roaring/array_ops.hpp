@@ -870,7 +870,7 @@ template <typename Layout, typename CowPolicy = cow_value_semantics>
             auto * const a{ lhs.values.data() };
             std::memmove( a + lb, a, la * sizeof( *a ) );
             auto const n{ x86_v4::union_sorted_uint16( a + lb, la, rhs.values.data(), lb, a ) };
-            lhs.values.resize_uninitialized( n );
+            lhs.values.resize_uninitialized( static_cast<std::uint32_t>( n ) );
             lhs.sync_header();
             return;
         }
