@@ -1268,40 +1268,31 @@ template <typename Layout, typename OutVector, typename CowPolicy = cow_value_se
     auto * const out{ result.data() };
     std::size_t written{ 0 };
     std::size_t ap{ 0 };
-    if ( card < rhs.runs.size() ) {
-        // Array-driven variant: the run-driven loop below pays two gallops and a
-        // memcpy per run regardless of how few array values are in play, so a
-        // small probe against many runs is dominated by that fixed per-run cost.
-        // Drive by array element with lazy run advance instead (run.end is
-        // inclusive, matching difference_array_run).
-        auto       run_it { rhs.runs.begin() };
-        auto const run_end{ rhs.runs.end  () };
-        while ( ap < card ) {
-            auto const value{ keys[ ap ] };
-            while ( static_cast<low_type>( run_it->end ) < value ) {
-                if ( ++run_it == run_end ) {
-                    resize_uninitialized( result, static_cast<std::uint32_t>( written ) );
-                    return;
-                }
-            }
-            if ( value >= static_cast<low_type>( run_it->begin ) ) {
-                out[ written++ ] = value;
-                ++ap;
-            } else {
-                ap = gallop_forward<false>( keys, ap, card, static_cast<low_type>( run_it->begin ) );
+    // Array-driven with a lazy run advance, the reference's shape: each array
+    // value is tested against the current run, the run cursor moves only when a
+    // value has passed it, and a gap before the next run is crossed by a
+    // gallop. A run-driven form (gallop to each run's start and end, memcpy the
+    // span) was measured against it: it loses on short runs — two gallops and a
+    // libc call per run for a 20-element span put array∩run 12-19 % behind the
+    // reference — and an inline copy in its place lost 1.7x on long runs, while
+    // this loop is at parity on both. (run.end is inclusive, matching
+    // difference_array_run.)
+    // [croaring-ref] deps/croaring/src/containers/mixed_intersection.c:array_run_container_intersection
+    auto       run_it { rhs.runs.begin() };
+    auto const run_end{ rhs.runs.end  () };
+    while ( ap < card ) {
+        auto const value{ keys[ ap ] };
+        while ( static_cast<low_type>( run_it->end ) < value ) {
+            if ( ++run_it == run_end ) {
+                resize_uninitialized( result, static_cast<std::uint32_t>( written ) );
+                return;
             }
         }
-        resize_uninitialized( result, static_cast<std::uint32_t>( written ) );
-        return;
-    }
-    for ( auto const & run : rhs.runs ) {
-        ap = gallop_forward<false>( keys, ap, card, static_cast<low_type>( run.begin ) );
-        auto const span_begin{ ap };
-        ap = gallop_forward<true >( keys, ap, card, static_cast<low_type>( run.end   ) );
-        std::memcpy( out + written, keys + span_begin, ( ap - span_begin ) * sizeof( low_type ) );
-        written += ap - span_begin;
-        if ( ap >= card ) {
-            break;
+        if ( value >= static_cast<low_type>( run_it->begin ) ) {
+            out[ written++ ] = value;
+            ++ap;
+        } else {
+            ap = gallop_forward<false>( keys, ap, card, static_cast<low_type>( run_it->begin ) );
         }
     }
     resize_uninitialized( result, static_cast<std::uint32_t>( written ) );
