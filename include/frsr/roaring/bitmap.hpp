@@ -2247,23 +2247,6 @@ public:
                 ++pos2;
                 continue;
             }
-            // array∪array: merge in place only while the accumulator stays SMALL.
-            // Past kLazyUnionArrayLowerBound the pair falls through to the mixed arm
-            // below, which promotes the accumulator to a bitset once and then scatters
-            // every later operand into it in O(|operand|) — CRoaring's lazy-union form
-            // rule. Merging arrays unconditionally (as this arm used to) rewrites the
-            // whole accumulator on EVERY fold, i.e. O(K·n) per chunk across a K-way
-            // union; that dominated the union phase of the lazy-union-fold benchmark
-            // at accumulator cardinalities above the bound (~2.6x CRoaring at 2048).
-            // The finishers still re-decide the final form.
-            if ( left_container.holds_array() && right_container.holds_array() &&
-                 ( static_cast<std::size_t>( left_container.count() ) + right_container.count() ) <= detail::kLazyUnionArrayLowerBound ) {
-                detail::union_array_array_inplace<layout_type>( left_container.as_array(), right_container.as_array() );
-                left_container = make_fast_container( std::move( left_container ) );
-                ++pos1;
-                ++pos2;
-                continue;
-            }
             if ( left_container.holds_bitset() && right_container.holds_bitset() ) {
                 // Prefer the card-updating bulk OR (outlined) so chunks that
                 // saturate mid-fold become known-full for later skips. nocard
@@ -2273,8 +2256,13 @@ public:
                 ++pos2;
                 continue;
             }
-            // Mixed array↔bitset: promote the accumulator to a bitset, OR the operand into
-            // its existing block in place (CRoaring LAZY_OR_BITSET_CONVERSION).
+            // Array/bitset pairs: the accumulator becomes a bitset on its first
+            // same-key fold, whatever its size, and every operand is then OR'd into
+            // that block in place. That is the reference's in-place lazy union with
+            // bitsetconversion (LAZY_OR_BITSET_CONVERSION is true): an array-merge
+            // arm that kept small accumulators as arrays rewrote the whole
+            // accumulator on every fold — O(K·n) per chunk — and measured 2.4x the
+            // reference on a 16-way union of 32-element operands.
             {
                 auto const left_is_bitset { left_container.holds_bitset()  };
                 auto const left_is_array  { left_container.holds_array()   };

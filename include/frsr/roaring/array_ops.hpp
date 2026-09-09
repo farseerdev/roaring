@@ -793,18 +793,6 @@ template <typename Layout, typename CowPolicy = cow_value_semantics>
     return result;
 }
 
-// Lazy-union form gate: an array∪array whose worst-case result exceeds this many
-// elements is accumulated as a BITSET instead of as an array. Rationale (CRoaring's,
-// arrived at by its own benchmarking): every later operand then costs an O(|operand|)
-// scatter rather than a full rewrite of the accumulator, and the consumers of an
-// accumulated union (intersections against many small operands) are cheaper against a
-// bitset; the one-time form repair at finish time pays for itself. Below the bound the
-// array stays an array — the rewrite is short, and an 8 KB bitset would cost more in
-// cache footprint than the merge saves.
-// [croaring-ref] deps/croaring/include/roaring/containers/perfparameters.h:ARRAY_LAZY_LOWERBOUND
-//               deps/croaring/src/containers/mixed_union.c:array_array_container_lazy_union
-inline constexpr std::size_t kLazyUnionArrayLowerBound{ 1024 };
-
 // Scalar forward merge of two sorted uint16 arrays into `out` (which must not
 // alias the inputs' unread parts and has sa + sb slots). Returns the count.
 // [croaring-ref] deps/croaring/src/array_util.c:union_uint16
