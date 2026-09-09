@@ -917,10 +917,26 @@ template <typename Layout, typename CowPolicy = cow_value_semantics>
         lhs.mark_endpoints_stale();
         return;
     }
-    for ( auto const value : values ) {
-        auto const word_index{ static_cast<std::size_t>( value ) >> 6U };
-        auto const bit_index { static_cast<unsigned>( value ) & 63U };
-        words[ word_index ] |= ( std::uint64_t{ 1 } << bit_index );
+    // Unrolled by four, as in CRoaring's _asm_bitset_set_list (bitset_util.c).
+    // This arm runs only when the values do NOT cluster - that is what the
+    // grouped arm above is for - so the four read-modify-writes almost always
+    // touch different words and their load->store latencies overlap instead of
+    // serialising. Written out rather than left to the optimiser because this
+    // function is gnu::cold, and a cold function is compiled for size: clang
+    // then neither unrolls this loop nor lowers the set to bts.
+    auto const set_bit{ [ &words ]( auto const value ) {
+        words[ static_cast<std::size_t>( value ) >> 6U ] |=
+            std::uint64_t{ 1 } << ( static_cast<unsigned>( value ) & 63U );
+    } };
+    std::size_t scatter{ 0 };
+    for ( ; scatter + 4 <= count; scatter += 4 ) {
+        set_bit( values[ scatter     ] );
+        set_bit( values[ scatter + 1 ] );
+        set_bit( values[ scatter + 2 ] );
+        set_bit( values[ scatter + 3 ] );
+    }
+    for ( ; scatter < count; ++scatter ) {
+        set_bit( values[ scatter ] );
     }
     lhs.mark_cardinality_stale();
     lhs.mark_endpoints_stale();
