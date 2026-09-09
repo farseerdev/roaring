@@ -59,6 +59,12 @@ inline constexpr std::array<std::array<std::uint8_t, 16>, 256> array_intersect_c
 // then the block with the smaller maximum is advanced (a SIMD merge). Each store writes
 // a full 8-lane vector, so `out` must have at least min(sa, sb) + 8 slots of capacity.
 // [croaring-ref] deps/croaring/src/array_util.c:intersect_vector16
+// Both sides must fill at least one 8-lane block or the kernel's vector loop is
+// skipped entirely (sta = (sa/vl)*vl == 0) and only its scalar tail runs — while
+// the caller has already paid the over-allocation that tail does not need. See
+// the dispatch in combine_array_array_into.
+inline constexpr std::size_t sse42_intersect_min_side{ 8 };
+
 [[ gnu::hot ]] inline std::size_t intersect_array_array_sse42(
     std::uint16_t const * const a, std::size_t const sa,
     std::uint16_t const * const b, std::size_t const sb,
@@ -719,10 +725,18 @@ template <typename Layout, typename OutVector, typename CowPolicy = cow_value_se
         if constexpr ( kSimdArrayIntersect && std::is_same_v<typename Layout::low_type, std::uint16_t> ) {
             auto const sa{ lhs.values.size() };
             auto const sb{ rhs.values.size() };
-            resize_uninitialized( result, std::min( sa, sb ) + 8U );
-            auto const count{ intersect_array_array_sse42( lhs.values.data(), sa, rhs.values.data(), sb, result.data() ) };
-            result.resize( static_cast<std::uint32_t>( count ) );
-            return;
+            // Only when the kernel's vector loop can actually run. Below one block
+            // per side it degenerates to its own scalar tail, and taking it anyway
+            // costs twice over: the +8 store slack it needs is dead, and it pushes
+            // the result past the handle's inline payload capacity — so a result
+            // that would have lived inline is forced onto the heap. The scalar
+            // merge below sizes the result exactly and keeps small ones inline.
+            if ( std::min( sa, sb ) >= sse42_intersect_min_side ) {
+                resize_uninitialized( result, std::min( sa, sb ) + 8U );
+                auto const count{ intersect_array_array_sse42( lhs.values.data(), sa, rhs.values.data(), sb, result.data() ) };
+                result.resize( static_cast<std::uint32_t>( count ) );
+                return;
+            }
         }
 #elif defined( __ARM_NEON ) && defined( __aarch64__ )
         // NEON vectorized intersection — same over-allocate-by-one-vector contract.
