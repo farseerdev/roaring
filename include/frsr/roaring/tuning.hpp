@@ -5,6 +5,7 @@
 // kUseSingletonChunkMap) are per-bitmap policy and live as static members of
 // frsr::roaring::bitmap in bitmap.hpp; the kernel-level knobs below are free.
 
+#include <cstddef>
 #include <cstdint>
 
 namespace frsr::roaring::detail {
@@ -25,6 +26,22 @@ namespace frsr::roaring::detail {
 #endif
 
 inline constexpr std::uint32_t array_sbo_size{ 8 };
+
+// Lazy in-place K-way union (bulk_or_inplace): an array∪array fold whose summed
+// cardinality is at or below this bound merges in place; above it the accumulator
+// becomes a bitset and every later operand is scattered into it. The reference's
+// in-place lazy union (with bitsetconversion, the way this library's consumer
+// always called it) converts on the FIRST fold whatever the size. That is the
+// right form as soon as the accumulator actually grows — 16 operands of 32
+// elements measured 2.4x the reference when merged as arrays — but it turns a
+// chunk whose union stays tiny into an 8 KB bitset for nothing, and a 64-way
+// union of 4-element chunks measured 4x slower converted than merged (the
+// reference pays the same). The bound keeps the merge only where a fold cannot
+// have grown the accumulator past a few cache lines.
+#ifndef FRSR_ROARING_LAZY_UNION_ARRAY_BOUND
+#   define FRSR_ROARING_LAZY_UNION_ARRAY_BOUND 64
+#endif
+inline constexpr std::size_t lazy_union_array_bound{ FRSR_ROARING_LAZY_UNION_ARRAY_BOUND };
 
 // Route the in-place bitset combine through the Harley-Seal carry-save kernel
 // (fused_combine_inplace_popcount) instead of the naive per-word loop in

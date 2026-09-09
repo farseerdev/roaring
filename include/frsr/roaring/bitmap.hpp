@@ -2247,6 +2247,16 @@ public:
                 ++pos2;
                 continue;
             }
+            // A small array pair merges in place (lazy_union_array_bound, tuning.hpp:
+            // the reference converts unconditionally; the bound is where that
+            // measurably loses).
+            if ( left_container.holds_array() && right_container.holds_array() &&
+                 ( static_cast<std::size_t>( left_container.count() ) + right_container.count() ) <= detail::lazy_union_array_bound ) {
+                detail::union_array_array_inplace<layout_type>( left_container.as_array(), right_container.as_array() );
+                ++pos1;
+                ++pos2;
+                continue;
+            }
             if ( left_container.holds_bitset() && right_container.holds_bitset() ) {
                 // Prefer the card-updating bulk OR (outlined) so chunks that
                 // saturate mid-fold become known-full for later skips. nocard
