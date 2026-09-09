@@ -567,6 +567,81 @@ template <typename T, typename OutVector>
     return count;
 }
 
+#if FRSR_ROARING_VP2
+// Sorted-array intersection through AVX-512 VP2INTERSECT. Same merge skeleton as
+// intersect_array_array_sse42 — compare the two current blocks, emit the matches,
+// advance whichever block has the smaller maximum — with two differences:
+//
+//   * the block is 16 lanes instead of 8, and
+//   * the all-pairs compare is ONE instruction (vp2intersectd) instead of PCMPISTRM,
+//     which is what makes the wider block pay. uint16 has no vp2intersect form, so
+//     each block is zero-extended to 16 uint32, intersected, compressed, and narrowed
+//     back — three cheap shuffles around the one compare.
+//
+// Store contract, as in the SSE kernel but wider: the compress-store writes a FULL
+// 16-lane (32-byte) vector, so `out` needs min(sa, sb) + 16 slots of capacity.
+//
+// No zero-terminator special case: unlike PCMPISTRM, vp2intersect gives a value 0 no
+// special meaning, so the SSE kernel's two-phase PCMPESTRM/PCMPISTRM dance is simply
+// absent here.
+//
+// Measured on Zen 5 against the SSE4.2 kernel it replaces: 2.2-2.5x from 16 elements
+// upward, and 2.8x SLOWER at 8 — hence intersect_min_side, mirroring
+// x86_v4::union_min_side.
+namespace x86_vp2 {
+
+// Both operands must fill at least one 16-lane block, or the kernel is all setup and
+// the scalar tail does the work anyway. Measured crossover, not a guess.
+inline constexpr std::size_t intersect_min_side{ 16 };
+
+FRSR_ROARING_VP2_KERNEL
+inline std::size_t intersect_sorted_uint16(
+    std::uint16_t const * const a, std::size_t const sa,
+    std::uint16_t const * const b, std::size_t const sb,
+    std::uint16_t       * const out
+) noexcept {
+    constexpr std::size_t vl{ 16 };
+    std::size_t const sta{ ( sa / vl ) * vl };
+    std::size_t const stb{ ( sb / vl ) * vl };
+    std::size_t ia{ 0 }, ib{ 0 }, count{ 0 };
+
+    while ( ia < sta && ib < stb ) {
+        __m512i const va{ _mm512_cvtepu16_epi32( _mm256_loadu_si256( reinterpret_cast<__m256i const *>( a + ia ) ) ) };
+        __m512i const vb{ _mm512_cvtepu16_epi32( _mm256_loadu_si256( reinterpret_cast<__m256i const *>( b + ib ) ) ) };
+        __mmask16 ma, mb;
+        _mm512_2intersect_epi32( va, vb, &ma, &mb );
+        _mm256_storeu_si256(
+            reinterpret_cast<__m256i *>( out + count ),
+            _mm512_cvtepi32_epi16( _mm512_maskz_compress_epi32( ma, va ) )
+        );
+        count += static_cast<std::size_t>( std::popcount( static_cast<unsigned>( ma ) ) );
+        std::uint16_t const amax{ a[ ia + vl - 1 ] };
+        std::uint16_t const bmax{ b[ ib + vl - 1 ] };
+        if ( amax <= bmax ) { ia += vl; }
+        if ( bmax <= amax ) { ib += vl; }
+    }
+    // Scalar tail for the sub-block remainders. Safe to resume at (ia, ib) with no
+    // carried state: an intersection emits its matches as it finds them, so unlike a
+    // difference there is never a pending block whose marks would be lost here.
+    while ( ia < sa && ib < sb ) {
+        std::uint16_t const av{ a[ ia ] };
+        std::uint16_t const bv{ b[ ib ] };
+        if ( av < bv ) {
+            ++ia;
+        } else if ( bv < av ) {
+            ++ib;
+        } else {
+            out[ count++ ] = av;
+            ++ia;
+            ++ib;
+        }
+    }
+    return count;
+}
+
+} // namespace x86_vp2
+#endif // FRSR_ROARING_VP2
+
 // Below this ratio, the linear two-pointer / SSE4.2 merge is used instead of the
 // skewed binary-search path — matches CRoaring's threshold exactly (`const int
 // threshold = 64;` in array_container_intersection).
@@ -620,6 +695,23 @@ template <typename Layout, typename OutVector, typename CowPolicy = cow_value_se
                 return;
             }
         }
+#if FRSR_ROARING_VP2
+        // VP2INTERSECT ahead of SSE4.2 where the CPU has it and both sides fill a
+        // 16-lane block: one instruction for the all-pairs compare against PCMPISTRM's
+        // 8-lane one. Below the floor, or on a CPU without it, this falls through to
+        // the SSE4.2 arm — the kernel is a pure addition, never a replacement.
+        if constexpr ( kSimdArrayIntersect && std::is_same_v<typename Layout::low_type, std::uint16_t> ) {
+            auto const sa{ lhs.values.size() };
+            auto const sb{ rhs.values.size() };
+            if ( sa >= x86_vp2::intersect_min_side && sb >= x86_vp2::intersect_min_side && have_vp2intersect() ) {
+                // +16: the compress-store writes a full 16-lane vector past `count`.
+                resize_uninitialized( result, std::min( sa, sb ) + 16U );
+                auto const count{ x86_vp2::intersect_sorted_uint16( lhs.values.data(), sa, rhs.values.data(), sb, result.data() ) };
+                result.resize( static_cast<std::uint32_t>( count ) );
+                return;
+            }
+        }
+#endif
 #if defined( __SSE4_2__ )
         // SSE4.2 vectorized intersection for the 16-bit container element type. The
         // store writes a full vector past `count`, so over-allocate by one vector and
@@ -843,7 +935,8 @@ inline constexpr std::size_t union_store_slack{ 32 };
 inline constexpr std::size_t union_min_side{ 32 };
 
 } // namespace x86_v4
-#endif // FRSR_ROARING_X86_V4
+#endif
+
 
 // True in-place union: grow lhs's payload to the worst-case size and merge
 // BACKWARDS (largest values first, writing down from slot la+lb-1). The write
