@@ -14,6 +14,16 @@ namespace frsr::roaring::detail {
 // Keep SBO intentionally small: CRoaring keeps array/run payloads heap-backed
 // with near-zero default capacity; shrinking SBO reduces container_variant size
 // and chunk-vector move/copy cost in sparse binary-op hot paths.
+// Equal-terms benchmarking knob (default OFF - never ship it on). The reference
+// implementation has no small-buffer optimization at any level, so with this set
+// the library gives up its own: container payloads always spill and the combine
+// scratch becomes a plain heap vector. Used to measure whether this library beats
+// the reference on the reference's own terms, before any SBO advantage is added
+// back on top.
+#ifndef FRSR_ROARING_NO_SBO
+#   define FRSR_ROARING_NO_SBO 0
+#endif
+
 inline constexpr std::uint32_t array_sbo_size{ 8 };
 
 // Route the in-place bitset combine through the Harley-Seal carry-save kernel

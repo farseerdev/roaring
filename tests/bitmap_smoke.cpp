@@ -101,6 +101,7 @@ TEST(FrsrRoaringSmoke, PublicContainerTypesAreDirectlyUsable) {
 }
 
 TEST(FrsrRoaringSmoke, ContainerHandleMaintainsHeaderInvariants) {
+    if constexpr ( FRSR_ROARING_NO_SBO ) { GTEST_SKIP() << "asserts inline-payload behaviour; FRSR_ROARING_NO_SBO deliberately removes it"; }
     using layout = frsr::roaring::detail::default_layout<std::uint32_t>;
     using handle = frsr::roaring::detail::container_handle<layout>;
 
@@ -153,7 +154,9 @@ TEST(FrsrRoaringSmoke, ContainerHandleMaintainsHeaderInvariants) {
     EXPECT_EQ( run_handle.max_value(), 140U );
 
     static_assert( sizeof( handle ) == 32U );
+#if !FRSR_ROARING_NO_SBO
     static_assert( handle::inline_capacity<std::uint16_t> >= 8U );  // the sparse-regime SBO win
+#endif
     static_assert( handle::is_trivially_moveable );
 }
 

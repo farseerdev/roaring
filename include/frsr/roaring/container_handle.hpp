@@ -23,6 +23,7 @@
 //
 // See the container-representation design notes.
 
+#include <frsr/roaring/tuning.hpp>
 #include <frsr/roaring/container_layout.hpp>
 #include <frsr/roaring/cow_policy.hpp>
 #include <frsr/roaring/run.hpp>
@@ -147,8 +148,18 @@ public:
     static constexpr std::size_t handle_size{ 32 };
     static constexpr std::size_t body_size{ 16 };
 
+    // MEASUREMENT KNOB, default off. The reference implementation has no
+    // small-buffer optimization anywhere: every container payload and every
+    // roaring_array_t array is a bare heap pointer. So a benchmark that lets this
+    // library keep values inline is not comparing like with like - it is scoring
+    // an advantage the reference cannot have. FRSR_ROARING_NO_SBO forces every
+    // payload to spill, which is what an equal-terms comparison needs.
+    // The handle layout is deliberately NOT changed: only the usable inline
+    // capacity goes to zero, so nothing about size or alignment moves and the
+    // knob isolates the SBO alone.
     template <typename E>
-    static constexpr std::uint32_t inline_capacity{ static_cast<std::uint32_t>( body_size / sizeof( E ) ) };
+    static constexpr std::uint32_t inline_capacity{
+        FRSR_ROARING_NO_SBO ? 0U : static_cast<std::uint32_t>( body_size / sizeof( E ) ) };
 
     constexpr container_handle() noexcept = default;   // empty inline array
 
@@ -1834,7 +1845,9 @@ decltype( auto ) visit_container_pair(
 
 static_assert( sizeof( container_handle<default_layout<std::uint32_t>> ) == container_handle<default_layout<std::uint32_t>>::handle_size );
 static_assert( sizeof( container_handle<default_layout<std::uint64_t>> ) == container_handle<default_layout<std::uint64_t>>::handle_size );
+#if !FRSR_ROARING_NO_SBO
 static_assert( container_handle<default_layout<std::uint32_t>>::inline_capacity<std::uint16_t> >= 8 ); // the sparse-regime SBO win — HARD constraint
+#endif
 static_assert( container_handle<default_layout<std::uint32_t>>::is_trivially_moveable );
 
 // The CoW policy shapes only the payload prefix and copy behavior — never the handle itself.
