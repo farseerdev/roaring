@@ -939,6 +939,33 @@ inline constexpr std::size_t union_store_slack{ 32 };
 // Below this per-side size the scalar merge is used (no whole 32-lane block).
 inline constexpr std::size_t union_min_side{ 32 };
 
+// Widening decode of an array container into 32-bit values, sixteen per store:
+// a 256-bit load of keys is widened to a full 512-bit block, the chunk base is
+// added, and the block is stored whole; the tail takes one masked load/store
+// pair instead of a scalar loop. The baseline loop in container_decode_into
+// auto-vectorizes only to 256-bit stores, half the width this tier moves per
+// instruction, and the decode is store-bound.
+// [croaring-ref] deps/croaring/src/array_util.c:avx512_array_container_to_uint32_array
+FRSR_ROARING_X86_V4_KERNEL
+inline std::uint32_t * decode_array_uint32(
+    std::uint16_t const * const keys, std::size_t const count, std::uint32_t * const out, std::uint32_t const base
+) noexcept {
+    __m512i const base_lanes{ _mm512_set1_epi32( static_cast<int>( base ) ) };
+    std::size_t i{ 0 };
+    for ( ; i + 16 <= count; i += 16 ) {
+        __m256i const packed{ _mm256_loadu_si256( reinterpret_cast<__m256i const *>( keys + i ) ) };
+        _mm512_storeu_si512( out + i, _mm512_add_epi32( _mm512_cvtepu16_epi32( packed ), base_lanes ) );
+    }
+    if ( i < count ) {
+        auto const tail{ static_cast<__mmask16>( ( 1U << ( count - i ) ) - 1U ) };
+        __m256i const packed{ _mm256_maskz_loadu_epi16( tail, keys + i ) };
+        _mm512_mask_storeu_epi32( out + i, tail, _mm512_add_epi32( _mm512_cvtepu16_epi32( packed ), base_lanes ) );
+    }
+    return out + count;
+}
+// Below this count the dispatched call is not worth its out-of-line hop.
+inline constexpr std::size_t decode_array_min_count{ 64 };
+
 } // namespace x86_v4
 #endif
 
