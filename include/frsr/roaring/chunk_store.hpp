@@ -116,7 +116,11 @@ public:
     // chunk table itself keeps its capacity across runs too.
     void clear_retiring_slots() noexcept {
         retired_.destroy_all();
-        live_.swap( retired_ );
+        // An empty live table has nothing to park, and keeps its capacity: the
+        // fresh result of every materializing operator arrives here empty.
+        if ( live_.size_ != 0 ) {
+            live_.swap( retired_ );
+        }
         retired_array_next_ = retired_bitset_next_ = 0;
         ++generation_;
     }
