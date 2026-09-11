@@ -164,9 +164,12 @@ public:
     // Parks a consumed handle's payload for take_retired() instead of freeing
     // it — the in-place combine walk pairs each such free with a fresh result
     // allocation one pair later, so this turns that free+alloc churn into
-    // in-place reuse. Non-spilled handles have nothing to offer and are dropped.
+    // in-place reuse. Only what take_retired() can hand out is parked: a
+    // non-spilled handle has no payload to offer, and a shared one cannot be
+    // rebuilt in place — parking it would allocate a retired table for nothing
+    // and hold the co-owners' payload alive until the next clear.
     void retire( handle_type && handle ) {
-        if ( handle.spilled() ) {
+        if ( handle.offers_reusable_payload( handle.kind() ) ) {
             retired_.push_back( chunk_type{}, std::move( handle ) );
         }
     }

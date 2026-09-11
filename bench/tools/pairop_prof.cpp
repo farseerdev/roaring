@@ -9,7 +9,7 @@
 // Not part of the build (nothing globs this directory). Compile with the
 // benchmark target's own flags (see bulkadd_prof.cpp), then:
 //
-//   pairop_prof <frsr|cpp> <union|difference|diffinplace|toarray|mixedandnot|runbitset|satandnot> <count> <high|mid|low> [passes]
+//   pairop_prof <frsr|cpp> <union|difference|diffinplace|toarray|mixedandnot|runbitset|satandnot|envelope> <count> <high|mid|low> [passes]
 //
 // mixedandnot ignores count/overlap (the band's fixture: 64 strided values \ a
 // 32768-value even-number bitset — an all-hit probe, empty result); runbitset
@@ -45,6 +45,9 @@ static Fixture make_fixture( std::string const & op, std::size_t const count, st
         for ( std::size_t r = 0; r < 64; ++r ) { f.a_runs.emplace_back( std::uint32_t( r * 1024 ), std::uint32_t( r * 1024 + run_length - 1 ) ); }
         f.optimize_a = true;
         for ( std::size_t i = 0; i < 32768; ++i ) { f.b.push_back( std::uint32_t( i ) ); }
+    } else if ( op == "envelope" ) {
+        // EnvelopePerChunk/chunks=<count>: both sides hold count chunks of 4 values, one of which matches.
+        for ( std::size_t c = 0; c < count; ++c ) { auto const base{ std::uint32_t( c * 65536 ) }; f.a.insert( f.a.end(), { base + 1, base + 3, base + 5, base + 7 } ); f.b.insert( f.b.end(), { base + 1, base + 2, base + 4, base + 6 } ); }
     } else if ( op == "satandnot" ) {
         for ( std::size_t i = 0; i < 64; ++i ) { f.a.push_back( std::uint32_t( i * 2048 ) ); }
         for ( std::size_t i = 0; i < count; ++i ) { f.b.push_back( std::uint32_t( i ) ); }
@@ -63,7 +66,7 @@ int main( int argc, char * argv[] ) {
     std::size_t const offset { overlap == "high" ? count / 4 : overlap == "mid" ? count / 2 : 9 * count / 10 };
     auto const fx{ make_fixture( op, count, offset ) };
     bool const is_andnot{ op == "difference" || op == "mixedandnot" || op == "satandnot" };
-    bool const is_and   { op == "runbitset" };
+    bool const is_and   { op == "runbitset" || op == "envelope" };
     std::int64_t sink{ 0 };
     if ( arm == "frsr" ) {
         Bitmap a, b;
