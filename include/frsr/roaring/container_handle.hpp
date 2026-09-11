@@ -736,14 +736,11 @@ private:
     }
 
     void copy_fields_from( container_handle const & other ) noexcept {
-        count_       = other.count_;
-        cardinality_ = other.cardinality_;
-        min_         = other.min_;
-        max_         = other.max_;
-        kind_        = other.kind_;
-        owner_       = other.owner_;
-        flags_       = other.flags_;
-        std::memcpy( &body_, &other.body_, body_size );   // whole-object byte copy; a union of trivially-copyable alternatives is itself trivially copyable
+        // One whole-object byte copy: every field is trivially copyable (the body is a
+        // union of trivially-copyable alternatives) and the class is trivially
+        // moveable, so this is the move — two vector moves instead of seven field
+        // copies and a memcpy, on the path every emitted result chunk takes.
+        std::memcpy( static_cast<void *>( this ), static_cast<void const *>( &other ), sizeof( container_handle ) );
     }
 
     void adopt_fields_from( container_handle & other ) noexcept {
