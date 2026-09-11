@@ -328,8 +328,13 @@ public:
         chunk_type chunk{};
         size_type index{ invalid_index };
         bool payload_private{ false };
+        // The resolved slot itself, as the reference caches its container: valid
+        // while `generation` still matches the chunk store's (no slot has moved
+        // or died since it was taken). add_bulk's hit lane goes through it.
+        handle_type * slot{ nullptr };
+        std::uint32_t generation{ 0 };
 
-        void reset() noexcept { index = invalid_index; payload_private = false; }
+        void reset() noexcept { index = invalid_index; payload_private = false; slot = nullptr; }
     };
 
     class const_iterator {
@@ -677,7 +682,39 @@ public:
         return add_impl( value, nullptr );
     }
 
+    // The context-hit lane is the whole function for a run of adds into one
+    // chunk, as the reference's add_bulk_impl is: the cached chunk is checked
+    // and the value goes straight into its container. Everything else (a new
+    // chunk, a singleton, the hot-index search) is the shared add_impl.
+    // [croaring-ref] deps/croaring/src/roaring.c:add_bulk_impl
     [[nodiscard]] bool add_bulk( bulk_context & ctx, key_type const value ) {
+        auto const chunk{ layout_type::chunk_key( value ) };
+        if ( ctx.slot != nullptr && ctx.generation == chunks_.generation() && ctx.chunk == chunk ) [[likely]] {
+            auto       & slot{ *ctx.slot };
+            auto const   low { layout_type::low_key( value ) };
+            // The common hit is an in-order append into a private array: one
+            // inline lane, as the reference's is, before the kind dispatch.
+            if ( ctx.payload_private && slot.holds_array() ) [[likely]] {
+                if ( detail::as_array_already_private( slot ).try_append( low ) ) [[likely]] {
+                    promote_if_needed( slot );
+                    return true;
+                }
+            }
+            bool const was_tombstone{
+                kUseLazyTombstoning && tombstone_count_ != 0 && detail::container_size( slot ) == 0
+            };
+            auto const added{
+                ctx.payload_private
+                    ? detail::container_add_already_private( slot, low )
+                    : detail::container_add               ( slot, low )
+            };
+            if ( !added ) { return false; }
+            ctx.payload_private = true;
+            ++size_;
+            if ( was_tombstone ) { --tombstone_count_; }
+            promote_if_needed( slot );
+            return true;
+        }
         return add_impl( value, &ctx );
     }
 
@@ -2102,11 +2139,14 @@ public:
                     // production fold's sparse shapes (HW-counter A/B vs a downstream
                     // engine's sparse run∩bitset kernel, which croaring-arm ran here).
                     auto const run_cardinality{ detail::container_size( run_side ) };
-                    if ( run_cardinality >= layout_type::low_domain_size - layout_type::low_domain_size / 8U ) {
-                        // Near-full runs (≥ 7/8 of the domain, incl. the full-domain
+                    if ( run_cardinality >= layout_type::low_domain_size / 2U ) {
+                        // Runs covering at least half the domain (incl. the full-domain
                         // run — CRoaring's run_container_is_full short-circuit): clone
                         // the bitset payload and clear only the gaps, with the
-                        // cardinality maintained by subtraction — cheaper than masking
+                        // cardinality maintained by subtraction. The masked fill below
+                        // costs per covered word, this form per gap word plus one 8 KB
+                        // copy; measured on 64 runs the two tie at half coverage and
+                        // this form wins 40 % at three quarters — cheaper than masking
                         // all 8 KB through the fill kernel below.
                         auto container{ detail::intersect_run_bitset_dense_runs<layout_type, CowPolicy>(
                             std::as_const( run_side ).as_run(),
@@ -2247,19 +2287,12 @@ public:
                 ++pos2;
                 continue;
             }
-            // array∪array: merge in place only while the accumulator stays SMALL.
-            // Past kLazyUnionArrayLowerBound the pair falls through to the mixed arm
-            // below, which promotes the accumulator to a bitset once and then scatters
-            // every later operand into it in O(|operand|) — CRoaring's lazy-union form
-            // rule. Merging arrays unconditionally (as this arm used to) rewrites the
-            // whole accumulator on EVERY fold, i.e. O(K·n) per chunk across a K-way
-            // union; that dominated the union phase of the lazy-union-fold benchmark
-            // at accumulator cardinalities above the bound (~2.6x CRoaring at 2048).
-            // The finishers still re-decide the final form.
+            // A small array pair merges in place (lazy_union_array_bound, tuning.hpp:
+            // the reference converts unconditionally; the bound is where that
+            // measurably loses).
             if ( left_container.holds_array() && right_container.holds_array() &&
-                 ( static_cast<std::size_t>( left_container.count() ) + right_container.count() ) <= detail::kLazyUnionArrayLowerBound ) {
+                 ( static_cast<std::size_t>( left_container.count() ) + right_container.count() ) <= detail::lazy_union_array_bound ) {
                 detail::union_array_array_inplace<layout_type>( left_container.as_array(), right_container.as_array() );
-                left_container = make_fast_container( std::move( left_container ) );
                 ++pos1;
                 ++pos2;
                 continue;
@@ -2273,8 +2306,13 @@ public:
                 ++pos2;
                 continue;
             }
-            // Mixed array↔bitset: promote the accumulator to a bitset, OR the operand into
-            // its existing block in place (CRoaring LAZY_OR_BITSET_CONVERSION).
+            // Array/bitset pairs: the accumulator becomes a bitset on its first
+            // same-key fold, whatever its size, and every operand is then OR'd into
+            // that block in place. That is the reference's in-place lazy union with
+            // bitsetconversion (LAZY_OR_BITSET_CONVERSION is true): an array-merge
+            // arm that kept small accumulators as arrays rewrote the whole
+            // accumulator on every fold — O(K·n) per chunk — and measured 2.4x the
+            // reference on a 16-way union of 32-element operands.
             {
                 auto const left_is_bitset { left_container.holds_bitset()  };
                 auto const left_is_array  { left_container.holds_array()   };
@@ -3557,6 +3595,7 @@ private:
                 if ( ctx != nullptr ) {
                     ctx->chunk = chunk;
                     ctx->index = invalid_index;
+                    ctx->slot  = nullptr;
                     ctx->payload_private = false;
                 }
                 return true;
@@ -3657,6 +3696,8 @@ private:
         if ( ctx != nullptr ) {
             ctx->chunk = chunk;
             ctx->index = pos;
+            ctx->slot  = &chunks_.slot( pos );
+            ctx->generation = chunks_.generation();
             // The add below makes this payload private (or already found it so),
             // and no copy can intervene before the next call on this context.
             ctx->payload_private = true;
@@ -3683,17 +3724,22 @@ private:
         return true;
     }
 
-    void promote_if_needed( handle_type & slot ) {
-        if ( slot.holds_array() && slot.count() >= array_to_bitset_threshold ) {
-            if constexpr ( supports_bitset_container ) {
-                // [croaring-ref] deps/croaring/include/roaring/roaring.h: array→bitset promotion concept
-                // std::as_const avoids an unneeded write-barrier clone under a
-                // refcounted CowPolicy: slot is about to be wholly replaced below.
-                auto const values{ std::as_const( slot ).as_array().values };
-                slot = detail::bitset_handle_from_sorted_values<layout_type, CowPolicy>( { values.data(), values.size() } );
-            } else {
-                slot = optimize_container_for_policy( std::move( slot ) );
-            }
+    // The threshold test is the inline part (two loads on the handle line the
+    // add just touched); the conversion itself is one cold call per 4096 adds.
+    [[gnu::always_inline]] void promote_if_needed( handle_type & slot ) {
+        if ( slot.holds_array() && slot.count() >= array_to_bitset_threshold ) [[unlikely]] {
+            promote_array( slot );
+        }
+    }
+    [[gnu::cold, gnu::noinline]] void promote_array( handle_type & slot ) {
+        if constexpr ( supports_bitset_container ) {
+            // [croaring-ref] deps/croaring/include/roaring/roaring.h: array→bitset promotion concept
+            // std::as_const avoids an unneeded write-barrier clone under a
+            // refcounted CowPolicy: slot is about to be wholly replaced below.
+            auto const values{ std::as_const( slot ).as_array().values };
+            slot = detail::bitset_handle_from_sorted_values<layout_type, CowPolicy>( { values.data(), values.size() } );
+        } else {
+            slot = optimize_container_for_policy( std::move( slot ) );
         }
     }
 

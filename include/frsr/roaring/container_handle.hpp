@@ -23,6 +23,7 @@
 //
 // See the container-representation design notes.
 
+#include <frsr/roaring/tuning.hpp>
 #include <frsr/roaring/container_layout.hpp>
 #include <frsr/roaring/cow_policy.hpp>
 #include <frsr/roaring/run.hpp>
@@ -62,6 +63,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cassert>
 #include <cstring>
 #include <limits>
 #include <new>
@@ -147,8 +149,18 @@ public:
     static constexpr std::size_t handle_size{ 32 };
     static constexpr std::size_t body_size{ 16 };
 
+    // MEASUREMENT KNOB, default off. The reference implementation has no
+    // small-buffer optimization anywhere: every container payload and every
+    // roaring_array_t array is a bare heap pointer. So a benchmark that lets this
+    // library keep values inline is not comparing like with like - it is scoring
+    // an advantage the reference cannot have. FRSR_ROARING_NO_SBO forces every
+    // payload to spill, which is what an equal-terms comparison needs.
+    // The handle layout is deliberately NOT changed: only the usable inline
+    // capacity goes to zero, so nothing about size or alignment moves and the
+    // knob isolates the SBO alone.
     template <typename E>
-    static constexpr std::uint32_t inline_capacity{ static_cast<std::uint32_t>( body_size / sizeof( E ) ) };
+    static constexpr std::uint32_t inline_capacity{
+        FRSR_ROARING_NO_SBO ? 0U : static_cast<std::uint32_t>( body_size / sizeof( E ) ) };
 
     constexpr container_handle() noexcept = default;   // empty inline array
 
@@ -327,6 +339,12 @@ public:
         max_ = max;
         flags_ &= static_cast<std::uint8_t>( ~endpoints_stale_flag );
     }
+    // Raises the upper endpoint only (an append past the current maximum);
+    // requires the endpoints to be valid already.
+    void set_max_value  ( low_type const max ) noexcept {
+        assert( endpoints_valid() );
+        max_ = max;
+    }
 
     // ---- scratch payload reuse (CRoaring persistent-dst analog) -------------
     //
@@ -441,7 +459,7 @@ public:
         }
         auto * const fresh{ allocate_payload( std::size_t{ count_ } * sizeof( E ) ) };
         std::memcpy( fresh, payload_data_raw(), std::size_t{ count_ } * sizeof( E ) );
-        free_payload( spill().data );
+        free_payload( spill().data, std::size_t{ capacity } * sizeof( E ) );
         spill_to( fresh, count_ );
         return old_bytes - new_bytes;
     }
@@ -455,7 +473,7 @@ public:
         auto * const fresh{ allocate_payload( std::size_t{ grown } * sizeof( E ) ) };
         std::memcpy( fresh, payload_data_raw(), std::size_t{ count_ } * sizeof( E ) );
         if ( spilled() ) {
-            free_payload( spill().data );
+            free_payload( spill().data, std::size_t{ spill().capacity } * sizeof( E ) );
         }
         spill_to( fresh, grown );
     }
@@ -534,7 +552,25 @@ private:
 
     // new/delete. free_payload always rebases by the *compile-time* offset (not
     // runtime owner) so a demoted-to-unique shared payload still frees its base.
+    //
+    // A bitset word block is allocated so that the WORDS start on a cache line,
+    // as the reference's roaring_aligned_malloc places them: the word kernels
+    // move whole 64-byte vectors, and a block whose words begin 8 bytes into a
+    // line (the refcount word's width) splits every load and store across two
+    // lines. The refcount word keeps its place immediately before the payload;
+    // only the allocation's base moves back to the line boundary. The prefix
+    // is a function of the payload size alone, so the free side recomputes it
+    // from the capacity it already knows.
+    static constexpr std::size_t payload_line_bytes{ 64 };
+    [[nodiscard]] static constexpr bool line_aligned_payload( std::size_t const bytes ) noexcept {
+        return bytes == sizeof( word_array );
+    }
+    [[nodiscard]] static constexpr std::size_t payload_prefix_bytes( std::size_t const bytes ) noexcept {
+        return line_aligned_payload( bytes ) && rc_prefix_bytes != 0 ? payload_line_bytes : rc_prefix_bytes;
+    }
+
     [[nodiscard]] static void * allocate_payload( std::size_t const bytes ) {
+        auto const prefix{ payload_prefix_bytes( bytes ) };
 #if FRSR_ROARING_PAYLOAD_ALLOC_STATS
         {
             auto & s{ payload_alloc_stats() };
@@ -548,27 +584,43 @@ private:
 #if FRSR_ROARING_HAS_MIMALLOC
         void * raw;
         if ( auto * const heap{ payload_heap() } ) [[likely]] {
-            raw = mi_heap_malloc( heap, rc_prefix_bytes + bytes );
+            raw = line_aligned_payload( bytes )
+                ? mi_heap_malloc_aligned( heap, prefix + bytes, payload_line_bytes )
+                : mi_heap_malloc        ( heap, prefix + bytes );
             if ( raw == nullptr ) [[unlikely]] { throw std::bad_alloc{}; }
         } else { // mi_heap_new failure fallback: default heap, mi_new OOM semantics
-            raw = mi_new( rc_prefix_bytes + bytes );
+            raw = line_aligned_payload( bytes )
+                ? mi_new_aligned( prefix + bytes, payload_line_bytes )
+                : mi_new        ( prefix + bytes );
         }
         auto * const base{ static_cast<std::byte *>( raw ) };
 #else
-        auto * const base{ static_cast<std::byte *>( ::operator new( rc_prefix_bytes + bytes ) ) };
+        auto * const base{ static_cast<std::byte *>( line_aligned_payload( bytes )
+            ? ::operator new( prefix + bytes, std::align_val_t{ payload_line_bytes } )
+            : ::operator new( prefix + bytes ) ) };
 #endif
+        auto * const data{ base + prefix };
         if constexpr ( CowPolicy::refcounted ) {
-            CowPolicy::rc_construct( base );
+            CowPolicy::rc_construct( data - rc_prefix_bytes );
         }
-        return base + rc_prefix_bytes;
+        return data;
     }
 
-    static void free_payload( void * const data ) noexcept {
+    // `bytes` must be the size the payload was allocated with (capacity, not count).
+    static void free_payload( void * const data, std::size_t const bytes ) noexcept {
+        auto * const base{ static_cast<std::byte *>( data ) - payload_prefix_bytes( bytes ) };
 #if FRSR_ROARING_HAS_MIMALLOC
-        mi_free( static_cast<std::byte *>( data ) - rc_prefix_bytes );
+        mi_free( base );
 #else
-        ::operator delete( static_cast<std::byte *>( data ) - rc_prefix_bytes );
+        if ( line_aligned_payload( bytes ) ) {
+            ::operator delete( base, std::align_val_t{ payload_line_bytes } );
+        } else {
+            ::operator delete( base );
+        }
 #endif
+    }
+    void free_payload( void * const data ) const noexcept {
+        free_payload( data, std::size_t{ spill().capacity } * element_size() );
     }
 
     [[nodiscard]] static void * rc_slot_of( void * const payload ) noexcept {
@@ -684,14 +736,11 @@ private:
     }
 
     void copy_fields_from( container_handle const & other ) noexcept {
-        count_       = other.count_;
-        cardinality_ = other.cardinality_;
-        min_         = other.min_;
-        max_         = other.max_;
-        kind_        = other.kind_;
-        owner_       = other.owner_;
-        flags_       = other.flags_;
-        std::memcpy( &body_, &other.body_, body_size );   // whole-object byte copy; a union of trivially-copyable alternatives is itself trivially copyable
+        // One whole-object byte copy: every field is trivially copyable (the body is a
+        // union of trivially-copyable alternatives) and the class is trivially
+        // moveable, so this is the move — two vector moves instead of seven field
+        // copies and a memcpy, on the path every emitted result chunk takes.
+        std::memcpy( static_cast<void *>( this ), static_cast<void const *>( &other ), sizeof( container_handle ) );
     }
 
     void adopt_fields_from( container_handle & other ) noexcept {
@@ -1019,11 +1068,34 @@ public:
         return sorted_array_contains( values.data(), values.size(), value );
     }
 
+    // The in-order append alone, inline, as the reference's array_container_try_add
+    // takes it: a value above the current maximum into a payload with room. Only
+    // the count and the upper endpoint move (the reference stores the count alone).
+    // Anything else — an empty or full payload, an out-of-order value — is add().
+    [[nodiscard]] [[gnu::always_inline]] bool try_append( low_type const value ) noexcept {
+        auto const cardinality{ values.size() };
+        if ( cardinality != 0 && values.back() < value && cardinality < values.capacity() ) [[likely]] {
+            values.data()[ cardinality ] = value;
+            handle_->set_count      ( cardinality + 1U );
+            handle_->set_cardinality( cardinality + 1U );
+            handle_->set_max_value  ( value );
+            return true;
+        }
+        return false;
+    }
+
     [[nodiscard]] bool add( low_type const value ) {
+        if ( try_append( value ) ) { return true; }
         auto const cardinality{ values.size() };
         if ( cardinality == 0 || values.back() < value ) {
+            // Append into a payload that must first grow (or is empty).
             values.push_back( value );
-            sync_header();
+            handle_->set_cardinality( cardinality + 1U );
+            if ( cardinality == 0 ) {
+                handle_->set_endpoints( value, value );
+            } else {
+                handle_->set_max_value( value );
+            }
             return true;
         }
 
@@ -1597,16 +1669,11 @@ public:
             return false;
         }
         word |= mask;
-        auto const previous_cardinality{ handle_->cardinality() };
-        handle_->set_cardinality( previous_cardinality + 1U );
-        if ( previous_cardinality == 0 ) {
-            handle_->set_endpoints( value, value );
-        } else if ( handle_->endpoints_valid() ) {
-            handle_->set_endpoints(
-                std::min( handle_->min_value(), value ),
-                std::max( handle_->max_value(), value )
-            );
-        }
+        // Count stays exact (the reference keeps only that); the endpoints are
+        // marked stale like the bulk word kernels do, and the first read
+        // recomputes them — cheaper than two compares and two stores per bit.
+        handle_->set_cardinality( handle_->cardinality() + 1U );
+        handle_->mark_endpoints_stale();
         return true;
     }
 
@@ -1834,7 +1901,9 @@ decltype( auto ) visit_container_pair(
 
 static_assert( sizeof( container_handle<default_layout<std::uint32_t>> ) == container_handle<default_layout<std::uint32_t>>::handle_size );
 static_assert( sizeof( container_handle<default_layout<std::uint64_t>> ) == container_handle<default_layout<std::uint64_t>>::handle_size );
+#if !FRSR_ROARING_NO_SBO
 static_assert( container_handle<default_layout<std::uint32_t>>::inline_capacity<std::uint16_t> >= 8 ); // the sparse-regime SBO win — HARD constraint
+#endif
 static_assert( container_handle<default_layout<std::uint32_t>>::is_trivially_moveable );
 
 // The CoW policy shapes only the payload prefix and copy behavior — never the handle itself.

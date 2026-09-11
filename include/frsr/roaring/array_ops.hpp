@@ -59,6 +59,12 @@ inline constexpr std::array<std::array<std::uint8_t, 16>, 256> array_intersect_c
 // then the block with the smaller maximum is advanced (a SIMD merge). Each store writes
 // a full 8-lane vector, so `out` must have at least min(sa, sb) + 8 slots of capacity.
 // [croaring-ref] deps/croaring/src/array_util.c:intersect_vector16
+// Both sides must fill at least one 8-lane block or the kernel's vector loop is
+// skipped entirely (sta = (sa/vl)*vl == 0) and only its scalar tail runs — while
+// the caller has already paid the over-allocation that tail does not need. See
+// the dispatch in combine_array_array_into.
+inline constexpr std::size_t sse42_intersect_min_side{ 8 };
+
 [[ gnu::hot ]] inline std::size_t intersect_array_array_sse42(
     std::uint16_t const * const a, std::size_t const sa,
     std::uint16_t const * const b, std::size_t const sb,
@@ -151,9 +157,9 @@ inline constexpr std::array<std::array<std::uint8_t, 16>, 256> array_intersect_c
 // accumulate while B advances under that block, and once no further B value can match it
 // (a_max <= b_max) the UNMARKED lanes are compacted to the front and stored. Each store
 // writes a full 8-lane vector, so `out` must have sa + 8 slots.
-// Zeros: PCMPISTRM treats a zero lane as a terminator, so while either current block holds
-// one (sorted input puts it in lane 0 of the first block only) the explicit-length
-// PCMPESTRM is used, exactly as the intersection kernel does. B's sub-vector remainder is
+// Zeros: PCMPISTRM treats a zero lane as a terminator, and sorted input can hold a zero
+// only at position 0 — so, as the reference does, that one element is settled up front
+// and the loop runs the implicit-length compare throughout. B's sub-vector remainder is
 // applied to the last pending A block through a zero-padded, explicit-length compare.
 // [croaring-ref] deps/croaring/src/array_util.c:difference_vector16
 [[ gnu::hot ]] inline std::size_t difference_array_array_sse42(
@@ -163,13 +169,19 @@ inline constexpr std::array<std::array<std::uint8_t, 16>, 256> array_intersect_c
 ) noexcept {
     constexpr std::size_t vl{ 8 };
     constexpr int flags{ _SIDD_UWORD_OPS | _SIDD_CMP_EQUAL_ANY | _SIDD_BIT_MASK };
+    if ( sa == 0 ) { return 0; }
     if ( sb == 0 ) {
         std::memcpy( out, a, sa * sizeof( *a ) );
         return sa;
     }
-    std::size_t const sta{ ( sa / vl ) * vl };
-    std::size_t const stb{ ( sb / vl ) * vl };
     std::size_t ia{ 0 }, ib{ 0 }, count{ 0 };
+    if ( a[ 0 ] == 0 || b[ 0 ] == 0 ) {
+        if      ( a[ 0 ] == 0 && b[ 0 ] == 0 ) { ++ia; ++ib; }
+        else if ( a[ 0 ] == 0 )                { out[ count++ ] = 0; ++ia; }
+        else                                   { ++ib; }
+    }
+    std::size_t const sta{ ia + ( ( sa - ia ) / vl ) * vl };
+    std::size_t const stb{ ib + ( ( sb - ib ) / vl ) * vl };
 
     // Keep (compact + store) the lanes of `va_raw` whose bit in `keep` is set.
     auto const compact_store{ [ & ]( __m128i const va_raw, unsigned const keep ) {
@@ -186,10 +198,7 @@ inline constexpr std::array<std::array<std::uint8_t, 16>, 256> array_intersect_c
         __m128i vb{ _mm_lddqu_si128( reinterpret_cast<__m128i const *>( b + ib ) ) };
         __m128i found{ _mm_setzero_si128() };
         while ( true ) {
-            __m128i const res{ ( a[ ia ] == 0 || b[ ib ] == 0 )
-                ? _mm_cmpestrm( vb, vl, va, vl, flags )
-                : _mm_cmpistrm( vb, va, flags ) };
-            found = _mm_or_si128( found, res );
+            found = _mm_or_si128( found, _mm_cmpistrm( vb, va, flags ) );
             std::uint16_t const amax{ a[ ia + vl - 1 ] };
             std::uint16_t const bmax{ b[ ib + vl - 1 ] };
             if ( amax <= bmax ) {
@@ -567,6 +576,81 @@ template <typename T, typename OutVector>
     return count;
 }
 
+#if FRSR_ROARING_VP2
+// Sorted-array intersection through AVX-512 VP2INTERSECT. Same merge skeleton as
+// intersect_array_array_sse42 — compare the two current blocks, emit the matches,
+// advance whichever block has the smaller maximum — with two differences:
+//
+//   * the block is 16 lanes instead of 8, and
+//   * the all-pairs compare is ONE instruction (vp2intersectd) instead of PCMPISTRM,
+//     which is what makes the wider block pay. uint16 has no vp2intersect form, so
+//     each block is zero-extended to 16 uint32, intersected, compressed, and narrowed
+//     back — three cheap shuffles around the one compare.
+//
+// Store contract, as in the SSE kernel but wider: the compress-store writes a FULL
+// 16-lane (32-byte) vector, so `out` needs min(sa, sb) + 16 slots of capacity.
+//
+// No zero-terminator special case: unlike PCMPISTRM, vp2intersect gives a value 0 no
+// special meaning, so the SSE kernel's two-phase PCMPESTRM/PCMPISTRM dance is simply
+// absent here.
+//
+// Measured on Zen 5 against the SSE4.2 kernel it replaces: 2.2-2.5x from 16 elements
+// upward, and 2.8x SLOWER at 8 — hence intersect_min_side, mirroring
+// x86_v4::union_min_side.
+namespace x86_vp2 {
+
+// Both operands must fill at least one 16-lane block, or the kernel is all setup and
+// the scalar tail does the work anyway. Measured crossover, not a guess.
+inline constexpr std::size_t intersect_min_side{ 16 };
+
+FRSR_ROARING_VP2_KERNEL
+inline std::size_t intersect_sorted_uint16(
+    std::uint16_t const * const a, std::size_t const sa,
+    std::uint16_t const * const b, std::size_t const sb,
+    std::uint16_t       * const out
+) noexcept {
+    constexpr std::size_t vl{ 16 };
+    std::size_t const sta{ ( sa / vl ) * vl };
+    std::size_t const stb{ ( sb / vl ) * vl };
+    std::size_t ia{ 0 }, ib{ 0 }, count{ 0 };
+
+    while ( ia < sta && ib < stb ) {
+        __m512i const va{ _mm512_cvtepu16_epi32( _mm256_loadu_si256( reinterpret_cast<__m256i const *>( a + ia ) ) ) };
+        __m512i const vb{ _mm512_cvtepu16_epi32( _mm256_loadu_si256( reinterpret_cast<__m256i const *>( b + ib ) ) ) };
+        __mmask16 ma, mb;
+        _mm512_2intersect_epi32( va, vb, &ma, &mb );
+        _mm256_storeu_si256(
+            reinterpret_cast<__m256i *>( out + count ),
+            _mm512_cvtepi32_epi16( _mm512_maskz_compress_epi32( ma, va ) )
+        );
+        count += static_cast<std::size_t>( std::popcount( static_cast<unsigned>( ma ) ) );
+        std::uint16_t const amax{ a[ ia + vl - 1 ] };
+        std::uint16_t const bmax{ b[ ib + vl - 1 ] };
+        if ( amax <= bmax ) { ia += vl; }
+        if ( bmax <= amax ) { ib += vl; }
+    }
+    // Scalar tail for the sub-block remainders. Safe to resume at (ia, ib) with no
+    // carried state: an intersection emits its matches as it finds them, so unlike a
+    // difference there is never a pending block whose marks would be lost here.
+    while ( ia < sa && ib < sb ) {
+        std::uint16_t const av{ a[ ia ] };
+        std::uint16_t const bv{ b[ ib ] };
+        if ( av < bv ) {
+            ++ia;
+        } else if ( bv < av ) {
+            ++ib;
+        } else {
+            out[ count++ ] = av;
+            ++ia;
+            ++ib;
+        }
+    }
+    return count;
+}
+
+} // namespace x86_vp2
+#endif // FRSR_ROARING_VP2
+
 // Below this ratio, the linear two-pointer / SSE4.2 merge is used instead of the
 // skewed binary-search path — matches CRoaring's threshold exactly (`const int
 // threshold = 64;` in array_container_intersection).
@@ -620,6 +704,23 @@ template <typename Layout, typename OutVector, typename CowPolicy = cow_value_se
                 return;
             }
         }
+#if FRSR_ROARING_VP2
+        // VP2INTERSECT ahead of SSE4.2 where the CPU has it and both sides fill a
+        // 16-lane block: one instruction for the all-pairs compare against PCMPISTRM's
+        // 8-lane one. Below the floor, or on a CPU without it, this falls through to
+        // the SSE4.2 arm — the kernel is a pure addition, never a replacement.
+        if constexpr ( kSimdArrayIntersect && std::is_same_v<typename Layout::low_type, std::uint16_t> ) {
+            auto const sa{ lhs.values.size() };
+            auto const sb{ rhs.values.size() };
+            if ( sa >= x86_vp2::intersect_min_side && sb >= x86_vp2::intersect_min_side && have_vp2intersect() ) {
+                // +16: the compress-store writes a full 16-lane vector past `count`.
+                resize_uninitialized( result, std::min( sa, sb ) + 16U );
+                auto const count{ x86_vp2::intersect_sorted_uint16( lhs.values.data(), sa, rhs.values.data(), sb, result.data() ) };
+                result.resize( static_cast<std::uint32_t>( count ) );
+                return;
+            }
+        }
+#endif
 #if defined( __SSE4_2__ )
         // SSE4.2 vectorized intersection for the 16-bit container element type. The
         // store writes a full vector past `count`, so over-allocate by one vector and
@@ -627,10 +728,18 @@ template <typename Layout, typename OutVector, typename CowPolicy = cow_value_se
         if constexpr ( kSimdArrayIntersect && std::is_same_v<typename Layout::low_type, std::uint16_t> ) {
             auto const sa{ lhs.values.size() };
             auto const sb{ rhs.values.size() };
-            resize_uninitialized( result, std::min( sa, sb ) + 8U );
-            auto const count{ intersect_array_array_sse42( lhs.values.data(), sa, rhs.values.data(), sb, result.data() ) };
-            result.resize( static_cast<std::uint32_t>( count ) );
-            return;
+            // Only when the kernel's vector loop can actually run. Below one block
+            // per side it degenerates to its own scalar tail, and taking it anyway
+            // costs twice over: the +8 store slack it needs is dead, and it pushes
+            // the result past the handle's inline payload capacity — so a result
+            // that would have lived inline is forced onto the heap. The scalar
+            // merge below sizes the result exactly and keeps small ones inline.
+            if ( std::min( sa, sb ) >= sse42_intersect_min_side ) {
+                resize_uninitialized( result, std::min( sa, sb ) + 8U );
+                auto const count{ intersect_array_array_sse42( lhs.values.data(), sa, rhs.values.data(), sb, result.data() ) };
+                result.resize( static_cast<std::uint32_t>( count ) );
+                return;
+            }
         }
 #elif defined( __ARM_NEON ) && defined( __aarch64__ )
         // NEON vectorized intersection — same over-allocate-by-one-vector contract.
@@ -686,18 +795,6 @@ template <typename Layout, typename CowPolicy = cow_value_semantics>
     combine_array_array_into<Layout>( lhs, rhs, op, result );
     return result;
 }
-
-// Lazy-union form gate: an array∪array whose worst-case result exceeds this many
-// elements is accumulated as a BITSET instead of as an array. Rationale (CRoaring's,
-// arrived at by its own benchmarking): every later operand then costs an O(|operand|)
-// scatter rather than a full rewrite of the accumulator, and the consumers of an
-// accumulated union (intersections against many small operands) are cheaper against a
-// bitset; the one-time form repair at finish time pays for itself. Below the bound the
-// array stays an array — the rewrite is short, and an 8 KB bitset would cost more in
-// cache footprint than the merge saves.
-// [croaring-ref] deps/croaring/include/roaring/containers/perfparameters.h:ARRAY_LAZY_LOWERBOUND
-//               deps/croaring/src/containers/mixed_union.c:array_array_container_lazy_union
-inline constexpr std::size_t kLazyUnionArrayLowerBound{ 1024 };
 
 // Scalar forward merge of two sorted uint16 arrays into `out` (which must not
 // alias the inputs' unread parts and has sa + sb slots). Returns the count.
@@ -842,8 +939,36 @@ inline constexpr std::size_t union_store_slack{ 32 };
 // Below this per-side size the scalar merge is used (no whole 32-lane block).
 inline constexpr std::size_t union_min_side{ 32 };
 
+// Widening decode of an array container into 32-bit values, sixteen per store:
+// a 256-bit load of keys is widened to a full 512-bit block, the chunk base is
+// added, and the block is stored whole; the tail takes one masked load/store
+// pair instead of a scalar loop. The baseline loop in container_decode_into
+// auto-vectorizes only to 256-bit stores, half the width this tier moves per
+// instruction, and the decode is store-bound.
+// [croaring-ref] deps/croaring/src/array_util.c:avx512_array_container_to_uint32_array
+FRSR_ROARING_X86_V4_KERNEL
+inline std::uint32_t * decode_array_uint32(
+    std::uint16_t const * const keys, std::size_t const count, std::uint32_t * const out, std::uint32_t const base
+) noexcept {
+    __m512i const base_lanes{ _mm512_set1_epi32( static_cast<int>( base ) ) };
+    std::size_t i{ 0 };
+    for ( ; i + 16 <= count; i += 16 ) {
+        __m256i const packed{ _mm256_loadu_si256( reinterpret_cast<__m256i const *>( keys + i ) ) };
+        _mm512_storeu_si512( out + i, _mm512_add_epi32( _mm512_cvtepu16_epi32( packed ), base_lanes ) );
+    }
+    if ( i < count ) {
+        auto const tail{ static_cast<__mmask16>( ( 1U << ( count - i ) ) - 1U ) };
+        __m256i const packed{ _mm256_maskz_loadu_epi16( tail, keys + i ) };
+        _mm512_mask_storeu_epi32( out + i, tail, _mm512_add_epi32( _mm512_cvtepu16_epi32( packed ), base_lanes ) );
+    }
+    return out + count;
+}
+// Below this count the dispatched call is not worth its out-of-line hop.
+inline constexpr std::size_t decode_array_min_count{ 64 };
+
 } // namespace x86_v4
-#endif // FRSR_ROARING_X86_V4
+#endif
+
 
 // True in-place union: grow lhs's payload to the worst-case size and merge
 // BACKWARDS (largest values first, writing down from slot la+lb-1). The write
@@ -1173,40 +1298,31 @@ template <typename Layout, typename OutVector, typename CowPolicy = cow_value_se
     auto * const out{ result.data() };
     std::size_t written{ 0 };
     std::size_t ap{ 0 };
-    if ( card < rhs.runs.size() ) {
-        // Array-driven variant: the run-driven loop below pays two gallops and a
-        // memcpy per run regardless of how few array values are in play, so a
-        // small probe against many runs is dominated by that fixed per-run cost.
-        // Drive by array element with lazy run advance instead (run.end is
-        // inclusive, matching difference_array_run).
-        auto       run_it { rhs.runs.begin() };
-        auto const run_end{ rhs.runs.end  () };
-        while ( ap < card ) {
-            auto const value{ keys[ ap ] };
-            while ( static_cast<low_type>( run_it->end ) < value ) {
-                if ( ++run_it == run_end ) {
-                    resize_uninitialized( result, static_cast<std::uint32_t>( written ) );
-                    return;
-                }
-            }
-            if ( value >= static_cast<low_type>( run_it->begin ) ) {
-                out[ written++ ] = value;
-                ++ap;
-            } else {
-                ap = gallop_forward<false>( keys, ap, card, static_cast<low_type>( run_it->begin ) );
+    // Array-driven with a lazy run advance, the reference's shape: each array
+    // value is tested against the current run, the run cursor moves only when a
+    // value has passed it, and a gap before the next run is crossed by a
+    // gallop. A run-driven form (gallop to each run's start and end, memcpy the
+    // span) was measured against it: it loses on short runs — two gallops and a
+    // libc call per run for a 20-element span put array∩run 12-19 % behind the
+    // reference — and an inline copy in its place lost 1.7x on long runs, while
+    // this loop is at parity on both. (run.end is inclusive, matching
+    // difference_array_run.)
+    // [croaring-ref] deps/croaring/src/containers/mixed_intersection.c:array_run_container_intersection
+    auto       run_it { rhs.runs.begin() };
+    auto const run_end{ rhs.runs.end  () };
+    while ( ap < card ) {
+        auto const value{ keys[ ap ] };
+        while ( static_cast<low_type>( run_it->end ) < value ) {
+            if ( ++run_it == run_end ) {
+                resize_uninitialized( result, static_cast<std::uint32_t>( written ) );
+                return;
             }
         }
-        resize_uninitialized( result, static_cast<std::uint32_t>( written ) );
-        return;
-    }
-    for ( auto const & run : rhs.runs ) {
-        ap = gallop_forward<false>( keys, ap, card, static_cast<low_type>( run.begin ) );
-        auto const span_begin{ ap };
-        ap = gallop_forward<true >( keys, ap, card, static_cast<low_type>( run.end   ) );
-        std::memcpy( out + written, keys + span_begin, ( ap - span_begin ) * sizeof( low_type ) );
-        written += ap - span_begin;
-        if ( ap >= card ) {
-            break;
+        if ( value >= static_cast<low_type>( run_it->begin ) ) {
+            out[ written++ ] = value;
+            ++ap;
+        } else {
+            ap = gallop_forward<false>( keys, ap, card, static_cast<low_type>( run_it->begin ) );
         }
     }
     resize_uninitialized( result, static_cast<std::uint32_t>( written ) );

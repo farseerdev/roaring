@@ -3545,6 +3545,89 @@ struct register_frsr_lazy_union_fold_registrar {
 template <class Arm> static void register_frsr_lazy_union_fold(std::size_t band) { register_frsr_lazy_union_fold_registrar<Arm>::run(band); }
 
 
+// The two halves of LazyUnionFold, timed apart. LazyUnionFold deliberately
+// prices the sum, because the accumulate phase pays for the promotion and the
+// fold phase collects on it; but a ratio on the sum cannot say which half a
+// gap lives in, and above the promotion threshold — where both libraries hold
+// bitsets and there is no form difference left to explain one — that is the
+// only question worth asking. Their times add up to the combined band's, so a
+// discrepancy between the split pair and the sum is itself a signal.
+template <class Arm>
+struct register_frsr_lazy_union_accum_registrar {
+    using TestBitmap32 = typename Arm::bitmap;
+    static void run(std::size_t band) {
+    using namespace band_fold;
+    Entry e;
+    char buf[128];
+    snprintf(buf, sizeof(buf), "set_ops/%sLazyUnionAccum/band=%zu", Arm::label(), band);
+    e.name        = buf;
+    e.description = "frsr lazy K-way union accumulate only (bulk_or_intermediate + "
+                    "bulk_or_finish_keep_bitsets), no fold — the promotion-paying half of "
+                    "LazyUnionFold, per-chunk union cardinality ~" + std::to_string(band) + ".";
+    e.setup       = [band]() -> void * {
+        auto *s = new FrsrState<Arm>;
+        fill_frsr_sources(*s, band);
+        return s;
+    };
+    e.run         = [](void *sv) -> int64_t {
+        auto *s = static_cast<FrsrState<Arm> *>(sv);
+        TestBitmap32 acc;
+        for (auto const &src : s->sources) {
+            acc.bulk_or_intermediate(src);
+        }
+        acc.bulk_or_finish_keep_bitsets();
+        return static_cast<int64_t>(acc.size());
+    };
+    e.teardown       = [](void *sv) { delete static_cast<FrsrState<Arm> *>(sv); };
+    e.ops_per_run    = static_cast<int64_t>(kOperands * kChunks);
+    e.inner_reps     = kInnerReps;
+    e.reusable_state = true;
+    g_benchmarks.push_back(std::move(e));
+}};
+template <class Arm> static void register_frsr_lazy_union_accum(std::size_t band) { register_frsr_lazy_union_accum_registrar<Arm>::run(band); }
+
+template <class Arm>
+struct register_frsr_lazy_fold_only_registrar {
+    using TestBitmap32 = typename Arm::bitmap;
+    static void run(std::size_t band) {
+    using namespace band_fold;
+    Entry e;
+    char buf[128];
+    snprintf(buf, sizeof(buf), "set_ops/%sLazyFoldOnly/band=%zu", Arm::label(), band);
+    e.name        = buf;
+    e.description = "frsr AND-fold of " + std::to_string(kProbes) + " small operands against an "
+                    "already-accumulated lazy union, no accumulate — the collecting half of "
+                    "LazyUnionFold, per-chunk union cardinality ~" + std::to_string(band) + ".";
+    e.setup       = [band]() -> void * {
+        auto *s = new FrsrState<Arm>;
+        fill_frsr_sources(*s, band);
+        fill_frsr_probes (*s, band);
+        for (auto const &src : s->sources) {
+            s->target.bulk_or_intermediate(src);
+        }
+        s->target.bulk_or_finish_keep_bitsets();
+        s->sources.clear();
+        return s;
+    };
+    e.run         = [](void *sv) -> int64_t {
+        auto *s = static_cast<FrsrState<Arm> *>(sv);
+        int64_t checksum = 0;
+        for (std::size_t p = 0; p < kProbes; ++p) {
+            TestBitmap32 probe = s->probes[p];
+            probe &= s->target;
+            checksum += static_cast<int64_t>(probe.size());
+        }
+        return checksum;
+    };
+    e.teardown       = [](void *sv) { delete static_cast<FrsrState<Arm> *>(sv); };
+    e.ops_per_run    = static_cast<int64_t>(kProbes * kChunks);
+    e.inner_reps     = kInnerReps;
+    e.reusable_state = true;
+    g_benchmarks.push_back(std::move(e));
+}};
+template <class Arm> static void register_frsr_lazy_fold_only(std::size_t band) { register_frsr_lazy_fold_only_registrar<Arm>::run(band); }
+
+
 // Same shape, but finishing through optimize() — the finish an index-building
 // caller actually performs. optimize() re-decides array-vs-bitset at
 // array_to_bitset_threshold and so discards a lazy union's promotion below it,
@@ -3603,11 +3686,44 @@ template <class Arm>
 struct CppBandState {
     std::vector<roaring_bitmap_t *> sources;
     std::vector<roaring_bitmap_t *> probes;
+    roaring_bitmap_t *              target{ nullptr };   // LazyFoldOnly only: the pre-accumulated union
     ~CppBandState() {
         for (auto *b : sources) { roaring_bitmap_free(b); }
         for (auto *b : probes ) { roaring_bitmap_free(b); }
+        if (target) { roaring_bitmap_free(target); }
     }
 };
+
+// Shared fill for every CRoaring band-fold variant — the same contents the frsr
+// side builds through fill_frsr_sources / fill_frsr_probes.
+template <class Arm>
+static void fill_cpp_band_sources(CppBandState<Arm> &s, std::size_t band) {
+    using namespace band_fold;
+    s.sources.resize(kOperands);
+    for (std::size_t k = 0; k < kOperands; ++k) {
+        s.sources[k] = Arm::create();
+        for (std::size_t c = 0; c < kChunks; ++c) {
+            for (std::size_t i = k; i < band; i += kOperands) {
+                roaring_bitmap_add(s.sources[k], band_value(c, band, i));
+            }
+        }
+    }
+}
+
+template <class Arm>
+static void fill_cpp_band_probes(CppBandState<Arm> &s, std::size_t band) {
+    using namespace band_fold;
+    s.probes.resize(kProbes);
+    auto const step = std::max<std::size_t>(1, band / kProbeCard);
+    for (std::size_t p = 0; p < kProbes; ++p) {
+        s.probes[p] = Arm::create();
+        for (std::size_t c = 0; c < kChunks; ++c) {
+            for (std::size_t j = 0; j < kProbeCard; ++j) {
+                roaring_bitmap_add(s.probes[p], band_value(c, band, (j * step + p) % band));
+            }
+        }
+    }
+}
 
 // CRoaring counterpart. Note the finish differs by necessity:
 // roaring_bitmap_repair_after_lazy() down-converts any bitset at or below
@@ -3628,25 +3744,8 @@ struct register_cpp_lazy_union_fold_registrar {
                     " small operands, per-chunk union cardinality ~" + std::to_string(band) + ".";
     e.setup       = [band]() -> void * {
         auto *s = new CppBandState<Arm>;
-        s->sources.resize(kOperands);
-        for (std::size_t k = 0; k < kOperands; ++k) {
-            s->sources[k] = Arm::create();
-            for (std::size_t c = 0; c < kChunks; ++c) {
-                for (std::size_t i = k; i < band; i += kOperands) {
-                    roaring_bitmap_add(s->sources[k], band_value(c, band, i));
-                }
-            }
-        }
-        s->probes.resize(kProbes);
-        auto const step = std::max<std::size_t>(1, band / kProbeCard);
-        for (std::size_t p = 0; p < kProbes; ++p) {
-            s->probes[p] = Arm::create();
-            for (std::size_t c = 0; c < kChunks; ++c) {
-                for (std::size_t j = 0; j < kProbeCard; ++j) {
-                    roaring_bitmap_add(s->probes[p], band_value(c, band, (j * step + p) % band));
-                }
-            }
-        }
+        fill_cpp_band_sources(*s, band);
+        fill_cpp_band_probes (*s, band);
         return s;
     };
     e.run         = [](void *sv) -> int64_t {
@@ -3673,6 +3772,86 @@ struct register_cpp_lazy_union_fold_registrar {
     g_benchmarks.push_back(std::move(e));
 }};
 template <class Arm> static void register_cpp_lazy_union_fold(std::size_t band) { register_cpp_lazy_union_fold_registrar<Arm>::run(band); }
+
+// CRoaring counterparts of the two halves — see the frsr split's note for why
+// the sum is not enough. The finish is repair_after_lazy() here, exactly as in
+// the combined band, so the accumulator each half operates on is the form
+// CRoaring's own bulk-union idiom produces.
+template <class Arm>
+struct register_cpp_lazy_union_accum_registrar {
+    static void run(std::size_t band) {
+    using namespace band_fold;
+    Entry e;
+    char buf[128];
+    snprintf(buf, sizeof(buf), "set_ops/%sLazyUnionAccum/band=%zu", Arm::label(), band);
+    e.name        = buf;
+    e.description = "CRoaring lazy K-way union accumulate only (roaring_bitmap_lazy_or_inplace + "
+                    "roaring_bitmap_repair_after_lazy), no fold.";
+    e.setup       = [band]() -> void * {
+        auto *s = new CppBandState<Arm>;
+        fill_cpp_band_sources(*s, band);
+        return s;
+    };
+    e.run         = [](void *sv) -> int64_t {
+        auto *s   = static_cast<CppBandState<Arm> *>(sv);
+        auto *acc = Arm::create();
+        for (auto *src : s->sources) {
+            roaring_bitmap_lazy_or_inplace(acc, src, true /* bitset conversion */);
+        }
+        roaring_bitmap_repair_after_lazy(acc);
+        int64_t const checksum = static_cast<int64_t>(roaring_bitmap_get_cardinality(acc));
+        roaring_bitmap_free(acc);
+        return checksum;
+    };
+    e.teardown       = [](void *sv) { delete static_cast<CppBandState<Arm> *>(sv); };
+    e.ops_per_run    = static_cast<int64_t>(kOperands * kChunks);
+    e.inner_reps     = kInnerReps;
+    e.reusable_state = true;
+    g_benchmarks.push_back(std::move(e));
+}};
+template <class Arm> static void register_cpp_lazy_union_accum(std::size_t band) { register_cpp_lazy_union_accum_registrar<Arm>::run(band); }
+
+template <class Arm>
+struct register_cpp_lazy_fold_only_registrar {
+    static void run(std::size_t band) {
+    using namespace band_fold;
+    Entry e;
+    char buf[128];
+    snprintf(buf, sizeof(buf), "set_ops/%sLazyFoldOnly/band=%zu", Arm::label(), band);
+    e.name        = buf;
+    e.description = "CRoaring AND-fold of " + std::to_string(kProbes) + " small operands against an "
+                    "already-accumulated lazy union, no accumulate.";
+    e.setup       = [band]() -> void * {
+        auto *s = new CppBandState<Arm>;
+        fill_cpp_band_sources(*s, band);
+        fill_cpp_band_probes (*s, band);
+        s->target = Arm::create();
+        for (auto *src : s->sources) {
+            roaring_bitmap_lazy_or_inplace(s->target, src, true /* bitset conversion */);
+        }
+        roaring_bitmap_repair_after_lazy(s->target);
+        for (auto *src : s->sources) { roaring_bitmap_free(src); }
+        s->sources.clear();
+        return s;
+    };
+    e.run         = [](void *sv) -> int64_t {
+        auto *s = static_cast<CppBandState<Arm> *>(sv);
+        int64_t checksum = 0;
+        for (std::size_t p = 0; p < kProbes; ++p) {
+            auto *probe = Arm::copy(s->probes[p]);
+            roaring_bitmap_and_inplace(probe, s->target);
+            checksum += static_cast<int64_t>(roaring_bitmap_get_cardinality(probe));
+            roaring_bitmap_free(probe);
+        }
+        return checksum;
+    };
+    e.teardown       = [](void *sv) { delete static_cast<CppBandState<Arm> *>(sv); };
+    e.ops_per_run    = static_cast<int64_t>(kProbes * kChunks);
+    e.inner_reps     = kInnerReps;
+    e.reusable_state = true;
+    g_benchmarks.push_back(std::move(e));
+}};
+template <class Arm> static void register_cpp_lazy_fold_only(std::size_t band) { register_cpp_lazy_fold_only_registrar<Arm>::run(band); }
 
 #endif // FRSR_ROARING_HAS_CROARING
 
@@ -4281,6 +4460,123 @@ struct register_frsr_mixed_array_bitset_intersect_registrar {
     g_benchmarks.push_back(std::move(e));
 }};
 template <class Arm> static void register_frsr_mixed_array_bitset_intersect(std::size_t repeat) { register_frsr_mixed_array_bitset_intersect_registrar<Arm>::run(repeat); }
+
+
+// ===================== PER-CHUNK ENVELOPE =====================
+// Isolates the cost of PRODUCING A RESULT BITMAP from the cost of the kernels
+// that fill it. Profiling put 84% of the array x bitset gap outside the kernel
+// (result construct/teardown, the grow chain) and cycle-weighting on two
+// platforms puts each library's OWN envelope code at frsr 1.5-1.9x CRoaring
+// while frsr's libc allocator time is 0.75x — but every existing band mixes
+// that envelope with real kernel work, so neither half can be moved without
+// the other's noise.
+//
+// The shape: both operands hold `chunks` distinct 2^16 chunks, and each chunk
+// holds only kEnvelopePerChunkCard elements, of which one matches. The kernel
+// therefore does almost nothing per chunk while the walk still emits a chunk,
+// so ns/chunk is dominated by: allocate/claim a result container, write one
+// value, append the key+handle to the result's parallel arrays, and later tear
+// the whole result down. That is exactly the envelope.
+//
+// Read it as ns per chunk (ops_per_run = chunks), and read the frsr/CRoaring
+// RATIO rather than the absolute, which is allocator-dependent.
+namespace envelope {
+
+static constexpr std::size_t kCard      { 4 };   // elements per chunk per side
+static constexpr std::size_t kRepeat    { 200 }; // results produced per timed run
+static constexpr int         kInnerReps { 5 };
+
+template <class Arm>
+struct FrsrState {
+    using TestBitmap32 = typename Arm::bitmap;
+    TestBitmap32 a, b;
+};
+
+template <class Arm>
+struct register_frsr_envelope_registrar {
+    using TestBitmap32 = typename Arm::bitmap;
+    static void run(std::size_t chunks) {
+    Entry e;
+    char buf[128];
+    snprintf(buf, sizeof(buf), "set_ops/%sEnvelopePerChunk/chunks=%zu", Arm::label(), chunks);
+    e.name        = buf;
+    e.description = "frsr per-chunk result-envelope cost: intersect two bitmaps spanning " +
+                    std::to_string(chunks) + " chunks holding " + std::to_string(kCard) +
+                    " elements each (one matching), so the per-chunk kernel work is negligible and "
+                    "the time is result container allocation, key+handle append and teardown.";
+    e.setup       = [chunks]() -> void * {
+        auto *s = new FrsrState<Arm>;
+        for (std::size_t c = 0; c < chunks; ++c) {
+            auto const base = static_cast<std::uint32_t>(c) * 65536U;
+            for (std::size_t i = 0; i < kCard; ++i) {
+                std::ignore = s->a.add(base + static_cast<std::uint32_t>(i) * 3U);
+                std::ignore = s->b.add(base + static_cast<std::uint32_t>(i) * 5U);   // only i==0 coincides
+            }
+        }
+        return s;
+    };
+    e.run         = [](void *sv) -> int64_t {
+        auto *s = static_cast<FrsrState<Arm> *>(sv);
+        int64_t checksum = 0;
+        for (std::size_t i = 0; i < kRepeat; ++i) {
+            TestBitmap32 r = s->a & s->b;      // fresh result: the whole envelope, per chunk
+            checksum += static_cast<int64_t>(r.size());
+        }                                       // ... and its teardown
+        return checksum;
+    };
+    e.teardown       = [](void *sv) { delete static_cast<FrsrState<Arm> *>(sv); };
+    e.ops_per_run    = static_cast<int64_t>(chunks * kRepeat);
+    e.inner_reps     = kInnerReps;
+    e.reusable_state = true;
+    g_benchmarks.push_back(std::move(e));
+}};
+template <class Arm> static void register_frsr_envelope(std::size_t chunks) { register_frsr_envelope_registrar<Arm>::run(chunks); }
+
+#if FRSR_ROARING_HAS_CROARING
+template <class Arm>
+struct CppState { roaring_bitmap_t *a{ nullptr }, *b{ nullptr };
+                  ~CppState() { if (a) roaring_bitmap_free(a); if (b) roaring_bitmap_free(b); } };
+
+template <class Arm>
+struct register_cpp_envelope_registrar {
+    static void run(std::size_t chunks) {
+    Entry e;
+    char buf[128];
+    snprintf(buf, sizeof(buf), "set_ops/%sEnvelopePerChunk/chunks=%zu", Arm::label(), chunks);
+    e.name        = buf;
+    e.description = "CRoaring counterpart of the per-chunk result-envelope band.";
+    e.setup       = [chunks]() -> void * {
+        auto *s = new CppState<Arm>;
+        s->a = Arm::create(); s->b = Arm::create();
+        for (std::size_t c = 0; c < chunks; ++c) {
+            auto const base = static_cast<std::uint32_t>(c) * 65536U;
+            for (std::size_t i = 0; i < kCard; ++i) {
+                roaring_bitmap_add(s->a, base + static_cast<std::uint32_t>(i) * 3U);
+                roaring_bitmap_add(s->b, base + static_cast<std::uint32_t>(i) * 5U);
+            }
+        }
+        return s;
+    };
+    e.run         = [](void *sv) -> int64_t {
+        auto *s = static_cast<CppState<Arm> *>(sv);
+        int64_t checksum = 0;
+        for (std::size_t i = 0; i < kRepeat; ++i) {
+            auto *r = roaring_bitmap_and(s->a, s->b);
+            checksum += static_cast<int64_t>(roaring_bitmap_get_cardinality(r));
+            roaring_bitmap_free(r);
+        }
+        return checksum;
+    };
+    e.teardown       = [](void *sv) { delete static_cast<CppState<Arm> *>(sv); };
+    e.ops_per_run    = static_cast<int64_t>(chunks * kRepeat);
+    e.inner_reps     = kInnerReps;
+    e.reusable_state = true;
+    g_benchmarks.push_back(std::move(e));
+}};
+template <class Arm> static void register_cpp_envelope(std::size_t chunks) { register_cpp_envelope_registrar<Arm>::run(chunks); }
+#endif
+
+} // namespace envelope
 
 
 // Clustered counterpart of the intersect scenario above: the strided 64-key shape
@@ -6177,11 +6473,15 @@ void register_benchmarks() {
         arms::for_each_frsr<register_frsr_and_small_vs_band_registrar>(band, /*as_bitset=*/false);
         arms::for_each_frsr<register_frsr_and_small_vs_band_registrar>(band, /*as_bitset=*/true );
         arms::for_each_frsr<register_frsr_lazy_union_fold_registrar>(band);
+        arms::for_each_frsr<register_frsr_lazy_union_accum_registrar>(band);
+        arms::for_each_frsr<register_frsr_lazy_fold_only_registrar>(band);
         arms::for_each_frsr<register_frsr_lazy_union_fold_optimized_registrar>(band, /*keep_bitsets=*/false);
         arms::for_each_frsr<register_frsr_lazy_union_fold_optimized_registrar>(band, /*keep_bitsets=*/true );
 #if FRSR_ROARING_HAS_CROARING
 #if FRSR_ROARING_HAS_CROARING
         arms::for_each_croaring<register_cpp_lazy_union_fold_registrar>(band);
+        arms::for_each_croaring<register_cpp_lazy_union_accum_registrar>(band);
+        arms::for_each_croaring<register_cpp_lazy_fold_only_registrar>(band);
 #endif
 #endif
     }
@@ -6190,9 +6490,13 @@ void register_benchmarks() {
     // mostly in 16385-65536, well past the 512/2048/8192 sweep above.
     for (std::size_t band : { std::size_t{16384}, std::size_t{32768}, std::size_t{65536} }) {
         arms::for_each_frsr<register_frsr_lazy_union_fold_registrar>(band);
+        arms::for_each_frsr<register_frsr_lazy_union_accum_registrar>(band);
+        arms::for_each_frsr<register_frsr_lazy_fold_only_registrar>(band);
 #if FRSR_ROARING_HAS_CROARING
 #if FRSR_ROARING_HAS_CROARING
         arms::for_each_croaring<register_cpp_lazy_union_fold_registrar>(band);
+        arms::for_each_croaring<register_cpp_lazy_union_accum_registrar>(band);
+        arms::for_each_croaring<register_cpp_lazy_fold_only_registrar>(band);
 #endif
 #endif
     }
@@ -6220,6 +6524,12 @@ void register_benchmarks() {
 #endif
 #endif
     arms::for_each_frsr<register_frsr_mixed_array_bitset_intersect_registrar>(100'000);
+    for (std::size_t chunks : { std::size_t{1}, std::size_t{8}, std::size_t{64}, std::size_t{512} }) {
+        arms::for_each_frsr<envelope::register_frsr_envelope_registrar>(chunks);
+#if FRSR_ROARING_HAS_CROARING
+        arms::for_each_croaring<envelope::register_cpp_envelope_registrar>(chunks);
+#endif
+    }
     arms::for_each_frsr<register_frsr_mixed_array_bitset_intersect_clustered_registrar>(100'000);
     arms::for_each_frsr<register_frsr_run_bitset_intersect_registrar>(100'000);
     arms::for_each_frsr<register_frsr_mixed_array_bitset_andnot_registrar>(100'000);
