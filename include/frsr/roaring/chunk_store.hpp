@@ -41,6 +41,12 @@ public:
     [[nodiscard]] std::size_t size () const noexcept { return live_.size_;      }
     [[nodiscard]] bool        empty() const noexcept { return live_.size_ == 0; }
 
+    // Structure generation: advances whenever a live slot may have moved or
+    // died (relocation, insert, erase, compaction, sort, swap, clear), so a
+    // caller holding a pointer to a slot can tell in one compare whether it is
+    // still the slot it took. Appends that do not relocate leave it alone.
+    [[nodiscard]] std::uint32_t generation() const noexcept { return generation_; }
+
     [[nodiscard]] chunk_type key( std::size_t const index ) const noexcept { return live_.keys()[ idx( index ) ]; }
     void set_key( std::size_t const index, chunk_type const key ) noexcept { live_.keys()[ idx( index ) ] = key; }
 
@@ -64,9 +70,15 @@ public:
         retired_.release();
         retired_array_next_ = retired_bitset_next_ = 0;
         live_.shrink_to_fit();
+        ++generation_;
     }
 
-    void reserve( std::size_t const capacity ) { live_.reserve( idx( capacity ) ); }
+    void reserve( std::size_t const capacity ) {
+        if ( idx( capacity ) > live_.capacity_ ) {
+            live_.reserve( idx( capacity ) );
+            ++generation_;
+        }
+    }
 
     // Retired slots (scratch payload reuse) are deliberately per-instance
     // transient state: copies start with none.
@@ -76,15 +88,24 @@ public:
     chunk_store & operator=( chunk_store const & other ) {
         if ( this != &other ) [[likely]] {
             live_.copy_from( other.live_ );
+            ++generation_;
         }
         return *this;
     }
-    chunk_store & operator=( chunk_store && ) noexcept = default;
+    chunk_store & operator=( chunk_store && other ) noexcept {
+        live_                = std::move( other.live_ );
+        retired_             = std::move( other.retired_ );
+        retired_array_next_  = other.retired_array_next_;
+        retired_bitset_next_ = other.retired_bitset_next_;
+        ++generation_;
+        return *this;
+    }
 
     void clear() noexcept {
         live_   .destroy_all();
         retired_.destroy_all();
         retired_array_next_ = retired_bitset_next_ = 0;
+        ++generation_;
     }
 
     // Scratch payload reuse (CRoaring persistent-dst analog, see
@@ -97,6 +118,7 @@ public:
         retired_.destroy_all();
         std::swap( live_, retired_ );
         retired_array_next_ = retired_bitset_next_ = 0;
+        ++generation_;
     }
 
     // Hands back a retired sole-owned spilled payload of `kind` (header reset
@@ -152,6 +174,7 @@ public:
             live_.keys()[ idx( to ) ] = live_.keys()[ idx( from ) ];
             retire( std::move( live_.slots()[ idx( to ) ] ) );
             live_.slots()[ idx( to ) ] = std::move( live_.slots()[ idx( from ) ] );
+            ++generation_;
         }
     }
 
@@ -167,19 +190,26 @@ public:
         std::swap( retired_, other.retired_ );
         std::swap( retired_array_next_ , other.retired_array_next_  );
         std::swap( retired_bitset_next_, other.retired_bitset_next_ );
+        ++generation_;
+        ++other.generation_;
     }
 
     template <typename Handle>
     void push_back( chunk_type const key, Handle && handle ) {
+        if ( live_.size_ == live_.capacity_ ) [[unlikely]] { ++generation_; }   // this append relocates
         live_.push_back( key, std::forward<Handle>( handle ) );
     }
 
     template <typename Handle>
     void insert( std::size_t const index, chunk_type const key, Handle && handle ) {
         live_.insert( idx( index ), key, std::forward<Handle>( handle ) );
+        ++generation_;
     }
 
-    void erase( std::size_t const index ) { live_.erase( idx( index ), idx( index ) + 1 ); }
+    void erase( std::size_t const index ) {
+        live_.erase( idx( index ), idx( index ) + 1 );
+        ++generation_;
+    }
 
     // In-place compaction support for the shrinking set-ops (&=, -=): the entry
     // at `from` moves down to `to` (to <= from always holds on those walks).
@@ -187,12 +217,23 @@ public:
         if ( to != from ) {
             live_.keys ()[ idx( to ) ] = live_.keys()[ idx( from ) ];
             live_.slots()[ idx( to ) ] = std::move( live_.slots()[ idx( from ) ] );
+            ++generation_;
         }
     }
 
-    void truncate( std::size_t const count ) { live_.erase( idx( count ), live_.size_ ); }
+    void truncate( std::size_t const count ) {
+        if ( idx( count ) != live_.size_ ) {
+            live_.erase( idx( count ), live_.size_ );
+            ++generation_;
+        }
+    }
 
-    void erase_front( std::size_t const count ) { live_.erase( 0, idx( count ) ); }
+    void erase_front( std::size_t const count ) {
+        if ( count != 0 ) {
+            live_.erase( 0, idx( count ) );
+            ++generation_;
+        }
+    }
 
     // Stable-compacts away every entry whose slot satisfies the predicate
     // (the SoA analog of remove_if over the entry vector).
@@ -211,6 +252,7 @@ public:
             }
         }
         truncate( out );
+        ++generation_;
     }
 
     // Permutation sort over both arrays (cold: only the lazy-sort configuration
@@ -232,6 +274,7 @@ public:
             sorted.push_back( keys[ index ], std::move( slots[ index ] ) );
         }
         live_ = std::move( sorted );
+        ++generation_;
     }
 
 private:
@@ -427,6 +470,7 @@ private:
     table retired_;
     std::uint32_t retired_array_next_ { 0 };
     std::uint32_t retired_bitset_next_{ 0 };
+    std::uint32_t generation_         { 0 };
 };
 
 } // namespace frsr::roaring::detail

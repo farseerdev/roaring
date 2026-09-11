@@ -328,8 +328,13 @@ public:
         chunk_type chunk{};
         size_type index{ invalid_index };
         bool payload_private{ false };
+        // The resolved slot itself, as the reference caches its container: valid
+        // while `generation` still matches the chunk store's (no slot has moved
+        // or died since it was taken). add_bulk's hit lane goes through it.
+        handle_type * slot{ nullptr };
+        std::uint32_t generation{ 0 };
 
-        void reset() noexcept { index = invalid_index; payload_private = false; }
+        void reset() noexcept { index = invalid_index; payload_private = false; slot = nullptr; }
     };
 
     class const_iterator {
@@ -677,7 +682,31 @@ public:
         return add_impl( value, nullptr );
     }
 
+    // The context-hit lane is the whole function for a run of adds into one
+    // chunk, as the reference's add_bulk_impl is: the cached chunk is checked
+    // and the value goes straight into its container. Everything else (a new
+    // chunk, a singleton, the hot-index search) is the shared add_impl.
+    // [croaring-ref] deps/croaring/src/roaring.c:add_bulk_impl
     [[nodiscard]] bool add_bulk( bulk_context & ctx, key_type const value ) {
+        auto const chunk{ layout_type::chunk_key( value ) };
+        if ( ctx.slot != nullptr && ctx.generation == chunks_.generation() && ctx.chunk == chunk ) [[likely]] {
+            auto       & slot{ *ctx.slot };
+            auto const   low { layout_type::low_key( value ) };
+            bool const was_tombstone{
+                kUseLazyTombstoning && tombstone_count_ != 0 && detail::container_size( slot ) == 0
+            };
+            auto const added{
+                ctx.payload_private
+                    ? detail::container_add_already_private( slot, low )
+                    : detail::container_add               ( slot, low )
+            };
+            if ( !added ) { return false; }
+            ctx.payload_private = true;
+            ++size_;
+            if ( was_tombstone ) { --tombstone_count_; }
+            promote_if_needed( slot );
+            return true;
+        }
         return add_impl( value, &ctx );
     }
 
@@ -3655,6 +3684,8 @@ private:
         if ( ctx != nullptr ) {
             ctx->chunk = chunk;
             ctx->index = pos;
+            ctx->slot  = &chunks_.slot( pos );
+            ctx->generation = chunks_.generation();
             // The add below makes this payload private (or already found it so),
             // and no copy can intervene before the next call on this context.
             ctx->payload_private = true;

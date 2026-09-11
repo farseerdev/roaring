@@ -63,6 +63,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cassert>
 #include <cstring>
 #include <limits>
 #include <new>
@@ -337,6 +338,12 @@ public:
         min_ = min;
         max_ = max;
         flags_ &= static_cast<std::uint8_t>( ~endpoints_stale_flag );
+    }
+    // Raises the upper endpoint only (an append past the current maximum);
+    // requires the endpoints to be valid already.
+    void set_max_value  ( low_type const max ) noexcept {
+        assert( endpoints_valid() );
+        max_ = max;
     }
 
     // ---- scratch payload reuse (CRoaring persistent-dst analog) -------------
@@ -1033,8 +1040,15 @@ public:
     [[nodiscard]] bool add( low_type const value ) {
         auto const cardinality{ values.size() };
         if ( cardinality == 0 || values.back() < value ) {
+            // Append: only the count and the upper endpoint move (the reference
+            // stores the count alone) — no re-read of both ends for the header.
             values.push_back( value );
-            sync_header();
+            handle_->set_cardinality( cardinality + 1U );
+            if ( cardinality == 0 ) {
+                handle_->set_endpoints( value, value );
+            } else {
+                handle_->set_max_value( value );
+            }
             return true;
         }
 
@@ -1608,16 +1622,11 @@ public:
             return false;
         }
         word |= mask;
-        auto const previous_cardinality{ handle_->cardinality() };
-        handle_->set_cardinality( previous_cardinality + 1U );
-        if ( previous_cardinality == 0 ) {
-            handle_->set_endpoints( value, value );
-        } else if ( handle_->endpoints_valid() ) {
-            handle_->set_endpoints(
-                std::min( handle_->min_value(), value ),
-                std::max( handle_->max_value(), value )
-            );
-        }
+        // Count stays exact (the reference keeps only that); the endpoints are
+        // marked stale like the bulk word kernels do, and the first read
+        // recomputes them — cheaper than two compares and two stores per bit.
+        handle_->set_cardinality( handle_->cardinality() + 1U );
+        handle_->mark_endpoints_stale();
         return true;
     }
 
