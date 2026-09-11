@@ -9,7 +9,7 @@
 // Not part of the build (nothing globs this directory). Compile with the
 // benchmark target's own flags (see bulkadd_prof.cpp), then:
 //
-//   pairop_prof <frsr|cpp> <union|difference|diffinplace|toarray|mixedandnot|runbitset|satandnot|envelope> <count> <high|mid|low> [passes]
+//   pairop_prof <frsr|cpp> <union|difference|diffinplace|toarray|mixedandnot|runbitset|satandnot|envelope|coldcard|coldcardnot> <count> <high|mid|low> [passes]
 //
 // mixedandnot ignores count/overlap (the band's fixture: 64 strided values \ a
 // 32768-value even-number bitset — an all-hit probe, empty result); runbitset
@@ -24,6 +24,7 @@
 #include <cstdlib>
 #include <string>
 #include <vector>
+#include <algorithm>
 using Bitmap = frsr::roaring::bitmap<
     std::uint32_t,
     frsr::roaring::default_container_set<std::uint32_t>,
@@ -57,6 +58,25 @@ static Fixture make_fixture( std::string const & op, std::size_t const count, st
     return f;
 }
 
+// cold_card/ColdCard{Intersect,Andnot}/acard=<count>: 102 pairs (a 1 MB nominal working set), each an array of
+// count values at stride 16384/count against the bitset [0,8192), touched in one shuffled order.
+template <typename Bitmap, typename Add>
+static std::vector<std::pair<Bitmap, Bitmap>> cold_pairs( std::size_t const acard, Add add ) {
+    std::vector<std::pair<Bitmap, Bitmap>> pairs( 102 );
+    std::size_t const stride{ std::max<std::size_t>( 1, 16384 / std::max<std::size_t>( acard, 1 ) ) };
+    for ( auto & [ arr, bmp ] : pairs ) {
+        for ( std::size_t v = 0; v < 8192; ++v ) { add( bmp, std::uint32_t( v ) ); }
+        for ( std::size_t v = 0; v < acard; ++v ) { add( arr, std::uint32_t( v * stride ) ); }
+    }
+    return pairs;
+}
+static std::vector<std::size_t> shuffled_order( std::size_t const n ) {
+    std::vector<std::size_t> order( n ); for ( std::size_t i = 0; i < n; ++i ) { order[ i ] = i; }
+    std::uint64_t x{ 0x9e3779b97f4a7c15ULL };
+    for ( std::size_t i = n; i > 1; --i ) { x ^= x << 13; x ^= x >> 7; x ^= x << 17; std::swap( order[ i - 1 ], order[ x % i ] ); }
+    return order;
+}
+
 int main( int argc, char * argv[] ) {
     std::string const arm    { argc > 1 ? argv[ 1 ] : "frsr"  };
     std::string const op     { argc > 2 ? argv[ 2 ] : "union" };
@@ -64,6 +84,26 @@ int main( int argc, char * argv[] ) {
     std::string const overlap{ argc > 4 ? argv[ 4 ] : "high" };
     std::size_t const passes { argc > 5 ? std::strtoull( argv[ 5 ], nullptr, 10 ) : 20'000 };
     std::size_t const offset { overlap == "high" ? count / 4 : overlap == "mid" ? count / 2 : 9 * count / 10 };
+    if ( op == "coldcard" || op == "coldcardnot" ) {
+        bool const andnot{ op == "coldcardnot" };
+        auto const order{ shuffled_order( 102 ) };
+        std::int64_t sink{ 0 };
+        if ( arm == "frsr" ) {
+            auto pairs{ cold_pairs<Bitmap>( count, []( Bitmap & b, std::uint32_t v ) { (void)b.add( v ); } ) };
+            auto const t0{ std::chrono::steady_clock::now() };
+            for ( std::size_t p = 0; p < passes; ++p ) { auto & [ arr, bmp ]{ pairs[ order[ p % 102 ] ] }; Bitmap r{ andnot ? arr - bmp : arr & bmp }; sink += std::int64_t( r.size() ); }
+            auto const t1{ std::chrono::steady_clock::now() };
+            std::printf( "frsr %s acard=%zu passes=%zu us/op=%.4f sink=%lld\n", op.c_str(), count, passes, std::chrono::duration<double, std::micro>( t1 - t0 ).count() / double( passes ), (long long)sink );
+        } else {
+            auto pairs{ cold_pairs<roaring_bitmap_t *>( count, []( roaring_bitmap_t * & b, std::uint32_t v ) { if ( !b ) { b = roaring_bitmap_create(); roaring_bitmap_set_copy_on_write( b, true ); } roaring_bitmap_add( b, v ); } ) };
+            auto const t0{ std::chrono::steady_clock::now() };
+            for ( std::size_t p = 0; p < passes; ++p ) { auto & [ arr, bmp ]{ pairs[ order[ p % 102 ] ] }; auto * r{ andnot ? roaring_bitmap_andnot( arr, bmp ) : roaring_bitmap_and( arr, bmp ) }; sink += std::int64_t( roaring_bitmap_get_cardinality( r ) ); roaring_bitmap_free( r ); }
+            auto const t1{ std::chrono::steady_clock::now() };
+            std::printf( "cpp  %s acard=%zu passes=%zu us/op=%.4f sink=%lld\n", op.c_str(), count, passes, std::chrono::duration<double, std::micro>( t1 - t0 ).count() / double( passes ), (long long)sink );
+            for ( auto & [ arr, bmp ] : pairs ) { roaring_bitmap_free( arr ); roaring_bitmap_free( bmp ); }
+        }
+        return 0;
+    }
     auto const fx{ make_fixture( op, count, offset ) };
     bool const is_andnot{ op == "difference" || op == "mixedandnot" || op == "satandnot" };
     bool const is_and   { op == "runbitset" || op == "envelope" };
