@@ -1037,11 +1037,27 @@ public:
         return sorted_array_contains( values.data(), values.size(), value );
     }
 
+    // The in-order append alone, inline, as the reference's array_container_try_add
+    // takes it: a value above the current maximum into a payload with room. Only
+    // the count and the upper endpoint move (the reference stores the count alone).
+    // Anything else — an empty or full payload, an out-of-order value — is add().
+    [[nodiscard]] [[gnu::always_inline]] bool try_append( low_type const value ) noexcept {
+        auto const cardinality{ values.size() };
+        if ( cardinality != 0 && values.back() < value && cardinality < values.capacity() ) [[likely]] {
+            values.data()[ cardinality ] = value;
+            handle_->set_count      ( cardinality + 1U );
+            handle_->set_cardinality( cardinality + 1U );
+            handle_->set_max_value  ( value );
+            return true;
+        }
+        return false;
+    }
+
     [[nodiscard]] bool add( low_type const value ) {
+        if ( try_append( value ) ) { return true; }
         auto const cardinality{ values.size() };
         if ( cardinality == 0 || values.back() < value ) {
-            // Append: only the count and the upper endpoint move (the reference
-            // stores the count alone) — no re-read of both ends for the header.
+            // Append into a payload that must first grow (or is empty).
             values.push_back( value );
             handle_->set_cardinality( cardinality + 1U );
             if ( cardinality == 0 ) {

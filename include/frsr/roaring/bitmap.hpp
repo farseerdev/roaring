@@ -692,6 +692,14 @@ public:
         if ( ctx.slot != nullptr && ctx.generation == chunks_.generation() && ctx.chunk == chunk ) [[likely]] {
             auto       & slot{ *ctx.slot };
             auto const   low { layout_type::low_key( value ) };
+            // The common hit is an in-order append into a private array: one
+            // inline lane, as the reference's is, before the kind dispatch.
+            if ( ctx.payload_private && slot.holds_array() ) [[likely]] {
+                if ( detail::as_array_already_private( slot ).try_append( low ) ) [[likely]] {
+                    promote_if_needed( slot );
+                    return true;
+                }
+            }
             bool const was_tombstone{
                 kUseLazyTombstoning && tombstone_count_ != 0 && detail::container_size( slot ) == 0
             };
@@ -3584,6 +3592,7 @@ private:
                 if ( ctx != nullptr ) {
                     ctx->chunk = chunk;
                     ctx->index = invalid_index;
+                    ctx->slot  = nullptr;
                     ctx->payload_private = false;
                 }
                 return true;
@@ -3712,17 +3721,22 @@ private:
         return true;
     }
 
-    void promote_if_needed( handle_type & slot ) {
-        if ( slot.holds_array() && slot.count() >= array_to_bitset_threshold ) {
-            if constexpr ( supports_bitset_container ) {
-                // [croaring-ref] deps/croaring/include/roaring/roaring.h: array→bitset promotion concept
-                // std::as_const avoids an unneeded write-barrier clone under a
-                // refcounted CowPolicy: slot is about to be wholly replaced below.
-                auto const values{ std::as_const( slot ).as_array().values };
-                slot = detail::bitset_handle_from_sorted_values<layout_type, CowPolicy>( { values.data(), values.size() } );
-            } else {
-                slot = optimize_container_for_policy( std::move( slot ) );
-            }
+    // The threshold test is the inline part (two loads on the handle line the
+    // add just touched); the conversion itself is one cold call per 4096 adds.
+    [[gnu::always_inline]] void promote_if_needed( handle_type & slot ) {
+        if ( slot.holds_array() && slot.count() >= array_to_bitset_threshold ) [[unlikely]] {
+            promote_array( slot );
+        }
+    }
+    [[gnu::cold, gnu::noinline]] void promote_array( handle_type & slot ) {
+        if constexpr ( supports_bitset_container ) {
+            // [croaring-ref] deps/croaring/include/roaring/roaring.h: array→bitset promotion concept
+            // std::as_const avoids an unneeded write-barrier clone under a
+            // refcounted CowPolicy: slot is about to be wholly replaced below.
+            auto const values{ std::as_const( slot ).as_array().values };
+            slot = detail::bitset_handle_from_sorted_values<layout_type, CowPolicy>( { values.data(), values.size() } );
+        } else {
+            slot = optimize_container_for_policy( std::move( slot ) );
         }
     }
 
