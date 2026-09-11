@@ -116,7 +116,7 @@ public:
     // chunk table itself keeps its capacity across runs too.
     void clear_retiring_slots() noexcept {
         retired_.destroy_all();
-        std::swap( live_, retired_ );
+        live_.swap( retired_ );
         retired_array_next_ = retired_bitset_next_ = 0;
         ++generation_;
     }
@@ -186,8 +186,8 @@ public:
     }
 
     void swap( chunk_store & other ) noexcept {
-        std::swap( live_   , other.live_    );
-        std::swap( retired_, other.retired_ );
+        live_   .swap( other.live_    );
+        retired_.swap( other.retired_ );
         std::swap( retired_array_next_ , other.retired_array_next_  );
         std::swap( retired_bitset_next_, other.retired_bitset_next_ );
         ++generation_;
@@ -312,6 +312,16 @@ private:
             keys_     = std::exchange( other.keys_    , nullptr );
             size_     = std::exchange( other.size_    , 0 );
             capacity_ = std::exchange( other.capacity_, 0 );
+        }
+
+        // Four field exchanges: the generation swap (temp + two move-assigns,
+        // each releasing an already-empty table) showed up as a tenth of a
+        // small-result band.
+        [[gnu::always_inline]] void swap( table & other ) noexcept {
+            std::swap( slots_   , other.slots_    );
+            std::swap( keys_    , other.keys_     );
+            std::swap( size_    , other.size_     );
+            std::swap( capacity_, other.capacity_ );
         }
 
         [[nodiscard]] handle_type       * slots()       noexcept { return slots_; }
