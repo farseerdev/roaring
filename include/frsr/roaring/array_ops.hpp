@@ -157,9 +157,9 @@ inline constexpr std::size_t sse42_intersect_min_side{ 8 };
 // accumulate while B advances under that block, and once no further B value can match it
 // (a_max <= b_max) the UNMARKED lanes are compacted to the front and stored. Each store
 // writes a full 8-lane vector, so `out` must have sa + 8 slots.
-// Zeros: PCMPISTRM treats a zero lane as a terminator, so while either current block holds
-// one (sorted input puts it in lane 0 of the first block only) the explicit-length
-// PCMPESTRM is used, exactly as the intersection kernel does. B's sub-vector remainder is
+// Zeros: PCMPISTRM treats a zero lane as a terminator, and sorted input can hold a zero
+// only at position 0 — so, as the reference does, that one element is settled up front
+// and the loop runs the implicit-length compare throughout. B's sub-vector remainder is
 // applied to the last pending A block through a zero-padded, explicit-length compare.
 // [croaring-ref] deps/croaring/src/array_util.c:difference_vector16
 [[ gnu::hot ]] inline std::size_t difference_array_array_sse42(
@@ -169,13 +169,19 @@ inline constexpr std::size_t sse42_intersect_min_side{ 8 };
 ) noexcept {
     constexpr std::size_t vl{ 8 };
     constexpr int flags{ _SIDD_UWORD_OPS | _SIDD_CMP_EQUAL_ANY | _SIDD_BIT_MASK };
+    if ( sa == 0 ) { return 0; }
     if ( sb == 0 ) {
         std::memcpy( out, a, sa * sizeof( *a ) );
         return sa;
     }
-    std::size_t const sta{ ( sa / vl ) * vl };
-    std::size_t const stb{ ( sb / vl ) * vl };
     std::size_t ia{ 0 }, ib{ 0 }, count{ 0 };
+    if ( a[ 0 ] == 0 || b[ 0 ] == 0 ) {
+        if      ( a[ 0 ] == 0 && b[ 0 ] == 0 ) { ++ia; ++ib; }
+        else if ( a[ 0 ] == 0 )                { out[ count++ ] = 0; ++ia; }
+        else                                   { ++ib; }
+    }
+    std::size_t const sta{ ia + ( ( sa - ia ) / vl ) * vl };
+    std::size_t const stb{ ib + ( ( sb - ib ) / vl ) * vl };
 
     // Keep (compact + store) the lanes of `va_raw` whose bit in `keep` is set.
     auto const compact_store{ [ & ]( __m128i const va_raw, unsigned const keep ) {
@@ -192,10 +198,7 @@ inline constexpr std::size_t sse42_intersect_min_side{ 8 };
         __m128i vb{ _mm_lddqu_si128( reinterpret_cast<__m128i const *>( b + ib ) ) };
         __m128i found{ _mm_setzero_si128() };
         while ( true ) {
-            __m128i const res{ ( a[ ia ] == 0 || b[ ib ] == 0 )
-                ? _mm_cmpestrm( vb, vl, va, vl, flags )
-                : _mm_cmpistrm( vb, va, flags ) };
-            found = _mm_or_si128( found, res );
+            found = _mm_or_si128( found, _mm_cmpistrm( vb, va, flags ) );
             std::uint16_t const amax{ a[ ia + vl - 1 ] };
             std::uint16_t const bmax{ b[ ib + vl - 1 ] };
             if ( amax <= bmax ) {
