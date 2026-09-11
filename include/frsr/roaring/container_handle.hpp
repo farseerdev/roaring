@@ -459,7 +459,7 @@ public:
         }
         auto * const fresh{ allocate_payload( std::size_t{ count_ } * sizeof( E ) ) };
         std::memcpy( fresh, payload_data_raw(), std::size_t{ count_ } * sizeof( E ) );
-        free_payload( spill().data );
+        free_payload( spill().data, std::size_t{ capacity } * sizeof( E ) );
         spill_to( fresh, count_ );
         return old_bytes - new_bytes;
     }
@@ -473,7 +473,7 @@ public:
         auto * const fresh{ allocate_payload( std::size_t{ grown } * sizeof( E ) ) };
         std::memcpy( fresh, payload_data_raw(), std::size_t{ count_ } * sizeof( E ) );
         if ( spilled() ) {
-            free_payload( spill().data );
+            free_payload( spill().data, std::size_t{ spill().capacity } * sizeof( E ) );
         }
         spill_to( fresh, grown );
     }
@@ -552,7 +552,25 @@ private:
 
     // new/delete. free_payload always rebases by the *compile-time* offset (not
     // runtime owner) so a demoted-to-unique shared payload still frees its base.
+    //
+    // A bitset word block is allocated so that the WORDS start on a cache line,
+    // as the reference's roaring_aligned_malloc places them: the word kernels
+    // move whole 64-byte vectors, and a block whose words begin 8 bytes into a
+    // line (the refcount word's width) splits every load and store across two
+    // lines. The refcount word keeps its place immediately before the payload;
+    // only the allocation's base moves back to the line boundary. The prefix
+    // is a function of the payload size alone, so the free side recomputes it
+    // from the capacity it already knows.
+    static constexpr std::size_t payload_line_bytes{ 64 };
+    [[nodiscard]] static constexpr bool line_aligned_payload( std::size_t const bytes ) noexcept {
+        return bytes == sizeof( word_array );
+    }
+    [[nodiscard]] static constexpr std::size_t payload_prefix_bytes( std::size_t const bytes ) noexcept {
+        return line_aligned_payload( bytes ) && rc_prefix_bytes != 0 ? payload_line_bytes : rc_prefix_bytes;
+    }
+
     [[nodiscard]] static void * allocate_payload( std::size_t const bytes ) {
+        auto const prefix{ payload_prefix_bytes( bytes ) };
 #if FRSR_ROARING_PAYLOAD_ALLOC_STATS
         {
             auto & s{ payload_alloc_stats() };
@@ -566,27 +584,43 @@ private:
 #if FRSR_ROARING_HAS_MIMALLOC
         void * raw;
         if ( auto * const heap{ payload_heap() } ) [[likely]] {
-            raw = mi_heap_malloc( heap, rc_prefix_bytes + bytes );
+            raw = line_aligned_payload( bytes )
+                ? mi_heap_malloc_aligned( heap, prefix + bytes, payload_line_bytes )
+                : mi_heap_malloc        ( heap, prefix + bytes );
             if ( raw == nullptr ) [[unlikely]] { throw std::bad_alloc{}; }
         } else { // mi_heap_new failure fallback: default heap, mi_new OOM semantics
-            raw = mi_new( rc_prefix_bytes + bytes );
+            raw = line_aligned_payload( bytes )
+                ? mi_new_aligned( prefix + bytes, payload_line_bytes )
+                : mi_new        ( prefix + bytes );
         }
         auto * const base{ static_cast<std::byte *>( raw ) };
 #else
-        auto * const base{ static_cast<std::byte *>( ::operator new( rc_prefix_bytes + bytes ) ) };
+        auto * const base{ static_cast<std::byte *>( line_aligned_payload( bytes )
+            ? ::operator new( prefix + bytes, std::align_val_t{ payload_line_bytes } )
+            : ::operator new( prefix + bytes ) ) };
 #endif
+        auto * const data{ base + prefix };
         if constexpr ( CowPolicy::refcounted ) {
-            CowPolicy::rc_construct( base );
+            CowPolicy::rc_construct( data - rc_prefix_bytes );
         }
-        return base + rc_prefix_bytes;
+        return data;
     }
 
-    static void free_payload( void * const data ) noexcept {
+    // `bytes` must be the size the payload was allocated with (capacity, not count).
+    static void free_payload( void * const data, std::size_t const bytes ) noexcept {
+        auto * const base{ static_cast<std::byte *>( data ) - payload_prefix_bytes( bytes ) };
 #if FRSR_ROARING_HAS_MIMALLOC
-        mi_free( static_cast<std::byte *>( data ) - rc_prefix_bytes );
+        mi_free( base );
 #else
-        ::operator delete( static_cast<std::byte *>( data ) - rc_prefix_bytes );
+        if ( line_aligned_payload( bytes ) ) {
+            ::operator delete( base, std::align_val_t{ payload_line_bytes } );
+        } else {
+            ::operator delete( base );
+        }
 #endif
+    }
+    void free_payload( void * const data ) const noexcept {
+        free_payload( data, std::size_t{ spill().capacity } * element_size() );
     }
 
     [[nodiscard]] static void * rc_slot_of( void * const payload ) noexcept {
