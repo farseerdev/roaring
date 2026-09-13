@@ -9,7 +9,7 @@
 // Not part of the build (nothing globs this directory). Compile with the
 // benchmark target's own flags (see bulkadd_prof.cpp), then:
 //
-//   pairop_prof <frsr|cpp> <union|difference|diffinplace|toarray|mixedandnot|runbitset|satandnot|envelope|coldcard|coldcardnot|lazyfold|subuniq|unioninplace> <count> <high|mid|low> [passes]
+//   pairop_prof <frsr|cpp> <union|difference|diffinplace|toarray|mixedandnot|runbitset|satandnot|envelope|coldcard|coldcardnot|lazyfold|subuniq|unioninplace|mixedrandom|mixedrandomnot> <count> <high|mid|low> [passes]
 //
 // mixedandnot ignores count/overlap (the band's fixture: 64 strided values \ a
 // 32768-value even-number bitset — an all-hit probe, empty result); runbitset
@@ -49,6 +49,14 @@ static Fixture make_fixture( std::string const & op, std::size_t const count, st
     } else if ( op == "envelope" ) {
         // EnvelopePerChunk/chunks=<count>: both sides hold count chunks of 4 values, one of which matches.
         for ( std::size_t c = 0; c < count; ++c ) { auto const base{ std::uint32_t( c * 65536 ) }; f.a.insert( f.a.end(), { base + 1, base + 3, base + 5, base + 7 } ); f.b.insert( f.b.end(), { base + 1, base + 2, base + 4, base + 6 } ); }
+    } else if ( op == "mixedrandom" || op == "mixedrandomnot" ) {
+        // <count> distinct random values of one chunk against a bitset holding each value of the chunk with
+        // probability 1/2: survivor masks with no structure for either polarity.
+        std::uint64_t x{ 0x9e3779b97f4a7c15ULL };
+        auto const next{ [ &x ] { x ^= x << 13; x ^= x >> 7; x ^= x << 17; return x; } };
+        std::vector<bool> chosen( 65536 );
+        for ( std::size_t added = 0; added < std::min<std::size_t>( count, 65536 ); ) { auto const v{ next() % 65536 }; if ( !chosen[ v ] ) { chosen[ v ] = true; ++added; } }
+        for ( std::size_t v = 0; v < 65536; ++v ) { if ( chosen[ v ] ) { f.a.push_back( std::uint32_t( v ) ); } if ( next() & 1U ) { f.b.push_back( std::uint32_t( v ) ); } }
     } else if ( op == "satandnot" ) {
         for ( std::size_t i = 0; i < 64; ++i ) { f.a.push_back( std::uint32_t( i * 2048 ) ); }
         for ( std::size_t i = 0; i < count; ++i ) { f.b.push_back( std::uint32_t( i ) ); }
@@ -189,8 +197,8 @@ int main( int argc, char * argv[] ) {
         return 0;
     }
     auto const fx{ make_fixture( op, count, offset ) };
-    bool const is_andnot{ op == "difference" || op == "mixedandnot" || op == "satandnot" };
-    bool const is_and   { op == "runbitset" || op == "envelope" };
+    bool const is_andnot{ op == "difference" || op == "mixedandnot" || op == "satandnot" || op == "mixedrandomnot" };
+    bool const is_and   { op == "runbitset" || op == "envelope" || op == "mixedrandom" };
     std::int64_t sink{ 0 };
     if ( arm == "frsr" ) {
         Bitmap a, b;
