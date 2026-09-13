@@ -6997,6 +6997,9 @@ int main(int argc, char *argv[]) {
 #endif
 
     std::string filter;
+    // --history <lo>:<hi> also runs the bands at registration indices [lo, hi) (see --list), in order, ahead of the
+    // filtered ones that follow them: reproduces the process state a band inherits inside the full run.
+    std::optional<std::pair<std::size_t, std::size_t>> history;
     bool list_only = false;
     std::optional<std::uint64_t> max_count;
 
@@ -7009,6 +7012,11 @@ int main(int argc, char *argv[]) {
             filter = argv[++i];
         } else if (arg.substr(0, 9) == "--filter=") {
             filter = arg.substr(9);
+        } else if (arg == "--history" && i + 1 < argc) {
+            std::string const range{ argv[++i] };
+            auto const colon = range.find(':');
+            history.emplace(std::strtoull(range.substr(0, colon).c_str(), nullptr, 10),
+                            colon == std::string::npos ? g_benchmarks.size() : std::strtoull(range.c_str() + colon + 1, nullptr, 10));
         } else if (arg == "--max-count" && i + 1 < argc) {
             max_count = std::strtoull(argv[++i], nullptr, 10);
         } else if (arg.substr(0, 12) == "--max-count=") {
@@ -7044,10 +7052,12 @@ int main(int argc, char *argv[]) {
         }
         return std::strtoull(slice.c_str(), nullptr, 10);
     };
-    for (const auto &e : g_benchmarks) {
+    for (std::size_t index = 0; index < g_benchmarks.size(); ++index) {
+        const auto &e = g_benchmarks[index];
+        bool const in_history = history.has_value() && index >= history->first && index < history->second;
         // Check if benchmark matches filter
-        if (!filter.empty()) {
-            if (e.name.find(filter) == std::string::npos) {
+        if (!in_history && (!filter.empty() || history.has_value())) {
+            if (filter.empty() || e.name.find(filter) == std::string::npos) {
                 continue;
             }
         }
