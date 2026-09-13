@@ -9,7 +9,7 @@
 // Not part of the build (nothing globs this directory). Compile with the
 // benchmark target's own flags (see bulkadd_prof.cpp), then:
 //
-//   pairop_prof <frsr|cpp> <union|difference|diffinplace|toarray|mixedandnot|runbitset|satandnot|envelope|coldcard|coldcardnot|lazyfold|subuniq|unioninplace|mixedrandom|mixedrandomnot> <count> <high|mid|low> [passes]
+//   pairop_prof <frsr|cpp> <union|intersect|difference|diffinplace|toarray|mixedandnot|runbitset|satandnot|envelope|coldcard|coldcardnot|lazyfold|subuniq|unioninplace|mixedrandom|mixedrandomnot> <count> <high|mid|low> [passes]
 //
 // mixedandnot ignores count/overlap (the band's fixture: 64 strided values \ a
 // 32768-value even-number bitset — an all-hit probe, empty result); runbitset
@@ -198,7 +198,7 @@ int main( int argc, char * argv[] ) {
     }
     auto const fx{ make_fixture( op, count, offset ) };
     bool const is_andnot{ op == "difference" || op == "mixedandnot" || op == "satandnot" || op == "mixedrandomnot" };
-    bool const is_and   { op == "runbitset" || op == "envelope" || op == "mixedrandom" };
+    bool const is_and   { op == "runbitset" || op == "envelope" || op == "mixedrandom" || op == "intersect" };
     std::int64_t sink{ 0 };
     if ( arm == "frsr" ) {
         Bitmap a, b;
