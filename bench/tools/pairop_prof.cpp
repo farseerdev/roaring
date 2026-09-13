@@ -9,7 +9,7 @@
 // Not part of the build (nothing globs this directory). Compile with the
 // benchmark target's own flags (see bulkadd_prof.cpp), then:
 //
-//   pairop_prof <frsr|cpp> <union|intersect|difference|diffinplace|toarray|mixedandnot|runbitset|satandnot|envelope|coldcard|coldcardnot|lazyfold|subuniq|unioninplace|mixedrandom|mixedrandomnot> <count> <high|mid|low> [passes]
+//   pairop_prof <frsr|cpp> <union|intersect|difference|diffinplace|toarray|mixedandnot|runbitset|satandnot|envelope|coldcard|coldcardnot|lazyfold|subuniq|arrayrunnot|unioninplace|mixedrandom|mixedrandomnot> <count> <high|mid|low> [passes]
 //
 // mixedandnot ignores count/overlap (the band's fixture: 64 strided values \ a
 // 32768-value even-number bitset — an all-hit probe, empty result); runbitset
@@ -173,6 +173,35 @@ int main( int argc, char * argv[] ) {
             auto const t1{ std::chrono::steady_clock::now() };
             std::printf( "cpp  %s passes=%zu us/op=%.4f sink=%lld\n", op.c_str(), passes, std::chrono::duration<double, std::micro>( t1 - t0 ).count() / double( passes ), (long long)sink );
             roaring_bitmap_free( sparse ); roaring_bitmap_free( dense );
+        }
+        return 0;
+    }
+    if ( op == "arrayrunnot" ) {
+        // The run-operand twin of subuniq: 64 values i*1024+1 (one sole-owned array) -= runs [i*1024+2, i*1024+1000]
+        // (one run container), in place on the same bitmap every pass; nothing matches, so the array never changes.
+        std::int64_t sink{ 0 };
+        if ( arm == "frsr" ) {
+            Bitmap sparse, runs;
+            for ( std::size_t i = 0; i < 64; ++i ) { runs.add_closed_range( std::uint32_t( i * 1024 + 2 ), std::uint32_t( i * 1024 + 1000 ) ); }
+            runs.optimize();
+            hold_padding();
+            for ( std::size_t i = 0; i < 64; ++i ) { (void)sparse.add( std::uint32_t( i * 1024 + 1 ) ); }
+            auto const t0{ std::chrono::steady_clock::now() };
+            for ( std::size_t p = 0; p < passes; ++p ) { sparse -= runs; sink += std::int64_t( sparse.size() ); }
+            auto const t1{ std::chrono::steady_clock::now() };
+            std::printf( "frsr %s passes=%zu us/op=%.4f sink=%lld\n", op.c_str(), passes, std::chrono::duration<double, std::micro>( t1 - t0 ).count() / double( passes ), (long long)sink );
+        } else {
+            auto * sparse{ roaring_bitmap_create() }; auto * runs{ roaring_bitmap_create() };
+            roaring_bitmap_set_copy_on_write( sparse, true ); roaring_bitmap_set_copy_on_write( runs, true );
+            for ( std::size_t i = 0; i < 64; ++i ) { roaring_bitmap_add_range_closed( runs, std::uint32_t( i * 1024 + 2 ), std::uint32_t( i * 1024 + 1000 ) ); }
+            roaring_bitmap_run_optimize( runs );
+            hold_padding();
+            for ( std::size_t i = 0; i < 64; ++i ) { roaring_bitmap_add( sparse, std::uint32_t( i * 1024 + 1 ) ); }
+            auto const t0{ std::chrono::steady_clock::now() };
+            for ( std::size_t p = 0; p < passes; ++p ) { roaring_bitmap_andnot_inplace( sparse, runs ); sink += std::int64_t( roaring_bitmap_get_cardinality( sparse ) ); }
+            auto const t1{ std::chrono::steady_clock::now() };
+            std::printf( "cpp  %s passes=%zu us/op=%.4f sink=%lld\n", op.c_str(), passes, std::chrono::duration<double, std::micro>( t1 - t0 ).count() / double( passes ), (long long)sink );
+            roaring_bitmap_free( sparse ); roaring_bitmap_free( runs );
         }
         return 0;
     }
