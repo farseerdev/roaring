@@ -2180,6 +2180,29 @@ public:
                         }
                         return;
                     }
+                    // Many runs covering 3/16 to 7/16 of the domain: clone, clear the gaps
+                    // and recount once. The masked fill below grows with the covered words
+                    // (a mask setup, a store and a popcount each, per run); this form costs
+                    // a block copy, the gap stores and one vector recount, flat across that
+                    // range. Below it the fill's covered words cost less than the copy and
+                    // recount, and on 64 runs the per-gap clears of this form lose from 7/16
+                    // on; from half coverage the subtracting clone above serves.
+                    if ( std::as_const( run_side ).as_run().runs.size() > 32U &&
+                         run_cardinality >= layout_type::low_domain_size * 3U / 16U &&
+                         run_cardinality <  layout_type::low_domain_size * 7U / 16U ) {
+                        auto container{ detail::intersect_run_bitset_clone_and_recount<layout_type, CowPolicy>(
+                            std::as_const( run_side ).as_run(),
+                            std::as_const( bitset_side ).as_bitset(),
+                            result_chunks.take_retired( detail::container_kind::bitset )
+                        ) };
+                        if constexpr ( !uses_default_container_set ) {
+                            container = optimize_container_for_policy( std::move( container ) );
+                        }
+                        if ( auto const bitset_size{ detail::container_size( container ) }; bitset_size != 0 ) {
+                            emit( left_key, std::move( container ), bitset_size );
+                        }
+                        return;
+                    }
                     // Dense runs: materialize into a (retired or fresh) bitset. NOT
                     // demoted (unlike the bitset×bitset sites below/above): the
                     // run-heavy fold witness regressed ~12% with demotion here — its

@@ -70,7 +70,27 @@ inline void or_words_inplace_v4( std::uint64_t * const a, std::uint64_t const * 
     for ( std::size_t i{ 0 }; i < n; ++i ) { a[ i ] |= b[ i ]; }
 }
 
+FRSR_ROARING_X86_V4_KERNEL
+[[nodiscard]] inline std::size_t popcount_words_v4( std::uint64_t const * const words, std::size_t const n ) noexcept {
+    std::size_t cardinality{ 0 };
+    for ( std::size_t i{ 0 }; i < n; ++i ) { cardinality += static_cast<std::size_t>( std::popcount( words[ i ] ) ); }
+    return cardinality;
+}
+
 #endif // FRSR_ROARING_X86_V4
+
+// Set-bit count of `n` words: one VPOPCNTQ per register on the AVX-512 tier, elsewhere the plain loop.
+// [croaring-ref] deps/croaring/src/containers/bitset.c:bitset_container_compute_cardinality
+[[nodiscard]] inline std::size_t popcount_words( std::uint64_t const * const words, std::size_t const n ) noexcept {
+#if FRSR_ROARING_X86_V4
+    if ( have_x86_v4() ) [[likely]] {
+        return popcount_words_v4( words, n );
+    }
+#endif
+    std::size_t cardinality{ 0 };
+    for ( std::size_t i{ 0 }; i < n; ++i ) { cardinality += static_cast<std::size_t>( std::popcount( words[ i ] ) ); }
+    return cardinality;
+}
 
 #if defined( __x86_64__ ) || defined( _M_X64 )
 // Set-bit positions of one byte, eight 16-bit lanes, zero padded past the count.
@@ -482,6 +502,63 @@ template <typename Layout, typename CowPolicy = cow_value_semantics>
     if ( !many_short_runs && next_unwritten < out.size() ) {
         std::fill( &out[ next_unwritten ], out.data() + out.size(), std::uint64_t{ 0 } );
     }
+    if ( cardinality == 0 ) {
+        return container_handle<Layout, CowPolicy>{};
+    }
+    result.set_cardinality( static_cast<std::uint32_t>( cardinality ) );
+    return result;
+}
+
+// Clone-and-recount run∩bitset: copy the bitset payload wholesale, clear the bits
+// no run covers gap by gap (a mask per boundary word, a zero store per interior
+// word), then recount the block once. Its cost is a block copy, the gap stores and
+// one vector recount, flat in how many words the runs cover; the masked fill above
+// pays a mask setup, a store and a popcount per covered word for every run, and the
+// subtracting clone below pays a popcount per cleared word.
+// [croaring-ref] deps/croaring/src/containers/mixed_intersection.c:
+// run_bitset_container_intersection (clone + bitset_reset_range per gap +
+// bitset_container_compute_cardinality)
+template <typename Layout, typename CowPolicy = cow_value_semantics>
+[[nodiscard]] inline container_handle<Layout, CowPolicy> intersect_run_bitset_clone_and_recount(
+    run_cref<Layout, CowPolicy> const runs,
+    bitset_cref<Layout, CowPolicy> const bitset,
+    container_handle<Layout, CowPolicy> && reuse = {}
+) noexcept {
+    auto result{ reuse.holds_bitset()
+        ? std::move( reuse )
+        : container_handle<Layout, CowPolicy>::make_bitset_uninitialized() };
+    auto result_bitset{ result.as_bitset() };
+    auto const & src{ bitset.words.as_array() };
+    auto       & out{ result_bitset.words.as_array() };
+    std::copy( src.data(), src.data() + src.size(), out.data() );
+    auto const clear_bits{ [ & ]( std::size_t const begin, std::size_t const end ) { // inclusive
+        auto const first_word{ begin >> 6U };
+        auto const last_word { end   >> 6U };
+        auto const first_bit { static_cast<unsigned>( begin ) & 63U };
+        auto const last_bit  { static_cast<unsigned>( end   ) & 63U };
+        auto const first_mask{ std::numeric_limits<std::uint64_t>::max() << first_bit };
+        auto const last_mask { ( last_bit == 63U )
+            ? std::numeric_limits<std::uint64_t>::max()
+            : ( std::uint64_t{ 1 } << ( last_bit + 1U ) ) - 1U };
+        if ( first_word == last_word ) {
+            out[ first_word ] &= ~( first_mask & last_mask );
+        } else {
+            out[ first_word ] &= ~first_mask;
+            std::fill( &out[ first_word + 1U ], &out[ last_word ], std::uint64_t{ 0 } );
+            out[ last_word ] &= ~last_mask;
+        }
+    } };
+    std::size_t next{ 0 };
+    for ( auto const & current : runs.runs ) {
+        if ( current.begin > next ) {
+            clear_bits( next, static_cast<std::size_t>( current.begin ) - 1U );
+        }
+        next = static_cast<std::size_t>( current.end ) + 1U;
+    }
+    if ( next < Layout::low_domain_size ) {
+        clear_bits( next, Layout::low_domain_size - 1U );
+    }
+    auto const cardinality{ popcount_words( out.data(), out.size() ) };
     if ( cardinality == 0 ) {
         return container_handle<Layout, CowPolicy>{};
     }
