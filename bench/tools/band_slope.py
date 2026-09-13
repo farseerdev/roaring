@@ -57,13 +57,18 @@ with open(path, encoding="utf-8", errors="replace") as f:
 
 
 def fit(per_point):
+    # Weighted least squares with weights 1/y^2, i.e. minimizing relative residuals: timing noise scales with the
+    # measured time, and an unweighted fit would let the largest parameter value decide the slope on its own.
     xs = sorted(per_point)
     ys = [statistics.median(per_point[x]) for x in xs]
     if len(xs) < 2:
         return float("nan"), float("nan"), xs
-    mx, my = statistics.fmean(xs), statistics.fmean(ys)
-    sxx = sum((x - mx) ** 2 for x in xs)
-    slope = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / sxx
+    ws = [1.0 / (y * y) for y in ys]
+    sw = sum(ws)
+    mx = sum(w * x for w, x in zip(ws, xs)) / sw
+    my = sum(w * y for w, y in zip(ws, ys)) / sw
+    sxx = sum(w * (x - mx) ** 2 for w, x in zip(ws, xs))
+    slope = sum(w * (x - mx) * (y - my) for w, x, y in zip(ws, xs, ys)) / sxx
     return my - slope * mx, slope, xs
 
 
@@ -78,3 +83,19 @@ for arm in sorted(fits):
     int_ratio = intercept / ref_intercept if ref_intercept else float("nan")
     slope_ratio = slope / ref_slope if ref_slope else float("nan")
     print(f"{arm:<16}{len(xs):>7}{intercept * 1000:>11.2f}{slope * 1000:>9.3f}{int_ratio:>9.3f}{slope_ratio:>10.3f}")
+
+# Per point: median us/op of each arm and its ratio to the reference arm at the same parameter value.
+values = sorted({x for per_point in points.values() for x in per_point})
+print(f"\nper point: median us/op (ratio to {ref})")
+print(f"{'arm':<16}" + "".join(f"{param + '=' + str(x):>20}" for x in values))
+for arm in sorted(points):
+    cells = []
+    for x in values:
+        if x not in points[arm]:
+            cells.append(f"{'-':>20}")
+            continue
+        us = statistics.median(points[arm][x]) / x
+        ref_points = points.get(ref, {})
+        ratio = us / (statistics.median(ref_points[x]) / x) if x in ref_points else float("nan")
+        cells.append(f"{us:>12.4f} ({ratio:.3f})")
+    print(f"{arm:<16}" + "".join(cells))
