@@ -84,6 +84,27 @@ int main( int argc, char * argv[] ) {
     std::string const overlap{ argc > 4 ? argv[ 4 ] : "high" };
     std::size_t const passes { argc > 5 ? std::strtoull( argv[ 5 ], nullptr, 10 ) : 20'000 };
     std::size_t const offset { overlap == "high" ? count / 4 : overlap == "mid" ? count / 2 : 9 * count / 10 };
+    // PAIROP_CHURN_MB=<n>: before any fixture exists, allocate n MB of mixed-size blocks (16 B..16 KB, log-uniform),
+    // then free them in shuffled order keeping one in PAIROP_CHURN_KEEP (default 64) alive — the fragmented heap a
+    // band inherits inside the full benchmark process, where earlier bands built and tore down large working sets.
+    std::vector<void *> churn_survivors;
+    if ( char const * const churn_mb{ std::getenv( "PAIROP_CHURN_MB" ) } ) {
+        std::size_t const budget{ std::size_t( std::strtoull( churn_mb, nullptr, 10 ) ) << 20 };
+        char const * const keep_env{ std::getenv( "PAIROP_CHURN_KEEP" ) };
+        std::size_t const keep{ keep_env ? std::max<std::size_t>( 1, std::strtoull( keep_env, nullptr, 10 ) ) : 64 };
+        std::vector<void *> blocks;
+        std::uint64_t x{ 0x2545f4914f6cdd1dULL };
+        for ( std::size_t total{ 0 }; total < budget; ) {
+            x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+            std::size_t const size{ ( std::size_t{ 16 } << ( x % 11 ) ) + ( ( x >> 32 ) % 16 ) };
+            auto * const block{ static_cast<char *>( std::malloc( size ) ) };
+            block[ 0 ] = block[ size - 1 ] = 1;
+            blocks.push_back( block ); total += size;
+        }
+        for ( std::size_t i = blocks.size(); i > 1; --i ) { x ^= x << 13; x ^= x >> 7; x ^= x << 17; std::swap( blocks[ i - 1 ], blocks[ x % i ] ); }
+        for ( std::size_t i = 0; i < blocks.size(); ++i ) { if ( i % keep == 0 ) { churn_survivors.push_back( blocks[ i ] ); } else { std::free( blocks[ i ] ); } }
+        std::fprintf( stderr, "churn: %zu blocks, %zu kept\n", blocks.size(), churn_survivors.size() );
+    }
     if ( op == "lazyfold" ) {
         // LazyFoldOnly/band=<count>: 32 probes (64 chunks x 64 values) each copied and AND-folded in place against a
         // 64-chunk bitset target holding <count> values per chunk.
