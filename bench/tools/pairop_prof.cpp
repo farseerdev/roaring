@@ -9,7 +9,7 @@
 // Not part of the build (nothing globs this directory). Compile with the
 // benchmark target's own flags (see bulkadd_prof.cpp), then:
 //
-//   pairop_prof <frsr|cpp> <union|difference|diffinplace|toarray|mixedandnot|runbitset|satandnot|envelope|coldcard|coldcardnot|lazyfold> <count> <high|mid|low> [passes]
+//   pairop_prof <frsr|cpp> <union|difference|diffinplace|toarray|mixedandnot|runbitset|satandnot|envelope|coldcard|coldcardnot|lazyfold|subuniq|unioninplace> <count> <high|mid|low> [passes]
 //
 // mixedandnot ignores count/overlap (the band's fixture: 64 strided values \ a
 // 32768-value even-number bitset — an all-hit probe, empty result); runbitset
@@ -69,6 +69,14 @@ static std::vector<std::pair<Bitmap, Bitmap>> cold_pairs( std::size_t const acar
         for ( std::size_t v = 0; v < acard; ++v ) { add( arr, std::uint32_t( v * stride ) ); }
     }
     return pairs;
+}
+// PAIROP_PAD=<bytes>: one held allocation of that size between the construction of the two operands, which moves
+// the second operand (and every later block) by a controlled offset relative to the first: sweeping it through a
+// page exposes address-dependent stalls such as store-to-load aliasing on the low 12 address bits.
+static void hold_padding() {
+    if ( char const * const pad{ std::getenv( "PAIROP_PAD" ) } ) {
+        if ( auto const bytes{ std::strtoull( pad, nullptr, 10 ) } ) { static_cast<char *>( std::malloc( bytes ) )[ 0 ] = 1; }
+    }
 }
 static std::vector<std::size_t> shuffled_order( std::size_t const n ) {
     std::vector<std::size_t> order( n ); for ( std::size_t i = 0; i < n; ++i ) { order[ i ] = i; }
@@ -132,6 +140,34 @@ int main( int argc, char * argv[] ) {
         }
         return 0;
     }
+    if ( op == "subuniq" ) {
+        // MixedArrayBitsetSubtractUniqueInplace: 64 values i*1024+1 (one sole-owned array) -= the 32768 even values
+        // (one bitset), in place on the same bitmap every pass; nothing matches, so the array never changes.
+        std::int64_t sink{ 0 };
+        if ( arm == "frsr" ) {
+            Bitmap sparse, dense;
+            for ( std::size_t i = 0; i < 32768; ++i ) { (void)dense.add( std::uint32_t( 2 * i ) ); }
+            hold_padding();
+            for ( std::size_t i = 0; i < 64; ++i ) { (void)sparse.add( std::uint32_t( i * 1024 + 1 ) ); }
+            auto const t0{ std::chrono::steady_clock::now() };
+            for ( std::size_t p = 0; p < passes; ++p ) { sparse -= dense; sink += std::int64_t( sparse.size() ); }
+            auto const t1{ std::chrono::steady_clock::now() };
+            std::printf( "frsr %s passes=%zu us/op=%.4f sink=%lld\n", op.c_str(), passes, std::chrono::duration<double, std::micro>( t1 - t0 ).count() / double( passes ), (long long)sink );
+        } else {
+            auto * sparse{ roaring_bitmap_create() }; auto * dense{ roaring_bitmap_create() };
+            roaring_bitmap_set_copy_on_write( sparse, true ); roaring_bitmap_set_copy_on_write( dense, true );
+            for ( std::size_t i = 0; i < 32768; ++i ) { roaring_bitmap_add( dense, std::uint32_t( 2 * i ) ); }
+            roaring_bitmap_run_optimize( dense );
+            hold_padding();
+            for ( std::size_t i = 0; i < 64; ++i ) { roaring_bitmap_add( sparse, std::uint32_t( i * 1024 + 1 ) ); }
+            auto const t0{ std::chrono::steady_clock::now() };
+            for ( std::size_t p = 0; p < passes; ++p ) { roaring_bitmap_andnot_inplace( sparse, dense ); sink += std::int64_t( roaring_bitmap_get_cardinality( sparse ) ); }
+            auto const t1{ std::chrono::steady_clock::now() };
+            std::printf( "cpp  %s passes=%zu us/op=%.4f sink=%lld\n", op.c_str(), passes, std::chrono::duration<double, std::micro>( t1 - t0 ).count() / double( passes ), (long long)sink );
+            roaring_bitmap_free( sparse ); roaring_bitmap_free( dense );
+        }
+        return 0;
+    }
     if ( op == "coldcard" || op == "coldcardnot" ) {
         bool const andnot{ op == "coldcardnot" };
         auto const order{ shuffled_order( 102 ) };
@@ -161,6 +197,7 @@ int main( int argc, char * argv[] ) {
         for ( auto const v : fx.a ) { (void)a.add( v ); }
         for ( auto const [ lo, hi ] : fx.a_runs ) { a.add_closed_range( lo, hi ); }
         if ( fx.optimize_a ) { a.optimize(); }
+        hold_padding();
         for ( auto const v : fx.b ) { (void)b.add( v ); }
         std::vector<std::uint32_t> out( a.size() );
         auto const t0{ std::chrono::steady_clock::now() };
@@ -169,6 +206,7 @@ int main( int argc, char * argv[] ) {
             else if ( is_andnot          ) { Bitmap r{ a - b }; sink += std::int64_t( r.size() ); }
             else if ( is_and             ) { Bitmap r{ a & b }; sink += std::int64_t( r.size() ); }
             else if ( op == "diffinplace") { Bitmap tmp{ a }; tmp -= b; sink += std::int64_t( tmp.size() ); }
+            else if ( op == "unioninplace") { Bitmap tmp{ a }; tmp |= b; sink += std::int64_t( tmp.size() ); }
             else if ( op == "toarray"    ) { sink += std::int64_t( a.to_array_into( { out.data(), out.size() } ) ); }
         }
         auto const t1{ std::chrono::steady_clock::now() };
@@ -180,6 +218,7 @@ int main( int argc, char * argv[] ) {
         for ( auto const v : fx.a ) { roaring_bitmap_add( a, v ); }
         for ( auto const [ lo, hi ] : fx.a_runs ) { roaring_bitmap_add_range_closed( a, lo, hi ); }
         if ( fx.optimize_a ) { roaring_bitmap_run_optimize( a ); }
+        hold_padding();
         for ( auto const v : fx.b ) { roaring_bitmap_add( b, v ); }
         if ( op == "mixedandnot" ) { roaring_bitmap_run_optimize( b ); }   // as the band does (a no-op form-wise: alternating bits stay a bitset)
         std::vector<std::uint32_t> out( roaring_bitmap_get_cardinality( a ) );
@@ -189,6 +228,7 @@ int main( int argc, char * argv[] ) {
             else if ( is_andnot          ) { auto * r{ roaring_bitmap_andnot( a, b ) }; sink += std::int64_t( roaring_bitmap_get_cardinality( r ) ); roaring_bitmap_free( r ); }
             else if ( is_and             ) { auto * r{ roaring_bitmap_and( a, b ) }; sink += std::int64_t( roaring_bitmap_get_cardinality( r ) ); roaring_bitmap_free( r ); }
             else if ( op == "diffinplace") { auto * tmp{ roaring_bitmap_copy( a ) }; roaring_bitmap_andnot_inplace( tmp, b ); sink += std::int64_t( roaring_bitmap_get_cardinality( tmp ) ); roaring_bitmap_free( tmp ); }
+            else if ( op == "unioninplace") { auto * tmp{ roaring_bitmap_copy( a ) }; roaring_bitmap_or_inplace( tmp, b ); sink += std::int64_t( roaring_bitmap_get_cardinality( tmp ) ); roaring_bitmap_free( tmp ); }
             else if ( op == "toarray"    ) { roaring_bitmap_to_uint32_array( a, out.data() ); sink += std::int64_t( out.size() ); }
         }
         auto const t1{ std::chrono::steady_clock::now() };
