@@ -9,7 +9,7 @@
 // Not part of the build (nothing globs this directory). Compile with the
 // benchmark target's own flags (see bulkadd_prof.cpp), then:
 //
-//   pairop_prof <frsr|cpp> <union|difference|diffinplace|toarray|mixedandnot|runbitset|satandnot|envelope|coldcard|coldcardnot> <count> <high|mid|low> [passes]
+//   pairop_prof <frsr|cpp> <union|difference|diffinplace|toarray|mixedandnot|runbitset|satandnot|envelope|coldcard|coldcardnot|lazyfold> <count> <high|mid|low> [passes]
 //
 // mixedandnot ignores count/overlap (the band's fixture: 64 strided values \ a
 // 32768-value even-number bitset — an all-hit probe, empty result); runbitset
@@ -84,6 +84,33 @@ int main( int argc, char * argv[] ) {
     std::string const overlap{ argc > 4 ? argv[ 4 ] : "high" };
     std::size_t const passes { argc > 5 ? std::strtoull( argv[ 5 ], nullptr, 10 ) : 20'000 };
     std::size_t const offset { overlap == "high" ? count / 4 : overlap == "mid" ? count / 2 : 9 * count / 10 };
+    if ( op == "lazyfold" ) {
+        // LazyFoldOnly/band=<count>: 32 probes (64 chunks x 64 values) each copied and AND-folded in place against a
+        // 64-chunk bitset target holding <count> values per chunk.
+        std::size_t const band{ count }, chunks{ 64 }, nprobes{ 32 }, probe_card{ 64 };
+        auto const band_value{ [ band ]( std::size_t c, std::size_t i ) { return std::uint32_t( c * 65536 + i * ( 65536 / band ) ); } };
+        std::size_t const step{ std::max<std::size_t>( 1, band / probe_card ) };
+        std::int64_t sink{ 0 };
+        if ( arm == "frsr" ) {
+            Bitmap target; std::vector<Bitmap> probes( nprobes );
+            for ( std::size_t c = 0; c < chunks; ++c ) for ( std::size_t i = 0; i < band; ++i ) { (void)target.add( band_value( c, i ) ); }
+            for ( std::size_t p = 0; p < nprobes; ++p ) for ( std::size_t c = 0; c < chunks; ++c ) for ( std::size_t j = 0; j < probe_card; ++j ) { (void)probes[ p ].add( band_value( c, ( j * step + p ) % band ) ); }
+            auto const t0{ std::chrono::steady_clock::now() };
+            for ( std::size_t p = 0; p < passes; ++p ) { Bitmap probe{ probes[ p % nprobes ] }; probe &= target; sink += std::int64_t( probe.size() ); }
+            auto const t1{ std::chrono::steady_clock::now() };
+            std::printf( "frsr %s band=%zu passes=%zu us/op=%.4f (per chunk %.4f) sink=%lld\n", op.c_str(), band, passes, std::chrono::duration<double, std::micro>( t1 - t0 ).count() / double( passes ), std::chrono::duration<double, std::micro>( t1 - t0 ).count() / double( passes * chunks ), (long long)sink );
+        } else {
+            auto * target{ roaring_bitmap_create() }; roaring_bitmap_set_copy_on_write( target, true ); std::vector<roaring_bitmap_t *> probes( nprobes );
+            for ( std::size_t c = 0; c < chunks; ++c ) for ( std::size_t i = 0; i < band; ++i ) { roaring_bitmap_add( target, band_value( c, i ) ); }
+            for ( std::size_t p = 0; p < nprobes; ++p ) { probes[ p ] = roaring_bitmap_create(); roaring_bitmap_set_copy_on_write( probes[ p ], true ); for ( std::size_t c = 0; c < chunks; ++c ) for ( std::size_t j = 0; j < probe_card; ++j ) { roaring_bitmap_add( probes[ p ], band_value( c, ( j * step + p ) % band ) ); } }
+            auto const t0{ std::chrono::steady_clock::now() };
+            for ( std::size_t p = 0; p < passes; ++p ) { auto * probe{ roaring_bitmap_copy( probes[ p % nprobes ] ) }; roaring_bitmap_and_inplace( probe, target ); sink += std::int64_t( roaring_bitmap_get_cardinality( probe ) ); roaring_bitmap_free( probe ); }
+            auto const t1{ std::chrono::steady_clock::now() };
+            std::printf( "cpp  %s band=%zu passes=%zu us/op=%.4f (per chunk %.4f) sink=%lld\n", op.c_str(), band, passes, std::chrono::duration<double, std::micro>( t1 - t0 ).count() / double( passes ), std::chrono::duration<double, std::micro>( t1 - t0 ).count() / double( passes * chunks ), (long long)sink );
+            for ( auto * b : probes ) { roaring_bitmap_free( b ); } roaring_bitmap_free( target );
+        }
+        return 0;
+    }
     if ( op == "coldcard" || op == "coldcardnot" ) {
         bool const andnot{ op == "coldcardnot" };
         auto const order{ shuffled_order( 102 ) };
