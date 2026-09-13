@@ -25,7 +25,13 @@ if(FRSR_ROARING_ADD_LOCAL_CROARING_TARGET AND NOT TARGET roaring)
     if(NOT EXISTS "${PROJECT_SOURCE_DIR}/../croaring/CMakeLists.txt")
         message(FATAL_ERROR "FRSR_ROARING_ADD_LOCAL_CROARING_TARGET=ON requires ../croaring with CMakeLists.txt")
     endif()
-    add_subdirectory("${PROJECT_SOURCE_DIR}/../croaring" "${PROJECT_BINARY_DIR}/croaring")
+    # The reference is always linked as a static archive. CRoaring builds a shared library
+    # whenever BUILD_SHARED_LIBS is on, and a value left in the cache by a dependency
+    # configured later (or by a superproject) would otherwise take effect on a reconfigure.
+    block()
+        set(BUILD_SHARED_LIBS OFF)
+        add_subdirectory("${PROJECT_SOURCE_DIR}/../croaring" "${PROJECT_BINARY_DIR}/croaring")
+    endblock()
 endif()
 
 add_library(frsr_roaring STATIC
