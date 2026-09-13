@@ -1,18 +1,20 @@
 #!/bin/sh
 # Runs every benchmark entry matching a filter in a process of its own.
 #
-# usage: run_isolated.sh [-c CPULIST] BENCH FILTER REPEATS [EXTRA_ARGS...]
+# usage: run_isolated.sh [-c CPULIST] [-s SEED] BENCH FILTER REPEATS [EXTRA_ARGS...]
 #
 #   BENCH       the frsr_roaring_bench binary
 #   FILTER      substring selecting entries, as for --filter
 #   REPEATS     how many processes to start per entry, a positive integer
 #   -c CPULIST  pin each process with taskset -c CPULIST (skipped with a warning when taskset is absent)
+#   -s SEED     seed of the per-repeat entry order (default 1)
 #   EXTRA_ARGS  passed to every process, e.g. --min-time-ms 200 --stat median
 #
 # The entries are taken from --list; each process is started with --exact --filter <entry>, so it sets up, warms and
 # measures one arm of one band in a fresh address space and heap, with no earlier band's state inherited. Repeats are
 # the outer loop and entries the inner one, so drift over the run (thermal, background load) lands on every entry
-# evenly instead of on whichever entries come last.
+# evenly instead of on whichever entries come last. Each repeat walks the entries in its own pseudo-random order
+# (seeded by SEED and the repeat number), so no arm of a band is always the one launched first.
 #
 # Prints each result line with a trailing "repeat=<n>" field. Exits 2 on a usage error and 1 when the listing fails or
 # matches nothing. A process that exits non-zero or prints no result line for its entry (an "#aa" line from --aa does
@@ -30,11 +32,19 @@ usage() {
 }
 
 cpus=
-if [ "${1:-}" = "-c" ]; then
-    [ $# -ge 2 ] || { echo "$me: -c needs a CPU list" >&2; exit 2; }
-    cpus=$2
-    shift 2
-fi
+seed=1
+while [ $# -gt 0 ]; do
+    case $1 in
+        -c) [ $# -ge 2 ] || { echo "$me: -c needs a CPU list" >&2; exit 2; }
+            cpus=$2; shift 2 ;;
+        -s) [ $# -ge 2 ] || { echo "$me: -s needs a seed" >&2; exit 2; }
+            seed=$2; shift 2 ;;
+        *)  break ;;
+    esac
+done
+case $seed in
+    ''|*[!0-9]*) echo "$me: SEED must be a non-negative integer, not '$seed'" >&2; exit 2 ;;
+esac
 if [ $# -lt 3 ]; then
     usage
     exit 2
@@ -111,8 +121,11 @@ run_entry() {
 
 repeat=1
 while [ "$repeat" -le "$repeats" ]; do
+    # awk's srand/rand give the same sequence for the same seed on one system, which is all a run needs. Entry names
+    # contain no spaces, so a space separates the sort key from the name.
+    order=$(printf '%s' "$entries" | awk -v s=$((seed * 1000003 + repeat)) 'BEGIN { srand(s) } { print rand(), $0 }' | sort -k1,1 | cut -d' ' -f2-)
     IFS=$nl
-    for entry in $entries; do
+    for entry in $order; do
         IFS=$old_ifs
         run_entry "$entry" "$repeat" "$@"
     done

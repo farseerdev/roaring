@@ -4480,13 +4480,27 @@ template <class Arm> static void register_frsr_mixed_array_bitset_intersect(std:
 // value, append the key+handle to the result's parallel arrays, and later tear
 // the whole result down. That is exactly the envelope.
 //
-// Read it as ns per chunk (ops_per_run = chunks), and read the frsr/CRoaring
-// RATIO rather than the absolute, which is allocator-dependent.
+// Each result also pays a fixed cost that does not scale with chunks (the
+// result bitmap, its chunk table, the intersect prologue), so a single chunk
+// count mixes the two. The band is therefore registered over a sweep of chunk
+// counts, each timed run producing about the same number of result chunks
+// (kChunkResultsPerRun), so every point gets comparable timed work. Read a
+// band's ns per chunk (ops_per_run = chunks x results) across the sweep as
+// time_per_result(chunks) = intercept + slope * chunks: the slope is the
+// per-chunk envelope this band exists to measure, the intercept the per-result
+// fixed cost (bench/tools/band_slope.py fits both per arm). Compare frsr and
+// CRoaring on the slope and intercept rather than on one chunk count, and on
+// ratios rather than absolutes, which are allocator-dependent.
 namespace envelope {
 
-static constexpr std::size_t kCard      { 4 };   // elements per chunk per side
-static constexpr std::size_t kRepeat    { 200 }; // results produced per timed run
-static constexpr int         kInnerReps { 5 };
+static constexpr std::size_t kCard               { 4 };     // elements per chunk per side
+static constexpr std::size_t kChunkResultsPerRun { 4096 };  // result chunks produced per timed run
+static constexpr int         kInnerReps          { 1000 };
+
+// Results per timed run for a chunk count: as many as fit kChunkResultsPerRun, at least one.
+[[nodiscard]] static constexpr std::size_t results_per_run(std::size_t const chunks) noexcept {
+    return std::max<std::size_t>(1, kChunkResultsPerRun / std::max<std::size_t>(1, chunks));
+}
 
 template <class Arm>
 struct FrsrState {
@@ -4517,17 +4531,17 @@ struct register_frsr_envelope_registrar {
         }
         return s;
     };
-    e.run         = [](void *sv) -> int64_t {
+    e.run         = [results = results_per_run(chunks)](void *sv) -> int64_t {
         auto *s = static_cast<FrsrState<Arm> *>(sv);
         int64_t checksum = 0;
-        for (std::size_t i = 0; i < kRepeat; ++i) {
+        for (std::size_t i = 0; i < results; ++i) {
             TestBitmap32 r = s->a & s->b;      // fresh result: the whole envelope, per chunk
             checksum += static_cast<int64_t>(r.size());
         }                                       // ... and its teardown
         return checksum;
     };
     e.teardown       = [](void *sv) { delete static_cast<FrsrState<Arm> *>(sv); };
-    e.ops_per_run    = static_cast<int64_t>(chunks * kRepeat);
+    e.ops_per_run    = static_cast<int64_t>(chunks * results_per_run(chunks));
     e.inner_reps     = kInnerReps;
     e.reusable_state = true;
     g_benchmarks.push_back(std::move(e));
@@ -4559,10 +4573,10 @@ struct register_cpp_envelope_registrar {
         }
         return s;
     };
-    e.run         = [](void *sv) -> int64_t {
+    e.run         = [results = results_per_run(chunks)](void *sv) -> int64_t {
         auto *s = static_cast<CppState<Arm> *>(sv);
         int64_t checksum = 0;
-        for (std::size_t i = 0; i < kRepeat; ++i) {
+        for (std::size_t i = 0; i < results; ++i) {
             auto *r = roaring_bitmap_and(s->a, s->b);
             checksum += static_cast<int64_t>(roaring_bitmap_get_cardinality(r));
             roaring_bitmap_free(r);
@@ -4570,7 +4584,7 @@ struct register_cpp_envelope_registrar {
         return checksum;
     };
     e.teardown       = [](void *sv) { delete static_cast<CppState<Arm> *>(sv); };
-    e.ops_per_run    = static_cast<int64_t>(chunks * kRepeat);
+    e.ops_per_run    = static_cast<int64_t>(chunks * results_per_run(chunks));
     e.inner_reps     = kInnerReps;
     e.reusable_state = true;
     g_benchmarks.push_back(std::move(e));
@@ -6526,7 +6540,7 @@ void register_benchmarks() {
 #endif
 #endif
     arms::for_each_frsr<register_frsr_mixed_array_bitset_intersect_registrar>(100'000);
-    for (std::size_t chunks : { std::size_t{1}, std::size_t{8}, std::size_t{64}, std::size_t{512} }) {
+    for (std::size_t chunks : { std::size_t{1}, std::size_t{2}, std::size_t{4}, std::size_t{8}, std::size_t{16}, std::size_t{32}, std::size_t{64}, std::size_t{512} }) {
         arms::for_each_frsr<envelope::register_frsr_envelope_registrar>(chunks);
 #if FRSR_ROARING_HAS_CROARING
         arms::for_each_croaring<envelope::register_cpp_envelope_registrar>(chunks);
