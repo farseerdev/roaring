@@ -2004,10 +2004,16 @@ public:
                 // bitset∩bitset arm above defers). Mirrors that arm's slot handling;
                 // only the kernel (and the filter polarity, keyed off op) differs.
                 // (Materializing mode must not mutate *this — it takes the generic arm.)
-                auto left_array{ left_container.as_array() };
+                // mutate_left has already established sole ownership, so the payload
+                // is written without a second write-barrier test; and a filter that
+                // drops nothing leaves the same set, whose header is still exact.
+                auto left_array{ detail::as_array_already_private( left_container ) };
+                auto const unfiltered_count{ left_array.values.size() };
                 detail::filter_array_bitset_inplace<layout_type>( left_array, right_container.as_bitset(), op == detail::set_operation::bit_and );
                 if ( !left_array.values.empty() ) {
-                    left_array.sync_header();
+                    if ( left_array.values.size() != unfiltered_count ) {
+                        left_array.sync_header();
+                    }
                     size_ += left_array.values.size();
                     chunks_.move_entry_retiring( write, left );
                     ++write;
