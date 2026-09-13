@@ -1408,12 +1408,12 @@ public:
                 detail::combine_stats().record_pair( left_container, right_container, detail::set_operation::bit_or );
 #endif
                 if ( left_container.holds_array() && right_container.holds_array() ) {
-                    detail::union_array_array_to_vector<layout_type>(
+                    auto container{ make_array_union_container_reusing(
+                        scratch.chunks_,
                         left_container.as_array(),
                         right_container.as_array(),
                         array_union_scratch
-                    );
-                    auto container{ make_fast_container_from_scratch_reusing( scratch.chunks_, array_union_scratch ) };
+                    ) };
                     scratch.size_ += detail::container_size( container );
                     scratch.chunks_.push_back( left_key, std::move( container ) );
                     ++left;
@@ -1634,12 +1634,12 @@ public:
                         }
                         merged.push_back( left_key, std::move( container ) );
                     } else {
-                        detail::union_array_array_to_vector<layout_type>(
+                        auto container{ make_array_union_container_reusing(
+                            merged,
                             std::as_const( left_container ).as_array(),
                             right_container.as_array(),
                             array_union_scratch
-                        );
-                        auto container{ make_fast_container_from_scratch_reusing( merged, array_union_scratch ) };
+                        ) };
                         if ( !lazy ) {
                             size_ += detail::container_size( container );
                         }
@@ -3172,6 +3172,31 @@ private:
         dst.set_cardinality( count );
         dst.set_endpoints( values.front(), values.back() );
         return dst;
+    }
+
+    // array ∪ array as a result container, decided on the operands' total the way
+    // the reference decides it: a total below the bitset threshold bounds the
+    // result below it too, so the union is merged straight into a retired (or
+    // fresh) array payload — the kernel sizes that payload for its own worst case,
+    // store slack included. A larger total is merged into `scratch`, whose exact
+    // size then picks array or bitset. A retired payload is only ever a sole-owned
+    // one, so it never aliases an operand the kernel is still reading.
+    // [croaring-ref] deps/croaring/src/containers/mixed_union.c:array_array_container_union
+    [[nodiscard]] static handle_type make_array_union_container_reusing(
+        detail::chunk_store<layout_type, CowPolicy> & store,
+        detail::array_cref<layout_type, CowPolicy> const lhs,
+        detail::array_cref<layout_type, CowPolicy> const rhs,
+        detail::small_array_values<low_type> & scratch
+    ) {
+        if ( lhs.values.size() + rhs.values.size() < array_to_bitset_threshold ) {
+            handle_type result_handle{ store.take_retired( detail::container_kind::array ) };
+            auto result_array{ result_handle.as_array() };
+            detail::union_array_array_to_vector<layout_type>( lhs, rhs, result_array.values );
+            result_array.sync_header();
+            return result_handle;
+        }
+        detail::union_array_array_to_vector<layout_type>( lhs, rhs, scratch );
+        return make_fast_container_from_scratch_reusing( store, scratch );
     }
 
     // ForcedRunSelectionPolicy defaults to the bitmap's own ambient RunSelectionPolicy
