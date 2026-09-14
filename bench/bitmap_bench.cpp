@@ -177,36 +177,30 @@ public:
     [[nodiscard]] bool contains( std::uint64_t const value ) const { return roaring64_bitmap_contains( bitmap_, value ); }
     [[nodiscard]] std::uint64_t cardinality() const { return roaring64_bitmap_get_cardinality( bitmap_ ); }
 
+    void runOptimize() { static_cast<void>( roaring64_bitmap_run_optimize( bitmap_ ) ); }
+    void shrinkToFit() { static_cast<void>( roaring64_bitmap_shrink_to_fit( bitmap_ ) ); }
+
+    // The frozen format mirrors the bitmap's memory layout, so CRoaring asks for a
+    // shrunk bitmap before it will size or write one. The caller shrinks it once,
+    // where it builds the bitmap, instead of every size and write call shrinking a
+    // copy of its own and charging the copy to whoever is timing the call.
     [[nodiscard]] std::size_t getSizeInBytes( bool const portable ) const {
         if ( portable ) {
             return roaring64_bitmap_portable_size_in_bytes( bitmap_ );
         }
-        auto * copy{ roaring64_bitmap_copy( bitmap_ ) };
-        roaring64_bitmap_shrink_to_fit( copy );
-        auto const size{ roaring64_bitmap_frozen_size_in_bytes( copy ) };
-        roaring64_bitmap_free( copy );
-        return size;
+        return roaring64_bitmap_frozen_size_in_bytes( bitmap_ );
     }
 
     [[nodiscard]] std::size_t getFrozenSizeInBytes() const { return getSizeInBytes( false ); }
 
-    [[nodiscard]] std::size_t write( char * dst, bool const portable ) const {
+    std::size_t write( char * dst, bool const portable ) const {
         if ( portable ) {
             return roaring64_bitmap_portable_serialize( bitmap_, dst );
         }
-        auto * copy{ roaring64_bitmap_copy( bitmap_ ) };
-        roaring64_bitmap_shrink_to_fit( copy );
-        auto const written{ roaring64_bitmap_frozen_serialize( copy, dst ) };
-        roaring64_bitmap_free( copy );
-        return written;
+        return roaring64_bitmap_frozen_serialize( bitmap_, dst );
     }
 
-    void writeFrozen( char * dst ) const {
-        auto * copy{ roaring64_bitmap_copy( bitmap_ ) };
-        roaring64_bitmap_shrink_to_fit( copy );
-        static_cast<void>( roaring64_bitmap_frozen_serialize( copy, dst ) );
-        roaring64_bitmap_free( copy );
-    }
+    std::size_t writeFrozen( char * dst ) const { return write( dst, false ); }
 
     [[nodiscard]] static Roaring64Map read( char const * src, bool const portable ) {
         if ( portable ) {
@@ -1222,6 +1216,15 @@ static void register_insert_remove() {
 #endif // FRSR_ROARING_HAS_CROARING
 // ====== FAMILY 4: Serialize / Deserialize (r64 + cpp; portable + frozen) =======
 // ported from deps/croaring/benchmarks/benchmark.cpp:3839-4142
+//
+// One run() is one serialize or one deserialize call over a bitmap of `count`
+// values, so one op is one call: the reported time is what that call costs, not
+// what it costs per value the bitmap carries.
+//
+// Every arm of a frozen band starts from the same bitmap: run encoded and shrunk
+// in setup. CRoaring requires the shrink before it will size or write a frozen
+// buffer, and run encoding is what the frsr arms' eager run selection hands them
+// anyway, so it is the one state every arm can hold at once.
 
 #if FRSR_ROARING_HAS_CROARING
 
@@ -1259,6 +1262,20 @@ struct serStateFrsr {
 #endif
 };
 
+// A rep is a timed region of its own - one run() between one clock pair - so the
+// rep count buys samples, not a longer region. What a frozen write costs follows
+// the bitmap's containers, not its values: consecutive values collapse into one
+// container however many of them there are, and writing a handful of containers
+// finishes well inside one clock tick, where a sample reads the tick or nothing
+// and only the mean over many of them carries the time. A bitmap spread over
+// enough containers already spans hundreds of ticks in a single call, and a few
+// samples settle that.
+static int64_t frozen_reps(size_t count, uint64_t step) {
+    uint64_t const values_per_chunk = step >= 65536 ? 1 : 65536 / step;
+    uint64_t const chunks = values_per_chunk <= 1 ? count : 1 + (count - 1) / values_per_chunk;
+    return chunks >= 1000 ? 20 : 2000;
+}
+
 template <class Arm>
 struct synthetic_frsr_PortableSerialize_registrar {
     using TestBitmap64 = typename Arm::bitmap;
@@ -1287,7 +1304,7 @@ struct synthetic_frsr_PortableSerialize_registrar {
             e.teardown = [](void *sv) {
                 delete static_cast<serStateFrsr<Arm> *>(sv);
             };
-            e.ops_per_run = static_cast<int64_t>(count);
+            e.ops_per_run = 1;
             e.inner_reps = 5;
             e.reusable_state = true;
             g_benchmarks.push_back(std::move(e));
@@ -1313,6 +1330,8 @@ struct synthetic_frsr_FrozenSerialize_registrar {
                     auto const v = static_cast<std::uint64_t>(i) * step;
                     s->r.add(v);
                 }
+                s->r.optimize_for_storage();
+                s->r.shrink_to_fit();
                 return s;
             };
             e.run = [](void *sv) -> int64_t {
@@ -1323,8 +1342,8 @@ struct synthetic_frsr_FrozenSerialize_registrar {
             e.teardown = [](void *sv) {
                 delete static_cast<serStateFrsr<Arm> *>(sv);
             };
-            e.ops_per_run = static_cast<int64_t>(count);
-            e.inner_reps = 5;
+            e.ops_per_run = 1;
+            e.inner_reps = frozen_reps(count, step);
             e.reusable_state = true;
             g_benchmarks.push_back(std::move(e));
         }
@@ -1360,7 +1379,7 @@ struct synthetic_frsr_PortableDeserialize_registrar {
             e.teardown = [](void *sv) {
                 delete static_cast<serStateFrsr<Arm> *>(sv);
             };
-            e.ops_per_run = static_cast<int64_t>(count);
+            e.ops_per_run = 1;
             e.inner_reps = 3;
             e.reusable_state = true;
             g_benchmarks.push_back(std::move(e));
@@ -1386,6 +1405,7 @@ struct synthetic_frsr_FrozenDeserialize_registrar {
                     s->r.add(static_cast<std::uint64_t>(i) * step);
                 }
                 s->r.optimize_for_storage();
+                s->r.shrink_to_fit();
                 s->r.serialize_frozen_to_vm_vector(s->serialized);
                 return s;
             };
@@ -1397,8 +1417,8 @@ struct synthetic_frsr_FrozenDeserialize_registrar {
             e.teardown = [](void *sv) {
                 delete static_cast<serStateFrsr<Arm> *>(sv);
             };
-            e.ops_per_run = static_cast<int64_t>(count);
-            e.inner_reps = 3;
+            e.ops_per_run = 1;
+            e.inner_reps = frozen_reps(count, step);
             e.reusable_state = true;
             g_benchmarks.push_back(std::move(e));
         }
@@ -1441,7 +1461,7 @@ static void register_ser_deser() {
                     roaring64_bitmap_free(s->r);
                     delete s;
                 };
-                e.ops_per_run = static_cast<int64_t>(count);
+                e.ops_per_run = 1;
                 e.inner_reps = 5;
                 e.reusable_state = true;
                 g_benchmarks.push_back(std::move(e));
@@ -1454,7 +1474,7 @@ static void register_ser_deser() {
                 e.name = "synthetic/r64FrozenSerialize/" + ptag;
                 e.description =
                     "synthetic_bench.cpp r64FrozenSerialize: preload a "
-                    "bitmap (run-optimised + shrunk), then time one "
+                    "bitmap, run-optimise and shrink it, then time one "
                     "roaring64_bitmap_frozen_serialize() call per "
                     "iteration.";
                 e.setup = [count, step]() -> void * {
@@ -1462,22 +1482,23 @@ static void register_ser_deser() {
                     s->r = roaring64_bitmap_create();
                     for (size_t i = 0; i < count; ++i)
                         roaring64_bitmap_add(s->r, i * step);
+                    roaring64_bitmap_run_optimize(s->r);
                     roaring64_bitmap_shrink_to_fit(s->r);
                     s->buf.resize(roaring64_bitmap_frozen_size_in_bytes(s->r));
                     return s;
                 };
                 e.run = [](void *sv) -> int64_t {
                     auto *s = static_cast<serState *>(sv);
-                    roaring64_bitmap_frozen_serialize(s->r, s->buf.data());
-                    return 0;
+                    return static_cast<int64_t>(
+                        roaring64_bitmap_frozen_serialize(s->r, s->buf.data()));
                 };
                 e.teardown = [](void *sv) {
                     auto *s = static_cast<serState *>(sv);
                     roaring64_bitmap_free(s->r);
                     delete s;
                 };
-                e.ops_per_run = static_cast<int64_t>(count);
-                e.inner_reps = 5;
+                e.ops_per_run = 1;
+                e.inner_reps = frozen_reps(count, step);
                 e.reusable_state = true;
                 g_benchmarks.push_back(std::move(e));
             }
@@ -1513,7 +1534,7 @@ static void register_ser_deser() {
                     delete s->r;
                     delete s;
                 };
-                e.ops_per_run = static_cast<int64_t>(count);
+                e.ops_per_run = 1;
                 e.inner_reps = 5;
                 e.reusable_state = true;
                 g_benchmarks.push_back(std::move(e));
@@ -1526,20 +1547,21 @@ static void register_ser_deser() {
                 e.name = "synthetic/cppFrozenSerialize/" + ptag;
                 e.description =
                     "synthetic_bench.cpp cppFrozenSerialize: "
-                    "Roaring64Map.writeFrozen() into a 32-byte aligned "
-                    "(overallocated) buffer.";
+                    "Roaring64Map.writeFrozen() into a 64-byte aligned "
+                    "buffer.";
                 e.setup = [count, step]() -> void * {
                     auto *s = new serStateCppFrozen;
                     s->r = new Roaring64Map();
                     for (size_t i = 0; i < count; ++i) s->r->add(i * step);
+                    s->r->runOptimize();
+                    s->r->shrinkToFit();
                     s->size = s->r->getFrozenSizeInBytes();
                     s->buf = static_cast<char *>(roaring_aligned_malloc(64, s->size));
                     return s;
                 };
                 e.run = [](void *sv) -> int64_t {
                     auto *s = static_cast<serStateCppFrozen *>(sv);
-                    s->r->writeFrozen(s->buf);
-                    return 0;
+                    return static_cast<int64_t>(s->r->writeFrozen(s->buf));
                 };
                 e.teardown = [](void *sv) {
                     auto *s = static_cast<serStateCppFrozen *>(sv);
@@ -1547,8 +1569,8 @@ static void register_ser_deser() {
                     delete s->r;
                     delete s;
                 };
-                e.ops_per_run = static_cast<int64_t>(count);
-                e.inner_reps = 5;
+                e.ops_per_run = 1;
+                e.inner_reps = frozen_reps(count, step);
                 e.reusable_state = true;
                 g_benchmarks.push_back(std::move(e));
             }
@@ -1587,7 +1609,7 @@ static void register_ser_deser() {
                     roaring64_bitmap_free(s->r);
                     delete s;
                 };
-                e.ops_per_run = static_cast<int64_t>(count);
+                e.ops_per_run = 1;
                 e.inner_reps = 3;
                 e.reusable_state = true;
                 g_benchmarks.push_back(std::move(e));
@@ -1609,6 +1631,7 @@ static void register_ser_deser() {
                     s->r = roaring64_bitmap_create();
                     for (size_t i = 0; i < count; ++i)
                         roaring64_bitmap_add(s->r, i * step);
+                    roaring64_bitmap_run_optimize(s->r);
                     roaring64_bitmap_shrink_to_fit(s->r);
                     s->size = roaring64_bitmap_frozen_size_in_bytes(s->r);
                     s->buf = static_cast<char *>(
@@ -1630,8 +1653,8 @@ static void register_ser_deser() {
                     roaring64_bitmap_free(s->r);
                     delete s;
                 };
-                e.ops_per_run = static_cast<int64_t>(count);
-                e.inner_reps = 20;
+                e.ops_per_run = 1;
+                e.inner_reps = frozen_reps(count, step);
                 e.reusable_state = true;
                 g_benchmarks.push_back(std::move(e));
             }
@@ -1669,7 +1692,7 @@ static void register_ser_deser() {
                     delete s->r;
                     delete s;
                 };
-                e.ops_per_run = static_cast<int64_t>(count);
+                e.ops_per_run = 1;
                 e.inner_reps = 3;
                 e.reusable_state = true;
                 g_benchmarks.push_back(std::move(e));
@@ -1688,6 +1711,8 @@ static void register_ser_deser() {
                     auto *s = new serStateCppFrozen;
                     s->r = new Roaring64Map();
                     for (size_t i = 0; i < count; ++i) s->r->add(i * step);
+                    s->r->runOptimize();
+                    s->r->shrinkToFit();
                     s->size = s->r->getFrozenSizeInBytes();
                     s->buf = static_cast<char *>(roaring_aligned_malloc(64, s->size));
                     s->r->writeFrozen(s->buf);
@@ -1704,8 +1729,8 @@ static void register_ser_deser() {
                     delete s->r;
                     delete s;
                 };
-                e.ops_per_run = static_cast<int64_t>(count);
-                e.inner_reps = 20;
+                e.ops_per_run = 1;
+                e.inner_reps = frozen_reps(count, step);
                 e.reusable_state = true;
                 g_benchmarks.push_back(std::move(e));
             }
@@ -7152,9 +7177,10 @@ static void report(live_entry &l, std::uint32_t const rounds, std::vector<int64_
     }
 
     // Report results
-    // 4 decimals: point-lookup cases land around 0.005-0.03 us/op, where %.2f
-    // quantises every result to 0.01 and hides the effect being measured.
-    printf("%s%s\t%.4f us/op\tchecksum=%ld\tmean_us=%.6f\tmedian_us=%.6f\tp10_us=%.6f\tp90_us=%.6f\tmad_us=%.6f\tsamples=%zu\ttimed_ms=%.3f\trun_checksum=%s\trounds=%u\n",
+    // The same 6 decimals mean_us and median_us carry: this is the column the
+    // analysis tools read, and at %.4f a sub-microsecond call gives them a ratio
+    // over one significant digit - or over a zero, once it rounds to 0.0000.
+    printf("%s%s\t%.6f us/op\tchecksum=%ld\tmean_us=%.6f\tmedian_us=%.6f\tp10_us=%.6f\tp90_us=%.6f\tmad_us=%.6f\tsamples=%zu\ttimed_ms=%.3f\trun_checksum=%s\trounds=%u\n",
            e.name.c_str(), suffix, time_per_op_us, (long)l.total_checksum, mean_us, median_ns * ns_to_us_per_op,
            quantile(sorted, 0.1) * ns_to_us_per_op, quantile(sorted, 0.9) * ns_to_us_per_op, mad_ns * ns_to_us_per_op,
            sorted.size(), static_cast<double>(total_time_ns) / 1e6, run_checksum, rounds);
