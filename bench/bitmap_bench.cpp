@@ -3,10 +3,12 @@
 #include <algorithm>
 #include <chrono>
 #include <cinttypes>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
+#include <limits>
 #include <numeric>
 #include <optional>
 #include <random>
@@ -1809,19 +1811,29 @@ static void release_data() {
     g_data = nullptr;
 }
 
-using Pick = const std::vector<roaring_bitmap_t *> &(*)(Data *);
-
-// ported from deps/croaring/benchmarks/benchmark.cpp:4217-4225
-static const std::vector<roaring_bitmap_t *> &pick_low(Data *d) {
-    return d->low;
-}
-static const std::vector<roaring_bitmap_t *> &pick_mod(Data *d) {
-    return d->mod;
-}
-static const std::vector<roaring_bitmap_t *> &pick_high(Data *d) {
-    return d->high;
-}
 enum class Density { Low, Mod, High };
+
+// The CRoaring fixture for one density; the frsr arms clone from these same sets.
+// ported from deps/croaring/benchmarks/benchmark.cpp:4217-4225
+static const std::vector<roaring_bitmap_t *> &pick(Data *const d, Density const density) {
+    switch (density) {
+        case Density::Low: return d->low;
+        case Density::Mod: return d->mod;
+        default          : return d->high;
+    }
+}
+
+// Both CRoaring arms probe the one shared fixture. A membership query copies
+// nothing, so the arms differ only in the copy-on-write flag, which lives on the
+// bitmap and is stamped here, in untimed setup.
+template <class Arm>
+static void *stamped_data() {
+    auto *const d = get_data();
+    for (auto *const set : { &d->low, &d->mod, &d->high }) {
+        for (auto *const bm : *set) { roaring_bitmap_set_copy_on_write(bm, Arm::cow); }
+    }
+    return d;
+}
 
 // The frsr side of the shared dataset, one instance per arm, built lazily from
 // the same CRoaring source sets so every arm probes identical bitmaps and the
@@ -1855,7 +1867,7 @@ struct add_cold_frsr_registrar {
         Entry e;
         e.name = std::string("synthetic/") + Arm::label() + op;
         e.description =
-            std::string(Arm::label()) + " variant of ContainsCold at " + density_label +
+            std::string(Arm::label()) + " variant of the ContainsCold band at " + density_label +
             " density over identical pre-generated bitmaps and query stream.";
         e.setup = []() -> void * { return get_frsr_data<Arm>(); };
         e.run = [d](void *sv) -> int64_t {
@@ -1881,7 +1893,7 @@ struct add_warm_frsr_registrar {
         Entry e;
         e.name = std::string("synthetic/") + Arm::label() + op;
         e.description =
-            std::string(Arm::label()) + " variant of ContainsWarm at " + density_label +
+            std::string(Arm::label()) + " variant of the ContainsWarm band at " + density_label +
             " density over identical pre-generated bitmaps and query stream.";
         e.setup = []() -> void * { return get_frsr_data<Arm>(); };
         e.run = [d](void *sv) -> int64_t {
@@ -1905,74 +1917,80 @@ struct add_warm_frsr_registrar {
 };
 
 // ported from deps/croaring/benchmarks/benchmark.cpp:4227-4254
-static void add_cold(const char *name, const char *density_label, Pick pick) {
-    Entry e;
-    e.name = name;
-    e.description =
-        std::string("10,000 bitmaps over [0, 2^18) at ") + density_label +
-        " density (per-block cardinality drawn from Poisson(density*2^16), "
-        "values placed uniformly within each 2^16 block). Cold variant: "
-        "issues one uniformly-random membership query against each of the "
-        "10,000 bitmaps in turn, so every probe touches a fresh bitmap and "
-        "the previous one is evicted from cache before its next access. "
-        "Reported cost is per query.";
-    e.setup = []() -> void * { return get_data(); };
-    e.run = [pick](void *sv) -> int64_t {
-        auto *d = static_cast<Data *>(sv);
-        const auto &bms = pick(d);
-        int64_t marker = 0;
-        for (size_t i = 0; i < kSyntheticCount; ++i) {
-            marker += roaring_bitmap_contains(bms[i], d->cold_queries[i]);
-        }
-        return marker;
-    };
-    e.teardown = nullptr;
-    e.ops_per_run = static_cast<int64_t>(kSyntheticCount);
-    e.inner_reps = 1;
-    e.reusable_state = true;
-    g_benchmarks.push_back(std::move(e));
-}
+template <class Arm>
+struct add_cold_cpp_registrar {
+    static void run(const char *op, const char *density_label, Density const d) {
+        Entry e;
+        e.name = std::string("synthetic/") + Arm::label() + op;
+        e.description =
+            std::string(Arm::label()) + ": 10,000 bitmaps over [0, 2^18) at " + density_label +
+            " density (per-block cardinality drawn from Poisson(density*2^16), "
+            "values placed uniformly within each 2^16 block). Cold variant: "
+            "issues one uniformly-random membership query against each of the "
+            "10,000 bitmaps in turn, so every probe touches a fresh bitmap and "
+            "the previous one is evicted from cache before its next access. "
+            "Reported cost is per query.";
+        e.setup = []() -> void * { return stamped_data<Arm>(); };
+        e.run = [d](void *sv) -> int64_t {
+            auto *data = static_cast<Data *>(sv);
+            const auto &bms = pick(data, d);
+            int64_t marker = 0;
+            for (size_t i = 0; i < kSyntheticCount; ++i) {
+                marker += roaring_bitmap_contains(bms[i], data->cold_queries[i]);
+            }
+            return marker;
+        };
+        e.teardown = nullptr;
+        e.ops_per_run = static_cast<int64_t>(kSyntheticCount);
+        e.inner_reps = 1;
+        e.reusable_state = true;
+        g_benchmarks.push_back(std::move(e));
+    }
+};
 
 // ported from deps/croaring/benchmarks/benchmark.cpp:4256-4286
-static void add_warm(const char *name, const char *density_label, Pick pick) {
-    Entry e;
-    e.name = name;
-    e.description =
-        std::string("10,000 bitmaps over [0, 2^18) at ") + density_label +
-        " density (per-block cardinality drawn from Poisson(density*2^16), "
-        "values placed uniformly within each 2^16 block). Warm variant: "
-        "probes the first 10 bitmaps 1,000 random times each, so every "
-        "bitmap is fully cache-resident for all but the first probe. The "
-        "total probe count (10,000) matches the cold variant, so per-query "
-        "times are directly comparable.";
-    e.setup = []() -> void * { return get_data(); };
-    e.run = [pick](void *sv) -> int64_t {
-        auto *d = static_cast<Data *>(sv);
-        const auto &bms = pick(d);
-        int64_t marker = 0;
-        for (size_t i = 0; i < kWarmBitmaps; ++i) {
-            roaring_bitmap_t *b = bms[i];
-            for (size_t r = 0; r < kWarmRepeats; ++r) {
-                marker += roaring_bitmap_contains(b, d->warm_queries[r]);
+template <class Arm>
+struct add_warm_cpp_registrar {
+    static void run(const char *op, const char *density_label, Density const d) {
+        Entry e;
+        e.name = std::string("synthetic/") + Arm::label() + op;
+        e.description =
+            std::string(Arm::label()) + ": 10,000 bitmaps over [0, 2^18) at " + density_label +
+            " density (per-block cardinality drawn from Poisson(density*2^16), "
+            "values placed uniformly within each 2^16 block). Warm variant: "
+            "probes the first 10 bitmaps 1,000 random times each, so every "
+            "bitmap is fully cache-resident for all but the first probe. The "
+            "total probe count (10,000) matches the cold variant, so per-query "
+            "times are directly comparable.";
+        e.setup = []() -> void * { return stamped_data<Arm>(); };
+        e.run = [d](void *sv) -> int64_t {
+            auto *data = static_cast<Data *>(sv);
+            const auto &bms = pick(data, d);
+            int64_t marker = 0;
+            for (size_t i = 0; i < kWarmBitmaps; ++i) {
+                roaring_bitmap_t *b = bms[i];
+                for (size_t r = 0; r < kWarmRepeats; ++r) {
+                    marker += roaring_bitmap_contains(b, data->warm_queries[r]);
+                }
             }
-        }
-        return marker;
-    };
-    e.teardown = nullptr;
-    e.ops_per_run = static_cast<int64_t>(kWarmBitmaps * kWarmRepeats);
-    e.inner_reps = 1;
-    e.reusable_state = true;
-    g_benchmarks.push_back(std::move(e));
-}
+            return marker;
+        };
+        e.teardown = nullptr;
+        e.ops_per_run = static_cast<int64_t>(kWarmBitmaps * kWarmRepeats);
+        e.inner_reps = 1;
+        e.reusable_state = true;
+        g_benchmarks.push_back(std::move(e));
+    }
+};
 
 // ported from deps/croaring/benchmarks/benchmark.cpp:4288-4297
 static void register_benchmarks() {
-    add_cold("synthetic/ContainsColdLow", "low (0.001)", pick_low);
-    add_cold("synthetic/ContainsColdMod", "moderate (0.01)", pick_mod);
-    add_cold("synthetic/ContainsColdHigh", "high (0.1)", pick_high);
-    add_warm("synthetic/ContainsWarmLow", "low (0.001)", pick_low);
-    add_warm("synthetic/ContainsWarmMod", "moderate (0.01)", pick_mod);
-    add_warm("synthetic/ContainsWarmHigh", "high (0.1)", pick_high);
+    arms::for_each_croaring<add_cold_cpp_registrar>("ContainsColdLow", "low (0.001)", Density::Low);
+    arms::for_each_croaring<add_cold_cpp_registrar>("ContainsColdMod", "moderate (0.01)", Density::Mod);
+    arms::for_each_croaring<add_cold_cpp_registrar>("ContainsColdHigh", "high (0.1)", Density::High);
+    arms::for_each_croaring<add_warm_cpp_registrar>("ContainsWarmLow", "low (0.001)", Density::Low);
+    arms::for_each_croaring<add_warm_cpp_registrar>("ContainsWarmMod", "moderate (0.01)", Density::Mod);
+    arms::for_each_croaring<add_warm_cpp_registrar>("ContainsWarmHigh", "high (0.1)", Density::High);
     arms::for_each_frsr<add_cold_frsr_registrar>("ContainsColdLow", "low (0.001)", Density::Low);
     arms::for_each_frsr<add_cold_frsr_registrar>("ContainsColdMod", "moderate (0.01)", Density::Mod);
     arms::for_each_frsr<add_cold_frsr_registrar>("ContainsColdHigh", "high (0.1)", Density::High);
@@ -4478,13 +4496,27 @@ template <class Arm> static void register_frsr_mixed_array_bitset_intersect(std:
 // value, append the key+handle to the result's parallel arrays, and later tear
 // the whole result down. That is exactly the envelope.
 //
-// Read it as ns per chunk (ops_per_run = chunks), and read the frsr/CRoaring
-// RATIO rather than the absolute, which is allocator-dependent.
+// Each result also pays a fixed cost that does not scale with chunks (the
+// result bitmap, its chunk table, the intersect prologue), so a single chunk
+// count mixes the two. The band is therefore registered over a sweep of chunk
+// counts, each timed run producing about the same number of result chunks
+// (kChunkResultsPerRun), so every point gets comparable timed work. Read a
+// band's ns per chunk (ops_per_run = chunks x results) across the sweep as
+// time_per_result(chunks) = intercept + slope * chunks: the slope is the
+// per-chunk envelope this band exists to measure, the intercept the per-result
+// fixed cost (bench/tools/band_slope.py fits both per arm). Compare frsr and
+// CRoaring on the slope and intercept rather than on one chunk count, and on
+// ratios rather than absolutes, which are allocator-dependent.
 namespace envelope {
 
-static constexpr std::size_t kCard      { 4 };   // elements per chunk per side
-static constexpr std::size_t kRepeat    { 200 }; // results produced per timed run
-static constexpr int         kInnerReps { 5 };
+static constexpr std::size_t kCard               { 4 };     // elements per chunk per side
+static constexpr std::size_t kChunkResultsPerRun { 4096 };  // result chunks produced per timed run
+static constexpr int         kInnerReps          { 1000 };
+
+// Results per timed run for a chunk count: as many as fit kChunkResultsPerRun, at least one.
+[[nodiscard]] static constexpr std::size_t results_per_run(std::size_t const chunks) noexcept {
+    return std::max<std::size_t>(1, kChunkResultsPerRun / std::max<std::size_t>(1, chunks));
+}
 
 template <class Arm>
 struct FrsrState {
@@ -4515,17 +4547,17 @@ struct register_frsr_envelope_registrar {
         }
         return s;
     };
-    e.run         = [](void *sv) -> int64_t {
+    e.run         = [results = results_per_run(chunks)](void *sv) -> int64_t {
         auto *s = static_cast<FrsrState<Arm> *>(sv);
         int64_t checksum = 0;
-        for (std::size_t i = 0; i < kRepeat; ++i) {
+        for (std::size_t i = 0; i < results; ++i) {
             TestBitmap32 r = s->a & s->b;      // fresh result: the whole envelope, per chunk
             checksum += static_cast<int64_t>(r.size());
         }                                       // ... and its teardown
         return checksum;
     };
     e.teardown       = [](void *sv) { delete static_cast<FrsrState<Arm> *>(sv); };
-    e.ops_per_run    = static_cast<int64_t>(chunks * kRepeat);
+    e.ops_per_run    = static_cast<int64_t>(chunks * results_per_run(chunks));
     e.inner_reps     = kInnerReps;
     e.reusable_state = true;
     g_benchmarks.push_back(std::move(e));
@@ -4557,10 +4589,10 @@ struct register_cpp_envelope_registrar {
         }
         return s;
     };
-    e.run         = [](void *sv) -> int64_t {
+    e.run         = [results = results_per_run(chunks)](void *sv) -> int64_t {
         auto *s = static_cast<CppState<Arm> *>(sv);
         int64_t checksum = 0;
-        for (std::size_t i = 0; i < kRepeat; ++i) {
+        for (std::size_t i = 0; i < results; ++i) {
             auto *r = roaring_bitmap_and(s->a, s->b);
             checksum += static_cast<int64_t>(roaring_bitmap_get_cardinality(r));
             roaring_bitmap_free(r);
@@ -4568,7 +4600,7 @@ struct register_cpp_envelope_registrar {
         return checksum;
     };
     e.teardown       = [](void *sv) { delete static_cast<CppState<Arm> *>(sv); };
-    e.ops_per_run    = static_cast<int64_t>(chunks * kRepeat);
+    e.ops_per_run    = static_cast<int64_t>(chunks * results_per_run(chunks));
     e.inner_reps     = kInnerReps;
     e.reusable_state = true;
     g_benchmarks.push_back(std::move(e));
@@ -6524,7 +6556,7 @@ void register_benchmarks() {
 #endif
 #endif
     arms::for_each_frsr<register_frsr_mixed_array_bitset_intersect_registrar>(100'000);
-    for (std::size_t chunks : { std::size_t{1}, std::size_t{8}, std::size_t{64}, std::size_t{512} }) {
+    for (std::size_t chunks : { std::size_t{1}, std::size_t{2}, std::size_t{4}, std::size_t{8}, std::size_t{16}, std::size_t{32}, std::size_t{64}, std::size_t{512} }) {
         arms::for_each_frsr<envelope::register_frsr_envelope_registrar>(chunks);
 #if FRSR_ROARING_HAS_CROARING
         arms::for_each_croaring<envelope::register_cpp_envelope_registrar>(chunks);
@@ -6594,70 +6626,491 @@ void register_benchmarks() {
 // Benchmark Execution and Main
 // ========================================================================
 
-// Execute a single benchmark entry
-static void run_benchmark(const Entry &e) {
-    if (e.setup == nullptr || e.run == nullptr) {
-        fprintf(stderr, "ERROR: Benchmark %s missing setup or run\n", e.name.c_str());
-        return;
-    }
-
-    // Setup once if not reusable; otherwise setup per iteration
-    void *state = nullptr;
-    int64_t total_checksum = 0;
-    int64_t total_time_ns = 0;
-
-    if (e.reusable_state) {
-        state = e.setup();
-    }
-
-    // FRSR_BENCH_REPS_MULT scales every band's repetition count. Meant for
-    // profiling: with the default reps a single band's process is dominated by
-    // fixture construction and startup, not by the operation being timed.
+// FRSR_BENCH_REPS_MULT scales every band's repetition count. Meant for
+// profiling: with the default reps a single band's process is dominated by
+// fixture construction and startup, not by the operation being timed.
+static int64_t reps_multiplier() {
     static const int64_t reps_mult{ []{
         if (char const *s = std::getenv("FRSR_BENCH_REPS_MULT")) { return std::max<int64_t>(1, std::strtoll(s, nullptr, 10)); }
         return int64_t{ 1 };
     }() };
-    int64_t const inner_reps{ e.inner_reps * reps_mult };
+    return reps_mult;
+}
+
+// How the selected entries are sequenced.
+//   registration: each entry runs to completion (setup, warm pass, every rep, teardown) in registration order.
+//   reversed:     the same, in reverse registration order.
+//   interleaved:  the arms of one band run side by side: all are set up and warmed first, then each arm's reps are
+//                 split into rounds, and every round runs one slice of each arm, the arm order rotated by the round
+//                 number (arm (r + i) mod n runs i-th in round r). The round count is --rounds rounded up to a
+//                 multiple of the band's arm count, so every arm takes every position equally often. Rotation keeps
+//                 each arm's predecessor the same in every round, so carry-over from the arm run just before is not
+//                 balanced.
+//   shuffled:     as interleaved, with an independent uniformly random arm order per round and exactly --rounds
+//                 rounds: positions and predecessors are balanced in expectation only.
+// In both side-by-side orders every arm runs at least one rep per round.
+enum class run_order { registration, reversed, interleaved, shuffled };
+
+static char const * order_name(run_order const order) {
+    switch (order) {
+        case run_order::registration: return "registration";
+        case run_order::reversed:     return "reversed";
+        case run_order::interleaved:  return "interleaved";
+        case run_order::shuffled:     return "shuffled";
+    }
+    return "?";
+}
+
+static bool side_by_side(run_order const order) {
+    return order == run_order::interleaved || order == run_order::shuffled;
+}
+
+struct run_options {
+    run_order order = run_order::registration;
+    std::uint32_t rounds = 6;
+    std::uint64_t seed = 0x6a09e667f3bcc908ULL;
+    bool aa = false;             // every selected entry also runs as "<name>#aa"
+    bool print_median = false;   // the second column prints the median instead of the mean
+    double min_time_ms = 0;      // raise reps so the timed work adds up to at least this long
+    FILE *dump = nullptr;        // one line per sample
+};
+
+// The band an entry measures is its name with the arm label taken out of the second path segment. The label is that
+// segment's leading run of [a-z0-9-] when an uppercase letter follows it: "cpp-cow" in
+// "set_ops/cpp-cowEnvelopePerChunk/chunks=8", whose band is "set_ops/EnvelopePerChunk/chunks=8". A name without a
+// label is a band of its own. That includes synthetic/Contains{Cold,Warm}{Low,Mod,High}, the CRoaring arms of the
+// frsr ContainsCold/ContainsWarm bands: registered without a label, they never run side by side with those arms.
+struct band_key {
+    std::string_view head;  // up to and including the first '/', or the whole name when unlabeled
+    std::string_view tail;  // what follows the label
+    bool labeled;
+
+    explicit band_key(std::string_view const name) : head{ name }, tail{}, labeled{ false } {
+        auto const slash = name.find('/');
+        if (slash == std::string_view::npos) { return; }
+        auto label_end = slash + 1;
+        while (label_end < name.size() && ((name[label_end] >= 'a' && name[label_end] <= 'z') ||
+                                           (name[label_end] >= '0' && name[label_end] <= '9') || name[label_end] == '-')) {
+            ++label_end;
+        }
+        if (label_end == slash + 1 || label_end == name.size() || name[label_end] < 'A' || name[label_end] > 'Z') { return; }
+        head = name.substr(0, slash + 1);
+        tail = name.substr(label_end);
+        labeled = true;
+    }
+
+    bool operator==(band_key const &) const = default;
+
+    // FNV-1a: stable across platforms and standard libraries, so a band's shuffled orders depend only on the seed
+    // and the band, not on which other entries a filter selected.
+    std::uint64_t hash() const {
+        std::uint64_t h = 0xcbf29ce484222325ULL;
+        auto const mix = [&h](char const c) { h = (h ^ static_cast<unsigned char>(c)) * 0x100000001b3ULL; };
+        for (char const c : head) { mix(c); }
+        mix(labeled ? '\1' : '\0');
+        for (char const c : tail) { mix(c); }
+        return h;
+    }
+};
+
+struct planned_entry {
+    Entry const *e;
+    bool aa;                  // the A/A duplicate of e
+    bool history;             // selected by --history: runs alone and as configured whatever the order
+    std::size_t group;        // band number, in order of first appearance in registration order
+    std::uint64_t band_hash;
+    int64_t configured_reps;  // inner_reps x FRSR_BENCH_REPS_MULT
+};
+
+struct run_plan {
+    std::vector<planned_entry> entries;
+    // Execution units in execution order: the members of a unit are prepared together, run their rounds side by side
+    // and are reported together; in registration and reversed order every unit holds a single entry.
+    std::vector<std::vector<std::size_t>> units;
+};
+
+// selected: indices into g_benchmarks, in registration order; history[i] marks selected[i] as a --history entry, which
+// forms a band of its own and gets no A/A duplicate, so that it reproduces the process state it exists to reproduce.
+static run_plan make_plan(std::vector<std::size_t> const &selected, std::vector<bool> const &history, run_options const &opts) {
+    std::size_t const k = selected.size();
+    run_plan plan;
+    plan.entries.reserve(opts.aa ? 2 * k : k);
+
+    // Band identity: positions sorted by key hash; within one hash, every position joins the first earlier position
+    // with an equal key. Group numbers follow the registration order of each band's first member.
+    std::vector<std::uint64_t> hashes(k);
+    for (std::size_t i = 0; i < k; ++i) { hashes[i] = band_key{ g_benchmarks[selected[i]].name }.hash(); }
+    std::vector<std::size_t> by_hash(k);
+    std::iota(by_hash.begin(), by_hash.end(), std::size_t{ 0 });
+    std::stable_sort(by_hash.begin(), by_hash.end(), [&hashes](std::size_t const a, std::size_t const b) { return hashes[a] < hashes[b]; });
+    std::vector<std::size_t> first_of_band(k);
+    for (std::size_t run_begin = 0; run_begin < k;) {
+        std::size_t run_end = run_begin + 1;
+        while (run_end < k && hashes[by_hash[run_end]] == hashes[by_hash[run_begin]]) { ++run_end; }
+        for (std::size_t j = run_begin; j < run_end; ++j) {
+            std::size_t const pos = by_hash[j];
+            first_of_band[pos] = pos;
+            if (history[pos]) { continue; }
+            band_key const key{ g_benchmarks[selected[pos]].name };
+            for (std::size_t earlier = run_begin; earlier < j; ++earlier) {
+                std::size_t const other = by_hash[earlier];
+                if (!history[other] && first_of_band[other] == other && band_key{ g_benchmarks[selected[other]].name } == key) {
+                    first_of_band[pos] = other;
+                    break;
+                }
+            }
+        }
+        run_begin = run_end;
+    }
+    std::vector<std::size_t> group_of(k);
+    std::size_t group_count = 0;
+    for (std::size_t i = 0; i < k; ++i) {
+        group_of[i] = first_of_band[i] == i ? group_count++ : group_of[first_of_band[i]];
+    }
+
+    for (std::size_t i = 0; i < k; ++i) {
+        Entry const &e = g_benchmarks[selected[i]];
+        plan.entries.push_back({ &e, false, history[i], group_of[i], hashes[i], e.inner_reps * reps_multiplier() });
+    }
+    // The duplicate of original i sits at index aa_of[i]; an original without one keeps no_duplicate.
+    constexpr std::size_t no_duplicate = std::numeric_limits<std::size_t>::max();
+    std::vector<std::size_t> aa_of(k, no_duplicate);
+    if (opts.aa) {
+        for (std::size_t i = 0; i < k; ++i) {
+            if (history[i]) { continue; }
+            aa_of[i] = plan.entries.size();
+            planned_entry dup = plan.entries[i];
+            dup.aa = true;
+            plan.entries.push_back(dup);
+        }
+    }
+
+    if (side_by_side(opts.order)) {
+        // One unit per band: the originals in registration order, then their duplicates.
+        plan.units.resize(group_count);
+        for (std::size_t i = 0; i < plan.entries.size(); ++i) { plan.units[plan.entries[i].group].push_back(i); }
+        return plan;
+    }
+
+    std::vector<std::size_t> sequence(k);
+    std::iota(sequence.begin(), sequence.end(), std::size_t{ 0 });
+    if (opts.order == run_order::reversed) { std::reverse(sequence.begin(), sequence.end()); }
+    // The duplicates of a band run right after the band's last entry in the sequence, i.e. in the positions its last
+    // arms run in.
+    std::vector<std::vector<std::size_t>> band_members(group_count);
+    for (std::size_t const i : sequence) { band_members[group_of[i]].push_back(i); }
+    for (std::size_t const i : sequence) {
+        plan.units.push_back({ i });
+        auto const &members = band_members[group_of[i]];
+        if (opts.aa && members.back() == i) {
+            for (std::size_t const m : members) {
+                if (aa_of[m] != no_duplicate) { plan.units.push_back({ aa_of[m] }); }
+            }
+        }
+    }
+    return plan;
+}
+
+// A uniform draw from [0, bound): rejection keeps it unbiased, and mt19937_64's output sequence is fixed by the
+// standard, so one seed names the same orders on every platform.
+static std::uint32_t draw_below(std::mt19937_64 &rng, std::uint32_t const bound) {
+    std::uint64_t const threshold = (std::uint64_t{ 0 } - bound) % bound;
+    for (;;) {
+        std::uint64_t const x = rng();
+        if (x >= threshold) { return static_cast<std::uint32_t>(x % bound); }
+    }
+}
+
+// Rounds a unit of n members runs. Registration and reversed order, and a --history entry, run one; interleaved order
+// runs --rounds rounded up to a multiple of n, which is what lets rotation put every member in every position equally
+// often; shuffled order runs --rounds. The count depends on nothing a run measures, so --print-plan shows the rounds a
+// run will use.
+static std::uint32_t unit_rounds(std::size_t const n, bool const history, run_options const &opts) {
+    if (!side_by_side(opts.order) || history) { return 1; }
+    if (opts.order == run_order::shuffled) { return opts.rounds; }
+    auto const width = static_cast<std::uint32_t>(n);
+    return (opts.rounds + width - 1) / width * width;
+}
+
+// Reps a member runs in a unit of the given rounds: at least one per round, so that a member configured with fewer reps
+// than the unit has rounds still runs in every round.
+static int64_t unit_reps(int64_t const reps, std::uint32_t const rounds) {
+    return std::max<int64_t>(reps, rounds);
+}
+
+// Member orders for every round of a unit: orders[r * n + i] is the member that runs i-th in round r. The shuffled
+// orders are drawn from --seed and the band alone, so the plan printed ahead of a run and the run itself see the same
+// orders.
+static void make_orders(std::vector<std::uint32_t> &orders, std::size_t const n, std::uint32_t const rounds, std::uint64_t const band_hash, run_options const &opts) {
+    orders.resize(std::size_t{ rounds } * n);
+    std::mt19937_64 rng{ opts.seed ^ band_hash };
+    for (std::uint32_t r = 0; r < rounds; ++r) {
+        auto const row = orders.begin() + std::size_t{ r } * n;
+        for (std::size_t i = 0; i < n; ++i) {
+            row[i] = static_cast<std::uint32_t>(opts.order == run_order::interleaved ? (r + i) % n : i);
+        }
+        if (opts.order == run_order::shuffled) {
+            for (std::size_t i = n; i > 1; --i) {
+                std::swap(row[i - 1], row[draw_below(rng, static_cast<std::uint32_t>(i))]);
+            }
+        }
+    }
+}
+
+static int64_t slice_reps(int64_t const reps, std::uint32_t const rounds, std::uint32_t const round) {
+    return reps / rounds + (round < reps % rounds ? 1 : 0);
+}
+
+static void print_plan(run_plan const &plan, run_options const &opts) {
+    printf("# plan order=%s", order_name(opts.order));
+    if (side_by_side(opts.order)) { printf(" requested_rounds=%u", opts.rounds); }
+    if (opts.order == run_order::shuffled) { printf(" seed=%llu", static_cast<unsigned long long>(opts.seed)); }
+    if (opts.min_time_ms > 0) { printf(" (reps shown before --min-time-ms raises them after the warm pass; the rounds stand)"); }
+    printf("\n# group\tround\tposition\tentry\treps\n");
+    std::vector<std::uint32_t> orders;
+    for (auto const &unit : plan.units) {
+        std::size_t const n = unit.size();
+        planned_entry const &first = plan.entries[unit.front()];
+        std::uint32_t const rounds = unit_rounds(n, first.history, opts);
+        if (side_by_side(opts.order)) { printf("# group %zu arms=%zu rounds=%u\n", first.group, n, rounds); }
+        make_orders(orders, n, rounds, first.band_hash, opts);
+        for (std::uint32_t r = 0; r < rounds; ++r) {
+            for (std::size_t i = 0; i < n; ++i) {
+                planned_entry const &p = plan.entries[unit[orders[std::size_t{ r } * n + i]]];
+                printf("%zu\t%u\t%zu\t%s%s\t%lld\n", p.group, r, i, p.e->name.c_str(), p.aa ? "#aa" : "",
+                       static_cast<long long>(slice_reps(unit_reps(p.configured_reps, rounds), rounds, r)));
+            }
+        }
+    }
+}
+
+// Sample buffers are reserved up to this many samples ahead of a run; an entry that runs more grows its buffer.
+inline constexpr int64_t max_reserved_samples = int64_t{ 1 } << 20;
+
+// An entry under measurement: its state between setup and teardown, and every timed run() so far.
+struct live_entry {
+    planned_entry const *p = nullptr;
+    bool valid = false;
+    int64_t reps = 0;
+    void *state = nullptr;
+    std::vector<int64_t> sample_ns;              // one per run() call, in execution order
+    std::vector<std::uint32_t> round_position;   // the entry's position in each round's order
+    int64_t total_checksum = 0;
+    int64_t run_checksum = 0;
+    bool checksum_mismatch = false;
+};
+
+static void prepare(live_entry &l, std::uint32_t const rounds, run_options const &opts) {
+    Entry const &e = *l.p->e;
+    l.reps = l.p->configured_reps;
+    l.state = nullptr;
+    l.sample_ns.clear();
+    l.round_position.clear();
+    l.total_checksum = 0;
+    l.run_checksum = 0;
+    l.checksum_mismatch = false;
+
+    if (e.reusable_state) {
+        l.state = e.setup();
+    }
 
     // One untimed pass first: the first execution of a band pays the process's
     // one-time costs (page faults on freshly allocated payloads, cold code), which
     // at 20 timed repetitions showed up as 50-100x outliers on whichever band a
-    // filter happened to run first.
-    if (e.reusable_state) {
-        (void)e.run(state);
-    } else {
-        void *warm = e.setup();
-        (void)e.run(warm);
-        if (e.teardown) { e.teardown(warm); }
-    }
+    // filter happened to run first. Its duration sizes --min-time-ms. For an entry
+    // without reusable state the pass is timed with the setup and teardown every
+    // rep pays around its run().
+    auto const warm_pass = [&e, &l]() -> int64_t {
+        auto const start = Clock::now();
+        if (e.reusable_state) {
+            (void)e.run(l.state);
+        } else {
+            void *warm = e.setup();
+            (void)e.run(warm);
+            if (e.teardown) { e.teardown(warm); }
+        }
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count();
+    };
+    int64_t warm_ns = warm_pass();
 
-    for (int64_t rep = 0; rep < inner_reps; ++rep) {
+    // --min-time-ms extrapolates from the warm passes, so the timed work lands near the budget rather than on it. One
+    // pass can end within a tick or two of the clock, so more passes follow until they add up to a measurable span. The
+    // passes of an entry without reusable state include its setup and teardown, so for that entry the budget covers
+    // the whole setup, run and teardown cycle: its wall time stays near the budget however costly the setup, and its
+    // timed work alone is not held to the budget.
+    if (opts.min_time_ms > 0) {
+        constexpr int64_t measurable_ns = 1'000'000;
+        constexpr int64_t max_warm_passes = int64_t{ 1 } << 20;
+        constexpr int64_t max_reps = 10'000'000;
+        int64_t warm_passes = 1;
+        while (warm_ns < measurable_ns && warm_passes < max_warm_passes) {
+            warm_ns += warm_pass();
+            ++warm_passes;
+        }
+        double const pass_ns = std::max(static_cast<double>(warm_ns) / static_cast<double>(warm_passes), 1.0);
+        double const needed = std::ceil(opts.min_time_ms * 1e6 / pass_ns);
+        l.reps = std::max(l.reps, needed >= max_reps ? max_reps : static_cast<int64_t>(needed));
+    }
+    l.reps = unit_reps(l.reps, rounds);
+    l.sample_ns.reserve(static_cast<std::size_t>(std::min(l.reps, max_reserved_samples)));
+}
+
+static void run_slice(live_entry &l, int64_t const count) {
+    Entry const &e = *l.p->e;
+    for (int64_t rep = 0; rep < count; ++rep) {
         if (!e.reusable_state) {
-            state = e.setup();
+            l.state = e.setup();
         }
 
         auto start = Clock::now();
-        int64_t checksum = e.run(state);
+        int64_t checksum = e.run(l.state);
         auto end = Clock::now();
 
-        total_checksum += checksum;
-        total_time_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
+        if (l.sample_ns.empty()) {
+            l.run_checksum = checksum;
+        } else if (checksum != l.run_checksum) {
+            l.checksum_mismatch = true;
+        }
+        l.total_checksum += checksum;
+        l.sample_ns.push_back(std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
 
         if (!e.reusable_state && e.teardown) {
-            e.teardown(state);
-            state = nullptr;
+            e.teardown(l.state);
+            l.state = nullptr;
+        }
+    }
+}
+
+static void finish(live_entry &l) {
+    Entry const &e = *l.p->e;
+    if (e.reusable_state && e.teardown) {
+        e.teardown(l.state);
+    }
+    l.state = nullptr;
+}
+
+// Linear interpolation between the closest ranks of an ascending sample.
+static double quantile(std::vector<int64_t> const &sorted, double const q) {
+    double const rank = q * static_cast<double>(sorted.size() - 1);
+    auto const lo = static_cast<std::size_t>(rank);
+    if (lo + 1 >= sorted.size()) { return static_cast<double>(sorted.back()); }
+    return static_cast<double>(sorted[lo]) + (rank - static_cast<double>(lo)) * static_cast<double>(sorted[lo + 1] - sorted[lo]);
+}
+
+static void report(live_entry &l, std::uint32_t const rounds, std::vector<int64_t> &scratch, run_options const &opts) {
+    Entry const &e = *l.p->e;
+    char const *const suffix = l.p->aa ? "#aa" : "";
+
+    if (opts.dump != nullptr) {
+        std::size_t sample = 0;
+        for (std::uint32_t r = 0; r < rounds; ++r) {
+            for (int64_t s = slice_reps(l.reps, rounds, r); s > 0; --s, ++sample) {
+                fprintf(opts.dump, "%s%s\t%s\t%u\t%u\t%zu\t%lld\t%lld\n", e.name.c_str(), suffix, order_name(opts.order), r,
+                        l.round_position[r], sample, static_cast<long long>(l.sample_ns[sample]), static_cast<long long>(e.ops_per_run));
+            }
         }
     }
 
-    if (e.reusable_state && e.teardown) {
-        e.teardown(state);
+    int64_t const total_time_ns = std::accumulate(l.sample_ns.begin(), l.sample_ns.end(), int64_t{ 0 });
+    int64_t const inner_reps = l.reps;
+    double time_per_op_us = static_cast<double>(total_time_ns) / (inner_reps * e.ops_per_run * 1000.0);
+    double const mean_us = time_per_op_us;
+    double const ns_to_us_per_op = 1.0 / (e.ops_per_run * 1000.0);
+
+    // Order statistics over the samples; the median absolute deviation is taken over doubled deviations so that a
+    // median halfway between two samples stays an integer.
+    std::vector<int64_t> &sorted = l.sample_ns;
+    std::sort(sorted.begin(), sorted.end());
+    double const median_ns = quantile(sorted, 0.5);
+    scratch.clear();
+    for (int64_t const ns : sorted) {
+        scratch.push_back(static_cast<int64_t>(std::llround(std::abs(2.0 * static_cast<double>(ns) - 2.0 * median_ns))));
+    }
+    std::sort(scratch.begin(), scratch.end());
+    double const mad_ns = quantile(scratch, 0.5) / 2;
+
+    if (opts.print_median) { time_per_op_us = median_ns * ns_to_us_per_op; }
+    char run_checksum[32];
+    if (l.checksum_mismatch) {
+        snprintf(run_checksum, sizeof(run_checksum), "MISMATCH");
+    } else {
+        snprintf(run_checksum, sizeof(run_checksum), "%lld", static_cast<long long>(l.run_checksum));
     }
 
     // Report results
-    double time_per_op_us = static_cast<double>(total_time_ns) / (inner_reps * e.ops_per_run * 1000.0);
     // 4 decimals: point-lookup cases land around 0.005-0.03 us/op, where %.2f
     // quantises every result to 0.01 and hides the effect being measured.
-    printf("%s\t%.4f us/op\tchecksum=%ld\n", e.name.c_str(), time_per_op_us, (long)total_checksum);
+    printf("%s%s\t%.4f us/op\tchecksum=%ld\tmean_us=%.6f\tmedian_us=%.6f\tp10_us=%.6f\tp90_us=%.6f\tmad_us=%.6f\tsamples=%zu\ttimed_ms=%.3f\trun_checksum=%s\trounds=%u\n",
+           e.name.c_str(), suffix, time_per_op_us, (long)l.total_checksum, mean_us, median_ns * ns_to_us_per_op,
+           quantile(sorted, 0.1) * ns_to_us_per_op, quantile(sorted, 0.9) * ns_to_us_per_op, mad_ns * ns_to_us_per_op,
+           sorted.size(), static_cast<double>(total_time_ns) / 1e6, run_checksum, rounds);
+}
+
+// Runs the plan and returns the number of entries run. The per-member buffers are reserved before the first unit,
+// sized for the widest unit, the most rounds and the largest rep count the plan configures (up to
+// max_reserved_samples), so nothing is allocated between one entry's timed runs and the next entry's setup unless
+// --min-time-ms raises a rep count past them; a buffer grown that way is released once its unit has reported.
+static std::size_t execute(run_plan const &plan, run_options const &opts) {
+    std::size_t widest = 0;
+    std::uint32_t most_rounds = 1;
+    int64_t most_reps = 1;
+    for (auto const &unit : plan.units) {
+        widest = std::max(widest, unit.size());
+        most_rounds = std::max(most_rounds, unit_rounds(unit.size(), plan.entries[unit.front()].history, opts));
+    }
+    for (auto const &p : plan.entries) { most_reps = std::max(most_reps, p.configured_reps); }
+    auto const reserved = static_cast<std::size_t>(std::min(unit_reps(most_reps, most_rounds), max_reserved_samples));
+    auto const reserve_samples = [reserved](std::vector<int64_t> &samples) {
+        if (samples.capacity() > reserved) { std::vector<int64_t>{}.swap(samples); }
+        samples.reserve(reserved);
+    };
+    std::vector<live_entry> live(widest);
+    for (auto &l : live) {
+        reserve_samples(l.sample_ns);
+        l.round_position.reserve(most_rounds);
+    }
+    std::vector<int64_t> scratch;
+    reserve_samples(scratch);
+    std::vector<std::uint32_t> orders;
+    orders.reserve(widest * most_rounds);
+
+    std::size_t run_count = 0;
+    for (auto const &unit : plan.units) {
+        std::size_t const n = unit.size();
+        std::uint32_t const rounds = unit_rounds(n, plan.entries[unit.front()].history, opts);
+        make_orders(orders, n, rounds, plan.entries[unit.front()].band_hash, opts);
+
+        for (std::size_t i = 0; i < n; ++i) {
+            live_entry &l = live[i];
+            l.p = &plan.entries[unit[i]];
+            l.valid = l.p->e->setup != nullptr && l.p->e->run != nullptr;
+            if (!l.valid) {
+                fprintf(stderr, "ERROR: Benchmark %s missing setup or run\n", l.p->e->name.c_str());
+                continue;
+            }
+            prepare(l, rounds, opts);
+        }
+
+        for (std::uint32_t r = 0; r < rounds; ++r) {
+            for (std::size_t i = 0; i < n; ++i) {
+                live_entry &l = live[orders[std::size_t{ r } * n + i]];
+                if (!l.valid) { continue; }
+                l.round_position.push_back(static_cast<std::uint32_t>(i));
+                run_slice(l, slice_reps(l.reps, rounds, r));
+            }
+        }
+
+        for (std::size_t i = 0; i < n; ++i) {
+            if (live[i].valid) { finish(live[i]); }
+        }
+        for (std::size_t i = 0; i < n; ++i) {
+            if (live[i].valid) { report(live[i], rounds, scratch, opts); }
+            ++run_count;
+            reserve_samples(live[i].sample_ns);
+        }
+        reserve_samples(scratch);
+    }
+    return run_count;
 }
 
 // ---------------------------------------------------------------------------
@@ -7002,25 +7455,75 @@ int main(int argc, char *argv[]) {
     std::optional<std::pair<std::size_t, std::size_t>> history;
     bool list_only = false;
     std::optional<std::uint64_t> max_count;
+    // --exact: the filter must equal the whole entry name, for drivers that run one arm per process.
+    bool exact = false;
+    // --print-plan: print the execution plan (group, round, position, entry, reps in the slice) and run nothing.
+    bool plan_only = false;
+    std::string dump_path;
+    run_options opts;
 
-    // Parse command-line arguments
+    auto const fail = [](char const *const what, std::string const &value) {
+        fprintf(stderr, "ERROR: invalid %s: '%s'\n", what, value.c_str());
+        return 1;
+    };
+
+    // Parse command-line arguments. Each option taking a value accepts "--opt value" and "--opt=value".
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
+        std::optional<std::string> value;
+        auto const takes = [&](std::string_view const option) {
+            if (arg == option && i + 1 < argc) {
+                value = argv[++i];
+                return true;
+            }
+            if (arg.size() > option.size() && arg.compare(0, option.size(), option) == 0 && arg[option.size()] == '=') {
+                value = arg.substr(option.size() + 1);
+                return true;
+            }
+            return false;
+        };
         if (arg == "--list") {
             list_only = true;
-        } else if (arg == "--filter" && i + 1 < argc) {
-            filter = argv[++i];
-        } else if (arg.substr(0, 9) == "--filter=") {
-            filter = arg.substr(9);
+        } else if (arg == "--exact") {
+            exact = true;
+        } else if (arg == "--aa") {
+            opts.aa = true;
+        } else if (arg == "--print-plan") {
+            plan_only = true;
+        } else if (takes("--filter")) {
+            filter = *value;
         } else if (arg == "--history" && i + 1 < argc) {
             std::string const range{ argv[++i] };
             auto const colon = range.find(':');
             history.emplace(std::strtoull(range.substr(0, colon).c_str(), nullptr, 10),
                             colon == std::string::npos ? g_benchmarks.size() : std::strtoull(range.c_str() + colon + 1, nullptr, 10));
-        } else if (arg == "--max-count" && i + 1 < argc) {
-            max_count = std::strtoull(argv[++i], nullptr, 10);
-        } else if (arg.substr(0, 12) == "--max-count=") {
-            max_count = std::strtoull(arg.c_str() + 12, nullptr, 10);
+        } else if (takes("--max-count")) {
+            max_count = std::strtoull(value->c_str(), nullptr, 10);
+        } else if (takes("--order")) {
+            if      (*value == "registration") { opts.order = run_order::registration; }
+            else if (*value == "reversed"    ) { opts.order = run_order::reversed;     }
+            else if (*value == "interleaved" ) { opts.order = run_order::interleaved;  }
+            else if (*value == "shuffled"    ) { opts.order = run_order::shuffled;     }
+            else { return fail("--order (registration|reversed|interleaved|shuffled)", *value); }
+        } else if (takes("--rounds")) {
+            char *end = nullptr;
+            auto const rounds = std::strtoll(value->c_str(), &end, 10);
+            if (value->empty() || *end != '\0' || rounds < 1 || rounds > 1'000'000) { return fail("--rounds", *value); }
+            opts.rounds = static_cast<std::uint32_t>(rounds);
+        } else if (takes("--seed")) {
+            char *end = nullptr;
+            opts.seed = std::strtoull(value->c_str(), &end, 0);
+            if (value->empty() || (*value)[0] < '0' || (*value)[0] > '9' || *end != '\0') { return fail("--seed", *value); }
+        } else if (takes("--stat")) {
+            if      (*value == "mean"  ) { opts.print_median = false; }
+            else if (*value == "median") { opts.print_median = true;  }
+            else { return fail("--stat (mean|median)", *value); }
+        } else if (takes("--min-time-ms")) {
+            char *end = nullptr;
+            opts.min_time_ms = std::strtod(value->c_str(), &end);
+            if (value->empty() || *end != '\0' || !(opts.min_time_ms >= 0)) { return fail("--min-time-ms", *value); }
+        } else if (takes("--dump-samples")) {
+            dump_path = *value;
         }
     }
 
@@ -7032,9 +7535,9 @@ int main(int argc, char *argv[]) {
         }
         return 0;
     }
+    if (exact && filter.empty()) { return fail("--exact (needs --filter <entry name>)", filter); }
 
-    // Run benchmarks, optionally filtered
-    size_t run_count = 0;
+    // Select benchmarks, optionally filtered
     size_t skipped_count = 0;
     auto const parse_count = [](std::string const & name) -> std::optional<std::uint64_t> {
         auto const pos = name.find("count=");
@@ -7052,12 +7555,14 @@ int main(int argc, char *argv[]) {
         }
         return std::strtoull(slice.c_str(), nullptr, 10);
     };
+    std::vector<std::size_t> selected;
+    std::vector<bool> selected_history;
     for (std::size_t index = 0; index < g_benchmarks.size(); ++index) {
         const auto &e = g_benchmarks[index];
         bool const in_history = history.has_value() && index >= history->first && index < history->second;
         // Check if benchmark matches filter
         if (!in_history && (!filter.empty() || history.has_value())) {
-            if (filter.empty() || e.name.find(filter) == std::string::npos) {
+            if (filter.empty() || (exact ? e.name != filter : e.name.find(filter) == std::string::npos)) {
                 continue;
             }
         }
@@ -7067,8 +7572,31 @@ int main(int argc, char *argv[]) {
                 continue;
             }
         }
-        run_benchmark(e);
-        run_count++;
+        selected.push_back(index);
+        selected_history.push_back(in_history);
+    }
+
+    size_t run_count = 0;
+    if (!selected.empty()) {
+        run_plan const plan{ make_plan(selected, selected_history, opts) };
+        if (plan_only) {
+            print_plan(plan, opts);
+            return 0;
+        }
+        if (!dump_path.empty()) {
+            opts.dump = std::fopen(dump_path.c_str(), "w");
+            if (opts.dump == nullptr) { return fail("--dump-samples (cannot open)", dump_path); }
+            fprintf(opts.dump, "# entry\torder\tround\tposition\tsample\tns\tops_per_run\n");
+        }
+        if (opts.order != run_order::registration) {
+            printf("# order=%s", order_name(opts.order));
+            if (side_by_side(opts.order)) { printf(" requested_rounds=%u", opts.rounds); }
+            if (opts.order == run_order::shuffled) { printf(" seed=%llu", static_cast<unsigned long long>(opts.seed)); }
+            if (side_by_side(opts.order)) { printf(" (each result line carries the rounds its band ran)"); }
+            printf("\n");
+        }
+        run_count = execute(plan, opts);
+        if (opts.dump != nullptr) { std::fclose(opts.dump); }
     }
 
     if (run_count == 0) {
