@@ -25,7 +25,13 @@ if(FRSR_ROARING_ADD_LOCAL_CROARING_TARGET AND NOT TARGET roaring)
     if(NOT EXISTS "${PROJECT_SOURCE_DIR}/../croaring/CMakeLists.txt")
         message(FATAL_ERROR "FRSR_ROARING_ADD_LOCAL_CROARING_TARGET=ON requires ../croaring with CMakeLists.txt")
     endif()
-    add_subdirectory("${PROJECT_SOURCE_DIR}/../croaring" "${PROJECT_BINARY_DIR}/croaring")
+    # The reference is always linked as a static archive. CRoaring builds a shared library
+    # whenever BUILD_SHARED_LIBS is on, and a value left in the cache by a dependency
+    # configured later (or by a superproject) would otherwise take effect on a reconfigure.
+    block()
+        set(BUILD_SHARED_LIBS OFF)
+        add_subdirectory("${PROJECT_SOURCE_DIR}/../croaring" "${PROJECT_BINARY_DIR}/croaring")
+    endblock()
 endif()
 
 add_library(frsr_roaring STATIC
@@ -163,44 +169,46 @@ set_target_properties(frsr_roaring PROPERTIES
     CXX_EXTENSIONS OFF
 )
 
-set(FRSR_ROARING_X64 FALSE)
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64|X86_64)$")
-    set(FRSR_ROARING_X64 TRUE)
+# Whether the C++ compiler targets x86-64, decided by compiling a check rather than from
+# CMAKE_SYSTEM_PROCESSOR, which names the host or system and not the compiler's target.
+include(CheckCXXSourceCompiles)
+check_cxx_source_compiles("
+#if !( defined( __x86_64__ ) || defined( _M_X64 ) )
+#error not x86-64
+#endif
+int main() { return 0; }" FRSR_ROARING_X64)
+
+# The headers carry most of the implementation, including kernels whose bodies
+# are selected by the instruction-set macros (__SSE4_2__, __AVX2__, ...). Every
+# translation unit that includes them instantiates its own copies, and the linker
+# keeps one arbitrary copy of each inline function or template. A consumer compiled
+# with different instruction-set options than the library therefore sees different
+# definitions of the same entities (an ODR violation) and may end up running either
+# copy. The options that decide those #if paths are thus a usage requirement: PUBLIC,
+# and in every configuration, so the tests and benchmarks built in any configuration
+# compile the same kernels as the library. Only additive feature options are used
+# (no -march/-mtune), so a consumer's own target selection is not overridden.
+# The kernels are written in gnu vector extensions and dispatched through
+# per-function target attributes, which Microsoft's compiler provides no form of,
+# so it cannot compile these headers at all. Say that here rather than through a
+# few hundred syntax errors; on Windows, configure with clang-cl.
+if(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
+    message(FATAL_ERROR "frsr::roaring needs Clang, clang-cl or GCC. Microsoft's cl.exe is not supported.")
 endif()
 
+if(FRSR_ROARING_X64)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+        target_compile_options(frsr_roaring PUBLIC "$<$<COMPILE_LANGUAGE:C,CXX>:/clang:-mavx2;/clang:-mpopcnt>")
+    elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang" OR CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+        target_compile_options(frsr_roaring PUBLIC "$<$<COMPILE_LANGUAGE:C,CXX>:-mavx2;-mpopcnt>")
+    endif()
+endif()
+
+# The optimization level only affects the library's own object code.
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
-    target_compile_options(frsr_roaring PRIVATE
-        "$<$<CONFIG:Release>:/O2>"
-        "$<$<CONFIG:RelWithDebInfo>:/O2>"
-        "$<$<CONFIG:MinSizeRel>:/O2>"
-        "$<$<AND:$<BOOL:${FRSR_ROARING_X64}>,$<CONFIG:Release>>:/clang:-mavx2>"
-        "$<$<AND:$<BOOL:${FRSR_ROARING_X64}>,$<CONFIG:RelWithDebInfo>>:/clang:-mavx2>"
-        "$<$<AND:$<BOOL:${FRSR_ROARING_X64}>,$<CONFIG:MinSizeRel>>:/clang:-mavx2>"
-        "$<$<AND:$<BOOL:${FRSR_ROARING_X64}>,$<CONFIG:Release>>:/clang:-mpopcnt>"
-        "$<$<AND:$<BOOL:${FRSR_ROARING_X64}>,$<CONFIG:RelWithDebInfo>>:/clang:-mpopcnt>"
-        "$<$<AND:$<BOOL:${FRSR_ROARING_X64}>,$<CONFIG:MinSizeRel>>:/clang:-mpopcnt>"
-    )
-elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-    target_compile_options(frsr_roaring PRIVATE
-        "$<$<CONFIG:Release>:-O3>"
-        "$<$<CONFIG:RelWithDebInfo>:-O3>"
-        "$<$<CONFIG:MinSizeRel>:-O3>"
-        "$<$<AND:$<BOOL:${FRSR_ROARING_X64}>,$<CONFIG:Release>>:-mavx2>"
-        "$<$<AND:$<BOOL:${FRSR_ROARING_X64}>,$<CONFIG:RelWithDebInfo>>:-mavx2>"
-        "$<$<AND:$<BOOL:${FRSR_ROARING_X64}>,$<CONFIG:MinSizeRel>>:-mavx2>"
-        "$<$<AND:$<BOOL:${FRSR_ROARING_X64}>,$<CONFIG:Release>>:-mpopcnt>"
-        "$<$<AND:$<BOOL:${FRSR_ROARING_X64}>,$<CONFIG:RelWithDebInfo>>:-mpopcnt>"
-        "$<$<AND:$<BOOL:${FRSR_ROARING_X64}>,$<CONFIG:MinSizeRel>>:-mpopcnt>"
-    )
-elseif(MSVC)
-    target_compile_options(frsr_roaring PRIVATE
-        "$<$<CONFIG:Release>:/O2>"
-        "$<$<CONFIG:RelWithDebInfo>:/O2>"
-        "$<$<CONFIG:MinSizeRel>:/O2>"
-        "$<$<AND:$<BOOL:${FRSR_ROARING_X64}>,$<CONFIG:Release>>:/arch:AVX2>"
-        "$<$<AND:$<BOOL:${FRSR_ROARING_X64}>,$<CONFIG:RelWithDebInfo>>:/arch:AVX2>"
-        "$<$<AND:$<BOOL:${FRSR_ROARING_X64}>,$<CONFIG:MinSizeRel>>:/arch:AVX2>"
-    )
+    target_compile_options(frsr_roaring PRIVATE "$<$<NOT:$<CONFIG:Debug>>:/O2>")
+elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang" OR CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    target_compile_options(frsr_roaring PRIVATE "$<$<NOT:$<CONFIG:Debug>>:-O3>")
 endif()
 
 if(FRSR_ROARING_BUILD_TESTS)
@@ -278,6 +286,42 @@ if(FRSR_ROARING_BUILD_BENCHMARKS)
         target_link_libraries(frsr_roaring_bench PRIVATE roaring)
         target_compile_definitions(frsr_roaring_bench PRIVATE FRSR_ROARING_HAS_CROARING=1)
     endif()
+endif()
+
+# Report-only tests: they always pass and print what they find.
+#  - header_isa_tokens: instruction-set dependent tokens per public header, i.e. how
+#    much of the header code preprocesses differently with different ISA options.
+#  - consumer_symbol_census: frsr::roaring symbols each consumer object defines for
+#    itself (its own copies of header code), next to the library's own object.
+if(FRSR_ROARING_BUILD_TESTS)
+    add_test(NAME frsr_roaring_report_header_isa_tokens
+        COMMAND ${CMAKE_COMMAND}
+            "-DHEADER_DIR=${PROJECT_SOURCE_DIR}/include/frsr/roaring"
+            -P "${PROJECT_SOURCE_DIR}/cmake/header_isa_tokens.cmake"
+    )
+
+    set(_frsr_roaring_nm "${CMAKE_NM}")
+    get_filename_component(_frsr_roaring_compiler_dir "${CMAKE_CXX_COMPILER}" DIRECTORY)
+    find_program(FRSR_ROARING_LLVM_NM NAMES llvm-nm HINTS "${_frsr_roaring_compiler_dir}")
+    if(FRSR_ROARING_LLVM_NM)
+        set(_frsr_roaring_nm "${FRSR_ROARING_LLVM_NM}")
+    endif()
+    set(_frsr_roaring_census_objects
+        "$<TARGET_OBJECTS:frsr_roaring>"
+        "$<TARGET_OBJECTS:frsr_roaring_tests>"
+    )
+    if(TARGET frsr_roaring_croaring_crosscheck)
+        list(APPEND _frsr_roaring_census_objects "$<TARGET_OBJECTS:frsr_roaring_croaring_crosscheck>")
+    endif()
+    if(TARGET frsr_roaring_bench)
+        list(APPEND _frsr_roaring_census_objects "$<TARGET_OBJECTS:frsr_roaring_bench>")
+    endif()
+    add_test(NAME frsr_roaring_report_consumer_symbol_census
+        COMMAND ${CMAKE_COMMAND}
+            "-DNM=${_frsr_roaring_nm}"
+            -P "${PROJECT_SOURCE_DIR}/cmake/consumer_symbol_census.cmake"
+            ${_frsr_roaring_census_objects}
+    )
 endif()
 
 # Compiled psi::vm library for file-mapped serialization / persistent_bitmap.
