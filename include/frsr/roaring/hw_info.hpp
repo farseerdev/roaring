@@ -142,6 +142,55 @@ template <set_operation Op, typename V>
 [[nodiscard]] constexpr bool have_x86_v4() noexcept { return true; }
 #endif
 
+
+// ---------------------------------------------------------------------------
+// AVX-512 VP2INTERSECT — a tier of its own, deliberately NOT folded into x86-64-v4.
+//
+// VP2INTERSECT computes BOTH operands' match masks for a 16x16 all-pairs compare in
+// a single instruction. That matters because the array intersection's match finding
+// is PCMPISTRM, an SSE4.2 *string* instruction with no 256/512-bit form: widening it
+// otherwise means all-pairs by rotation, which costs ~2N ops for N^2 pairs and
+// measured 4.1-5.6x SLOWER at 32 lanes than the 128-bit kernel it would replace.
+// VP2INTERSECT is the only wide instruction that avoids that.
+//
+// Separate tier because it is NOT part of x86-64-v4 and its availability does not
+// track the rest: absent on most Intel server parts, present on Zen 5. Where it is
+// missing the caller keeps the SSE4.2 kernel, which is why this is a pure addition.
+#if defined( __AVX512VP2INTERSECT__ )
+#   define FRSR_ROARING_VP2_NATIVE   1
+#   define FRSR_ROARING_VP2_DISPATCH 0
+#else
+#   define FRSR_ROARING_VP2_NATIVE   0
+#   define FRSR_ROARING_VP2_DISPATCH 1
+#endif
+#define FRSR_ROARING_VP2 ( FRSR_ROARING_VP2_NATIVE || FRSR_ROARING_VP2_DISPATCH )
+
+#define FRSR_ROARING_VP2_TARGET FRSR_ROARING_X86_V4_TARGET ",avx512vp2intersect"
+
+#if FRSR_ROARING_VP2_DISPATCH
+#   define FRSR_ROARING_VP2_KERNEL [[ using gnu: target( FRSR_ROARING_VP2_TARGET ), noinline, hot ]]
+
+// CPUID.(EAX=07H,ECX=0):EDX[8]. Layered on have_x86_v4() rather than repeating it:
+// the kernel also uses AVX-512 F/BW and the 32->16 bit compress, and that check
+// already covers the OS ZMM-state enable, which a bare feature bit does not.
+[[nodiscard]] inline bool have_vp2intersect() noexcept {
+    static bool const value{ []() noexcept {
+        if ( !have_x86_v4() ) { return false; }
+        std::uint32_t eax, ebx, ecx, edx;
+        __asm__ volatile ( "cpuid" : "=a"( eax ), "=b"( ebx ), "=c"( ecx ), "=d"( edx ) : "a"( 7U ), "c"( 0U ) );
+        return ( edx & ( 1U << 8 ) ) != 0;
+    }() };
+    return value;
+}
+#else // native
+#   define FRSR_ROARING_VP2_KERNEL [[ gnu::hot ]]
+[[nodiscard]] constexpr bool have_vp2intersect() noexcept { return true; }
+#endif
+
 #endif // FRSR_ROARING_X86_V4
+
+#ifndef FRSR_ROARING_VP2
+#   define FRSR_ROARING_VP2 0
+#endif
 
 } // namespace frsr::roaring::detail

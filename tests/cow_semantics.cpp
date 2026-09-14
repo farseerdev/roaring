@@ -162,6 +162,7 @@ TYPED_TEST( RefcountedCow, LastOwnerFreesPayload ) {
 }
 
 TYPED_TEST( RefcountedCow, InlinePayloadCopiesByValue ) {
+    if constexpr ( FRSR_ROARING_NO_SBO ) { GTEST_SKIP() << "asserts inline-payload behaviour; FRSR_ROARING_NO_SBO deliberately removes it"; }
     low_type const values[]{ 1, 2, 3, 4 };
     auto const original{ handle_t<TypeParam>::make_array_from_sorted( values ) };
     ASSERT_FALSE( original.spilled() );
@@ -299,6 +300,7 @@ TYPED_TEST( BorrowedPayload, WriteBarrierClonesAndMasterBytesStayIntact ) {
 }
 
 TYPED_TEST( BorrowedPayload, SmallBorrowedPayloadClonesInline ) {
+    if constexpr ( FRSR_ROARING_NO_SBO ) { GTEST_SKIP() << "asserts inline-payload behaviour; FRSR_ROARING_NO_SBO deliberately removes it"; }
     low_type const master[]{ 1, 2, 3, 4 };
     auto handle{ handle_t<TypeParam>::make_borrowed(
         container_kind::array, master, 4U, 4U

@@ -35,7 +35,13 @@ namespace frsr::roaring::detail {
 // staging below array_sbo_size elements stays on the stack, larger scratch
 // spills to the CRT heap.
 template <typename T>
-using small_array_values = psi::vm::small_vector<T, array_sbo_size, std::uint32_t>;
+using small_array_values =
+#if FRSR_ROARING_NO_SBO
+    // Equal terms with the reference: no inline staging either.
+    psi::vm::heap_vector<T, std::uint32_t>;
+#else
+    psi::vm::small_vector<T, array_sbo_size, std::uint32_t>;
+#endif
 #else
 template <typename T>
 using small_array_values = std::vector<T>;
@@ -53,9 +59,11 @@ inline void resize_uninitialized( small_array_values<T> & values, std::size_t co
 #endif
 }
 
-#ifdef FRSR_ROARING_HAS_PSI_VM
+#if defined( FRSR_ROARING_HAS_PSI_VM ) && !FRSR_ROARING_NO_SBO
 // Distinct type from small_array_values only under psi::vm; without it both are
-// std::vector and the overload above already covers it.
+// std::vector and the overload above already covers it. Under FRSR_ROARING_NO_SBO
+// small_array_values IS heap_vector, so the overload above covers it there too and
+// defining this one would redeclare the same function.
 template <typename T>
 inline void resize_uninitialized( heap_vector<T> & values, std::size_t const new_size ) {
     values.resize( static_cast<std::uint32_t>( new_size ), psi::vm::no_init );

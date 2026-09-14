@@ -57,10 +57,20 @@ struct cow_atomic_refcount {
         std::launder( static_cast<rc_word *>( rc_slot ) )->fetch_add( 1, std::memory_order_relaxed );
     }
 
-    // release-decrement + acquire fence on the last release: the freeing thread
-    // must observe every co-owner's writes before the payload is reused.
+    // A sole owner is decided by a plain acquire load: a count only this
+    // handle holds cannot be raised by anyone else (a reference is only ever
+    // taken from an existing owner), so no read-modify-write is needed to
+    // release it, and the acquire load synchronizes with the release-decrement
+    // of the last co-owner. That keeps the locked instruction off the teardown
+    // of every unshared payload — the common case for a result bitmap, and the
+    // reference frees a fresh container with a plain free. Shared payloads take
+    // the release-decrement + acquire fence on the last release: the freeing
+    // thread must observe every co-owner's writes before the payload is reused.
     [[nodiscard]] static bool rc_decrement_is_last( void * const rc_slot ) noexcept {
         auto & rc{ *std::launder( static_cast<rc_word *>( rc_slot ) ) };
+        if ( rc.load( std::memory_order_acquire ) == 1 ) {
+            return true;
+        }
         if ( rc.fetch_sub( 1, std::memory_order_release ) == 1 ) {
             std::atomic_thread_fence( std::memory_order_acquire );
             return true;

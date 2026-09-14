@@ -287,8 +287,11 @@ template <typename Layout, typename CowPolicy = cow_value_semantics>
 // minus the per-value capacity check and size increment: each kind writes through a
 // plain pointer, which is what lets the array kind's widening loop vectorise.
 // [croaring-ref] deps/croaring/src/roaring.c:roaring_bitmap_to_uint32_array
+// Inlined into its per-chunk callers (to_array_into, to_vector): outlined, the
+// decode loops lose the callers' knowledge of the output span and the run and
+// array kinds decode at half speed.
 template <typename Layout, typename CowPolicy>
-[[ gnu::hot ]] inline typename Layout::key_type * container_decode_into(
+[[ using gnu: hot, always_inline ]] inline typename Layout::key_type * container_decode_into(
     container_handle<Layout, CowPolicy> const & container,
     typename Layout::chunk_type const chunk_key,
     typename Layout::key_type * out,
@@ -301,6 +304,13 @@ template <typename Layout, typename CowPolicy>
             auto const & values{ container.as_array().values };
             auto const   count { values.size() };
             auto const * const source{ values.data() };
+#if FRSR_ROARING_X86_V4
+            if constexpr ( std::is_same_v<key_type, std::uint32_t> && std::is_same_v<typename Layout::low_type, std::uint16_t> ) {
+                if ( count >= x86_v4::decode_array_min_count && have_x86_v4() ) {
+                    return x86_v4::decode_array_uint32( source, count, out, base );
+                }
+            }
+#endif
             // Widening add over a contiguous run: clang lowers this to unpack +
             // add + store (vpmovzxwd/vpaddd on x86, ushll/add on AArch64).
             for ( std::uint32_t i{ 0 }; i < count; ++i ) {

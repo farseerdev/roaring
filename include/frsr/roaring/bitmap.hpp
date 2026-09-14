@@ -328,8 +328,13 @@ public:
         chunk_type chunk{};
         size_type index{ invalid_index };
         bool payload_private{ false };
+        // The resolved slot itself, as the reference caches its container: valid
+        // while `generation` still matches the chunk store's (no slot has moved
+        // or died since it was taken). add_bulk's hit lane goes through it.
+        handle_type * slot{ nullptr };
+        std::uint32_t generation{ 0 };
 
-        void reset() noexcept { index = invalid_index; payload_private = false; }
+        void reset() noexcept { index = invalid_index; payload_private = false; slot = nullptr; }
     };
 
     class const_iterator {
@@ -677,7 +682,39 @@ public:
         return add_impl( value, nullptr );
     }
 
+    // The context-hit lane is the whole function for a run of adds into one
+    // chunk, as the reference's add_bulk_impl is: the cached chunk is checked
+    // and the value goes straight into its container. Everything else (a new
+    // chunk, a singleton, the hot-index search) is the shared add_impl.
+    // [croaring-ref] deps/croaring/src/roaring.c:add_bulk_impl
     [[nodiscard]] bool add_bulk( bulk_context & ctx, key_type const value ) {
+        auto const chunk{ layout_type::chunk_key( value ) };
+        if ( ctx.slot != nullptr && ctx.generation == chunks_.generation() && ctx.chunk == chunk ) [[likely]] {
+            auto       & slot{ *ctx.slot };
+            auto const   low { layout_type::low_key( value ) };
+            // The common hit is an in-order append into a private array: one
+            // inline lane, as the reference's is, before the kind dispatch.
+            if ( ctx.payload_private && slot.holds_array() ) [[likely]] {
+                if ( detail::as_array_already_private( slot ).try_append( low ) ) [[likely]] {
+                    promote_if_needed( slot );
+                    return true;
+                }
+            }
+            bool const was_tombstone{
+                kUseLazyTombstoning && tombstone_count_ != 0 && detail::container_size( slot ) == 0
+            };
+            auto const added{
+                ctx.payload_private
+                    ? detail::container_add_already_private( slot, low )
+                    : detail::container_add               ( slot, low )
+            };
+            if ( !added ) { return false; }
+            ctx.payload_private = true;
+            ++size_;
+            if ( was_tombstone ) { --tombstone_count_; }
+            promote_if_needed( slot );
+            return true;
+        }
         return add_impl( value, &ctx );
     }
 
@@ -1316,7 +1353,6 @@ public:
         const_cast<bitmap*>(&other)->ensure_sorted();
 
         scratch.clear_keep_capacity();
-        scratch.chunks_.reserve( std::min( chunks_.size(), other.chunks_.size() ) );
 
         // Materializing mode never mutates *this (the spine's in-place arms are
         // gated on out == nullptr), so the const_cast is only formal.
@@ -1371,12 +1407,12 @@ public:
                 detail::combine_stats().record_pair( left_container, right_container, detail::set_operation::bit_or );
 #endif
                 if ( left_container.holds_array() && right_container.holds_array() ) {
-                    detail::union_array_array_to_vector<layout_type>(
+                    auto container{ make_array_union_container_reusing(
+                        scratch.chunks_,
                         left_container.as_array(),
                         right_container.as_array(),
                         array_union_scratch
-                    );
-                    auto container{ make_fast_container_from_scratch_reusing( scratch.chunks_, array_union_scratch ) };
+                    ) };
                     scratch.size_ += detail::container_size( container );
                     scratch.chunks_.push_back( left_key, std::move( container ) );
                     ++left;
@@ -1597,12 +1633,12 @@ public:
                         }
                         merged.push_back( left_key, std::move( container ) );
                     } else {
-                        detail::union_array_array_to_vector<layout_type>(
+                        auto container{ make_array_union_container_reusing(
+                            merged,
                             std::as_const( left_container ).as_array(),
                             right_container.as_array(),
                             array_union_scratch
-                        );
-                        auto container{ make_fast_container_from_scratch_reusing( merged, array_union_scratch ) };
+                        ) };
                         if ( !lazy ) {
                             size_ += detail::container_size( container );
                         }
@@ -1791,6 +1827,12 @@ public:
         if ( in_place ) { size_ = 0; }
         auto & result_size { in_place ? size_    : out->size_    };
         auto & result_chunks{ in_place ? chunks_ : out->chunks_ };
+        if ( !in_place ) {
+            // One slot per possible match (chunk keys are unique on both sides): result
+            // containers are built in their destination slots (chunk_store::open_back),
+            // which must not relocate.
+            result_chunks.reserve( std::min( chunks_.size(), other.chunks_.size() ) );
+        }
         // Store a finished result container for the current left_key. In-place mode
         // rewrites the already-consumed prefix of our own chunk table; materializing
         // mode appends to the (pre-reserved) destination.
@@ -1810,6 +1852,51 @@ public:
             } else {
                 result_chunks.push_back( key, std::move( container ) );
             }
+        } };
+        // A result container an arm fills itself (rather than receiving one by
+        // value from a helper) is built where it can stay. Materializing mode builds
+        // it in the destination's next slot — intersect_into reserved one per
+        // possible match — and commits it where it lies. In-place mode cannot: its
+        // destination slot may be the very operand the kernel is reading, so it
+        // builds in `staged` and emit() moves the finished result into the
+        // rewritten prefix. An opened slot stays put until committed, since nothing
+        // appends to the destination's live table in between (retire() and
+        // demote_sparse_bitset() push only to its retired table). `staged` owns no
+        // payload while no result is open, so it is bare storage: each opened result
+        // constructs a handle in it, and none is ever destroyed there (a committed
+        // result is moved out and an abandoned one emptied), which keeps a handle
+        // construction and destruction off every call that opens no result.
+        union staged_storage {
+            handle_type handle;
+            staged_storage() noexcept {}
+            ~staged_storage() {}
+        } staged;
+        // Owns the result under construction until commit_result() hands it on.
+        // Leaving scope uncommitted (an empty result, or a kernel whose payload
+        // growth threw) empties it, so no payload is left in a slot past the
+        // destination's size, nor in `staged`.
+        struct result_under_construction {
+            handle_type * handle;
+            explicit result_under_construction( handle_type & result ) noexcept : handle{ &result } {}
+            result_under_construction( result_under_construction const & ) = delete;
+            ~result_under_construction() noexcept {
+                if ( handle != nullptr ) { *handle = handle_type{}; }
+            }
+        };
+        auto const open_result{ [&]( detail::container_kind const kind ) {
+            return result_under_construction{ result_chunks.take_retired_into( in_place ? &staged.handle : result_chunks.open_back(), kind ) };
+        } };
+        auto const commit_result{ [&]( auto const key, result_under_construction & result, size_type const count ) {
+            if ( in_place ) {
+                emit( key, std::move( *result.handle ), count );
+            } else {
+#if FRSR_ROARING_COMBINE_STATS
+                detail::combine_stats().record_result( *result.handle );
+#endif
+                result_size += count;
+                result_chunks.commit_back( key );
+            }
+            result.handle = nullptr;
         } };
 
         while ( left != chunks_.size() ) {
@@ -1882,8 +1969,8 @@ public:
                     // std::as_const avoids an unneeded write-barrier clone under a
                     // refcounted CowPolicy. Seeding from a retired scratch slot makes
                     // the inline write land in a reused payload (scratch-reuse path).
-                    handle_type result_handle{ result_chunks.take_retired( detail::container_kind::array ) };
-                    auto result_array{ result_handle.as_array() };
+                    auto result{ open_result( detail::container_kind::array ) };
+                    auto result_array{ result.handle->as_array() };
                     detail::combine_array_array_into<layout_type>(
                         std::as_const( left_container ).as_array(),
                         right_container.as_array(),
@@ -1893,7 +1980,7 @@ public:
                     if ( !result_array.values.empty() ) {
                         result_array.sync_header();
                         auto const count{ static_cast<size_type>( result_array.values.size() ) };
-                        emit( left_key, std::move( result_handle ), count );
+                        commit_result( left_key, result, count );
                     }
                 } else if ( mutate_left ) {
                     detail::difference_array_array_inplace<layout_type>( left_container.as_array(), right_container.as_array() );
@@ -1904,8 +1991,8 @@ public:
                 } else {
                     // array \ array with a shared left payload: write the survivors into
                     // a fresh handle (what difference_into does for every pair).
-                    handle_type result_handle{ result_chunks.take_retired( detail::container_kind::array ) };
-                    auto result_array{ result_handle.as_array() };
+                    auto result{ open_result( detail::container_kind::array ) };
+                    auto result_array{ result.handle->as_array() };
                     detail::difference_array_array_to_vector<layout_type>(
                         std::as_const( left_container ).as_array(),
                         right_container.as_array(),
@@ -1914,7 +2001,7 @@ public:
                     if ( !result_array.values.empty() ) {
                         result_array.sync_header();
                         auto const count{ static_cast<size_type>( result_array.values.size() ) };
-                        emit( left_key, std::move( result_handle ), count );
+                        commit_result( left_key, result, count );
                     }
                 }
                 ++left;
@@ -1967,10 +2054,16 @@ public:
                 // bitset∩bitset arm above defers). Mirrors that arm's slot handling;
                 // only the kernel (and the filter polarity, keyed off op) differs.
                 // (Materializing mode must not mutate *this — it takes the generic arm.)
-                auto left_array{ left_container.as_array() };
+                // mutate_left has already established sole ownership, so the payload
+                // is written without a second write-barrier test; and a filter that
+                // drops nothing leaves the same set, whose header is still exact.
+                auto left_array{ detail::as_array_already_private( left_container ) };
+                auto const unfiltered_count{ left_array.values.size() };
                 detail::filter_array_bitset_inplace<layout_type>( left_array, right_container.as_bitset(), op == detail::set_operation::bit_and );
                 if ( !left_array.values.empty() ) {
-                    left_array.sync_header();
+                    if ( left_array.values.size() != unfiltered_count ) {
+                        left_array.sync_header();
+                    }
                     size_ += left_array.values.size();
                     chunks_.move_entry_retiring( write, left );
                     ++write;
@@ -2024,8 +2117,8 @@ public:
                     ++left;
                     continue;
                 }
-                handle_type result_handle{ result_chunks.take_retired( detail::container_kind::array ) };
-                auto result_array{ result_handle.as_array() };
+                auto result{ open_result( detail::container_kind::array ) };
+                auto result_array{ result.handle->as_array() };
                 detail::filter_array_bitset_into<layout_type>(
                     array_side.as_array(),
                     bitset_side.as_bitset(),
@@ -2035,7 +2128,7 @@ public:
                 if ( !result_array.values.empty() ) {
                     result_array.sync_header();
                     auto const count{ static_cast<size_type>( result_array.values.size() ) };
-                    emit( left_key, std::move( result_handle ), count );
+                    commit_result( left_key, result, count );
                 }
                 ++left;
                 continue;
@@ -2071,13 +2164,13 @@ public:
                         }
                         return;
                     }
-                    handle_type result_handle{ result_chunks.take_retired( detail::container_kind::array ) };
-                    auto result_array{ result_handle.as_array() };
+                    auto result{ open_result( detail::container_kind::array ) };
+                    auto result_array{ result.handle->as_array() };
                     detail::filter_array_run_into<layout_type>( array_side.as_array(), run_side.as_run(), result_array.values );
                     if ( !result_array.values.empty() ) {
                         result_array.sync_header();
                         auto const count{ static_cast<size_type>( result_array.values.size() ) };
-                        emit( left_key, std::move( result_handle ), count );
+                        commit_result( left_key, result, count );
                     }
                 }();
                 ++left;
@@ -2102,11 +2195,14 @@ public:
                     // production fold's sparse shapes (HW-counter A/B vs a downstream
                     // engine's sparse run∩bitset kernel, which croaring-arm ran here).
                     auto const run_cardinality{ detail::container_size( run_side ) };
-                    if ( run_cardinality >= layout_type::low_domain_size - layout_type::low_domain_size / 8U ) {
-                        // Near-full runs (≥ 7/8 of the domain, incl. the full-domain
+                    if ( run_cardinality >= layout_type::low_domain_size / 2U ) {
+                        // Runs covering at least half the domain (incl. the full-domain
                         // run — CRoaring's run_container_is_full short-circuit): clone
                         // the bitset payload and clear only the gaps, with the
-                        // cardinality maintained by subtraction — cheaper than masking
+                        // cardinality maintained by subtraction. The masked fill below
+                        // costs per covered word, this form per gap word plus one 8 KB
+                        // copy; measured on 64 runs the two tie at half coverage and
+                        // this form wins 40 % at three quarters — cheaper than masking
                         // all 8 KB through the fill kernel below.
                         auto container{ detail::intersect_run_bitset_dense_runs<layout_type, CowPolicy>(
                             std::as_const( run_side ).as_run(),
@@ -2131,6 +2227,29 @@ public:
                         ) };
                         if ( auto const array_size{ detail::container_size( container ) }; array_size != 0 ) {
                             emit( left_key, std::move( container ), array_size );
+                        }
+                        return;
+                    }
+                    // Many runs covering 3/16 to 7/16 of the domain: clone, clear the gaps
+                    // and recount once. The masked fill below grows with the covered words
+                    // (a mask setup, a store and a popcount each, per run); this form costs
+                    // a block copy, the gap stores and one vector recount, flat across that
+                    // range. Below it the fill's covered words cost less than the copy and
+                    // recount, and on 64 runs the per-gap clears of this form lose from 7/16
+                    // on; from half coverage the subtracting clone above serves.
+                    if ( std::as_const( run_side ).as_run().runs.size() > 32U &&
+                         run_cardinality >= layout_type::low_domain_size * 3U / 16U &&
+                         run_cardinality <  layout_type::low_domain_size * 7U / 16U ) {
+                        auto container{ detail::intersect_run_bitset_clone_and_recount<layout_type, CowPolicy>(
+                            std::as_const( run_side ).as_run(),
+                            std::as_const( bitset_side ).as_bitset(),
+                            result_chunks.take_retired( detail::container_kind::bitset )
+                        ) };
+                        if constexpr ( !uses_default_container_set ) {
+                            container = optimize_container_for_policy( std::move( container ) );
+                        }
+                        if ( auto const bitset_size{ detail::container_size( container ) }; bitset_size != 0 ) {
+                            emit( left_key, std::move( container ), bitset_size );
                         }
                         return;
                     }
@@ -2247,19 +2366,12 @@ public:
                 ++pos2;
                 continue;
             }
-            // array∪array: merge in place only while the accumulator stays SMALL.
-            // Past kLazyUnionArrayLowerBound the pair falls through to the mixed arm
-            // below, which promotes the accumulator to a bitset once and then scatters
-            // every later operand into it in O(|operand|) — CRoaring's lazy-union form
-            // rule. Merging arrays unconditionally (as this arm used to) rewrites the
-            // whole accumulator on EVERY fold, i.e. O(K·n) per chunk across a K-way
-            // union; that dominated the union phase of the lazy-union-fold benchmark
-            // at accumulator cardinalities above the bound (~2.6x CRoaring at 2048).
-            // The finishers still re-decide the final form.
+            // A small array pair merges in place (lazy_union_array_bound, tuning.hpp:
+            // the reference converts unconditionally; the bound is where that
+            // measurably loses).
             if ( left_container.holds_array() && right_container.holds_array() &&
-                 ( static_cast<std::size_t>( left_container.count() ) + right_container.count() ) <= detail::kLazyUnionArrayLowerBound ) {
+                 ( static_cast<std::size_t>( left_container.count() ) + right_container.count() ) <= detail::lazy_union_array_bound ) {
                 detail::union_array_array_inplace<layout_type>( left_container.as_array(), right_container.as_array() );
-                left_container = make_fast_container( std::move( left_container ) );
                 ++pos1;
                 ++pos2;
                 continue;
@@ -2273,8 +2385,13 @@ public:
                 ++pos2;
                 continue;
             }
-            // Mixed array↔bitset: promote the accumulator to a bitset, OR the operand into
-            // its existing block in place (CRoaring LAZY_OR_BITSET_CONVERSION).
+            // Array/bitset pairs: the accumulator becomes a bitset on its first
+            // same-key fold, whatever its size, and every operand is then OR'd into
+            // that block in place. That is the reference's in-place lazy union with
+            // bitsetconversion (LAZY_OR_BITSET_CONVERSION is true): an array-merge
+            // arm that kept small accumulators as arrays rewrote the whole
+            // accumulator on every fold — O(K·n) per chunk — and measured 2.4x the
+            // reference on a 16-way union of 32-element operands.
             {
                 auto const left_is_bitset { left_container.holds_bitset()  };
                 auto const left_is_array  { left_container.holds_array()   };
@@ -3136,6 +3253,31 @@ private:
         return dst;
     }
 
+    // array ∪ array as a result container, decided on the operands' total the way
+    // the reference decides it: a total below the bitset threshold bounds the
+    // result below it too, so the union is merged straight into a retired (or
+    // fresh) array payload — the kernel sizes that payload for its own worst case,
+    // store slack included. A larger total is merged into `scratch`, whose exact
+    // size then picks array or bitset. A retired payload is only ever a sole-owned
+    // one, so it never aliases an operand the kernel is still reading.
+    // [croaring-ref] deps/croaring/src/containers/mixed_union.c:array_array_container_union
+    [[nodiscard]] static handle_type make_array_union_container_reusing(
+        detail::chunk_store<layout_type, CowPolicy> & store,
+        detail::array_cref<layout_type, CowPolicy> const lhs,
+        detail::array_cref<layout_type, CowPolicy> const rhs,
+        detail::small_array_values<low_type> & scratch
+    ) {
+        if ( lhs.values.size() + rhs.values.size() < array_to_bitset_threshold ) {
+            handle_type result_handle{ store.take_retired( detail::container_kind::array ) };
+            auto result_array{ result_handle.as_array() };
+            detail::union_array_array_to_vector<layout_type>( lhs, rhs, result_array.values );
+            result_array.sync_header();
+            return result_handle;
+        }
+        detail::union_array_array_to_vector<layout_type>( lhs, rhs, scratch );
+        return make_fast_container_from_scratch_reusing( store, scratch );
+    }
+
     // ForcedRunSelectionPolicy defaults to the bitmap's own ambient RunSelectionPolicy
     // (used by every ordinary insert/merge call site below) but can be overridden
     // explicitly — the public, caller-requested optimize()/optimize_for_storage()
@@ -3557,6 +3699,7 @@ private:
                 if ( ctx != nullptr ) {
                     ctx->chunk = chunk;
                     ctx->index = invalid_index;
+                    ctx->slot  = nullptr;
                     ctx->payload_private = false;
                 }
                 return true;
@@ -3657,6 +3800,8 @@ private:
         if ( ctx != nullptr ) {
             ctx->chunk = chunk;
             ctx->index = pos;
+            ctx->slot  = &chunks_.slot( pos );
+            ctx->generation = chunks_.generation();
             // The add below makes this payload private (or already found it so),
             // and no copy can intervene before the next call on this context.
             ctx->payload_private = true;
@@ -3683,17 +3828,22 @@ private:
         return true;
     }
 
-    void promote_if_needed( handle_type & slot ) {
-        if ( slot.holds_array() && slot.count() >= array_to_bitset_threshold ) {
-            if constexpr ( supports_bitset_container ) {
-                // [croaring-ref] deps/croaring/include/roaring/roaring.h: array→bitset promotion concept
-                // std::as_const avoids an unneeded write-barrier clone under a
-                // refcounted CowPolicy: slot is about to be wholly replaced below.
-                auto const values{ std::as_const( slot ).as_array().values };
-                slot = detail::bitset_handle_from_sorted_values<layout_type, CowPolicy>( { values.data(), values.size() } );
-            } else {
-                slot = optimize_container_for_policy( std::move( slot ) );
-            }
+    // The threshold test is the inline part (two loads on the handle line the
+    // add just touched); the conversion itself is one cold call per 4096 adds.
+    [[gnu::always_inline]] void promote_if_needed( handle_type & slot ) {
+        if ( slot.holds_array() && slot.count() >= array_to_bitset_threshold ) [[unlikely]] {
+            promote_array( slot );
+        }
+    }
+    [[gnu::cold, gnu::noinline]] void promote_array( handle_type & slot ) {
+        if constexpr ( supports_bitset_container ) {
+            // [croaring-ref] deps/croaring/include/roaring/roaring.h: array→bitset promotion concept
+            // std::as_const avoids an unneeded write-barrier clone under a
+            // refcounted CowPolicy: slot is about to be wholly replaced below.
+            auto const values{ std::as_const( slot ).as_array().values };
+            slot = detail::bitset_handle_from_sorted_values<layout_type, CowPolicy>( { values.data(), values.size() } );
+        } else {
+            slot = optimize_container_for_policy( std::move( slot ) );
         }
     }
 
