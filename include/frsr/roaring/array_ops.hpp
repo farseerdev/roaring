@@ -746,10 +746,10 @@ inline __m512i bitonic_cx16( __m512i const v, __m512i const t, __mmask32 const h
 // Sort a bitonic 32-lane sequence ascending; every distance has a cheap in-lane shuffle.
 FRSR_ROARING_X86_V4_HELPER
 inline __m512i bitonic_sort32( __m512i v ) noexcept {
-    v = bitonic_cx16( v, _mm512_shuffle_i64x2( v, v, 0x4E ), 0xFFFF0000U ); // d=16
-    v = bitonic_cx16( v, _mm512_shuffle_i64x2( v, v, 0xB1 ), 0xFF00FF00U ); // d=8
-    v = bitonic_cx16( v, _mm512_shuffle_epi32( v, 0x4E ),    0xF0F0F0F0U ); // d=4
-    v = bitonic_cx16( v, _mm512_shuffle_epi32( v, 0xB1 ),    0xCCCCCCCCU ); // d=2
+    v = bitonic_cx16( v, _mm512_shuffle_i64x2( v, v, static_cast<_MM_PERM_ENUM>( 0x4E ) ), 0xFFFF0000U ); // d=16
+    v = bitonic_cx16( v, _mm512_shuffle_i64x2( v, v, static_cast<_MM_PERM_ENUM>( 0xB1 ) ), 0xFF00FF00U ); // d=8
+    v = bitonic_cx16( v, _mm512_shuffle_epi32( v, static_cast<_MM_PERM_ENUM>( 0x4E ) ),    0xF0F0F0F0U ); // d=4
+    v = bitonic_cx16( v, _mm512_shuffle_epi32( v, static_cast<_MM_PERM_ENUM>( 0xB1 ) ),    0xCCCCCCCCU ); // d=2
     v = bitonic_cx16( v, _mm512_rol_epi32( v, 16 ),          0xAAAAAAAAU ); // d=1
     return v;
 }
