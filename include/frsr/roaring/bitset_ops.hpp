@@ -776,17 +776,17 @@ template <typename Layout, set_operation Op>
         carry_save_add( foursB,   twos,   twos,   twosA,   twosB   );
         carry_save_add( eightsB,  fours,  fours,  foursA,  foursB  );
         carry_save_add( sixteens, eights, eights, eightsA, eightsB );
-        total += __builtin_elementwise_popcount( sixteens );
+        total += vector_popcount( sixteens );
     }
     total <<= 4;
-    total += __builtin_elementwise_popcount( eights ) << 3;
-    total += __builtin_elementwise_popcount( fours  ) << 2;
-    total += __builtin_elementwise_popcount( twos   ) << 1;
-    total += __builtin_elementwise_popcount( ones   );
+    total += vector_popcount( eights ) << 3;
+    total += vector_popcount( fours  ) << 2;
+    total += vector_popcount( twos   ) << 1;
+    total += vector_popcount( ones   );
     for ( ; i < regs; ++i ) {
-        total += __builtin_elementwise_popcount( combine( i ) );
+        total += vector_popcount( combine( i ) );
     }
-    std::size_t cardinality{ static_cast<std::size_t>( __builtin_reduce_add( total ) ) };
+    std::size_t cardinality{ static_cast<std::size_t>( vector_reduce_add( total ) ) };
     // Scalar tail for layouts whose word_count is not a multiple of the register width.
     for ( std::size_t w{ regs * lanes }; w < n; ++w ) {
         std::uint64_t const r{ apply_bitwise_op<Op>( lhs_words[ w ], rhs_words[ w ] ) };

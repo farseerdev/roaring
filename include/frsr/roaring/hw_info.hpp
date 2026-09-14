@@ -53,6 +53,36 @@ typedef std::uint64_t bitset_word_tile
 typedef std::uint64_t bitset_reg
     __attribute__(( vector_size( hw_info::simd_register_bytes ), aligned( 1 ), may_alias ));
 
+// A lane-wise population count and a horizontal add over a gnu vector. Clang has
+// both as builtins; GCC has neither, so the operations are named once here and
+// written out where the builtin is missing. The Harley-Seal count below is their
+// only caller, and it counts uint64 lanes.
+template <typename V>
+[[nodiscard]] inline V vector_popcount( V const v ) noexcept {
+#if defined( __has_builtin ) && __has_builtin( __builtin_elementwise_popcount )
+    return __builtin_elementwise_popcount( v );
+#else
+    V x{ v };
+    x = x - ( ( x >> 1 ) & 0x5555'5555'5555'5555ULL );
+    x = ( x & 0x3333'3333'3333'3333ULL ) + ( ( x >> 2 ) & 0x3333'3333'3333'3333ULL );
+    x = ( x + ( x >> 4 ) ) & 0x0F0F'0F0F'0F0F'0F0FULL;
+    return ( x * 0x0101'0101'0101'0101ULL ) >> 56;
+#endif
+}
+
+template <typename V>
+[[nodiscard]] inline std::uint64_t vector_reduce_add( V const v ) noexcept {
+#if defined( __has_builtin ) && __has_builtin( __builtin_reduce_add )
+    return static_cast<std::uint64_t>( __builtin_reduce_add( v ) );
+#else
+    std::uint64_t sum{ 0 };
+    for ( std::size_t lane{ 0 }; lane < sizeof( V ) / sizeof( std::uint64_t ); ++lane ) {
+        sum += static_cast<std::uint64_t>( v[ lane ] );
+    }
+    return sum;
+#endif
+}
+
 // Carry-save adder over one SIMD register: a full-adder on bit-vectors. Given a, b, c
 // each contributing 0/1 per bit position, writes the weight-2 part to h and the
 // weight-1 part to l. The kernel of the Harley-Seal population count.
