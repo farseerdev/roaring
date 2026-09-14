@@ -3704,7 +3704,7 @@ template <class Arm>
 struct CppBandState {
     std::vector<roaring_bitmap_t *> sources;
     std::vector<roaring_bitmap_t *> probes;
-    roaring_bitmap_t *              target{ nullptr };   // LazyFoldOnly only: the pre-accumulated union
+    roaring_bitmap_t *              target{ nullptr };   // the pre-built right-hand side: AndSmallVsBand's band container, LazyFoldOnly's accumulated union
     ~CppBandState() {
         for (auto *b : sources) { roaring_bitmap_free(b); }
         for (auto *b : probes ) { roaring_bitmap_free(b); }
@@ -3742,6 +3742,53 @@ static void fill_cpp_band_probes(CppBandState<Arm> &s, std::size_t band) {
         }
     }
 }
+
+// CRoaring counterpart of the form-cost band. Only one form per band exists
+// here: the frsr side forces array-vs-bitset through a call CRoaring's public
+// API has no equivalent of, so the reference arm can only ever hold the form
+// CRoaring picks for itself around its 4096-element array limit.
+template <class Arm>
+struct register_cpp_and_small_vs_band_registrar {
+    static void run(std::size_t band, bool as_bitset) {
+    using namespace band_fold;
+    Entry e;
+    char buf[128];
+    snprintf(buf, sizeof(buf), "set_ops/%sAndSmallVsBand/band=%zu/form=%s", Arm::label(),
+             band, as_bitset ? "bitset" : "array");
+    e.name        = buf;
+    e.description = std::string("CRoaring small-array ∩ cardinality-") + std::to_string(band) +
+                    " container, which CRoaring holds as " + (as_bitset ? "a bitset" : "an array") +
+                    " of its own accord at this cardinality.";
+    e.setup       = [band]() -> void * {
+        auto *s   = new CppBandState<Arm>;
+        s->target = Arm::create();
+        for (std::size_t c = 0; c < kChunks; ++c) {
+            for (std::size_t i = 0; i < band; ++i) {
+                roaring_bitmap_add(s->target, band_value(c, band, i));
+            }
+        }
+        fill_cpp_band_probes(*s, band);
+        return s;
+    };
+    e.run         = [](void *sv) -> int64_t {
+        auto *s = static_cast<CppBandState<Arm> *>(sv);
+        int64_t checksum = 0;
+        for (std::size_t p = 0; p < kProbes; ++p) {
+            auto *probe = Arm::copy(s->probes[p]);
+            roaring_bitmap_and_inplace(probe, s->target);
+            checksum += static_cast<int64_t>(roaring_bitmap_get_cardinality(probe));
+            roaring_bitmap_free(probe);
+        }
+        return checksum;
+    };
+    e.teardown       = [](void *sv) { delete static_cast<CppBandState<Arm> *>(sv); };
+    e.ops_per_run    = static_cast<int64_t>(kProbes * kChunks);
+    e.inner_reps     = kInnerReps;
+    e.reusable_state = true;
+    g_benchmarks.push_back(std::move(e));
+}};
+template <class Arm> static void register_cpp_and_small_vs_band(std::size_t band, bool as_bitset) { register_cpp_and_small_vs_band_registrar<Arm>::run(band, as_bitset); }
+
 
 // CRoaring counterpart. Note the finish differs by necessity:
 // roaring_bitmap_repair_after_lazy() down-converts any bitset at or below
@@ -3870,6 +3917,57 @@ struct register_cpp_lazy_fold_only_registrar {
     g_benchmarks.push_back(std::move(e));
 }};
 template <class Arm> static void register_cpp_lazy_fold_only(std::size_t band) { register_cpp_lazy_fold_only_registrar<Arm>::run(band); }
+
+// CRoaring counterpart of the index-build finish. roaring_bitmap_run_optimize()
+// stands in for frsr's optimize(): both re-decide the container encoding once
+// the union is complete. `keep_bitsets` only names the cell — CRoaring has a
+// single finish, and repair_after_lazy() has already demoted whatever it is
+// going to demote before run_optimize() ever sees the accumulator.
+template <class Arm>
+struct register_cpp_lazy_union_fold_optimize_registrar {
+    static void run(std::size_t band, bool keep_bitsets) {
+    using namespace band_fold;
+    Entry e;
+    char buf[128];
+    snprintf(buf, sizeof(buf), "set_ops/%sLazyUnionFoldOptimize/band=%zu/finish=%s", Arm::label(),
+             band, keep_bitsets ? "keep_bitsets" : "optimize");
+    e.name        = buf;
+    e.description = "CRoaring lazy K-way union accumulate (roaring_bitmap_lazy_or_inplace + "
+                    "roaring_bitmap_repair_after_lazy) finished through roaring_bitmap_run_optimize(), "
+                    "then AND-fold of " + std::to_string(kProbes) +
+                    " small operands, per-chunk union cardinality ~" + std::to_string(band) +
+                    " — the index-build finish path.";
+    e.setup       = [band]() -> void * {
+        auto *s = new CppBandState<Arm>;
+        fill_cpp_band_sources(*s, band);
+        fill_cpp_band_probes (*s, band);
+        return s;
+    };
+    e.run         = [](void *sv) -> int64_t {
+        auto *s   = static_cast<CppBandState<Arm> *>(sv);
+        auto *acc = Arm::create();
+        for (auto *src : s->sources) {
+            roaring_bitmap_lazy_or_inplace(acc, src, true /* bitset conversion */);
+        }
+        roaring_bitmap_repair_after_lazy(acc);
+        std::ignore = roaring_bitmap_run_optimize(acc);
+        int64_t checksum = static_cast<int64_t>(roaring_bitmap_get_cardinality(acc));
+        for (std::size_t p = 0; p < kProbes; ++p) {
+            auto *probe = Arm::copy(s->probes[p]);
+            roaring_bitmap_and_inplace(probe, acc);
+            checksum += static_cast<int64_t>(roaring_bitmap_get_cardinality(probe));
+            roaring_bitmap_free(probe);
+        }
+        roaring_bitmap_free(acc);
+        return checksum;
+    };
+    e.teardown       = [](void *sv) { delete static_cast<CppBandState<Arm> *>(sv); };
+    e.ops_per_run    = static_cast<int64_t>((kOperands + kProbes) * kChunks);
+    e.inner_reps     = kInnerReps;
+    e.reusable_state = true;
+    g_benchmarks.push_back(std::move(e));
+}};
+template <class Arm> static void register_cpp_lazy_union_fold_optimize(std::size_t band, bool keep_bitsets) { register_cpp_lazy_union_fold_optimize_registrar<Arm>::run(band, keep_bitsets); }
 
 #endif // FRSR_ROARING_HAS_CROARING
 
@@ -6511,9 +6609,25 @@ void register_benchmarks() {
         arms::for_each_frsr<register_frsr_lazy_union_fold_optimized_registrar>(band, /*keep_bitsets=*/true );
 #if FRSR_ROARING_HAS_CROARING
 #if FRSR_ROARING_HAS_CROARING
+        // CRoaring converts an array container to a bitset above this many
+        // elements and converts it back below, so its container form follows
+        // the band rather than a caller's request.
+        constexpr std::size_t kCroaringArrayLimit{ 4096 };
+        // Hence only the form CRoaring chooses here has a reference arm; the
+        // opposite form (a bitset at 512 or 2048, an array at 8192) cannot be
+        // built through its public API and stays unscoreable.
+        arms::for_each_croaring<register_cpp_and_small_vs_band_registrar>(band, /*as_bitset=*/band > kCroaringArrayLimit);
         arms::for_each_croaring<register_cpp_lazy_union_fold_registrar>(band);
         arms::for_each_croaring<register_cpp_lazy_union_accum_registrar>(band);
         arms::for_each_croaring<register_cpp_lazy_fold_only_registrar>(band);
+        arms::for_each_croaring<register_cpp_lazy_union_fold_optimize_registrar>(band, /*keep_bitsets=*/false);
+        // repair_after_lazy() demotes every bitset at or below that same limit,
+        // so the kept-bitsets state is unreachable at 512 and 2048 and those two
+        // cells stay unscoreable; at 8192 nothing is demoted and CRoaring's one
+        // finish is the reference for both names.
+        if (band > kCroaringArrayLimit) {
+            arms::for_each_croaring<register_cpp_lazy_union_fold_optimize_registrar>(band, /*keep_bitsets=*/true );
+        }
 #endif
 #endif
     }
