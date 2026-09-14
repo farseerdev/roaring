@@ -162,7 +162,14 @@ public:
     static constexpr std::uint32_t inline_capacity{
         FRSR_ROARING_NO_SBO ? 0U : static_cast<std::uint32_t>( body_size / sizeof( E ) ) };
 
-    constexpr container_handle() noexcept = default;   // empty inline array
+    // Empty inline array. The fields are initialized here rather than by default
+    // member initializers: the copy and move constructors take every byte from
+    // their source, and member initializers would first store zeros they then
+    // overwrite — stores the compiler cannot drop, because the source might alias
+    // the object under construction.
+    constexpr container_handle() noexcept
+        : count_{ 0 }, cardinality_{ 0 }, min_{ 0 }, max_{ 0 },
+          kind_{ container_kind::array }, owner_{ storage_ownership::unique }, flags_{ 0 }, reserved_{ 0 } {}
 
     container_handle( container_handle const & other ) { clone_from( other ); }
 
@@ -783,14 +790,14 @@ private:
     friend class bitset_cref<Layout, CowPolicy>;
 
 private:
-    std::uint32_t             count_      { 0 };
-    std::uint32_t             cardinality_{ 0 };
-    mutable low_type          min_        { 0 };
-    mutable low_type          max_        { 0 };
-    container_kind            kind_       { container_kind::array };
-    storage_ownership         owner_      { storage_ownership::unique };
-    mutable std::uint8_t      flags_      { 0 };
-    std::uint8_t              reserved_   { 0 };
+    std::uint32_t             count_;
+    std::uint32_t             cardinality_;
+    mutable low_type          min_;
+    mutable low_type          max_;
+    container_kind            kind_;
+    storage_ownership         owner_;
+    mutable std::uint8_t      flags_;
+    std::uint8_t              reserved_;
     alignas( 8 ) body_union_t body_;
 };
 

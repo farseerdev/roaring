@@ -1353,7 +1353,6 @@ public:
         const_cast<bitmap*>(&other)->ensure_sorted();
 
         scratch.clear_keep_capacity();
-        scratch.chunks_.reserve( std::min( chunks_.size(), other.chunks_.size() ) );
 
         // Materializing mode never mutates *this (the spine's in-place arms are
         // gated on out == nullptr), so the const_cast is only formal.
@@ -1828,6 +1827,12 @@ public:
         if ( in_place ) { size_ = 0; }
         auto & result_size { in_place ? size_    : out->size_    };
         auto & result_chunks{ in_place ? chunks_ : out->chunks_ };
+        if ( !in_place ) {
+            // One slot per possible match (chunk keys are unique on both sides): result
+            // containers are built in their destination slots (chunk_store::open_back),
+            // which must not relocate.
+            result_chunks.reserve( std::min( chunks_.size(), other.chunks_.size() ) );
+        }
         // Store a finished result container for the current left_key. In-place mode
         // rewrites the already-consumed prefix of our own chunk table; materializing
         // mode appends to the (pre-reserved) destination.
@@ -1847,6 +1852,51 @@ public:
             } else {
                 result_chunks.push_back( key, std::move( container ) );
             }
+        } };
+        // A result container an arm fills itself (rather than receiving one by
+        // value from a helper) is built where it can stay. Materializing mode builds
+        // it in the destination's next slot — intersect_into reserved one per
+        // possible match — and commits it where it lies. In-place mode cannot: its
+        // destination slot may be the very operand the kernel is reading, so it
+        // builds in `staged` and emit() moves the finished result into the
+        // rewritten prefix. An opened slot stays put until committed, since nothing
+        // appends to the destination's live table in between (retire() and
+        // demote_sparse_bitset() push only to its retired table). `staged` owns no
+        // payload while no result is open, so it is bare storage: each opened result
+        // constructs a handle in it, and none is ever destroyed there (a committed
+        // result is moved out and an abandoned one emptied), which keeps a handle
+        // construction and destruction off every call that opens no result.
+        union staged_storage {
+            handle_type handle;
+            staged_storage() noexcept {}
+            ~staged_storage() {}
+        } staged;
+        // Owns the result under construction until commit_result() hands it on.
+        // Leaving scope uncommitted (an empty result, or a kernel whose payload
+        // growth threw) empties it, so no payload is left in a slot past the
+        // destination's size, nor in `staged`.
+        struct result_under_construction {
+            handle_type * handle;
+            explicit result_under_construction( handle_type & result ) noexcept : handle{ &result } {}
+            result_under_construction( result_under_construction const & ) = delete;
+            ~result_under_construction() noexcept {
+                if ( handle != nullptr ) { *handle = handle_type{}; }
+            }
+        };
+        auto const open_result{ [&]( detail::container_kind const kind ) {
+            return result_under_construction{ result_chunks.take_retired_into( in_place ? &staged.handle : result_chunks.open_back(), kind ) };
+        } };
+        auto const commit_result{ [&]( auto const key, result_under_construction & result, size_type const count ) {
+            if ( in_place ) {
+                emit( key, std::move( *result.handle ), count );
+            } else {
+#if FRSR_ROARING_COMBINE_STATS
+                detail::combine_stats().record_result( *result.handle );
+#endif
+                result_size += count;
+                result_chunks.commit_back( key );
+            }
+            result.handle = nullptr;
         } };
 
         while ( left != chunks_.size() ) {
@@ -1919,8 +1969,8 @@ public:
                     // std::as_const avoids an unneeded write-barrier clone under a
                     // refcounted CowPolicy. Seeding from a retired scratch slot makes
                     // the inline write land in a reused payload (scratch-reuse path).
-                    handle_type result_handle{ result_chunks.take_retired( detail::container_kind::array ) };
-                    auto result_array{ result_handle.as_array() };
+                    auto result{ open_result( detail::container_kind::array ) };
+                    auto result_array{ result.handle->as_array() };
                     detail::combine_array_array_into<layout_type>(
                         std::as_const( left_container ).as_array(),
                         right_container.as_array(),
@@ -1930,7 +1980,7 @@ public:
                     if ( !result_array.values.empty() ) {
                         result_array.sync_header();
                         auto const count{ static_cast<size_type>( result_array.values.size() ) };
-                        emit( left_key, std::move( result_handle ), count );
+                        commit_result( left_key, result, count );
                     }
                 } else if ( mutate_left ) {
                     detail::difference_array_array_inplace<layout_type>( left_container.as_array(), right_container.as_array() );
@@ -1941,8 +1991,8 @@ public:
                 } else {
                     // array \ array with a shared left payload: write the survivors into
                     // a fresh handle (what difference_into does for every pair).
-                    handle_type result_handle{ result_chunks.take_retired( detail::container_kind::array ) };
-                    auto result_array{ result_handle.as_array() };
+                    auto result{ open_result( detail::container_kind::array ) };
+                    auto result_array{ result.handle->as_array() };
                     detail::difference_array_array_to_vector<layout_type>(
                         std::as_const( left_container ).as_array(),
                         right_container.as_array(),
@@ -1951,7 +2001,7 @@ public:
                     if ( !result_array.values.empty() ) {
                         result_array.sync_header();
                         auto const count{ static_cast<size_type>( result_array.values.size() ) };
-                        emit( left_key, std::move( result_handle ), count );
+                        commit_result( left_key, result, count );
                     }
                 }
                 ++left;
@@ -2067,8 +2117,8 @@ public:
                     ++left;
                     continue;
                 }
-                handle_type result_handle{ result_chunks.take_retired( detail::container_kind::array ) };
-                auto result_array{ result_handle.as_array() };
+                auto result{ open_result( detail::container_kind::array ) };
+                auto result_array{ result.handle->as_array() };
                 detail::filter_array_bitset_into<layout_type>(
                     array_side.as_array(),
                     bitset_side.as_bitset(),
@@ -2078,7 +2128,7 @@ public:
                 if ( !result_array.values.empty() ) {
                     result_array.sync_header();
                     auto const count{ static_cast<size_type>( result_array.values.size() ) };
-                    emit( left_key, std::move( result_handle ), count );
+                    commit_result( left_key, result, count );
                 }
                 ++left;
                 continue;
@@ -2114,13 +2164,13 @@ public:
                         }
                         return;
                     }
-                    handle_type result_handle{ result_chunks.take_retired( detail::container_kind::array ) };
-                    auto result_array{ result_handle.as_array() };
+                    auto result{ open_result( detail::container_kind::array ) };
+                    auto result_array{ result.handle->as_array() };
                     detail::filter_array_run_into<layout_type>( array_side.as_array(), run_side.as_run(), result_array.values );
                     if ( !result_array.values.empty() ) {
                         result_array.sync_header();
                         auto const count{ static_cast<size_type>( result_array.values.size() ) };
-                        emit( left_key, std::move( result_handle ), count );
+                        commit_result( left_key, result, count );
                     }
                 }();
                 ++left;

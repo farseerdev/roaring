@@ -4,9 +4,11 @@
 #include <frsr/roaring/containers.hpp>
 
 #include <algorithm>
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <new>
 #include <numeric>
 #include <span>
@@ -147,18 +149,47 @@ public:
     }
 
     [[nodiscard]] handle_type take_retired( container_kind const kind ) noexcept {
+        handle_type handle;
+        take_retired_into( &handle, kind );
+        return handle;
+    }
+
+    // take_retired( kind ) constructed straight into `destination`, which must be
+    // uninitialized storage or a handle that owns no payload: the handle is
+    // constructed over it without its destructor running.
+    handle_type & take_retired_into( handle_type * const destination, container_kind const kind ) noexcept {
         auto & cursor{ kind == container_kind::bitset ? retired_bitset_next_ : retired_array_next_ };
         auto * const retired{ retired_.slots() };
         while ( cursor < retired_.size_ ) {
             auto & candidate{ retired[ cursor++ ] };
             if ( candidate.offers_reusable_payload( kind ) ) {
-                auto handle{ std::move( candidate ) };
+                auto & handle{ *std::construct_at( destination, std::move( candidate ) ) };
                 if ( kind == container_kind::bitset ) { handle.reset_for_bitset_reuse(); }
                 else                                  { handle.reset_for_array_reuse (); }
                 return handle;
             }
         }
-        return {};
+        return *std::construct_at( destination );
+    }
+
+    // In-slot construction for a table filled by appends into capacity reserved
+    // beforehand (the destination of a materializing combine): open_back() yields
+    // the storage past the last entry, the caller constructs and fills a handle
+    // there (take_retired_into), and commit_back() makes it the last entry under
+    // `key` — a finished container is never moved into the table. Neither call
+    // relocates, so the opened handle stays put between the two as long as
+    // nothing else appends meanwhile, and generation() does not advance (as for a
+    // non-relocating push_back). The opened slot is not part of the table until
+    // committed: a caller that abandons it must leave it owning no payload.
+    [[nodiscard]] handle_type * open_back() noexcept {
+        assert( live_.size_ < live_.capacity_ && "open_back() needs reserved capacity" );
+        return live_.slots() + live_.size_;
+    }
+
+    void commit_back( chunk_type const key ) noexcept {
+        assert( live_.size_ < live_.capacity_ );
+        live_.keys()[ live_.size_ ] = key;
+        ++live_.size_;
     }
 
     // Parks a consumed handle's payload for take_retired() instead of freeing
