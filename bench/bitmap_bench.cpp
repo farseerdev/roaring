@@ -1811,19 +1811,29 @@ static void release_data() {
     g_data = nullptr;
 }
 
-using Pick = const std::vector<roaring_bitmap_t *> &(*)(Data *);
-
-// ported from deps/croaring/benchmarks/benchmark.cpp:4217-4225
-static const std::vector<roaring_bitmap_t *> &pick_low(Data *d) {
-    return d->low;
-}
-static const std::vector<roaring_bitmap_t *> &pick_mod(Data *d) {
-    return d->mod;
-}
-static const std::vector<roaring_bitmap_t *> &pick_high(Data *d) {
-    return d->high;
-}
 enum class Density { Low, Mod, High };
+
+// The CRoaring fixture for one density; the frsr arms clone from these same sets.
+// ported from deps/croaring/benchmarks/benchmark.cpp:4217-4225
+static const std::vector<roaring_bitmap_t *> &pick(Data *const d, Density const density) {
+    switch (density) {
+        case Density::Low: return d->low;
+        case Density::Mod: return d->mod;
+        default          : return d->high;
+    }
+}
+
+// Both CRoaring arms probe the one shared fixture. A membership query copies
+// nothing, so the arms differ only in the copy-on-write flag, which lives on the
+// bitmap and is stamped here, in untimed setup.
+template <class Arm>
+static void *stamped_data() {
+    auto *const d = get_data();
+    for (auto *const set : { &d->low, &d->mod, &d->high }) {
+        for (auto *const bm : *set) { roaring_bitmap_set_copy_on_write(bm, Arm::cow); }
+    }
+    return d;
+}
 
 // The frsr side of the shared dataset, one instance per arm, built lazily from
 // the same CRoaring source sets so every arm probes identical bitmaps and the
@@ -1857,7 +1867,7 @@ struct add_cold_frsr_registrar {
         Entry e;
         e.name = std::string("synthetic/") + Arm::label() + op;
         e.description =
-            std::string(Arm::label()) + " variant of ContainsCold at " + density_label +
+            std::string(Arm::label()) + " variant of the ContainsCold band at " + density_label +
             " density over identical pre-generated bitmaps and query stream.";
         e.setup = []() -> void * { return get_frsr_data<Arm>(); };
         e.run = [d](void *sv) -> int64_t {
@@ -1883,7 +1893,7 @@ struct add_warm_frsr_registrar {
         Entry e;
         e.name = std::string("synthetic/") + Arm::label() + op;
         e.description =
-            std::string(Arm::label()) + " variant of ContainsWarm at " + density_label +
+            std::string(Arm::label()) + " variant of the ContainsWarm band at " + density_label +
             " density over identical pre-generated bitmaps and query stream.";
         e.setup = []() -> void * { return get_frsr_data<Arm>(); };
         e.run = [d](void *sv) -> int64_t {
@@ -1907,74 +1917,80 @@ struct add_warm_frsr_registrar {
 };
 
 // ported from deps/croaring/benchmarks/benchmark.cpp:4227-4254
-static void add_cold(const char *name, const char *density_label, Pick pick) {
-    Entry e;
-    e.name = name;
-    e.description =
-        std::string("10,000 bitmaps over [0, 2^18) at ") + density_label +
-        " density (per-block cardinality drawn from Poisson(density*2^16), "
-        "values placed uniformly within each 2^16 block). Cold variant: "
-        "issues one uniformly-random membership query against each of the "
-        "10,000 bitmaps in turn, so every probe touches a fresh bitmap and "
-        "the previous one is evicted from cache before its next access. "
-        "Reported cost is per query.";
-    e.setup = []() -> void * { return get_data(); };
-    e.run = [pick](void *sv) -> int64_t {
-        auto *d = static_cast<Data *>(sv);
-        const auto &bms = pick(d);
-        int64_t marker = 0;
-        for (size_t i = 0; i < kSyntheticCount; ++i) {
-            marker += roaring_bitmap_contains(bms[i], d->cold_queries[i]);
-        }
-        return marker;
-    };
-    e.teardown = nullptr;
-    e.ops_per_run = static_cast<int64_t>(kSyntheticCount);
-    e.inner_reps = 1;
-    e.reusable_state = true;
-    g_benchmarks.push_back(std::move(e));
-}
+template <class Arm>
+struct add_cold_cpp_registrar {
+    static void run(const char *op, const char *density_label, Density const d) {
+        Entry e;
+        e.name = std::string("synthetic/") + Arm::label() + op;
+        e.description =
+            std::string(Arm::label()) + ": 10,000 bitmaps over [0, 2^18) at " + density_label +
+            " density (per-block cardinality drawn from Poisson(density*2^16), "
+            "values placed uniformly within each 2^16 block). Cold variant: "
+            "issues one uniformly-random membership query against each of the "
+            "10,000 bitmaps in turn, so every probe touches a fresh bitmap and "
+            "the previous one is evicted from cache before its next access. "
+            "Reported cost is per query.";
+        e.setup = []() -> void * { return stamped_data<Arm>(); };
+        e.run = [d](void *sv) -> int64_t {
+            auto *data = static_cast<Data *>(sv);
+            const auto &bms = pick(data, d);
+            int64_t marker = 0;
+            for (size_t i = 0; i < kSyntheticCount; ++i) {
+                marker += roaring_bitmap_contains(bms[i], data->cold_queries[i]);
+            }
+            return marker;
+        };
+        e.teardown = nullptr;
+        e.ops_per_run = static_cast<int64_t>(kSyntheticCount);
+        e.inner_reps = 1;
+        e.reusable_state = true;
+        g_benchmarks.push_back(std::move(e));
+    }
+};
 
 // ported from deps/croaring/benchmarks/benchmark.cpp:4256-4286
-static void add_warm(const char *name, const char *density_label, Pick pick) {
-    Entry e;
-    e.name = name;
-    e.description =
-        std::string("10,000 bitmaps over [0, 2^18) at ") + density_label +
-        " density (per-block cardinality drawn from Poisson(density*2^16), "
-        "values placed uniformly within each 2^16 block). Warm variant: "
-        "probes the first 10 bitmaps 1,000 random times each, so every "
-        "bitmap is fully cache-resident for all but the first probe. The "
-        "total probe count (10,000) matches the cold variant, so per-query "
-        "times are directly comparable.";
-    e.setup = []() -> void * { return get_data(); };
-    e.run = [pick](void *sv) -> int64_t {
-        auto *d = static_cast<Data *>(sv);
-        const auto &bms = pick(d);
-        int64_t marker = 0;
-        for (size_t i = 0; i < kWarmBitmaps; ++i) {
-            roaring_bitmap_t *b = bms[i];
-            for (size_t r = 0; r < kWarmRepeats; ++r) {
-                marker += roaring_bitmap_contains(b, d->warm_queries[r]);
+template <class Arm>
+struct add_warm_cpp_registrar {
+    static void run(const char *op, const char *density_label, Density const d) {
+        Entry e;
+        e.name = std::string("synthetic/") + Arm::label() + op;
+        e.description =
+            std::string(Arm::label()) + ": 10,000 bitmaps over [0, 2^18) at " + density_label +
+            " density (per-block cardinality drawn from Poisson(density*2^16), "
+            "values placed uniformly within each 2^16 block). Warm variant: "
+            "probes the first 10 bitmaps 1,000 random times each, so every "
+            "bitmap is fully cache-resident for all but the first probe. The "
+            "total probe count (10,000) matches the cold variant, so per-query "
+            "times are directly comparable.";
+        e.setup = []() -> void * { return stamped_data<Arm>(); };
+        e.run = [d](void *sv) -> int64_t {
+            auto *data = static_cast<Data *>(sv);
+            const auto &bms = pick(data, d);
+            int64_t marker = 0;
+            for (size_t i = 0; i < kWarmBitmaps; ++i) {
+                roaring_bitmap_t *b = bms[i];
+                for (size_t r = 0; r < kWarmRepeats; ++r) {
+                    marker += roaring_bitmap_contains(b, data->warm_queries[r]);
+                }
             }
-        }
-        return marker;
-    };
-    e.teardown = nullptr;
-    e.ops_per_run = static_cast<int64_t>(kWarmBitmaps * kWarmRepeats);
-    e.inner_reps = 1;
-    e.reusable_state = true;
-    g_benchmarks.push_back(std::move(e));
-}
+            return marker;
+        };
+        e.teardown = nullptr;
+        e.ops_per_run = static_cast<int64_t>(kWarmBitmaps * kWarmRepeats);
+        e.inner_reps = 1;
+        e.reusable_state = true;
+        g_benchmarks.push_back(std::move(e));
+    }
+};
 
 // ported from deps/croaring/benchmarks/benchmark.cpp:4288-4297
 static void register_benchmarks() {
-    add_cold("synthetic/ContainsColdLow", "low (0.001)", pick_low);
-    add_cold("synthetic/ContainsColdMod", "moderate (0.01)", pick_mod);
-    add_cold("synthetic/ContainsColdHigh", "high (0.1)", pick_high);
-    add_warm("synthetic/ContainsWarmLow", "low (0.001)", pick_low);
-    add_warm("synthetic/ContainsWarmMod", "moderate (0.01)", pick_mod);
-    add_warm("synthetic/ContainsWarmHigh", "high (0.1)", pick_high);
+    arms::for_each_croaring<add_cold_cpp_registrar>("ContainsColdLow", "low (0.001)", Density::Low);
+    arms::for_each_croaring<add_cold_cpp_registrar>("ContainsColdMod", "moderate (0.01)", Density::Mod);
+    arms::for_each_croaring<add_cold_cpp_registrar>("ContainsColdHigh", "high (0.1)", Density::High);
+    arms::for_each_croaring<add_warm_cpp_registrar>("ContainsWarmLow", "low (0.001)", Density::Low);
+    arms::for_each_croaring<add_warm_cpp_registrar>("ContainsWarmMod", "moderate (0.01)", Density::Mod);
+    arms::for_each_croaring<add_warm_cpp_registrar>("ContainsWarmHigh", "high (0.1)", Density::High);
     arms::for_each_frsr<add_cold_frsr_registrar>("ContainsColdLow", "low (0.001)", Density::Low);
     arms::for_each_frsr<add_cold_frsr_registrar>("ContainsColdMod", "moderate (0.01)", Density::Mod);
     arms::for_each_frsr<add_cold_frsr_registrar>("ContainsColdHigh", "high (0.1)", Density::High);
