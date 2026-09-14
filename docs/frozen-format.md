@@ -59,7 +59,8 @@ Concatenated after the index, each aligned with `align_up(offset, alignment)`:
 ## Validation performed by `frozen_view_from_vm_vector`
 
 Rejects (returns a null view) on: short buffer, magic / key_bits / version
-mismatch, unsorted or duplicate chunk keys, misaligned or out-of-bounds
+mismatch, unsorted or duplicate chunk keys, chunk keys wider than the reading
+bitmap's chunk key type, misaligned or out-of-bounds
 payload offsets, payload_bytes not matching the kind-derived size, and
 Σ cardinality ≠ header value_count.
 

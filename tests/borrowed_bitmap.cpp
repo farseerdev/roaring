@@ -148,6 +148,25 @@ TEST(FrsrRoaringBorrow, WrongFormatVersionIsRejected) {
     EXPECT_FALSE( static_cast<bool>( TestBitmap::frozen_view_from_vm_vector( buffer ) ) );
 }
 
+TEST(FrsrRoaringBorrow, ChunkKeyWiderThanTheChunkKeyTypeIsRejected) {
+    auto const source{ make_mixed_container_bitmap() };   // chunk keys 0, 1, 2 and 3
+
+    TestBitmap::serialized_byte_vector buffer;
+    source.serialize_frozen_to_vm_vector( buffer );
+    ASSERT_TRUE( static_cast<bool>( TestBitmap::frozen_view_from_vm_vector( buffer ) ) );
+
+    // The index follows the 24-byte header, 32 bytes per entry, each starting with its u64 chunk key
+    // (docs/frozen-format.md). A key that still sorts after its predecessor but does not fit the 16-bit
+    // chunk key would alias chunk 0 once narrowed.
+    std::size_t const last_entry{ 24U + 3U * 32U };
+    std::uint64_t key{};
+    std::memcpy( &key, buffer.data() + last_entry, sizeof( key ) );
+    ASSERT_EQ( key, 3U );
+    key = 0x1'0000U;
+    std::memcpy( buffer.data() + last_entry, &key, sizeof( key ) );
+    EXPECT_FALSE( static_cast<bool>( TestBitmap::frozen_view_from_vm_vector( buffer ) ) );
+}
+
 #if defined(FRSR_ROARING_HAS_PSI_VM) && defined(FRSR_ROARING_ENABLE_VM_VECTOR_SERIALIZATION)
 
 TEST(FrsrRoaringBorrow, PersistentBitmapFileRoundTrip) {
