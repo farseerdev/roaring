@@ -188,23 +188,27 @@ int main() { return 0; }" FRSR_ROARING_X64)
 # and in every configuration, so the tests and benchmarks built in any configuration
 # compile the same kernels as the library. Only additive feature options are used
 # (no -march/-mtune), so a consumer's own target selection is not overridden.
+# The kernels are written in gnu vector extensions and dispatched through
+# per-function target attributes, which Microsoft's compiler provides no form of,
+# so it cannot compile these headers at all. Say that here rather than through a
+# few hundred syntax errors; on Windows, configure with clang-cl.
+if(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
+    message(FATAL_ERROR "frsr::roaring needs Clang, clang-cl or GCC. Microsoft's cl.exe is not supported.")
+endif()
+
 if(FRSR_ROARING_X64)
     if(CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
         target_compile_options(frsr_roaring PUBLIC "$<$<COMPILE_LANGUAGE:C,CXX>:/clang:-mavx2;/clang:-mpopcnt>")
-    elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang" OR CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
         target_compile_options(frsr_roaring PUBLIC "$<$<COMPILE_LANGUAGE:C,CXX>:-mavx2;-mpopcnt>")
-    elseif(MSVC)
-        target_compile_options(frsr_roaring PUBLIC "$<$<COMPILE_LANGUAGE:C,CXX>:/arch:AVX2>")
     endif()
 endif()
 
 # The optimization level only affects the library's own object code.
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
     target_compile_options(frsr_roaring PRIVATE "$<$<NOT:$<CONFIG:Debug>>:/O2>")
-elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang" OR CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     target_compile_options(frsr_roaring PRIVATE "$<$<NOT:$<CONFIG:Debug>>:-O3>")
-elseif(MSVC)
-    target_compile_options(frsr_roaring PRIVATE "$<$<NOT:$<CONFIG:Debug>>:/O2>")
 endif()
 
 if(FRSR_ROARING_BUILD_TESTS)
