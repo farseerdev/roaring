@@ -8,9 +8,10 @@ from several runs or from bench/tools/run_isolated.sh. BAND (default EnvelopePer
 contains it; --param names the swept parameter in the entry name (default chunks). A result line reports
 microseconds per op, where one op is one unit of the swept parameter, so the time of one result is us/op * param.
 Per arm the script takes the median over repeated lines of each point, fits
-time_per_result = intercept + slope * param by least squares, and prints both in nanoseconds with each arm's ratio
-to the reference arm. The slope is the cost per unit of the swept parameter; the intercept is the fixed cost per
-result.
+time_per_result = intercept + slope * param by least squares, and prints both in nanoseconds. The slope is the cost per
+unit of the swept parameter and is compared as a ratio to the reference arm. The intercept is the fixed cost per
+result; it is small next to the swept cost and can fit near zero or below it, so it is compared as a difference to
+the reference arm's intercept, never as a ratio.
 """
 import collections
 import re
@@ -76,13 +77,12 @@ fits = {arm: fit(per_point) for arm, per_point in points.items()}
 if not fits:
     sys.exit("no matching result lines for band " + band + " with " + param + "= in " + path)
 ref_intercept, ref_slope, _ = fits.get(ref, (float("nan"), float("nan"), []))
-print(f"band {band}: time per result = intercept + slope * {param} (ns), ratios to {ref}")
-print(f"{'arm':<16}{'points':>7}{'intercept':>11}{'slope':>9}{'int/ref':>9}{'slope/ref':>10}")
+print(f"band {band}: time per result = intercept + slope * {param} (ns), compared to {ref}")
+print(f"{'arm':<16}{'points':>7}{'intercept':>11}{'slope':>9}{'int-ref':>9}{'slope/ref':>10}")
 for arm in sorted(fits):
     intercept, slope, xs = fits[arm]
-    int_ratio = intercept / ref_intercept if ref_intercept else float("nan")
     slope_ratio = slope / ref_slope if ref_slope else float("nan")
-    print(f"{arm:<16}{len(xs):>7}{intercept * 1000:>11.2f}{slope * 1000:>9.3f}{int_ratio:>9.3f}{slope_ratio:>10.3f}")
+    print(f"{arm:<16}{len(xs):>7}{intercept * 1000:>11.2f}{slope * 1000:>9.3f}{(intercept - ref_intercept) * 1000:>9.2f}{slope_ratio:>10.3f}")
 
 # Per point: median us/op of each arm and its ratio to the reference arm at the same parameter value.
 values = sorted({x for per_point in points.values() for x in per_point})
