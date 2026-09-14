@@ -366,6 +366,38 @@ TEST(FrsrRoaringSmoke, InPlaceArrayVsRunCombinesMatchMaterializingOps) {
     EXPECT_EQ( sole_subtract.to_vector(), expected_andnot );
 }
 
+TEST(FrsrRoaringSmoke, ArrayVsEmptiedRunChunkCombines) {
+    // A 64-bit bitmap erases lazily: a run chunk emptied by removals stays in its slot holding no runs, and the
+    // array-vs-run arms of both combine modes meet it as the right operand. Removing from the top leaves the run
+    // [65536, 65536] last, so a walk that read the emptied run list would still find 65536 there.
+    using WideBitmap = frsr::roaring::bitmap<std::uint64_t>;
+    WideBitmap runs;
+    runs.add_closed_range( 0U, 99U );
+    runs.add_closed_range( 65'536U, 65'635U );
+    runs.add_closed_range( 131'072U, 131'171U );
+    runs.optimize();
+    for ( std::uint64_t value{ 65'635U }; value >= 65'536U; --value ) {
+        std::ignore = runs.remove( value );
+    }
+    ASSERT_EQ( runs.size(), 200U );
+
+    WideBitmap array_side;
+    std::ignore = array_side.add( 65'536U );
+    std::ignore = array_side.add( 65'700U );
+    std::vector<std::uint64_t> const all{ 65'536U, 65'700U };
+
+    EXPECT_TRUE( ( array_side & runs ).empty() );
+    EXPECT_EQ( ( array_side - runs ).to_vector(), all );
+
+    WideBitmap and_accumulator{ array_side & array_side };
+    and_accumulator &= runs;
+    EXPECT_TRUE( and_accumulator.empty() );
+
+    WideBitmap subtract_accumulator{ array_side & array_side };
+    subtract_accumulator -= runs;
+    EXPECT_EQ( subtract_accumulator.to_vector(), all );
+}
+
 TEST(FrsrRoaringSmoke, RunAccumulatorAndBitsetCombineArmsMatchExpectations) {
     // Exercises the dedicated combine-spine arms for run-encoded accumulators
     // (run∩array, run∩bitset — the dominant fold pairs when the accumulator is a

@@ -1310,6 +1310,11 @@ template <typename Layout, typename OutVector, typename CowPolicy = cow_value_se
     // [croaring-ref] deps/croaring/src/containers/mixed_intersection.c:array_run_container_intersection
     auto       run_it { rhs.runs.begin() };
     auto const run_end{ rhs.runs.end  () };
+    if ( run_it == run_end ) {
+        // a run chunk emptied by removals and kept as a lazily erased slot holds no runs
+        resize_uninitialized( result, 0U );
+        return;
+    }
     while ( ap < card ) {
         auto const value{ keys[ ap ] };
         while ( static_cast<low_type>( run_it->end ) < value ) {
