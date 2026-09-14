@@ -118,7 +118,12 @@ template <set_operation Op, typename V>
 // winning its microbench (outlining cost inside the spine), and the
 // repair_cardinality popcount dispatch measured neutral-to-negative. Don't add
 // sites without an in-context full-scale A/B.
-#if ( defined( __x86_64__ ) || defined( _M_X64 ) ) && defined( __clang__ )
+//
+// The kernels are standard Intel intrinsics behind GNU target attributes, so GCC
+// carries them too. Its shuffle intrinsics type their control operand as
+// _MM_PERM_ENUM where clang takes a plain int, which is why those four call sites
+// name the enum; clang declares it as well.
+#if ( defined( __x86_64__ ) || defined( _M_X64 ) ) && ( defined( __clang__ ) || defined( __GNUC__ ) )
 #   if defined( __AVX512VPOPCNTDQ__ ) && defined( __AVX512VBMI2__ ) && defined( __AVX512BW__ ) && defined( __AVX512VL__ )
 #       define FRSR_ROARING_X86_V4_NATIVE   1
 #       define FRSR_ROARING_X86_V4_DISPATCH 0
