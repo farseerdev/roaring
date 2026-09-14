@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <random>
 #include <span>
+#include <tuple>
 #include <vector>
 
 namespace {
@@ -144,6 +145,82 @@ TEST(FrsrRoaringCrosscheck, RandomizedBinaryOperationsMatchCRoaring) {
             EXPECT_EQ( rhs.contains( value ), roaring_bitmap_contains( rhs_roaring.bitmap, value ) );
         }
     }
+}
+
+TEST(FrsrRoaringCrosscheck, InPlaceArrayVsRunFiltersMatchCRoaring) {
+    // A sole-owned array-encoded chunk &= and -= a run-encoded chunk, over random shapes: from one run to a thousand,
+    // from one value to four thousand, with values placed on run boundaries in every other round, and values before
+    // the first and after the last run. Run selection is deferred, so the accumulator stays an array whatever its
+    // values, and optimize() gives the operand its run encoding.
+    using LazyRunBitmap = frsr::roaring::bitmap<
+        std::uint32_t,
+        frsr::roaring::default_container_set<std::uint32_t>,
+        frsr::roaring::detail::cow_value_semantics,
+        frsr::roaring::detail::run_selection_lazy
+    >;
+    std::mt19937 rng{ 0x5EED5EEDU };
+    std::uniform_int_distribution<std::uint32_t> point_dist{ 0U, 65'535U };
+    std::uniform_int_distribution<int> run_count_dist{ 1, 1'000 };
+    std::uniform_int_distribution<int> card_dist{ 1, 4'000 };
+
+    int covered{ 0 };
+    for ( int round{ 0 }; round < 300; ++round ) {
+        std::vector<std::uint32_t> points( static_cast<std::size_t>( 2 * run_count_dist( rng ) ) );
+        for ( auto & point : points ) {
+            point = point_dist( rng );
+        }
+        std::sort( points.begin(), points.end() );
+        points.erase( std::unique( points.begin(), points.end() ), points.end() );
+        points.resize( points.size() & ~std::size_t{ 1 } );
+        if ( points.empty() ) {
+            continue;
+        }
+
+        LazyRunBitmap runs;
+        roaring_bitmap_holder runs_roaring;
+        std::vector<std::uint32_t> values;
+        for ( std::size_t index{ 0 }; index < points.size(); index += 2 ) {
+            runs.add_closed_range( points[ index ], points[ index + 1 ] );
+            roaring_bitmap_add_range_closed( runs_roaring.bitmap, points[ index ], points[ index + 1 ] );
+            if ( round % 2 == 0 ) {
+                for ( auto const edge : { points[ index ], points[ index + 1 ] } ) {
+                    values.push_back( edge );
+                    if ( edge > 0U ) { values.push_back( edge - 1U ); }
+                    if ( edge < 65'535U ) { values.push_back( edge + 1U ); }
+                }
+            }
+        }
+        runs.optimize();
+        std::ignore = roaring_bitmap_run_optimize( runs_roaring.bitmap );
+        if ( runs.statistics().run_containers != 1U ) {
+            continue;  // a lone short run can stay an array, which is not the pair under test
+        }
+        ++covered;
+
+        auto const card{ static_cast<std::size_t>( card_dist( rng ) ) };
+        while ( values.size() < card ) {
+            values.push_back( point_dist( rng ) );
+        }
+        std::sort( values.begin(), values.end() );
+        values.erase( std::unique( values.begin(), values.end() ), values.end() );
+        values.resize( std::min<std::size_t>( values.size(), 4'000U ) );
+
+        for ( bool const subtract : { false, true } ) {
+            LazyRunBitmap accumulator{ std::span<std::uint32_t const>{ values } };
+            ASSERT_EQ( accumulator.statistics().array_containers, 1U );
+            auto expected{ make_roaring( values ) };
+            if ( subtract ) {
+                accumulator -= runs;
+                roaring_bitmap_andnot_inplace( expected.bitmap, runs_roaring.bitmap );
+            } else {
+                accumulator &= runs;
+                roaring_bitmap_and_inplace( expected.bitmap, runs_roaring.bitmap );
+            }
+            EXPECT_EQ( accumulator.to_vector(), to_vector( expected.bitmap ) ) << "round " << round << ( subtract ? " -=" : " &=" );
+            EXPECT_EQ( accumulator.size(), roaring_bitmap_get_cardinality( expected.bitmap ) );
+        }
+    }
+    EXPECT_GE( covered, 250 );
 }
 
 TEST(FrsrRoaringCrosscheck, ArrayPromotionStillMatchesCRoaring) {

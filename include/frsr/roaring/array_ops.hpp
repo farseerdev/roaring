@@ -1519,42 +1519,60 @@ template <typename Layout, typename CowPolicy = cow_value_semantics>
 // In-place membership filter of `arr` against a run list — array∩run for
 // keep_matches == true, array\run for keep_matches == false. Same contract as
 // filter_array_bitset_inplace above (result ⊆ input, forward compaction within
-// arr's own payload, no allocation, stays an array); the run list drives the
-// walk over a monotone cursor, so each kept span moves as one memmove block
-// instead of one compare+append per element.
+// arr's own payload, no allocation, stays an array). The walk is
+// filter_array_run_into's array-driven shape, the reference's: each array value
+// is tested against the current run, the run cursor moves only when a value has
+// passed it, a kept value is written on its own, and a stretch the filter drops
+// (the gap before a run for ∩, the run's cover for \) is crossed by a gallop. A
+// value is never written ahead of where it was read, so the compaction needs no
+// scratch.
+// [croaring-ref] deps/croaring/src/containers/mixed_intersection.c:array_run_container_intersection
+// [croaring-ref] deps/croaring/src/containers/mixed_andnot.c:array_run_container_andnot
 template <typename Layout, typename CowPolicy = cow_value_semantics>
 [[ gnu::hot ]] inline void filter_array_run_inplace(
     array_ref<Layout, CowPolicy> arr,
     run_cref<Layout, CowPolicy> const rhs,
     bool const keep_matches = true
 ) {
+    using low_type = typename Layout::low_type;
     auto * const base{ arr.values.data() };
     auto const card{ static_cast<std::size_t>( arr.values.size() ) };
     std::size_t out{ 0 };
     std::size_t in { 0 };
-    auto const emit_span{ [ & ]( std::size_t const span_begin, std::size_t const span_end ) {
-        std::memmove( base + out, base + span_begin, ( span_end - span_begin ) * sizeof( *base ) );
-        out += span_end - span_begin;
-    } };
-    for ( auto const & run : rhs.runs ) {
-        auto const miss_begin{ in };
-        in = gallop_forward<false>( base, in, card, static_cast<typename Layout::low_type>( run.begin ) );
+    auto const finish{ [ & ] {
         if ( !keep_matches ) {
-            emit_span( miss_begin, in );
+            // past the last run: every remaining value misses
+            std::memmove( base + out, base + in, ( card - in ) * sizeof( *base ) );
+            out += card - in;
         }
-        auto const match_begin{ in };
-        in = gallop_forward<true >( base, in, card, static_cast<typename Layout::low_type>( run.end ) );
-        if ( keep_matches ) {
-            emit_span( match_begin, in );
+        arr.values.resize_uninitialized( static_cast<std::uint32_t>( out ) );
+    } };
+    auto       run_it { rhs.runs.begin() };
+    auto const run_end{ rhs.runs.end  () };
+    if ( run_it == run_end ) {
+        // a run chunk emptied by removals and kept as a lazily erased slot holds no runs
+        finish();
+        return;
+    }
+    while ( in < card ) {
+        auto const value{ base[ in ] };
+        while ( static_cast<low_type>( run_it->end ) < value ) {
+            if ( ++run_it == run_end ) {
+                finish();
+                return;
+            }
         }
-        if ( in == card ) {
-            break;
+        bool const in_run{ value >= static_cast<low_type>( run_it->begin ) };
+        if ( in_run == keep_matches ) {
+            base[ out++ ] = value;
+            ++in;
+        } else if ( in_run ) {
+            in = gallop_forward<true >( base, in, card, static_cast<low_type>( run_it->end ) );
+        } else {
+            in = gallop_forward<false>( base, in, card, static_cast<low_type>( run_it->begin ) );
         }
     }
-    if ( !keep_matches ) {
-        emit_span( in, card );  // tail past the last run: all misses
-    }
-    arr.values.resize_uninitialized( static_cast<std::uint32_t>( out ) );
+    finish();
 }
 
 template <typename Layout, typename CowPolicy = cow_value_semantics>
