@@ -3,8 +3,11 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
+#include <iterator>
+#include <set>
 #include <thread>
 #include <vector>
 
@@ -361,6 +364,52 @@ TEST(FrsrRoaringSmoke, InPlaceArrayVsRunCombinesMatchMaterializingOps) {
     TestBitmap sole_subtract{ array_side & array_side };
     sole_subtract -= runs_side;
     EXPECT_EQ( sole_subtract.to_vector(), expected_andnot );
+}
+
+TEST(FrsrRoaringSmoke, WideKeyChunksOutOfOrderStillReadAndCombineCorrectly) {
+    // A 64-bit bitmap appends new chunks in arrival order and remembers whether that order
+    // is still ascending, because the paths that sort, search and rebuild the chunk index
+    // act on that answer. Build one the wrong way round - descending chunks, then a chunk
+    // dropped in between - and pin that reads and set operations still agree with a plain
+    // ordered set. A bitmap that believed itself sorted here would binary search a table
+    // that is not, and answer wrongly rather than slowly.
+    using WideBitmap = frsr::roaring::bitmap<std::uint64_t>;
+    constexpr std::uint64_t chunk_span{ 1ULL << 16 };
+    WideBitmap bitmap;
+    std::set<std::uint64_t> reference;
+    auto const insert{ [ & ]( std::uint64_t const value ) { std::ignore = bitmap.add( value ); reference.insert( value ); } };
+    for ( std::uint64_t chunk{ 600 }; chunk > 0; --chunk ) {          // descending: every append breaks the order
+        insert( chunk * chunk_span + 5 );
+        insert( chunk * chunk_span + 4'000 );
+    }
+    for ( std::uint64_t chunk : { 250ULL, 1'000ULL, 3ULL, 777ULL } ) { // and now out of order among themselves
+        insert( chunk * chunk_span + 9 );
+    }
+    EXPECT_EQ( bitmap.size(), reference.size() );
+    EXPECT_EQ( bitmap.to_vector(), std::vector<std::uint64_t>( reference.begin(), reference.end() ) );
+    for ( std::uint64_t chunk{ 0 }; chunk <= 1'001; ++chunk ) {
+        for ( std::uint64_t const low : { std::uint64_t{ 5 }, std::uint64_t{ 9 }, std::uint64_t{ 4'000 }, std::uint64_t{ 61'234 } } ) {
+            auto const value{ chunk * chunk_span + low };
+            EXPECT_EQ( bitmap.contains( value ), reference.contains( value ) ) << "value " << value;
+        }
+    }
+    WideBitmap every_other;
+    std::set<std::uint64_t> every_other_reference;
+    for ( std::uint64_t chunk{ 0 }; chunk <= 1'000; chunk += 2 ) {
+        std::ignore = every_other.add( chunk * chunk_span + 5 );
+        every_other_reference.insert( chunk * chunk_span + 5 );
+    }
+    std::set<std::uint64_t> intersection_reference;
+    std::set_intersection( reference.begin(), reference.end(), every_other_reference.begin(), every_other_reference.end(),
+                           std::inserter( intersection_reference, intersection_reference.end() ) );
+    auto const intersection{ bitmap & every_other };
+    EXPECT_EQ( intersection.to_vector(), std::vector<std::uint64_t>( intersection_reference.begin(), intersection_reference.end() ) );
+    std::set<std::uint64_t> difference_reference;
+    std::set_difference( reference.begin(), reference.end(), every_other_reference.begin(), every_other_reference.end(),
+                         std::inserter( difference_reference, difference_reference.end() ) );
+    auto subtracted{ bitmap };
+    subtracted -= every_other;
+    EXPECT_EQ( subtracted.to_vector(), std::vector<std::uint64_t>( difference_reference.begin(), difference_reference.end() ) );
 }
 
 TEST(FrsrRoaringSmoke, RunAccumulatorAndBitsetCombineArmsMatchExpectations) {
