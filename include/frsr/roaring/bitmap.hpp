@@ -3762,10 +3762,17 @@ private:
                 pos = it->second;
                 found_existing = true;
             } else if constexpr ( kUseLazySort ) {
-                // New chunk: push_back (O(1)), mark unsorted, update map.
+                // New chunk: push_back (O(1)), update map. An append breaks the key
+                // order only when the new key sits below the one already last, and
+                // that is what the flag records. A monotone build - values arriving
+                // in order, which is the shape a bulk load has - therefore stays
+                // sorted, and the paths that would otherwise sort a million chunks
+                // to make progress (the tombstone compaction, the index rebuild)
+                // find nothing to do.
+                auto const appended_in_order{ chunks_.size() == 0 || chunks_.key( chunks_.size() - 1 ) < chunk };
                 chunks_.push_back( chunk, handle_type{} );
                 pos = chunks_.size() - 1;
-                chunks_sorted_ = false;
+                if ( !appended_in_order ) { chunks_sorted_ = false; }
                 removes_since_structural_add_ = 0;
                 chunk_index_map_().emplace( chunk, chunks_.size() - 1 );
             } else {
