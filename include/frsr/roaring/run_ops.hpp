@@ -21,42 +21,30 @@ template <typename Layout, typename CowPolicy = cow_value_semantics>
     return result;
 }
 
+// Whether the runs are the whole domain in one run.
 template <typename Layout, typename CowPolicy = cow_value_semantics>
-[[nodiscard]] inline run_container<Layout> intersect_run_run(
-    run_cref<Layout, CowPolicy> const lhs,
-    run_cref<Layout, CowPolicy> const rhs
-) {
-    run_container<Layout> result;
-    if ( lhs.runs.empty() || rhs.runs.empty() ) {
+[[nodiscard]] inline bool run_is_full( run_cref<Layout, CowPolicy> const run ) noexcept {
+    return run.runs.size() == 1U &&
+        run.runs.front().begin == 0U &&
+        run.runs.front().end == std::numeric_limits<typename Layout::low_type>::max();
+}
+
+// Run∩run merge into `out`, which MUST hold lhs.size + rhs.size runs (the most an intersection can
+// produce, one more than it does). Returns the run count and the cardinality they cover.
+// [croaring-ref] deps/croaring/src/containers/run.c:run_container_intersection
+struct run_intersection { std::size_t runs; std::size_t cardinality; };
+
+template <typename Layout>
+[[ gnu::hot ]] inline run_intersection intersect_runs(
+    run<typename Layout::low_type> const * const lhs_runs, std::size_t const lhs_size,
+    run<typename Layout::low_type> const * const rhs_runs, std::size_t const rhs_size,
+    run<typename Layout::low_type> * const out
+) noexcept {
+    using low_type = typename Layout::low_type;
+    run_intersection result{ 0, 0 };
+    if ( lhs_size == 0 || rhs_size == 0 ) {
         return result;
     }
-
-    auto const is_full = []( run_cref<Layout, CowPolicy> const run ) noexcept {
-        return run.runs.size() == 1U &&
-            run.runs.front().begin == 0U &&
-            run.runs.front().end == std::numeric_limits<typename Layout::low_type>::max();
-    };
-    if ( is_full( lhs ) ) {
-        return run_container_from<Layout, CowPolicy>( rhs );
-    }
-    if ( is_full( rhs ) ) {
-        return run_container_from<Layout, CowPolicy>( lhs );
-    }
-
-    result.runs.reserve( lhs.runs.size() + rhs.runs.size() );
-
-    // Cache the payload pointer + count ONCE: `.runs[i]` on the const-view goes
-    // through container_handle::payload_data_raw(), which re-derives the
-    // spilled-payload pointer via std::launder on every call (the launder is a
-    // hard optimizer barrier — it forbids hoisting/CSE-ing that load across
-    // calls, so indexing through the view per-iteration re-pays it every time).
-    // Neither lhs nor rhs is mutated for the lifetime of this loop, so the raw
-    // pointer and size are loop-invariant; index those locals instead.
-    auto const * const lhs_runs{ lhs.runs.data() };
-    auto const lhs_size{ lhs.runs.size() };
-    auto const * const rhs_runs{ rhs.runs.data() };
-    auto const rhs_size{ rhs.runs.size() };
-
     auto li{ std::size_t{ 0 } };
     auto ri{ std::size_t{ 0 } };
     auto start{ static_cast<std::size_t>( lhs_runs[ li ].begin ) };
@@ -110,12 +98,98 @@ template <typename Layout, typename CowPolicy = cow_value_semantics>
             }
         }
 
-        result.runs.push_back( run<typename Layout::low_type>{
-            static_cast<typename Layout::low_type>( begin ),
-            static_cast<typename Layout::low_type>( earliest_end - 1U )
-        } );
+        out[ result.runs++ ] = run<low_type>{ static_cast<low_type>( begin ), static_cast<low_type>( earliest_end - 1U ) };
         result.cardinality += earliest_end - begin;
     }
+    return result;
+}
+
+// How many values two run lists have in common: the merge of intersect_runs with the stores dropped.
+// [croaring-ref] deps/croaring/src/containers/run.c:run_container_intersection_cardinality
+template <typename Layout>
+[[nodiscard]] [[ gnu::hot ]] inline std::size_t intersect_runs_cardinality(
+    run<typename Layout::low_type> const * const lhs_runs, std::size_t const lhs_size,
+    run<typename Layout::low_type> const * const rhs_runs, std::size_t const rhs_size
+) noexcept {
+    std::size_t cardinality{ 0 };
+    if ( lhs_size == 0 || rhs_size == 0 ) {
+        return cardinality;
+    }
+    auto li{ std::size_t{ 0 } };
+    auto ri{ std::size_t{ 0 } };
+    auto start{ static_cast<std::size_t>( lhs_runs[ li ].begin ) };
+    auto end{ static_cast<std::size_t>( lhs_runs[ li ].end ) + 1U };
+    auto xstart{ static_cast<std::size_t>( rhs_runs[ ri ].begin ) };
+    auto xend{ static_cast<std::size_t>( rhs_runs[ ri ].end ) + 1U };
+    while ( li < lhs_size && ri < rhs_size ) {
+        if ( end <= xstart ) {
+            ++li;
+            if ( li < lhs_size ) {
+                start = static_cast<std::size_t>( lhs_runs[ li ].begin );
+                end = static_cast<std::size_t>( lhs_runs[ li ].end ) + 1U;
+            }
+        } else if ( xend <= start ) {
+            ++ri;
+            if ( ri < rhs_size ) {
+                xstart = static_cast<std::size_t>( rhs_runs[ ri ].begin );
+                xend = static_cast<std::size_t>( rhs_runs[ ri ].end ) + 1U;
+            }
+        } else {
+            cardinality += std::min( end, xend ) - std::max( start, xstart );
+            if ( end <= xend ) {
+                ++li;
+                if ( li < lhs_size ) {
+                    start = static_cast<std::size_t>( lhs_runs[ li ].begin );
+                    end = static_cast<std::size_t>( lhs_runs[ li ].end ) + 1U;
+                }
+            }
+            if ( xend <= end ) {
+                ++ri;
+                if ( ri < rhs_size ) {
+                    xstart = static_cast<std::size_t>( rhs_runs[ ri ].begin );
+                    xend = static_cast<std::size_t>( rhs_runs[ ri ].end ) + 1U;
+                }
+            }
+        }
+    }
+    return cardinality;
+}
+
+// Run∩run written straight into a caller-supplied run payload (the result container's own, on the
+// hot combine path, so no standalone result is built and copied). The caller sets the header.
+template <typename Layout, typename OutVector, typename CowPolicy = cow_value_semantics>
+[[nodiscard]] inline std::size_t intersect_run_run_into(
+    run_cref<Layout, CowPolicy> const lhs,
+    run_cref<Layout, CowPolicy> const rhs,
+    OutVector & result
+) {
+    // Neither side is mutated while the merge runs, so the raw pointers are loop-invariant (indexing
+    // the views re-derives them, through a launder, per access).
+    auto const lhs_size{ lhs.runs.size() };
+    auto const rhs_size{ rhs.runs.size() };
+    resize_uninitialized( result, lhs_size + rhs_size );
+    auto const merged{ intersect_runs<Layout>( lhs.runs.data(), lhs_size, rhs.runs.data(), rhs_size, result.data() ) };
+    resize_uninitialized( result, merged.runs );
+    return merged.cardinality;
+}
+
+template <typename Layout, typename CowPolicy = cow_value_semantics>
+[[nodiscard]] inline run_container<Layout> intersect_run_run(
+    run_cref<Layout, CowPolicy> const lhs,
+    run_cref<Layout, CowPolicy> const rhs
+) {
+    run_container<Layout> result;
+    if ( lhs.runs.empty() || rhs.runs.empty() ) {
+        return result;
+    }
+    if ( run_is_full<Layout, CowPolicy>( lhs ) ) {
+        return run_container_from<Layout, CowPolicy>( rhs );
+    }
+    if ( run_is_full<Layout, CowPolicy>( rhs ) ) {
+        return run_container_from<Layout, CowPolicy>( lhs );
+    }
+    result.cardinality = static_cast<typename run_container<Layout>::cardinality_type>(
+        intersect_run_run_into<Layout, decltype( result.runs ), CowPolicy>( lhs, rhs, result.runs ) );
     return result;
 }
 

@@ -5,6 +5,8 @@
 #include <frsr/roaring/array_ops.hpp>
 #include <frsr/roaring/run_ops.hpp>
 
+#include <algorithm>
+#include <bit>
 #include <cstddef>
 #include <limits>
 #include <type_traits>
@@ -276,6 +278,97 @@ template <typename Layout, typename CowPolicy = cow_value_semantics>
                 }
             }
             return false;
+        }
+    }, lhs, rhs );
+}
+
+// How many values the two containers have in common, without building the intersection. Not for two
+// arrays: the array kernels are the materializing ones, so a caller that meets that pair intersects it.
+// [croaring-ref] deps/croaring/src/containers/mixed_intersection.c (the *_intersection_cardinality family)
+template <typename Layout, typename CowPolicy = cow_value_semantics>
+[[nodiscard]] inline std::size_t container_intersect_cardinality(
+    container_variant<Layout, CowPolicy> const & lhs,
+    container_variant<Layout, CowPolicy> const & rhs
+) noexcept {
+    using low_type = typename Layout::low_type;
+    // set bits of one word block inside [first, last], both inclusive
+    auto const bits_in_range{ []( std::uint64_t const * const words, std::size_t const first, std::size_t const last ) noexcept {
+        auto const first_word{ first >> 6U };
+        auto const last_word{ last >> 6U };
+        auto const first_mask{ std::numeric_limits<std::uint64_t>::max() << ( first & 63U ) };
+        auto const last_mask{ std::numeric_limits<std::uint64_t>::max() >> ( 63U - ( last & 63U ) ) };
+        if ( first_word == last_word ) {
+            return static_cast<std::size_t>( std::popcount( words[ first_word ] & first_mask & last_mask ) );
+        }
+        auto count{ static_cast<std::size_t>( std::popcount( words[ first_word ] & first_mask ) ) };
+        count += popcount_words( words + first_word + 1U, last_word - first_word - 1U );
+        return count + static_cast<std::size_t>( std::popcount( words[ last_word ] & last_mask ) );
+    } };
+    return visit_container_pair<Layout, CowPolicy>( [ & ]( auto const & left, auto const & right ) noexcept -> std::size_t {
+        using left_type = std::remove_cvref_t<decltype( left )>;
+        using right_type = std::remove_cvref_t<decltype( right )>;
+        constexpr bool left_array { std::same_as<left_type , array_cref<Layout, CowPolicy>> };
+        constexpr bool right_array{ std::same_as<right_type, array_cref<Layout, CowPolicy>> };
+        constexpr bool left_run   { std::same_as<left_type , run_cref  <Layout, CowPolicy>> };
+        constexpr bool right_run  { std::same_as<right_type, run_cref  <Layout, CowPolicy>> };
+        if constexpr ( left_array && right_array ) {
+            return 0;  // not a counted pair, see above
+        } else if constexpr ( ( left_array && right_run ) || ( left_run && right_array ) ) {
+            auto const & values{ [ & ]() -> auto const & { if constexpr ( left_array ) { return left.values; } else { return right.values; } }() };
+            auto const & runs  { [ & ]() -> auto const & { if constexpr ( left_run   ) { return left.runs  ; } else { return right.runs  ; } }() };
+            auto const * const keys{ values.data() };
+            auto const card{ static_cast<std::size_t>( values.size() ) };
+            auto run_it { runs.begin() };
+            auto run_end{ runs.end  () };
+            std::size_t count{ 0 };
+            std::size_t ap{ 0 };
+            if ( run_it == run_end ) { return 0; }
+            if ( runs.size() * 16U <= card ) {
+                // few runs over many values: two gallops per run count the values it covers
+                for ( auto const & run : runs ) {
+                    ap = gallop_forward<false>( keys, ap, card, static_cast<low_type>( run.begin ) );
+                    if ( ap == card ) { break; }
+                    auto const past{ gallop_forward<true>( keys, ap, card, static_cast<low_type>( run.end ) ) };
+                    count += past - ap;
+                    ap = past;
+                }
+                return count;
+            }
+            // the array-driven walk of filter_array_run_into, counting instead of storing
+            while ( ap < card ) {
+                auto const value{ keys[ ap ] };
+                while ( static_cast<low_type>( run_it->end ) < value ) {
+                    if ( ++run_it == run_end ) { return count; }
+                }
+                if ( value >= static_cast<low_type>( run_it->begin ) ) {
+                    ++count;
+                    ++ap;
+                } else {
+                    ap = gallop_forward<false>( keys, ap, card, static_cast<low_type>( run_it->begin ) );
+                }
+            }
+            return count;
+        } else if constexpr ( left_array || right_array ) {
+            // array against a bitset: one bit test per value
+            auto const & values{ [ & ]() -> auto const & { if constexpr ( left_array ) { return left.values; } else { return right.values; } }() };
+            auto const * const words{ [ & ]() { if constexpr ( left_array ) { return right.words.begin(); } else { return left.words.begin(); } }() };
+            std::size_t count{ 0 };
+            for ( auto const value : values ) {
+                count += ( words[ value >> 6U ] >> ( value & 63U ) ) & 1U;
+            }
+            return count;
+        } else if constexpr ( left_run && right_run ) {
+            return intersect_runs_cardinality<Layout>( left.runs.data(), left.runs.size(), right.runs.data(), right.runs.size() );
+        } else if constexpr ( left_run || right_run ) {
+            auto const & runs { [ & ]() -> auto const & { if constexpr ( left_run ) { return left.runs; } else { return right.runs; } }() };
+            auto const * const words{ [ & ]() { if constexpr ( left_run ) { return right.words.begin(); } else { return left.words.begin(); } }() };
+            std::size_t count{ 0 };
+            for ( auto const & run : runs ) {
+                count += bits_in_range( words, run.begin, run.end );
+            }
+            return count;
+        } else {
+            return and_popcount_words( left.words.begin(), right.words.begin(), left.words.size() );
         }
     }, lhs, rhs );
 }

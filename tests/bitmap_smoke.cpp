@@ -650,15 +650,18 @@ void check_run_heavy_pairings() {
     } };
 
     unsigned pair_index{ 0 };
+    // every pairing as built, and again with each operand storage-optimized (the run form of a run-shaped chunk)
+    for ( bool const optimized : { false, true } ) {
     for ( auto const left_shape : shapes ) {
         for ( auto const right_shape : shapes ) {
             std::set<std::uint32_t> left_values, right_values;
-            auto const left { build( left_shape , 0x1000 + pair_index, left_values  ) };
-            auto const right{ build( right_shape, 0x2000 + pair_index, right_values ) };
+            auto left { build( left_shape , 0x1000 + pair_index, left_values  ) };
+            auto right{ build( right_shape, 0x2000 + pair_index, right_values ) };
+            if ( optimized ) { left.optimize(); right.optimize(); }
             ++pair_index;
             ASSERT_EQ( left.validate(), nullptr );
             ASSERT_EQ( right.validate(), nullptr );
-            auto const name{ [ & ]( char const * const op ) { return std::string{ "shapes " } + std::to_string( static_cast<int>( left_shape ) ) + op + std::to_string( static_cast<int>( right_shape ) ); } };
+            auto const name{ [ & ]( char const * const op ) { return std::string{ optimized ? "optimized " : "" } + "shapes " + std::to_string( static_cast<int>( left_shape ) ) + op + std::to_string( static_cast<int>( right_shape ) ); } };
             for ( char const op : { '&', '-', '|' } ) {
                 auto const want{ reference( left_values, right_values, op ) };
                 Bitmap in_place{ left };
@@ -677,7 +680,13 @@ void check_run_heavy_pairings() {
             EXPECT_EQ( stats_ab.array_containers , stats_ba.array_containers  ) << name( " & (order)" );
             EXPECT_EQ( stats_ab.bitset_containers, stats_ba.bitset_containers ) << name( " & (order)" );
             EXPECT_EQ( stats_ab.run_containers   , stats_ba.run_containers    ) << name( " & (order)" );
+            // and the n-way questions over the same two operands
+            Bitmap const * const operands[]{ &left, &right };
+            auto const common{ reference( left_values, right_values, '&' ) };
+            EXPECT_EQ( Bitmap::and_many_cardinality( operands ), common.size() ) << name( " (and_many_cardinality)" );
+            EXPECT_EQ( Bitmap::and_many_intersects( operands ), !common.empty() ) << name( " (and_many_intersects)" );
         }
+    }
     }
 }
 

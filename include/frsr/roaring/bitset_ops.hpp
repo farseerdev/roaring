@@ -77,6 +77,13 @@ FRSR_ROARING_X86_V4_KERNEL
     return cardinality;
 }
 
+FRSR_ROARING_X86_V4_KERNEL
+[[nodiscard]] inline std::size_t and_popcount_words_v4( std::uint64_t const * const a, std::uint64_t const * const b, std::size_t const n ) noexcept {
+    std::size_t cardinality{ 0 };
+    for ( std::size_t i{ 0 }; i < n; ++i ) { cardinality += static_cast<std::size_t>( std::popcount( a[ i ] & b[ i ] ) ); }
+    return cardinality;
+}
+
 #endif // FRSR_ROARING_X86_V4
 
 // Set-bit count of `n` words: one VPOPCNTQ per register on the AVX-512 tier, elsewhere the plain loop.
@@ -89,6 +96,19 @@ FRSR_ROARING_X86_V4_KERNEL
 #endif
     std::size_t cardinality{ 0 };
     for ( std::size_t i{ 0 }; i < n; ++i ) { cardinality += static_cast<std::size_t>( std::popcount( words[ i ] ) ); }
+    return cardinality;
+}
+
+// Set-bit count of the AND of two `n`-word blocks, without storing it.
+// [croaring-ref] deps/croaring/src/containers/bitset.c:bitset_container_and_justcard
+[[nodiscard]] inline std::size_t and_popcount_words( std::uint64_t const * const a, std::uint64_t const * const b, std::size_t const n ) noexcept {
+#if FRSR_ROARING_X86_V4
+    if ( have_x86_v4() ) [[likely]] {
+        return and_popcount_words_v4( a, b, n );
+    }
+#endif
+    std::size_t cardinality{ 0 };
+    for ( std::size_t i{ 0 }; i < n; ++i ) { cardinality += static_cast<std::size_t>( std::popcount( a[ i ] & b[ i ] ) ); }
     return cardinality;
 }
 

@@ -2239,6 +2239,59 @@ public:
                 ++left;
                 continue;
             }
+            if ( op == detail::set_operation::bit_and && left_container.holds_run() && right_container.holds_run() ) {
+                // run ∩ run: the merge writes its runs straight into a fresh result payload (the
+                // reference's shape: the intersection lands in the destination run container, then
+                // one size decision), instead of building a standalone run_container and copying
+                // it into a handle — two allocations and a copy per pair, most of the cost of a
+                // pair of short run lists. Outlined like the other run arms.
+                // [croaring-ref] deps/croaring/src/roaring.c:container_and (run, run)
+                [ & ] [[ gnu::noinline ]] () {
+                    auto const & lhs{ std::as_const( left_container ) };
+                    // A full-domain side leaves the other: share its payload.
+                    if ( detail::container_is_known_full<layout_type, CowPolicy>( lhs ) ) {
+                        if ( auto const count{ static_cast<size_type>( detail::container_size( right_container ) ) }; count != 0 ) {
+                            emit( left_key, handle_type{ right_container }, count );
+                        }
+                        return;
+                    }
+                    if ( detail::container_is_known_full<layout_type, CowPolicy>( right_container ) ) {
+                        if ( auto const count{ static_cast<size_type>( detail::container_size( lhs ) ) }; count != 0 ) {
+                            emit( left_key, handle_type{ lhs }, count );
+                        }
+                        return;
+                    }
+                    // A retired payload is offered by kind, and only the array and bitset kinds are
+                    // parked, so a run result starts from an empty run handle.
+                    result_under_construction result{ *std::construct_at( in_place ? &staged.handle : result_chunks.open_back(), handle_type::make_run() ) };
+                    auto result_run{ result.handle->as_run() };
+                    auto const cardinality{ detail::intersect_run_run_into<layout_type>( lhs.as_run(), right_container.as_run(), result_run.runs ) };
+                    if ( cardinality == 0 ) {
+                        return;
+                    }
+                    auto const run_count{ result_run.runs.size() };
+                    auto const run_bytes{ run_count * sizeof( typename detail::run_container<layout_type>::run ) };
+                    auto const array_bytes{ cardinality * sizeof( typename layout_type::low_type ) };
+                    constexpr auto bitset_bytes{ layout_type::word_count * sizeof( std::uint64_t ) };
+                    if ( run_bytes <= array_bytes && !( cardinality >= array_to_bitset_threshold && bitset_bytes <= run_bytes ) ) {
+                        result.handle->set_cardinality( static_cast<std::uint32_t>( cardinality ) );
+                        result.handle->set_endpoints( result_run.runs.front().begin, result_run.runs.back().end );
+                        commit_result( left_key, result, static_cast<size_type>( cardinality ) );
+                        return;
+                    }
+                    // The runs are not the smallest form: the size decision the other run results
+                    // take, over the runs just written.
+                    detail::run_container<layout_type> merged;
+                    merged.runs.reserve( static_cast<std::uint32_t>( run_count ) );
+                    for ( auto const & current : std::as_const( result_run.runs ) ) { merged.runs.push_back( current ); }
+                    merged.cardinality = static_cast<typename detail::run_container<layout_type>::cardinality_type>( cardinality );
+                    *result.handle = handle_type{};
+                    result.handle = nullptr;  // the slot is free for the emit below
+                    emit( left_key, detail::make_container_from_runs<layout_type, CowPolicy>( std::move( merged ), array_to_bitset_threshold ), static_cast<size_type>( cardinality ) );
+                }();
+                ++left;
+                continue;
+            }
             if ( op == detail::set_operation::bit_and &&
                  ( ( left_container.holds_run   () && right_container.holds_bitset() ) ||
                    ( left_container.holds_bitset() && right_container.holds_run   () ) ) ) {
@@ -2643,9 +2696,17 @@ public:
         and_many_scratch scratch;
         size_type total{ 0 };
         and_many_walk( operands, [ & ]( chunk_type const, std::span<handle_type const * const> const ordered ) {
-            bool owned{ false };
-            if ( auto const * const acc{ and_chunk( ordered, scratch, owned ) } ) {
-                total += acc->cardinality();
+            // The largest container is only counted against the intersection of the others, never
+            // combined with it.
+            if ( ordered.size() == 1 ) {
+                total += ordered[ 0 ]->cardinality();
+            } else if ( ordered.size() == 2 ) {
+                total += and_many_count_pair( *ordered[ 0 ], *ordered[ 1 ], scratch );
+            } else {
+                bool owned{ false };
+                if ( auto const * const acc{ and_chunk( ordered.first( ordered.size() - 1 ), scratch, owned ) } ) {
+                    total += and_many_count_pair( *acc, *ordered.back(), scratch );
+                }
             }
             return true;
         } );
@@ -2844,6 +2905,17 @@ private:
     // The AND of the containers of one chunk, ascending by cardinality, as a handle: a view of the only
     // container when there is just one operand, otherwise one of the scratch handles (owned = true).
     // nullptr when the intersection is empty.
+    // |acc ∩ last| without storing it. Two arrays are the exception: their kernel is the materializing
+    // one, so the intersection is written to scratch and measured there.
+    [[nodiscard]] static size_type and_many_count_pair( handle_type const & acc, handle_type const & last, and_many_scratch & scratch ) {
+        if ( !( acc.holds_array() && last.holds_array() ) ) {
+            return static_cast<size_type>( detail::container_intersect_cardinality<layout_type, CowPolicy>( acc, last ) );
+        }
+        auto common{ scratch.array_alt.as_array() };
+        detail::combine_array_array_into<layout_type>( acc.as_array(), last.as_array(), detail::set_operation::bit_and, common.values );
+        return static_cast<size_type>( common.values.size() );
+    }
+
     [[nodiscard]] static handle_type const * and_chunk( std::span<handle_type const * const> const ordered, and_many_scratch & scratch, bool & owned ) {
         owned = false;
         if ( ordered.size() == 1 ) {
