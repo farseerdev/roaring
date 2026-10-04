@@ -4,6 +4,13 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <algorithm>
+#include <iterator>
+#include <random>
+#include <set>
+#include <string>
+#include <span>
+#include <tuple>
 #include <atomic>
 #include <thread>
 #include <vector>
@@ -396,6 +403,292 @@ TEST(FrsrRoaringSmoke, ArrayVsEmptiedRunChunkCombines) {
     WideBitmap subtract_accumulator{ array_side & array_side };
     subtract_accumulator -= runs;
     EXPECT_EQ( subtract_accumulator.to_vector(), all );
+}
+
+// The n-way AND, checked against an ordered set over random operand mixes: arrays, bitsets and runs meeting in
+// every order, empty and absent operands, 32- and 64-bit keys. Besides the values, the block form's contract is
+// pinned: at most 256 values per block, never across a chunk, cut by count from the start of the chunk's result -
+// and therefore identical for the same operands held as arrays and bitsets, run-optimized, or rebuilt.
+template <typename Key>
+void check_and_many_against_ordered_sets( std::uint64_t const seed, unsigned const trials ) {
+    using Bitmap = frsr::roaring::bitmap<Key>;
+    std::mt19937_64 rng{ seed };
+    auto const pick{ [ & ]( std::uint64_t const n ) { return static_cast<std::uint64_t>( rng() % n ); } };
+    constexpr std::uint64_t chunk_span{ 1ULL << 16 };
+    constexpr std::uint64_t key_universe{ sizeof( Key ) > 4 ? 14 : 12 };
+    // 64-bit keys are spread far apart, and built descending, so the chunk tables are not in order
+    auto const chunk_base{ [ & ]( std::uint64_t const chunk ) -> std::uint64_t {
+        return sizeof( Key ) > 4 ? ( ( key_universe - 1 - chunk ) << 24 ) * chunk_span : chunk * chunk_span;
+    } };
+
+    for ( unsigned trial{ 0 }; trial < trials; ++trial ) {
+        auto const operand_count{ 1U + static_cast<unsigned>( pick( 9 ) ) };
+        // per chunk key, a pool of low values every operand draws a subset of, and a range every run operand shares
+        std::vector<std::vector<std::uint32_t>> pools( key_universe );
+        std::vector<std::pair<std::uint32_t, std::uint32_t>> ranges( key_universe );
+        for ( std::uint64_t c{ 0 }; c < key_universe; ++c ) {
+            auto const size{ 150U + static_cast<std::uint32_t>( pick( 7'000 ) ) };
+            for ( std::uint32_t i{ 0 }; i < size; ++i ) { pools[ c ].push_back( static_cast<std::uint32_t>( pick( chunk_span ) ) ); }
+            auto const first{ static_cast<std::uint32_t>( pick( 40'000 ) ) };
+            ranges[ c ] = { first, first + static_cast<std::uint32_t>( 1 + pick( 20'000 ) ) };
+        }
+        std::vector<Bitmap> plain( operand_count ), rebuilt( operand_count ), optimized( operand_count );
+        std::vector<std::set<std::uint64_t>> sets( operand_count );
+        std::vector<bool> absent( operand_count, false );
+        for ( unsigned o{ 0 }; o < operand_count; ++o ) {
+            absent[ o ] = pick( 12 ) == 0;
+            if ( pick( 14 ) == 0 ) { continue; }  // an empty operand
+            static constexpr double fractions[]{ 0.04, 0.3, 0.7, 0.95 };
+            auto const fraction{ fractions[ pick( 4 ) ] };
+            auto const use_ranges{ pick( 3 ) == 0 };
+            for ( std::uint64_t c{ 0 }; c < key_universe; ++c ) {
+                if ( pick( 5 ) == 0 ) { continue; }  // the operand lacks this chunk
+                auto const base{ chunk_base( c ) };
+                if ( use_ranges ) {
+                    plain[ o ].add_closed_range( static_cast<Key>( base + ranges[ c ].first ), static_cast<Key>( base + ranges[ c ].second ) );
+                    for ( auto v{ ranges[ c ].first }; v <= ranges[ c ].second; ++v ) { sets[ o ].insert( base + v ); }
+                } else {
+                    for ( auto const low : pools[ c ] ) {
+                        if ( pick( 1000 ) < static_cast<std::uint64_t>( fraction * 1000 ) ) {
+                            std::ignore = plain[ o ].add( static_cast<Key>( base + low ) );
+                            sets[ o ].insert( base + low );
+                        }
+                    }
+                }
+            }
+            std::vector<Key> values;
+            for ( auto const v : sets[ o ] ) { values.push_back( static_cast<Key>( v ) ); }
+            if constexpr ( sizeof( Key ) <= 4 ) {
+                rebuilt[ o ].add_many_sorted( values );
+            } else {
+                for ( auto const v : values ) { std::ignore = rebuilt[ o ].add( v ); }
+            }
+            optimized[ o ] = plain[ o ];
+            optimized[ o ].optimize();
+        }
+
+        std::set<std::uint64_t> expected;
+        bool first{ true };
+        for ( unsigned o{ 0 }; o < operand_count; ++o ) {
+            if ( absent[ o ] ) { continue; }
+            if ( first ) { expected = sets[ o ]; first = false; continue; }
+            std::set<std::uint64_t> next;
+            std::set_intersection( expected.begin(), expected.end(), sets[ o ].begin(), sets[ o ].end(), std::inserter( next, next.end() ) );
+            expected = std::move( next );
+        }
+        if ( first ) { expected.clear(); }  // only absent operands: nothing to intersect
+
+        auto const pointers{ [ & ]( std::vector<Bitmap> const & held ) {
+            std::vector<Bitmap const *> out;
+            for ( unsigned o{ 0 }; o < operand_count; ++o ) { out.push_back( absent[ o ] ? nullptr : &held[ o ] ); }
+            return out;
+        } };
+        auto const expected_vector{ std::vector<std::uint64_t>( expected.begin(), expected.end() ) };
+        auto const blocks_of{ [ & ]( std::vector<Bitmap> const & held ) {
+            std::vector<Bitmap const *> const named{ pointers( held ) };
+            auto const before{ named };
+            std::vector<std::size_t> sizes;
+            std::vector<std::uint64_t> flat;
+            std::uint64_t previous_chunk{ 0 };
+            std::size_t   in_chunk{ 0 };
+            bool          any{ false };
+            Bitmap::and_many_for_each_block( std::span<Bitmap const * const>{ named }, [ & ]( std::span<Key const> const block ) {
+                EXPECT_FALSE( block.empty() );
+                EXPECT_LE( block.size(), 256U );
+                auto const chunk{ static_cast<std::uint64_t>( block.front() ) / chunk_span };
+                for ( auto const v : block ) {
+                    EXPECT_EQ( static_cast<std::uint64_t>( v ) / chunk_span, chunk ) << "a block crossed a chunk";
+                    flat.push_back( v );
+                }
+                if ( any && chunk == previous_chunk ) {
+                    EXPECT_EQ( in_chunk % 256U, 0U ) << "a block ended early inside a chunk";
+                } else {
+                    in_chunk = 0;
+                }
+                in_chunk += block.size();
+                previous_chunk = chunk;
+                any = true;
+                sizes.push_back( block.size() );
+            } );
+            EXPECT_EQ( named, before ) << "the operand span was modified";
+            if ( flat != expected_vector ) {
+                std::size_t at{ 0 };
+                while ( at < flat.size() && at < expected_vector.size() && flat[ at ] == expected_vector[ at ] ) { ++at; }
+                ADD_FAILURE() << "block values differ, trial " << trial << ": first difference at index " << at << " of " << flat.size() << " vs " << expected_vector.size()
+                              << ", got " << ( at < flat.size() ? std::to_string( flat[ at ] ) : std::string{ "end" } )
+                              << ", expected " << ( at < expected_vector.size() ? std::to_string( expected_vector[ at ] ) : std::string{ "end" } )
+                              << ", operands " << operand_count;
+            }
+            return sizes;
+        } };
+        auto const blocks_plain{ blocks_of( plain ) };
+        EXPECT_EQ( blocks_of( rebuilt ), blocks_plain ) << "the block cuts depend on how the operands were built, trial " << trial;
+        EXPECT_EQ( blocks_of( optimized ), blocks_plain ) << "the block cuts depend on run-optimizing, trial " << trial;
+
+        for ( auto const * held : { &plain, &rebuilt, &optimized } ) {
+            auto const named{ pointers( *held ) };
+            std::span<Bitmap const * const> const operands{ named };
+            auto const combined{ Bitmap::and_many( operands ) };
+            EXPECT_EQ( combined.validate( true ), nullptr ) << "and_many result, trial " << trial;  // canonical: a bitset only above the array limit
+            for ( auto const * operand : named ) { if ( operand != nullptr ) { EXPECT_EQ( operand->validate(), nullptr ) << "operand, trial " << trial; } }
+            auto const decoded{ combined.to_vector() };
+            EXPECT_EQ( std::vector<std::uint64_t>( decoded.begin(), decoded.end() ), expected_vector ) << "and_many, trial " << trial;
+            EXPECT_EQ( combined.size(), expected.size() );
+            EXPECT_EQ( Bitmap::and_many_cardinality( operands ), expected.size() ) << "trial " << trial;
+            EXPECT_EQ( Bitmap::and_many_intersects( operands ), !expected.empty() ) << "trial " << trial;
+            std::vector<std::uint64_t> each;
+            Bitmap::and_many_for_each( operands, [ & ]( Key const v ) { each.push_back( v ); } );
+            EXPECT_EQ( each, expected_vector ) << "and_many_for_each, trial " << trial;
+            // the same intersection through the extra-operand overload: hold the last live operand back
+            for ( unsigned o{ operand_count }; o-- > 0; ) {
+                if ( absent[ o ] ) { continue; }
+                auto rest{ named };
+                rest[ o ] = nullptr;
+                EXPECT_EQ( Bitmap::and_many_intersects( std::span<Bitmap const * const>{ rest }, ( *held )[ o ] ), !expected.empty() ) << "trial " << trial;
+                break;
+            }
+        }
+    }
+}
+
+TEST(FrsrRoaringSmoke, AndManyMatchesAnOrderedSetForEveryOperandMix) {
+    check_and_many_against_ordered_sets<std::uint32_t>( 0xA11D'0001ULL, 60 );
+}
+
+TEST(FrsrRoaringSmoke, AndManyOverWideKeysBuiltOutOfOrder) {
+    check_and_many_against_ordered_sets<std::uint64_t>( 0xA11D'0002ULL, 20 );
+}
+
+TEST(FrsrRoaringSmoke, AndManyOfNothingAndOfOneOperand) {
+    using Bitmap = frsr::roaring::bitmap<std::uint32_t>;
+    Bitmap one;
+    for ( std::uint32_t v{ 5 }; v < 70'000; v += 3 ) { std::ignore = one.add( v ); }
+    std::vector<Bitmap const *> none;
+    EXPECT_TRUE( Bitmap::and_many( none ).empty() );
+    EXPECT_EQ( Bitmap::and_many_cardinality( none ), 0U );
+    EXPECT_FALSE( Bitmap::and_many_intersects( none ) );
+    std::vector<Bitmap const *> only_null{ nullptr, nullptr };
+    EXPECT_TRUE( Bitmap::and_many( only_null ).empty() );
+    // a lone operand of each container kind is walked as it lies
+    Bitmap runs;
+    runs.add_closed_range( 3U, 9'000U );
+    runs.add_closed_range( 131'072U + 500U, 131'072U + 40'000U );
+    Bitmap arrays;
+    for ( std::uint32_t v{ 7 }; v < 3'000'000U; v += 40'009U ) { std::ignore = arrays.add( v ); }
+    for ( auto const * lone : { &one, &runs, &arrays } ) {
+        std::vector<Bitmap const *> single{ lone };
+        std::vector<std::uint32_t> got;
+        Bitmap::and_many_for_each( single, [ & ]( std::uint32_t const v ) { got.push_back( v ); } );
+        auto const want{ lone->to_vector() };
+        EXPECT_EQ( got, std::vector<std::uint32_t>( want.begin(), want.end() ) );
+        EXPECT_EQ( Bitmap::and_many_cardinality( single ), lone->size() );
+    }
+    std::vector<Bitmap const *> alone{ &one };
+    EXPECT_EQ( Bitmap::and_many( alone ).to_vector(), one.to_vector() );
+    EXPECT_EQ( Bitmap::and_many_cardinality( alone ), one.size() );
+    EXPECT_TRUE( Bitmap::and_many_intersects( alone ) );
+    Bitmap empty;
+    std::vector<Bitmap const *> with_empty{ &one, &empty };
+    EXPECT_TRUE( Bitmap::and_many( with_empty ).empty() );
+    EXPECT_FALSE( Bitmap::and_many_intersects( with_empty ) );
+}
+
+// Run-heavy operands in every kind pairing and both orders, through each binary operator and its in-place
+// form: the values must match an ordered set and the result must be a legal bitmap - above all, no array
+// may hold more values than the array limit, since the portable format tells an array from a bitset by
+// cardinality alone, and the result kind must not depend on the order the operands meet in.
+template <typename Bitmap>
+void check_run_heavy_pairings() {
+    constexpr std::uint32_t chunk{ 1U << 16 };
+    enum class shape { long_run, short_runs, dense_bitset, barely_bitset, sparse_array, full_run, empty };
+    constexpr shape shapes[]{ shape::long_run, shape::short_runs, shape::dense_bitset, shape::barely_bitset, shape::sparse_array, shape::full_run, shape::empty };
+    // one operand per shape; each holds the same two chunks (3 and 4) so every pairing meets in both
+    auto const build{ [ & ]( shape const kind, std::uint64_t const seed, std::set<std::uint32_t> & values ) {
+        std::mt19937_64 rng{ seed };
+        Bitmap bitmap;
+        for ( std::uint32_t c : { 3U, 4U } ) {
+            auto const base{ c * chunk };
+            auto const add_range{ [ & ]( std::uint32_t const from, std::uint32_t const to ) {
+                bitmap.add_closed_range( base + from, base + to );
+                for ( auto v{ from }; v <= to; ++v ) { values.insert( base + v ); }
+            } };
+            auto const add_random{ [ & ]( std::uint32_t const count, std::uint32_t const range ) {
+                for ( std::uint32_t i{ 0 }; i < count; ++i ) {
+                    auto const low{ static_cast<std::uint32_t>( rng() % range ) };
+                    std::ignore = bitmap.add( base + low );
+                    values.insert( base + low );
+                }
+            } };
+            switch ( kind ) {
+                case shape::long_run     : add_range( 1'000U + c * 100U, 20'000U + c * 100U ); break;                          // 19,001 values, one run
+                case shape::short_runs   : add_range( 100U, 300U ); add_range( 900U, 1'200U ); add_range( 40'000U, 40'500U ); break;
+                case shape::dense_bitset : add_random( 40'000U, chunk ); break;
+                case shape::barely_bitset: add_random( 6'500U, chunk ); break;                                                  // just past the array limit
+                case shape::sparse_array : add_random( 1'800U, chunk ); break;
+                case shape::full_run     : add_range( 0U, chunk - 1U ); break;
+                case shape::empty        : break;
+            }
+        }
+        return bitmap;
+    } };
+
+    auto const reference{ []( std::set<std::uint32_t> const & a, std::set<std::uint32_t> const & b, char const op ) {
+        std::set<std::uint32_t> out;
+        switch ( op ) {
+            case '&': std::set_intersection( a.begin(), a.end(), b.begin(), b.end(), std::inserter( out, out.end() ) ); break;
+            case '-': std::set_difference  ( a.begin(), a.end(), b.begin(), b.end(), std::inserter( out, out.end() ) ); break;
+            default : std::set_union       ( a.begin(), a.end(), b.begin(), b.end(), std::inserter( out, out.end() ) ); break;
+        }
+        return out;
+    } };
+    auto const check{ [ & ]( Bitmap const & result, std::set<std::uint32_t> const & want, char const * const what ) {
+        // legal, not canonical: a pairwise AND keeps a sparse bitset result a bitset on purpose (demoting a fold
+        // accumulator costs the dense kernels of every later fold step), so only the array limit is asserted here
+        EXPECT_EQ( result.validate(), nullptr ) << what;
+        auto const got{ result.to_vector() };
+        EXPECT_EQ( std::vector<std::uint32_t>( got.begin(), got.end() ), std::vector<std::uint32_t>( want.begin(), want.end() ) ) << what;
+    } };
+
+    unsigned pair_index{ 0 };
+    for ( auto const left_shape : shapes ) {
+        for ( auto const right_shape : shapes ) {
+            std::set<std::uint32_t> left_values, right_values;
+            auto const left { build( left_shape , 0x1000 + pair_index, left_values  ) };
+            auto const right{ build( right_shape, 0x2000 + pair_index, right_values ) };
+            ++pair_index;
+            ASSERT_EQ( left.validate(), nullptr );
+            ASSERT_EQ( right.validate(), nullptr );
+            auto const name{ [ & ]( char const * const op ) { return std::string{ "shapes " } + std::to_string( static_cast<int>( left_shape ) ) + op + std::to_string( static_cast<int>( right_shape ) ); } };
+            for ( char const op : { '&', '-', '|' } ) {
+                auto const want{ reference( left_values, right_values, op ) };
+                Bitmap in_place{ left };
+                switch ( op ) {
+                    case '&': check( left & right, want, name( " & " ).c_str() ); in_place &= right; break;
+                    case '-': check( left - right, want, name( " - " ).c_str() ); in_place -= right; break;
+                    default : check( left | right, want, name( " | " ).c_str() ); in_place |= right; break;
+                }
+                check( in_place, want, name( ( std::string{ " " } + op + "= " ).c_str() ).c_str() );
+            }
+            // the result kind must not depend on the order the operands meet in
+            auto const ab{ left & right };
+            auto const ba{ right & left };
+            auto const stats_ab{ ab.statistics() };
+            auto const stats_ba{ ba.statistics() };
+            EXPECT_EQ( stats_ab.array_containers , stats_ba.array_containers  ) << name( " & (order)" );
+            EXPECT_EQ( stats_ab.bitset_containers, stats_ba.bitset_containers ) << name( " & (order)" );
+            EXPECT_EQ( stats_ab.run_containers   , stats_ba.run_containers    ) << name( " & (order)" );
+        }
+    }
+}
+
+TEST(FrsrRoaringSmoke, RunHeavyPairingsStayLegalAndOrderIndependentByValueSemantics) {
+    check_run_heavy_pairings<frsr::roaring::bitmap<std::uint32_t>>();
+}
+
+TEST(FrsrRoaringSmoke, RunHeavyPairingsStayLegalAndOrderIndependentWhenRefcountedAndLazy) {
+    check_run_heavy_pairings<frsr::roaring::bitmap<
+        std::uint32_t, frsr::roaring::default_container_set<std::uint32_t>,
+        frsr::roaring::detail::cow_atomic_refcount, frsr::roaring::detail::run_selection_lazy>>();
 }
 
 TEST(FrsrRoaringSmoke, RunAccumulatorAndBitsetCombineArmsMatchExpectations) {
