@@ -2586,24 +2586,432 @@ public:
         }
     }
 
-    [[nodiscard]] static bitmap and_many( std::span<bitmap const *> others ) {
-        if ( others.empty() ) {
-            return {};
-        }
-        std::ranges::sort( others, []( bitmap const * const lhs, bitmap const * const rhs ) {
-            return lhs->data_byte_size() < rhs->data_byte_size();
-        } );
-        bitmap result{ *others.front() };
-        for ( auto index{ std::size_t{ 1 } }; index < others.size(); ++index ) {
-            if ( others[ index ] != nullptr ) {
-                result &= *others[ index ];
-                if ( result.empty() ) {
-                    return {};
-                }
+    // ---- n-way AND ------------------------------------------------------------------------------
+    //
+    // The AND of N bitmaps, answered one chunk at a time. Operands are only read: never reordered,
+    // copied or mutated, and neither is the span that names them (a wide key settles its deferred
+    // chunk sort first, as every set operation does; for a 32-bit key the walk writes nothing the
+    // operands own). Operands must be finalized, i.e. not in the middle of a bulk_or_intermediate
+    // fold: the walk reads cardinalities straight from the container headers.
+    //
+    // The chunk tables are walked together, leapfrogging from the operand with the fewest chunks, so
+    // a chunk any operand lacks costs a gallop and no container is opened. Where every operand has
+    // the chunk its containers meet in ascending order of their exact cardinalities - read from the
+    // headers, so the ordering is free and involves no estimate - which makes the accumulator start
+    // as the smallest container and only ever shrink, runs the cheap array probes before the dense
+    // word-wise steps, and ends the chunk at the first empty accumulator. The accumulator lives in a
+    // few scratch containers; no intermediate bitmap or chunk table exists.
+    struct and_many_scratch {
+        handle_type array_acc;
+        handle_type array_alt;
+        handle_type bitset_acc;
+        handle_type bitset_alt;
+    };
+
+    // The values common to every operand, ascending, handed over in blocks. A block is a run of
+    // consecutive result values inside one chunk: the first 256 values of the chunk's result, the next
+    // 256, and so on, the last one shorter. The cut points are a function of the result SET alone, not
+    // of the container kinds it passed through, so a reduction written inside f groups its operands the
+    // same way whatever the result's representation - which a per-value callback cannot promise once
+    // the compiler reassociates a floating-point sum across the loop around it.
+    template <typename F>
+    static void and_many_for_each_block( std::span<bitmap const * const> const operands, F && f, and_many_scratch & scratch ) {
+        and_many_walk( operands, [ & ]( chunk_type const key, std::span<handle_type const * const> const ordered ) {
+            bool owned{ false };
+            if ( auto const * const acc{ and_chunk( ordered, scratch, owned ) } ) {
+                and_many_emit_blocks( *acc, key, f );
             }
+            return true;
+        } );
+    }
+    template <typename F>
+    static void and_many_for_each_block( std::span<bitmap const * const> const operands, F && f ) {
+        and_many_scratch scratch;
+        and_many_for_each_block( operands, std::forward<F>( f ), scratch );
+    }
+
+    // One call per common value, in ascending order. The grouping of a floating-point reduction fused
+    // into f is unspecified; use and_many_for_each_block where it matters.
+    template <typename F>
+    static void and_many_for_each( std::span<bitmap const * const> const operands, F && f ) {
+        and_many_for_each_block( operands, [ & ]( std::span<key_type const> const block ) {
+            for ( auto const value : block ) { f( value ); }
+        } );
+    }
+
+    [[nodiscard]] static size_type and_many_cardinality( std::span<bitmap const * const> const operands ) {
+        and_many_scratch scratch;
+        size_type total{ 0 };
+        and_many_walk( operands, [ & ]( chunk_type const, std::span<handle_type const * const> const ordered ) {
+            bool owned{ false };
+            if ( auto const * const acc{ and_chunk( ordered, scratch, owned ) } ) {
+                total += acc->cardinality();
+            }
+            return true;
+        } );
+        return total;
+    }
+
+    // Whether the operands have any value in common. Stops at the first chunk that does: the last
+    // container of that chunk is only tested against the accumulator, not combined with it.
+    [[nodiscard]] static bool and_many_intersects( std::span<bitmap const * const> const operands ) {
+        and_many_scratch scratch;
+        bool found{ false };
+        and_many_walk( operands, [ & ]( chunk_type const, std::span<handle_type const * const> const ordered ) {
+            if ( ordered.size() == 1 ) {
+                found = true;
+            } else if ( ordered.size() == 2 ) {
+                found = detail::container_intersects( *ordered[ 0 ], *ordered[ 1 ] );
+            } else {
+                bool owned{ false };
+                auto const * const acc{ and_chunk( ordered.first( ordered.size() - 1 ), scratch, owned ) };
+                found = acc != nullptr && detail::container_intersects( *acc, *ordered.back() );
+            }
+            return !found;
+        } );
+        return found;
+    }
+    [[nodiscard]] static bool and_many_intersects( std::span<bitmap const * const> const operands, bitmap const & other ) {
+        and_many_buffer<bitmap const *> all{ operands.size() + 1 };
+        std::size_t count{ 0 };
+        for ( auto const * const operand : operands ) {
+            if ( operand != nullptr ) { all.data[ count++ ] = operand; }
         }
+        all.data[ count++ ] = &other;
+        return and_many_intersects( std::span<bitmap const * const>{ all.data, count } );
+    }
+
+    // The AND as a bitmap. A result bitset that fell to array size is stored as an array.
+    [[nodiscard]] static bitmap and_many( std::span<bitmap const * const> const operands ) {
+        bitmap result;
+        and_many_scratch scratch;
+        and_many_walk( operands, [ & ]( chunk_type const key, std::span<handle_type const * const> const ordered ) {
+            bool owned{ false };
+            auto const * const acc{ and_chunk( ordered, scratch, owned ) };
+            if ( acc == nullptr ) {
+                return true;
+            }
+            auto const count{ static_cast<size_type>( acc->cardinality() ) };
+            if ( !owned ) {
+                result.chunks_.push_back( key, handle_type{ *acc } );
+            } else if ( auto & mine{ const_cast<handle_type &>( *acc ) }; mine.holds_bitset() && count <= array_to_bitset_threshold ) {
+                result.chunks_.push_back( key, detail::array_handle_from_container<layout_type, CowPolicy>( mine ) );
+            } else {
+                result.chunks_.push_back( key, std::move( mine ) );
+            }
+            result.size_ += count;
+            return true;
+        } );
         return result;
     }
+
+private:
+    static constexpr std::size_t and_many_inline_operands{ 16 };
+    static constexpr std::size_t and_many_block_values{ 256 };
+
+    template <typename T>
+    struct and_many_buffer {
+        std::array<T, and_many_inline_operands> inline_;
+        std::unique_ptr<T[]>                    heap_;
+        T *                                     data;
+        explicit and_many_buffer( std::size_t const n )
+            : data{ n <= inline_.size() ? inline_.data() : ( heap_ = std::make_unique<T[]>( n ), heap_.get() ) } {}
+    };
+
+    // The first index at or after `from` whose chunk key is not below `key` (size() if there is none).
+    [[nodiscard]] static size_type and_many_gallop( bitmap const & bm, size_type const from, chunk_type const key ) noexcept {
+        auto const n{ bm.chunks_.size() };
+        if ( from >= n || !( bm.chunks_.key( from ) < key ) ) {
+            return from < n ? from : n;
+        }
+        auto low { from };       // key( low ) < key
+        auto step{ size_type{ 1 } };
+        while ( low + step < n && bm.chunks_.key( low + step ) < key ) {
+            low  += step;
+            step <<= 1;
+        }
+        auto high{ std::min( low + step, n ) };  // key( high ) >= key, or high == n
+        while ( low + 1 < high ) {
+            auto const mid{ low + ( high - low ) / 2 };
+            ( bm.chunks_.key( mid ) < key ? low : high ) = mid;
+        }
+        return high;
+    }
+
+    // Calls chunk( key, handles ) for every chunk key every operand holds a live container for, in
+    // ascending key order, with `handles` ordered by ascending container cardinality. chunk returns
+    // false to stop the walk.
+    template <typename Chunk>
+    static void and_many_walk( std::span<bitmap const * const> const operands, Chunk && chunk ) {
+        std::size_t count{ 0 };
+        for ( auto const * const operand : operands ) {
+            count += operand != nullptr;
+        }
+        if ( count == 0 ) {
+            return;
+        }
+        and_many_buffer<bitmap const *>      ops    { count };
+        and_many_buffer<size_type>           cursors{ count };
+        and_many_buffer<handle_type const *> handles{ count };
+        count = 0;
+        for ( auto const * const operand : operands ) {
+            if ( operand == nullptr ) {
+                continue;
+            }
+            if constexpr ( kUseSingletonChunkMap ) {
+                operand->materialize_singleton_chunks();
+            }
+            operand->compact_front_tombstones( true );
+            const_cast<bitmap *>( operand )->ensure_sorted();
+            if ( operand->chunks_.size() == 0 ) {
+                return;
+            }
+            ops.data[ count ]     = operand;
+            cursors.data[ count ] = 0;
+            ++count;
+        }
+
+        // The driver has the fewest chunks; only keys inside every operand's key range can match.
+        std::size_t driver{ 0 };
+        auto lowest { std::numeric_limits<chunk_type>::lowest() };
+        auto highest{ std::numeric_limits<chunk_type>::max() };
+        for ( std::size_t j{ 0 }; j < count; ++j ) {
+            auto const & chunks{ ops.data[ j ]->chunks_ };
+            if ( chunks.size() < ops.data[ driver ]->chunks_.size() ) { driver = j; }
+            lowest  = std::max( lowest , chunks.key( 0 ) );
+            highest = std::min( highest, chunks.key( chunks.size() - 1 ) );
+        }
+        if ( highest < lowest ) {
+            return;
+        }
+
+        auto const & driving{ *ops.data[ driver ] };
+        auto const   driving_size{ driving.chunks_.size() };
+        for ( auto at{ and_many_gallop( driving, 0, lowest ) }; at < driving_size; ++at ) {
+            auto const key{ driving.chunks_.key( at ) };
+            if ( highest < key ) {
+                break;
+            }
+            bool all_present{ true };
+            for ( std::size_t j{ 0 }; j < count; ++j ) {
+                auto const & bm{ *ops.data[ j ] };
+                auto const   index{ and_many_gallop( bm, cursors.data[ j ], key ) };
+                cursors.data[ j ] = index;
+                if ( index == bm.chunks_.size() ) {
+                    return;  // nothing at or above this key in this operand: nothing further can intersect
+                }
+                auto const found{ bm.chunks_.key( index ) };
+                if ( found != key ) {
+                    // leapfrog: the driver jumps to the operand's next key
+                    at = and_many_gallop( driving, at + 1, found ) - 1;
+                    all_present = false;
+                    break;
+                }
+                handles.data[ j ] = &bm.chunks_.slot( index );
+                if ( detail::container_size( *handles.data[ j ] ) == 0 ) {
+                    all_present = false;  // a lazily erased slot
+                    break;
+                }
+            }
+            if ( !all_present ) {
+                continue;
+            }
+            for ( std::size_t i{ 1 }; i < count; ++i ) {  // ascending cardinality, insertion sort
+                auto const * const moving{ handles.data[ i ] };
+                auto j{ i };
+                for ( ; j > 0 && moving->cardinality() < handles.data[ j - 1 ]->cardinality(); --j ) {
+                    handles.data[ j ] = handles.data[ j - 1 ];
+                }
+                handles.data[ j ] = moving;
+            }
+            if ( !chunk( key, std::span<handle_type const * const>{ handles.data, count } ) ) {
+                return;
+            }
+        }
+    }
+
+    static void and_many_seed_bitset( and_many_scratch & scratch, handle_type const & source ) {
+        auto & acc{ scratch.bitset_acc };
+        if ( !acc.holds_bitset() ) {
+            acc = handle_type::make_bitset_uninitialized();
+        }
+        auto words{ acc.as_bitset() };
+        std::memcpy( words.words.as_array().data(), source.as_bitset().words.as_array().data(), layout_type::word_count * sizeof( std::uint64_t ) );
+        words.cardinality = static_cast<std::uint32_t>( source.cardinality() );
+        words.mark_endpoints_stale();
+    }
+
+    // The AND of the containers of one chunk, ascending by cardinality, as a handle: a view of the only
+    // container when there is just one operand, otherwise one of the scratch handles (owned = true).
+    // nullptr when the intersection is empty.
+    [[nodiscard]] static handle_type const * and_chunk( std::span<handle_type const * const> const ordered, and_many_scratch & scratch, bool & owned ) {
+        owned = false;
+        if ( ordered.size() == 1 ) {
+            return ordered[ 0 ];
+        }
+        owned = true;
+        auto const & seed{ *ordered[ 0 ] };
+        handle_type * acc{};
+        switch ( seed.kind() ) {
+            case detail::container_kind::array: {
+                auto const source{ seed.as_array() };
+                auto       target{ scratch.array_acc.as_array() };
+                detail::resize_uninitialized( target.values, source.values.size() );
+                std::memcpy( target.values.data(), source.values.data(), source.values.size() * sizeof( low_type ) );
+                target.sync_header();
+                acc = &scratch.array_acc;
+                break;
+            }
+            case detail::container_kind::bitset:
+                and_many_seed_bitset( scratch, seed );
+                acc = &scratch.bitset_acc;
+                break;
+            case detail::container_kind::run: {
+                auto const runs{ seed.as_run() };
+                if ( seed.cardinality() <= array_to_bitset_threshold ) {
+                    auto target{ scratch.array_acc.as_array() };
+                    detail::resize_uninitialized( target.values, seed.cardinality() );
+                    auto * out{ target.values.data() };
+                    for ( auto const & run : runs.runs ) {
+                        for ( auto value{ static_cast<std::uint32_t>( run.begin ) }; value <= run.end; ++value ) {
+                            *out++ = static_cast<low_type>( value );
+                        }
+                    }
+                    target.sync_header();
+                    acc = &scratch.array_acc;
+                } else {
+                    auto & bits{ scratch.bitset_acc };
+                    if ( !bits.holds_bitset() ) { bits = handle_type::make_bitset_uninitialized(); }
+                    auto words{ bits.as_bitset() };
+                    std::memset( words.words.as_array().data(), 0, layout_type::word_count * sizeof( std::uint64_t ) );
+                    for ( auto const & run : runs.runs ) {
+                        detail::apply_range_to_words<layout_type>( words.words.as_array(), run.begin, run.end, detail::range_operation::add );
+                    }
+                    words.cardinality = static_cast<std::uint32_t>( seed.cardinality() );
+                    words.mark_endpoints_stale();
+                    acc = &scratch.bitset_acc;
+                }
+                break;
+            }
+        }
+
+        for ( std::size_t i{ 1 }; i < ordered.size(); ++i ) {
+            auto const & other{ *ordered[ i ] };
+            if ( acc->holds_array() ) {
+                auto array{ acc->as_array() };
+                switch ( other.kind() ) {
+                    case detail::container_kind::array : detail::intersect_array_array_inplace<layout_type>( array, other.as_array() ); break;
+                    case detail::container_kind::bitset: detail::filter_array_bitset_inplace  <layout_type>( array, other.as_bitset(), true ); break;
+                    case detail::container_kind::run   : detail::filter_array_run_inplace     <layout_type>( array, other.as_run(), true ); break;
+                }
+                array.sync_header();
+            } else {
+                switch ( other.kind() ) {
+                    case detail::container_kind::bitset:
+                        detail::combine_bitset_bitset_inplace<layout_type, CowPolicy>( acc->as_bitset(), other.as_bitset(), detail::set_operation::bit_and );
+                        break;
+                    case detail::container_kind::array: {
+                        auto alt{ scratch.array_alt.as_array() };
+                        detail::filter_array_bitset_into<layout_type>( other.as_array(), std::as_const( *acc ).as_bitset(), true, alt.values );
+                        alt.sync_header();
+                        std::swap( scratch.array_acc, scratch.array_alt );
+                        acc = &scratch.array_acc;
+                        break;
+                    }
+                    case detail::container_kind::run:
+                        scratch.bitset_alt = detail::intersect_run_bitset<layout_type, CowPolicy>( other.as_run(), std::as_const( *acc ).as_bitset(), std::move( scratch.bitset_alt ) );
+                        std::swap( scratch.bitset_acc, scratch.bitset_alt );
+                        acc = &scratch.bitset_acc;
+                        break;
+                }
+            }
+            if ( acc->cardinality() == 0 ) {
+                return nullptr;
+            }
+        }
+        return acc;
+    }
+
+    // Hands the values of an accumulator over in blocks of and_many_block_values, cut by count from the
+    // start of the chunk. A bitset is decoded a slice of words at a time with the library's vector
+    // extractor and the surplus over whole blocks is carried to the front of the buffer; a scalar
+    // one-bit-at-a-time loop here would cost more than building and decoding an array result.
+    template <typename F>
+    static void and_many_emit_blocks( handle_type const & acc, chunk_type const chunk, F & f ) {
+        constexpr std::size_t block{ and_many_block_values };
+        constexpr bool        vector_decode{ std::is_same_v<key_type, std::uint32_t> };
+        constexpr std::size_t slice_words{ vector_decode ? 64U : 4U };
+        constexpr std::size_t capacity{ slice_words * 64U + block + 64U };  // a slice's values, the carry, and the extractor's slack
+        auto const base{ layout_type::compose( chunk, 0 ) };
+        std::array<key_type, capacity> buffer;
+        if ( acc.holds_array() ) {
+            auto const & values{ acc.as_array().values };
+            auto const   n{ static_cast<std::size_t>( values.size() ) };
+            for ( std::size_t at{ 0 }; at < n; at += block ) {
+                auto const m{ std::min( block, n - at ) };
+                for ( std::size_t j{ 0 }; j < m; ++j ) {
+                    buffer[ j ] = base + static_cast<key_type>( values[ at + j ] );
+                }
+                f( std::span<key_type const>{ buffer.data(), m } );
+            }
+        } else if ( acc.holds_run() ) {
+            // only a lone operand's own container reaches here: the walk expands a run seed
+            std::size_t fill{ 0 };
+            for ( auto const & run : acc.as_run().runs ) {
+                auto value    { static_cast<std::uint32_t>( run.begin ) };
+                auto remaining{ static_cast<std::size_t>( run.end - run.begin ) + 1U };
+                while ( remaining != 0 ) {
+                    auto const n{ std::min( remaining, block - fill ) };
+                    for ( std::size_t j{ 0 }; j < n; ++j ) {
+                        buffer[ fill + j ] = base + static_cast<key_type>( value + j );
+                    }
+                    fill      += n;
+                    value     += static_cast<std::uint32_t>( n );
+                    remaining -= n;
+                    if ( fill == block ) {
+                        f( std::span<key_type const>{ buffer.data(), block } );
+                        fill = 0;
+                    }
+                }
+            }
+            if ( fill != 0 ) {
+                f( std::span<key_type const>{ buffer.data(), fill } );
+            }
+        } else {
+            auto const & words{ acc.as_bitset().words.as_array() };
+            std::size_t fill{ 0 };
+            for ( std::size_t w{ 0 }; w < layout_type::word_count; w += slice_words ) {
+                auto const slice_base{ base + static_cast<key_type>( w << 6U ) };
+                key_type * out{ buffer.data() + fill };
+                if constexpr ( vector_decode ) {
+                    out = detail::extract_setbits_uint32( words.data() + w, slice_words, out, buffer.data() + capacity, slice_base );
+                } else {
+                    for ( std::size_t k{ 0 }; k < slice_words; ++k ) {
+                        auto word{ words[ w + k ] };
+                        auto const word_base{ slice_base + static_cast<key_type>( k << 6U ) };
+                        while ( word != 0 ) {
+                            *out++ = word_base + static_cast<key_type>( std::countr_zero( word ) );
+                            word &= word - 1U;
+                        }
+                    }
+                }
+                fill = static_cast<std::size_t>( out - buffer.data() );
+                std::size_t at{ 0 };
+                for ( ; fill - at >= block; at += block ) {
+                    f( std::span<key_type const>{ buffer.data() + at, block } );
+                }
+                if ( at != 0 ) {
+                    std::copy( buffer.begin() + at, buffer.begin() + fill, buffer.begin() );
+                    fill -= at;
+                }
+            }
+            if ( fill != 0 ) {
+                f( std::span<key_type const>{ buffer.data(), fill } );
+            }
+        }
+    }
+
+public:
 
     // Gives back every byte the bitmap holds beyond its contents: each container's
     // payload slack, the parked scratch payloads, and the chunk arrays' spare
