@@ -1271,6 +1271,15 @@ template <bool Greater, typename E>
     if ( lo == hi || !below( keys[ lo ], limit ) ) {
         return lo;
     }
+    // A skip of up to four elements settles with predictable compares and no search: the dominant
+    // outcome when the key sequence and the limits interleave closely (short runs against an array).
+    // [croaring-ref] deps/croaring/include/roaring/array_util.h:advanceUntil
+    for ( std::size_t offset{ 1 }; offset <= 3; ++offset ) {
+        if ( lo + offset >= hi || !below( keys[ lo + offset ], limit ) ) {
+            return lo + offset;
+        }
+    }
+    lo += 3;
     std::size_t step{ 1 };
     while ( lo + step < hi && below( keys[ lo + step ], limit ) ) {
         lo += step;
