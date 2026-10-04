@@ -5,6 +5,7 @@
 
 #include <array>
 #include <atomic>
+#include <set>
 #include <thread>
 #include <vector>
 
@@ -396,6 +397,49 @@ TEST(FrsrRoaringSmoke, ArrayVsEmptiedRunChunkCombines) {
     WideBitmap subtract_accumulator{ array_side & array_side };
     subtract_accumulator -= runs;
     EXPECT_EQ( subtract_accumulator.to_vector(), all );
+}
+
+TEST(FrsrRoaringSmoke, WideKeyContainsReadsAMissOffTheChunkIndex) {
+    // Past a chunk count of its own, a 64-bit bitmap resolves a membership query through its chunk
+    // index map instead of a search. A chunk the valid map does not hold is absent, so that is the
+    // answer - this pins it across the mutations that build, extend and invalidate the map, where a
+    // stale "absent" would be a wrong answer rather than a slow one.
+    using WideBitmap = frsr::roaring::bitmap<std::uint64_t>;
+    constexpr std::uint64_t chunk_span { 1ULL << 16 };
+    constexpr std::uint64_t chunk_count{ 900 };  // past the map's chunk-count threshold
+    WideBitmap bitmap;
+    std::set<std::uint64_t> reference;
+    auto const insert{ [ & ]( std::uint64_t const value ) { std::ignore = bitmap.add   ( value ); reference.insert( value ); } };
+    auto const erase { [ & ]( std::uint64_t const value ) { std::ignore = bitmap.remove( value ); reference.erase ( value ); } };
+    // only even chunks, so the odd ones are the misses
+    for ( std::uint64_t chunk{ 0 }; chunk < chunk_count; ++chunk ) {
+        insert( 2 * chunk * chunk_span +     7 );
+        insert( 2 * chunk * chunk_span + 4'242 );
+    }
+    auto const probe_every_chunk{ [ & ]( char const * const stage ) {
+        for ( std::uint64_t chunk{ 0 }; chunk < 2 * chunk_count + 4; ++chunk ) {
+            for ( std::uint64_t const low : { std::uint64_t{ 7 }, std::uint64_t{ 4'242 }, std::uint64_t{ 9'999 } } ) {
+                auto const value{ chunk * chunk_span + low };
+                EXPECT_EQ( bitmap.contains( value ), reference.contains( value ) ) << stage << ", value " << value;
+            }
+        }
+    } };
+    probe_every_chunk( "as built" );
+    for ( std::uint64_t chunk{ 0 }; chunk < 40; ++chunk ) {
+        erase( 2 * chunk * chunk_span +     7 );
+        erase( 2 * chunk * chunk_span + 4'242 );
+    }
+    probe_every_chunk( "after emptying chunks" );
+    // Past half the chunks emptied, the store compacts its tombstones and every index moves.
+    for ( std::uint64_t chunk{ 40 }; chunk < 480; ++chunk ) {
+        erase( 2 * chunk * chunk_span +     7 );
+        erase( 2 * chunk * chunk_span + 4'242 );
+    }
+    probe_every_chunk( "after the tombstone compaction" );
+    for ( std::uint64_t chunk{ 0 }; chunk < 30; ++chunk ) { insert( ( 2 * chunk + 1 ) * chunk_span + 11 ); }
+    probe_every_chunk( "after filling gaps that were misses" );
+    bitmap.optimize();
+    probe_every_chunk( "after optimize" );
 }
 
 TEST(FrsrRoaringSmoke, RunAccumulatorAndBitsetCombineArmsMatchExpectations) {

@@ -619,9 +619,14 @@ public:
         }
         if constexpr ( kUseChunkHashMap ) {
             size_type indexed_pos{};
-            if ( try_chunk_index_lookup( chunk, indexed_pos, true ) ) {
-                note_hot_chunk( indexed_pos );
-                return detail::container_contains( chunks_.slot( indexed_pos ), layout_type::low_key( value ) );
+            switch ( try_chunk_index_lookup( chunk, indexed_pos, true ) ) {
+                case chunk_lookup_result::found:
+                    note_hot_chunk( indexed_pos );
+                    return detail::container_contains( chunks_.slot( indexed_pos ), layout_type::low_key( value ) );
+                case chunk_lookup_result::missing:
+                    return false;
+                case chunk_lookup_result::not_used:
+                    break;
             }
         }
         ensure_sorted();
@@ -779,7 +784,7 @@ public:
             size_type hot_index{};
             if ( try_hot_chunk_index( chunk, hot_index ) ) {
                 pos = hot_index;
-            } else if ( try_chunk_index_lookup( chunk, hot_index, true ) ) {
+            } else if ( try_chunk_index_lookup( chunk, hot_index, true ) == chunk_lookup_result::found ) {
                 pos = hot_index;
             } else {
                 pos = lower_bound( chunk );
@@ -2915,7 +2920,16 @@ private:
         chunk_index_lookup_probes_ = 0;
     }
 
-    [[nodiscard]] bool try_chunk_index_lookup(
+    // A chunk-index lookup answers three ways: the map is not in use and the
+    // caller must resolve the chunk itself, the map is in use and the chunk is
+    // absent, or the chunk was found. Same shape as singleton_lookup_result.
+    enum class chunk_lookup_result : std::uint8_t {
+        not_used,
+        missing,
+        found
+    };
+
+    [[nodiscard]] chunk_lookup_result try_chunk_index_lookup(
         chunk_type const chunk,
         size_type & index,
         bool const allow_build
@@ -2927,26 +2941,30 @@ private:
         // that CRoaring resolves with a plain binary search.
         if constexpr ( !kUseChunkHashMap ) {
             (void)chunk; (void)index; (void)allow_build;
-            return false;
+            return chunk_lookup_result::not_used;
         } else {
         if ( chunks_.size() < chunk_index_lookup_threshold ) {
-            return false;
+            return chunk_lookup_result::not_used;
         }
         if ( !chunk_index_map_valid_ ) {
             if ( !allow_build ) {
-                return false;
+                return chunk_lookup_result::not_used;
             }
             if ( ++chunk_index_lookup_probes_ < chunk_index_probe_build_threshold ) {
-                return false;
+                return chunk_lookup_result::not_used;
             }
             ensure_chunk_index_map();
         }
         auto const it{ chunk_index_map_().find( chunk ) };
         if ( it == chunk_index_map_().end() ) {
-            return false;
+            // A valid map indexes every chunk - a structural add inserts into it
+            // and everything else invalidates it - so a miss is the answer, not a
+            // reason to search the chunk array. remove() and contains_bulk()
+            // already read it that way.
+            return chunk_lookup_result::missing;
         }
         index = it->second;
-        return true;
+        return chunk_lookup_result::found;
         }
     }
 
@@ -3684,7 +3702,7 @@ private:
 
             size_type sorted_pos;
             size_type indexed_pos{};
-            if ( try_chunk_index_lookup( chunk, indexed_pos, false ) ) {
+            if ( try_chunk_index_lookup( chunk, indexed_pos, false ) == chunk_lookup_result::found ) {
                 sorted_pos = indexed_pos;
             } else {
                 sorted_pos = lower_bound( chunk );
@@ -3763,7 +3781,7 @@ private:
             if ( try_hot_chunk_index( chunk, hot_index ) ) {
                 pos = hot_index;
                 found_existing = true;
-            } else if ( try_chunk_index_lookup( chunk, hot_index, false ) ) {
+            } else if ( try_chunk_index_lookup( chunk, hot_index, false ) == chunk_lookup_result::found ) {
                 pos = hot_index;
                 found_existing = true;
             } else {
