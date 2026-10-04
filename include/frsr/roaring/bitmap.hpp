@@ -513,6 +513,69 @@ public:
             return static_cast<std::uint16_t>( chunks_.size() );
         }
     }
+    // Checks the structural invariants the set operations and the portable format rely on, and returns a
+    // short description of the first one that does not hold, or nullptr when they all do. The portable
+    // format tells an array from a bitset by cardinality alone, so an array above the array limit is not a
+    // legal container however its values are ordered. A bitmap in the middle of a bulk_or_intermediate
+    // fold carries stale bitset cardinalities and size by design and is reported as broken until it is
+    // finished. With canonical_kinds, a bitset at or below the array limit is reported too: the kind a
+    // result of a set operation settles in is then a function of its cardinality, not of the operation's
+    // path. Linear in the bitmap's size: a debugging and testing aid, never a hot-path check.
+    [[nodiscard]] char const * validate( bool const canonical_kinds = false ) const noexcept {
+        size_type total{ 0 };
+        chunk_type previous{};
+        for ( size_type index{ 0 }; index < chunks_.size(); ++index ) {
+            auto const key{ chunks_.key( index ) };
+            if ( ( !kUseLazySort || chunks_sorted_ ) && index != 0 && !( previous < key ) ) {
+                return "chunk keys are not strictly ascending";
+            }
+            previous = key;
+            auto const & slot{ chunks_.slot( index ) };
+            auto const cardinality{ static_cast<size_type>( slot.cardinality() ) };
+            if ( cardinality == 0 && !kUseLazyTombstoning ) {
+                return "a chunk holds an empty container";
+            }
+            switch ( slot.kind() ) {
+                case detail::container_kind::array: {
+                    auto const & values{ slot.as_array().values };
+                    if ( static_cast<size_type>( values.size() ) != cardinality ) { return "an array's cardinality header differs from its length"; }
+                    if ( cardinality > array_to_bitset_threshold ) { return "an array holds more values than the array limit"; }
+                    for ( size_type i{ 1 }; i < cardinality; ++i ) {
+                        if ( !( values[ i - 1 ] < values[ i ] ) ) { return "an array's values are not strictly ascending"; }
+                    }
+                    break;
+                }
+                case detail::container_kind::bitset: {
+                    auto const & words{ slot.as_bitset().words.as_array() };
+                    size_type bits{ 0 };
+                    for ( size_type w{ 0 }; w < layout_type::word_count; ++w ) { bits += static_cast<size_type>( std::popcount( words[ w ] ) ); }
+                    if ( bits != cardinality ) { return "a bitset's cardinality header differs from its popcount"; }
+                    if ( canonical_kinds && cardinality <= array_to_bitset_threshold ) { return "a bitset holds no more values than the array limit"; }
+                    break;
+                }
+                case detail::container_kind::run: {
+                    size_type counted{ 0 };
+                    bool      first_run{ true };
+                    low_type  previous_end{};
+                    for ( auto const & run : slot.as_run().runs ) {
+                        if ( run.end < run.begin ) { return "a run ends before it begins"; }
+                        if ( !first_run && !( previous_end < run.begin ) ) { return "runs overlap or are out of order"; }
+                        first_run    = false;
+                        previous_end = run.end;
+                        counted     += static_cast<size_type>( run.end - run.begin ) + 1U;
+                    }
+                    if ( counted != cardinality ) { return "a run container's cardinality header differs from its runs"; }
+                    break;
+                }
+            }
+            total += cardinality;
+        }
+        if constexpr ( !kUseSingletonChunkMap ) {
+            if ( total != size_ ) { return "the size differs from the sum of the container cardinalities"; }
+        }
+        return nullptr;
+    }
+
     [[nodiscard]] container_statistics statistics() const noexcept {
         container_statistics result;
         for ( auto const & slot : chunks_.slots() ) {
