@@ -5,6 +5,18 @@
 #include <cstddef>
 #include <cstdint>
 
+// Starts a hot, branch-heavy loop on a cache-line boundary. On Zen the same loop body runs up to 20%
+// apart depending on where it lands relative to the branch predictor's fetch blocks, so its placement
+// is pinned instead of depending on whatever precedes it.
+#if defined( __clang__ ) && defined( __has_cpp_attribute )
+#   if __has_cpp_attribute( clang::code_align )
+#       define FRSR_ROARING_LOOP_ALIGN [[ clang::code_align( 64 ) ]]
+#   endif
+#endif
+#ifndef FRSR_ROARING_LOOP_ALIGN
+#   define FRSR_ROARING_LOOP_ALIGN
+#endif
+
 namespace frsr::roaring::detail {
 
 // Compile-time SIMD characteristics of the build target. The bitset word kernels

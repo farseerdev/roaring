@@ -1,6 +1,7 @@
 #pragma once
 
 #include <frsr/roaring/containers.hpp>
+#include <frsr/roaring/hw_info.hpp>
 
 #include <algorithm>
 #include <cstddef>
@@ -52,7 +53,7 @@ template <typename Layout>
     auto xstart{ static_cast<std::size_t>( rhs_runs[ ri ].begin ) };
     auto xend{ static_cast<std::size_t>( rhs_runs[ ri ].end ) + 1U };
 
-    while ( li < lhs_size && ri < rhs_size ) {
+    FRSR_ROARING_LOOP_ALIGN while ( li < lhs_size && ri < rhs_size ) {
         if ( end <= xstart ) {
             ++li;
             if ( li < lhs_size ) {
@@ -121,7 +122,7 @@ template <typename Layout>
     auto end{ static_cast<std::size_t>( lhs_runs[ li ].end ) + 1U };
     auto xstart{ static_cast<std::size_t>( rhs_runs[ ri ].begin ) };
     auto xend{ static_cast<std::size_t>( rhs_runs[ ri ].end ) + 1U };
-    while ( li < lhs_size && ri < rhs_size ) {
+    FRSR_ROARING_LOOP_ALIGN while ( li < lhs_size && ri < rhs_size ) {
         if ( end <= xstart ) {
             ++li;
             if ( li < lhs_size ) {

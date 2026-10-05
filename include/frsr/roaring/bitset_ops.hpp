@@ -224,7 +224,7 @@ inline std::uint32_t * extract_setbits_uint32(
     __m512i const inc64     { _mm512_set1_epi32( 64 ) };
     __m512i const indices   { _mm512_load_si512( index_table ) };
     std::size_t index{ 0 };
-    for ( ; index < n; ++index ) {
+    FRSR_ROARING_LOOP_ALIGN for ( ; index < n; ++index ) {
         auto const word{ words[ index ] };
         if ( word != 0 ) {
             auto const count{ static_cast<std::size_t>( std::popcount( word ) ) };
@@ -436,6 +436,40 @@ template <typename Layout, typename CowPolicy = cow_value_semantics>
     return result;
 }
 
+// The fill of intersect_run_bitset for many short runs, into words that are already zero: every
+// covered word is OR-ed in with no state carried between runs. The masks come from one shift and one
+// subtraction each (bits first_bit..63 and 0..last_bit; the shift of 2 by 63 wraps to 0, and 0 - 1 is
+// all ones), with no branch for last_bit == 63. Kept out of line so the few-long-runs fill, which it
+// would otherwise share a body with, keeps its own code. Returns the set-bit count.
+template <typename Layout, typename Runs, typename Words>
+[[ gnu::noinline ]] inline std::size_t fill_run_bitset_words_of_many_runs( Runs const & runs, Words const & src, Words & out ) noexcept {
+    std::size_t cardinality{ 0 };
+    for ( auto const & current : runs ) {
+        auto const first_word{ static_cast<std::size_t>( current.begin ) >> 6U };
+        auto const last_word { static_cast<std::size_t>( current.end   ) >> 6U };
+        auto const first_mask{ std::uint64_t{ 0 } - ( std::uint64_t{ 1 } << ( current.begin & 63U ) ) };
+        auto const last_mask { ( std::uint64_t{ 2 } << ( current.end & 63U ) ) - 1U };
+        if ( first_word == last_word ) {
+            auto const masked{ src[ first_word ] & first_mask & last_mask };
+            out[ first_word ] |= masked;
+            cardinality += static_cast<std::size_t>( std::popcount( masked ) );
+        } else {
+            auto const first_masked{ src[ first_word ] & first_mask };
+            out[ first_word ] |= first_masked;
+            cardinality += static_cast<std::size_t>( std::popcount( first_masked ) );
+            for ( auto word_index{ first_word + 1U }; word_index < last_word; ++word_index ) {
+                auto const word{ src[ word_index ] };
+                out[ word_index ] = word;
+                cardinality += static_cast<std::size_t>( std::popcount( word ) );
+            }
+            auto const last_masked{ src[ last_word ] & last_mask };
+            out[ last_word ] = last_masked;
+            cardinality += static_cast<std::size_t>( std::popcount( last_masked ) );
+        }
+    }
+    return cardinality;
+}
+
 // run∩bitset written directly into a (retired or fresh) bitset handle — the
 // dedicated combine-spine arm's analog of combine_bitset_bitset's reuse
 // contract. The generic path builds a zero-initialized stack word_array, ORs
@@ -475,6 +509,12 @@ template <typename Layout, typename CowPolicy = cow_value_semantics>
     bool const many_short_runs{ runs.runs.size() > 32U };
     if ( many_short_runs ) {
         out.fill( 0 );
+        auto const cardinality{ fill_run_bitset_words_of_many_runs<Layout>( runs.runs, src, out ) };
+        if ( cardinality == 0 ) {
+            return container_handle<Layout, CowPolicy>{};
+        }
+        result.set_cardinality( static_cast<std::uint32_t>( cardinality ) );
+        return result;
     }
     std::size_t cardinality{ 0 };
     std::size_t next_unwritten{ 0 }; // first word index not yet written
@@ -483,7 +523,7 @@ template <typename Layout, typename CowPolicy = cow_value_semantics>
         auto const last_word { static_cast<std::size_t>( current.end   ) >> 6U };
         auto const first_bit { static_cast<unsigned>( current.begin ) & 63U };
         auto const last_bit  { static_cast<unsigned>( current.end   ) & 63U };
-        if ( !many_short_runs && first_word > next_unwritten ) {
+        if ( first_word > next_unwritten ) {
             std::fill( &out[ next_unwritten ], &out[ first_word ], std::uint64_t{ 0 } );
         }
         auto const first_mask{ std::numeric_limits<std::uint64_t>::max() << first_bit };
@@ -519,7 +559,7 @@ template <typename Layout, typename CowPolicy = cow_value_semantics>
         }
         next_unwritten = last_word + 1U;
     }
-    if ( !many_short_runs && next_unwritten < out.size() ) {
+    if ( next_unwritten < out.size() ) {
         std::fill( &out[ next_unwritten ], out.data() + out.size(), std::uint64_t{ 0 } );
     }
     if ( cardinality == 0 ) {
