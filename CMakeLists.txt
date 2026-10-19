@@ -237,6 +237,7 @@ if(FRSR_ROARING_BUILD_TESTS)
         tests/borrowed_bitmap.cpp
         tests/cow_semantics.cpp
         tests/cow_bitmap.cpp
+        tests/bitmap_concurrent_reads.cpp
     )
     target_link_libraries(frsr_roaring_tests
         PRIVATE

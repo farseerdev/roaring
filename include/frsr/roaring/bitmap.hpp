@@ -4514,6 +4514,12 @@ private:
     // binary-search lookup, immediate erase, no singleton-chunk staging. This is
     // the parity baseline — frsr must match CRoaring here before any of the novel
     // optimizations below are enabled to try to beat it.
+    // The three chunk-array flags below are off for every key width: a wide key
+    // gets the same always-sorted chunk array and pure binary-search reads as a
+    // narrow one, so every const query is a pure read (CRoaring's guarantee that
+    // concurrent readers of an unmodified bitmap are safe). They may be re-enabled
+    // for wide keys only as opt-in features that keep const reads pure, i.e. all
+    // lazy state is repaired inside non-const operations.
     // Note: kUseLazySort requires kUseChunkHashMap (unsorted chunks need the map).
     // Same split as kUseLazyTombstoning below, for the other half of the flat
     // chunk map's O(n) per chunk: INSERTING a chunk in the middle of a sorted
@@ -4525,8 +4531,8 @@ private:
     // goes 5.55 -> 0.024 us per value, and 100k scattered inserts 0.031 ->
     // 0.017, i.e. 14x AHEAD of the reference implementation's 64-bit map where
     // the flat array was 16x behind it.
-    static constexpr bool kUseLazySort        = ( sizeof( chunk_type ) > 2 ); // defer chunk sort to set-op paths
-    static constexpr bool kUseChunkHashMap    = ( sizeof( chunk_type ) > 2 ); // hash-map chunk lookup vs binary search
+    static constexpr bool kUseLazySort        = false; // defer chunk sort to set-op paths
+    static constexpr bool kUseChunkHashMap    = false; // hash-map chunk lookup vs binary search
     // Erasing an emptied chunk memmoves the tail of the chunk array, so removing
     // many chunks is quadratic in the chunk count. How much that matters depends
     // entirely on how wide the chunk key is:
@@ -4537,7 +4543,7 @@ private:
     //     measured on a 10 000-chunk remove-all, 6.18 -> 0.031 us per value, i.e.
     //     ~197x, which also puts it 1.6x ahead of the reference implementation's
     //     64-bit map instead of ~120x behind it.
-    static constexpr bool kUseLazyTombstoning = ( sizeof( chunk_type ) > 2 ); // mark-erased vs immediate erase
+    static constexpr bool kUseLazyTombstoning = false; // mark-erased vs immediate erase
     // Novel: remember the last resolved chunk slot and probe it (plus its two
     // neighbours) before the binary search. CRoaring has no analog on the plain
     // lookup path — it keeps this amortization opt-in via roaring_bulk_context_t
