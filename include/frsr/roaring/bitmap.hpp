@@ -297,18 +297,21 @@ public:
     // any in-place write sequence would observe a half-applied one anyway - and
     // in practice it falls out of the lock discipline: writers hold the
     // exclusive lock, readers copy under a shared one.
+    //
+    // A context belongs to the bitmap it was filled from. It holds the resolved slot
+    // itself, as the reference caches its container, together with the chunk table's
+    // generation at the time: any call that restructures the table (a chunk added or
+    // removed, a set operation, a swap) advances the generation, the context is then
+    // stale, and the next call locates the chunk again. The slot pointer and the cursor
+    // are never dereferenced before the generation has been compared.
     struct bulk_context {
         chunk_type chunk{};
         chunk_cursor at{};
-        bool located{ false };      // `at` holds the chunk's position (revalidated by key on use)
-        bool payload_private{ false };
-        // The resolved slot itself, as the reference caches its container: valid
-        // while `generation` still matches the chunk store's (no slot has moved
-        // or died since it was taken). add_bulk's hit lane goes through it.
-        handle_type * slot{ nullptr };
+        handle_type const * slot{ nullptr };   // nullptr: nothing is cached
         std::uint32_t generation{ 0 };
+        bool payload_private{ false };
 
-        void reset() noexcept { located = false; payload_private = false; slot = nullptr; }
+        void reset() noexcept { slot = nullptr; payload_private = false; }
     };
 
     class const_iterator {
@@ -583,13 +586,16 @@ public:
 
     [[nodiscard]] bool contains_bulk( bulk_context & ctx, key_type const value ) const noexcept {
         auto const chunk{ layout_type::chunk_key( value ) };
-        if ( ctx.located && ctx.at != chunks_.end() ) {
-            if ( chunks_.key( ctx.at ) == chunk ) {
-                return detail::container_contains( chunks_.slot( ctx.at ), layout_type::low_key( value ) );
+        auto const low  { layout_type::low_key( value ) };
+        if ( ctx.slot != nullptr && ctx.generation == chunks_.generation() ) [[likely]] {
+            if ( ctx.chunk == chunk ) {
+                return detail::container_contains( *ctx.slot, low );
             }
             if ( try_adjacent_chunk( chunk, ctx.at ) ) {
-                ctx.chunk = chunk;
-                return detail::container_contains( chunks_.slot( ctx.at ), layout_type::low_key( value ) );
+                ctx.chunk           = chunk;
+                ctx.slot            = &chunks_.slot( ctx.at );
+                ctx.payload_private = false;
+                return detail::container_contains( *ctx.slot, low );
             }
         }
         auto const at{ lower_bound_outlined( chunk ) };
@@ -597,10 +603,12 @@ public:
             ctx.reset();
             return false;
         }
-        ctx.chunk   = chunk;
-        ctx.at      = at;
-        ctx.located = true;
-        return detail::container_contains( chunks_.slot( at ), layout_type::low_key( value ) );
+        ctx.chunk           = chunk;
+        ctx.at              = at;
+        ctx.slot            = &chunks_.slot( at );
+        ctx.generation      = chunks_.generation();
+        ctx.payload_private = false;
+        return detail::container_contains( *ctx.slot, low );
     }
 
     [[nodiscard]] bool add( key_type const value ) {
@@ -615,7 +623,8 @@ public:
     [[nodiscard]] bool add_bulk( bulk_context & ctx, key_type const value ) {
         auto const chunk{ layout_type::chunk_key( value ) };
         if ( ctx.slot != nullptr && ctx.generation == chunks_.generation() && ctx.chunk == chunk ) [[likely]] {
-            auto       & slot{ *ctx.slot };
+            // The context was filled from this (non-const) bitmap, whose slots are not const.
+            auto       & slot{ const_cast<handle_type &>( *ctx.slot ) };
             auto const   low { layout_type::low_key( value ) };
             // The common hit is an in-order append into a private array: one
             // inline lane, as the reference's is, before the kind dispatch.
@@ -3377,41 +3386,23 @@ private:
         auto const chunk{ layout_type::chunk_key( value ) };
         auto const low{ layout_type::low_key( value ) };
 
-        chunk_cursor at;
-        bool ctx_payload_private{ false };
-        if (
-            ctx != nullptr &&
-            ctx->located &&
-            ctx->at != chunks_.end() &&
-            chunks_.key( ctx->at ) == chunk
-        ) {
-            at = ctx->at;
-            ctx_payload_private = ctx->payload_private;
-        } else {
-            // CRoaring-style: O(log n) binary search + sorted insert.
-            at = chunks_.lower_bound( chunk );
-            if ( at == chunks_.end() || chunks_.key( at ) != chunk ) {
-                at = chunks_.insert( at, chunk, handle_type{} );
-            }
+        // CRoaring-style: O(log n) binary search + sorted insert.
+        auto at{ chunks_.lower_bound( chunk ) };
+        if ( at == chunks_.end() || chunks_.key( at ) != chunk ) {
+            at = chunks_.insert( at, chunk, handle_type{} );
         }
 
         if ( ctx != nullptr ) {
-            ctx->chunk   = chunk;
-            ctx->at      = at;
-            ctx->located = true;
-            ctx->slot    = &chunks_.slot( at );
+            ctx->chunk      = chunk;
+            ctx->at         = at;
+            ctx->slot       = &chunks_.slot( at );
             ctx->generation = chunks_.generation();
-            // The add below makes this payload private (or already found it so),
-            // and no copy can intervene before the next call on this context.
+            // The add below makes this payload private (or finds it so), and no copy can
+            // intervene before the next call on this context.
             ctx->payload_private = true;
         }
 
-        auto const added{
-            ctx_payload_private
-                ? detail::container_add_already_private( chunks_.slot( at ), low )
-                : detail::container_add               ( chunks_.slot( at ), low )
-        };
-        if ( !added ) { return false; }
+        if ( !detail::container_add( chunks_.slot( at ), low ) ) { return false; }
 
         ++size_;
         promote_if_needed( chunks_.slot( at ) );
