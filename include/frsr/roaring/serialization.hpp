@@ -39,10 +39,6 @@ std::size_t bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy>::serialized
 template <std::unsigned_integral Key, typename ContainerSet, typename CowPolicy, typename RunSelectionPolicy>
     requires detail::valid_container_set<Key, ContainerSet>
 std::size_t bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy>::frozen_size_bytes() const {
-    if constexpr ( kUseSingletonChunkMap ) {
-        materialize_singleton_chunks();
-    }
-    ensure_sorted();
 
     std::size_t chunk_count{};
     std::size_t offset{ sizeof( frozen_header ) };
@@ -97,10 +93,6 @@ void bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy>::serialize_to_vm_v
 template <std::unsigned_integral Key, typename ContainerSet, typename CowPolicy, typename RunSelectionPolicy>
     requires detail::valid_container_set<Key, ContainerSet>
 void bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy>::serialize_frozen_to_vm_vector( serialized_byte_vector & out ) const {
-    if constexpr ( kUseSingletonChunkMap ) {
-        materialize_singleton_chunks();
-    }
-    ensure_sorted();
 
     std::uint32_t chunk_count{};
     for ( auto const & slot : chunks_.slots() ) {
@@ -377,10 +369,6 @@ bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy> bitmap<Key, ContainerSe
         }
         result.chunks_.push_back( static_cast<chunk_type>( entry.chunk ), std::move( container ) );
     }
-    if constexpr ( kUseLazySort ) {
-        result.chunks_sorted_ = true;
-    }
-    result.invalidate_chunk_index_map();
     return result;
 }
 
@@ -414,10 +402,6 @@ void bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy>::frozen_view::borr
             )
         );
     }
-    if constexpr ( kUseLazySort ) {
-        out.chunks_sorted_ = true;
-    }
-    out.invalidate_chunk_index_map();
 }
 
 template <std::unsigned_integral Key, typename ContainerSet, typename CowPolicy, typename RunSelectionPolicy>
@@ -694,10 +678,6 @@ template <std::unsigned_integral Key, typename ContainerSet, typename CowPolicy,
     requires detail::valid_container_set<Key, ContainerSet>
 std::size_t bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy>::portable_size_in_bytes() const requires ( std::numeric_limits<Key>::digits >= 32 ) {
     static_assert( std::numeric_limits<key_type>::digits == 32 || std::numeric_limits<key_type>::digits == 64, "the portable format is defined for 32- and 64-bit keys" );
-    if constexpr ( kUseSingletonChunkMap ) {
-        materialize_singleton_chunks();
-    }
-    ensure_sorted();
 
     if constexpr ( std::numeric_limits<key_type>::digits == 32 ) {
         auto const plan{ portable_plan_for( 0, chunks_.size() ) };
@@ -724,10 +704,6 @@ template <std::unsigned_integral Key, typename ContainerSet, typename CowPolicy,
     requires detail::valid_container_set<Key, ContainerSet>
 std::size_t bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy>::portable_serialize( std::span<std::byte> const out ) const requires ( std::numeric_limits<Key>::digits >= 32 ) {
     static_assert( std::numeric_limits<key_type>::digits == 32 || std::numeric_limits<key_type>::digits == 64, "the portable format is defined for 32- and 64-bit keys" );
-    if constexpr ( kUseSingletonChunkMap ) {
-        materialize_singleton_chunks();
-    }
-    ensure_sorted();
     assert( out.size() >= portable_size_in_bytes() );
 
     auto * cursor{ out.data() };
@@ -953,10 +929,6 @@ std::optional<bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy>> bitmap<K
     }
 
     result.size_ = total;
-    if constexpr ( kUseLazySort ) {
-        result.chunks_sorted_ = true;
-    }
-    result.invalidate_chunk_index_map();
     return result;
 }
 

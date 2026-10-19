@@ -1,9 +1,6 @@
 #pragma once
 
-// Compile-time configuration knobs for the container kernels. The container-set /
-// chunk-strategy flags (kUseLazySort, kUseChunkHashMap, kUseLazyTombstoning,
-// kUseSingletonChunkMap) are per-bitmap policy and live as static members of
-// frsr::roaring::bitmap in bitmap.hpp; the kernel-level knobs below are free.
+// Compile-time configuration knobs for the container kernels.
 
 #include <cstddef>
 #include <cstdint>

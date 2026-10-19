@@ -307,7 +307,6 @@ TEST(FrsrRoaringSmoke, LazyUnionFinishersExposeExpectedContainerForms) {
         EXPECT_EQ( stats.array_containers, arrays );
         EXPECT_EQ( stats.run_containers, runs );
         EXPECT_EQ( stats.bitset_containers, bitsets );
-        EXPECT_EQ( stats.staged_singleton_chunks, 0U );
         EXPECT_EQ( stats.container_count(), 1U );
     };
 
@@ -734,12 +733,12 @@ TEST(FrsrRoaringSmoke, WideKeyContainsReadsAMissOffTheChunkIndex) {
         erase( 2 * chunk * chunk_span + 4'242 );
     }
     probe_every_chunk( "after emptying chunks" );
-    // Past half the chunks emptied, the store compacts its tombstones and every index moves.
+    // Past half the chunks emptied, every later chunk has moved down.
     for ( std::uint64_t chunk{ 40 }; chunk < 480; ++chunk ) {
         erase( 2 * chunk * chunk_span +     7 );
         erase( 2 * chunk * chunk_span + 4'242 );
     }
-    probe_every_chunk( "after the tombstone compaction" );
+    probe_every_chunk( "after the long erase run" );
     for ( std::uint64_t chunk{ 0 }; chunk < 30; ++chunk ) { insert( ( 2 * chunk + 1 ) * chunk_span + 11 ); }
     probe_every_chunk( "after filling gaps that were misses" );
     bitmap.optimize();

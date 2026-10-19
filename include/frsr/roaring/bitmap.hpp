@@ -35,7 +35,6 @@
 #include <ranges>
 #include <span>
 #include <type_traits>
-#include <unordered_map>
 #include <utility>
 #include <variant>
 #include <vector>   // the serialized_byte_vector fallback uses std::vector even with psi::vm present
@@ -46,14 +45,6 @@
 #       include <psi/vm/containers/vm_vector.hpp>
 #   endif
     // heap_vector already pulled in via run_container.hpp → psi/vm/containers/heap_vector.hpp
-#endif
-
-// Prefer Boost's open-addressing flat_hash_map for the chunk-index cache:
-// it eliminates pointer chasing in std::unordered_map and greatly reduces
-// cache misses on large sparse bitmaps (1M+ distinct chunk keys).
-#if __has_include(<boost/unordered/unordered_flat_map.hpp>)
-#   include <boost/unordered/unordered_flat_map.hpp>
-#   define FRSR_USE_BOOST_FLAT_MAP 1
 #endif
 
 namespace frsr::roaring {
@@ -73,42 +64,6 @@ template <std::unsigned_integral Key>
 using default_container_set = std::variant<array_container<Key>, run_container<Key>, bitset_container<Key>>;
 
 namespace detail {
-
-// A bitmap bookkeeping member that forwards to a real T while its feature flag
-// is Active, but is an empty (combined with [[no_unique_address]]) stand-in when
-// the flag is compiled off: reads yield OffValue, writes/increments are no-ops.
-// This lets every novel-feature counter (lazy-tombstone / lazy-sort / hot-chunk /
-// adaptive chunk-index bookkeeping) cost zero footprint when its flag is off
-// WITHOUT guarding each of its dozens of use sites — the flags-off bitmap shrinks
-// by construction and the existing read / write / ++ / compare sites keep working
-// through these operators. Feature-off semantics are correct by construction:
-// e.g. tombstone_count reads 0 so every `tombstone_count_ != 0` guard is false,
-// exactly matching "no lazy tombstones exist when the feature is off".
-template <typename T, bool Active, T OffValue = T{}>
-struct feature_field {
-    T value_{ OffValue };
-    constexpr feature_field(                    ) noexcept = default;
-    constexpr feature_field( feature_field const & ) noexcept = default;
-    constexpr feature_field & operator=( feature_field const & ) noexcept = default;
-    constexpr operator T() const noexcept { return value_; }
-    constexpr feature_field & operator= ( T const v ) noexcept { value_ = v; return *this; }
-    constexpr feature_field & operator++(          ) noexcept { ++value_; return *this; }
-    constexpr T               operator++( int      ) noexcept { return value_++; }
-    constexpr feature_field & operator--(          ) noexcept { --value_; return *this; }
-    constexpr T               operator--( int      ) noexcept { return value_--; }
-};
-template <typename T, T OffValue>
-struct feature_field<T, false, OffValue> {
-    constexpr feature_field(                    ) noexcept = default;
-    constexpr feature_field( feature_field const & ) noexcept = default;
-    constexpr feature_field & operator=( feature_field const & ) noexcept = default;
-    constexpr operator T() const noexcept { return OffValue; }
-    constexpr feature_field & operator= ( T          ) noexcept { return *this; }
-    constexpr feature_field & operator++(            ) noexcept { return *this; }
-    constexpr T               operator++( int        ) noexcept { return OffValue; }
-    constexpr feature_field & operator--(            ) noexcept { return *this; }
-    constexpr T               operator--( int        ) noexcept { return OffValue; }
-};
 
 template <typename... Types>
 struct unique_types : std::true_type {};
@@ -317,10 +272,9 @@ public:
         size_type array_containers{};
         size_type run_containers{};
         size_type bitset_containers{};
-        size_type staged_singleton_chunks{};
 
         [[nodiscard]] constexpr size_type container_count() const noexcept {
-            return array_containers + run_containers + bitset_containers + staged_singleton_chunks;
+            return array_containers + run_containers + bitset_containers;
         }
     };
 
@@ -443,20 +397,7 @@ public:
 
     bitmap() = default;
 
-    // User-defined copy (the boxed chunk-index cache makes the implicit one
-    // deleted): copies the real state — chunks, singleton staging, tombstone /
-    // sort bookkeeping, cardinality — and deliberately NOT the derived caches
-    // (chunk index map, read index, hot indices): a copy starts with a cold
-    // cache instead of paying a map clone for state it may never look up.
-    bitmap( bitmap const & other )
-        : chunks_{ other.chunks_ }
-        , front_tombstones_{ other.front_tombstones_ }
-        , singleton_chunks_{ other.singleton_chunks_ }
-        , removes_since_structural_add_{ other.removes_since_structural_add_ }
-        , chunks_sorted_{ other.chunks_sorted_ }
-        , tombstone_count_{ other.tombstone_count_ }
-        , size_{ other.size_ }
-    {}
+    bitmap( bitmap const & ) = default;
 
     bitmap( bitmap && ) noexcept = default;
 
@@ -493,9 +434,6 @@ public:
         for ( auto const & slot : chunks_.slots() ) {
             total += detail::container_byte_size( slot );
         }
-        if constexpr ( kUseSingletonChunkMap ) {
-            total += singleton_chunks_.size() * sizeof( singleton_chunk_entry );
-        }
         return total;
     }
 
@@ -518,18 +456,10 @@ public:
         for ( auto const & slot : chunks_.slots() ) {
             total += detail::container_byte_size( slot );
         }
-        if constexpr ( kUseSingletonChunkMap ) {
-            total += singleton_chunks_.size()
-                   * ( chunk_descriptor_bytes + sizeof( typename layout_type::low_type ) );
-        }
         return total;
     }
     [[nodiscard]] std::uint16_t container_count() const noexcept {
-        if constexpr ( kUseSingletonChunkMap ) {
-            return static_cast<std::uint16_t>( chunks_.size() + singleton_chunks_.size() );
-        } else {
-            return static_cast<std::uint16_t>( chunks_.size() );
-        }
+        return static_cast<std::uint16_t>( chunks_.size() );
     }
     // Checks the structural invariants the set operations and the portable format rely on, and returns a
     // short description of the first one that does not hold, or nullptr when they all do. The portable
@@ -544,13 +474,13 @@ public:
         chunk_type previous{};
         for ( size_type index{ 0 }; index < chunks_.size(); ++index ) {
             auto const key{ chunks_.key( index ) };
-            if ( ( !kUseLazySort || chunks_sorted_ ) && index != 0 && !( previous < key ) ) {
+            if ( index != 0 && !( previous < key ) ) {
                 return "chunk keys are not strictly ascending";
             }
             previous = key;
             auto const & slot{ chunks_.slot( index ) };
             auto const cardinality{ static_cast<size_type>( slot.cardinality() ) };
-            if ( cardinality == 0 && !kUseLazyTombstoning ) {
+            if ( cardinality == 0 ) {
                 return "a chunk holds an empty container";
             }
             switch ( slot.kind() ) {
@@ -588,18 +518,13 @@ public:
             }
             total += cardinality;
         }
-        if constexpr ( !kUseSingletonChunkMap ) {
-            if ( total != size_ ) { return "the size differs from the sum of the container cardinalities"; }
-        }
+        if ( total != size_ ) { return "the size differs from the sum of the container cardinalities"; }
         return nullptr;
     }
 
     [[nodiscard]] container_statistics statistics() const noexcept {
         container_statistics result;
         for ( auto const & slot : chunks_.slots() ) {
-            if ( detail::container_size( slot ) == 0 ) {
-                continue;  // lazy-removal tombstone, not a logical container
-            }
             if ( slot.holds_array() ) {
                 ++result.array_containers;
             } else if ( slot.holds_run() ) {
@@ -608,16 +533,10 @@ public:
                 ++result.bitset_containers;
             }
         }
-        if constexpr ( kUseSingletonChunkMap ) {
-            result.staged_singleton_chunks = singleton_chunks_.size();
-        }
         return result;
     }
     [[nodiscard]] key_type front() const noexcept { return *begin(); }
     [[nodiscard]] key_type back() const noexcept {
-        if constexpr ( kUseSingletonChunkMap ) {
-            materialize_singleton_chunks();
-        }
         auto chunk_index{ chunks_.size() };
         while ( chunk_index > 0 ) {
             --chunk_index;
@@ -636,7 +555,7 @@ public:
 
     void clear() noexcept {
         chunks_.clear();
-        clear_bookkeeping();
+        size_ = 0;
     }
     // Scratch reuse (CRoaring persistent-dst analog): logically empty, but the
     // container payloads are retired for chunk_store::take_retired() reuse by
@@ -644,105 +563,24 @@ public:
     // reallocated) on every *_into combine.
     void clear_keep_capacity() noexcept {
         chunks_.clear_retiring_slots();
-        clear_bookkeeping();
-    }
-
-private:
-    void clear_bookkeeping() noexcept {
-        front_tombstones_ = 0;
-        hot_chunk_index_ = invalid_index;
-        if constexpr ( kUseSingletonChunkMap ) {
-            singleton_chunks_.clear();
-            reset_singleton_read_index_empty();
-        }
-        if ( chunk_index_map_box_ ) {
-            chunk_index_map_box_->clear();
-        }
-        chunk_index_map_valid_ = false;
-        chunk_index_lookup_probes_ = 0;
-        if constexpr ( kUseLazySort ) { chunks_sorted_ = true; }
-        if constexpr ( kUseLazyTombstoning ) { tombstone_count_ = 0; }
         size_ = 0;
     }
 
 public:
 
+    // A pure binary search over the chunk keys, nothing written, so concurrent readers of one
+    // bitmap are safe. [croaring-ref] roaring_bitmap_contains -> containerptr_roaring is
+    // likewise a read-only container lookup; amortization is opt-in through
+    // roaring_bitmap_contains_bulk, mirrored here by contains_bulk.
     [[nodiscard]] bool contains( key_type const value ) const noexcept {
         auto const chunk{ layout_type::chunk_key( value ) };
-        if constexpr ( kUseSingletonChunkMap ) {
-            singleton_chunk_entry const * indexed_entry{};
-            switch ( try_singleton_read_index_lookup( chunk, indexed_entry, false ) ) {
-                case singleton_lookup_result::found:
-                    return singleton_contains( *indexed_entry, layout_type::low_key( value ) );
-                case singleton_lookup_result::missing:
-                    return false;
-                case singleton_lookup_result::not_used:
-                    break;
-            }
-            auto const it{ singleton_chunks_.find( chunk ) };
-            if ( it != singleton_chunks_.end() ) {
-                return singleton_contains( it->second, layout_type::low_key( value ) );
-            }
-        }
-        // Parity shape (all novel flags off): a pure binary search, nothing
-        // written. [croaring-ref] roaring_bitmap_contains -> containerptr_roaring
-        // is likewise a read-only container lookup; amortization is opt-in
-        // through roaring_bitmap_contains_bulk, mirrored here by contains_bulk.
-        if constexpr ( kUseHotChunkIndex ) {
-            size_type hot_index{};
-            if ( try_hot_chunk_index( chunk, hot_index ) ) {
-                return detail::container_contains( chunks_.slot( hot_index ), layout_type::low_key( value ) );
-            }
-            if ( try_adjacent_chunk_index( chunk, hot_chunk_index_, hot_index ) ) {
-                hot_chunk_index_ = hot_index;
-                return detail::container_contains( chunks_.slot( hot_index ), layout_type::low_key( value ) );
-            }
-        }
-        if constexpr ( kUseChunkHashMap ) {
-            size_type indexed_pos{};
-            switch ( try_chunk_index_lookup( chunk, indexed_pos, true ) ) {
-                case chunk_lookup_result::found:
-                    note_hot_chunk( indexed_pos );
-                    return detail::container_contains( chunks_.slot( indexed_pos ), layout_type::low_key( value ) );
-                case chunk_lookup_result::missing:
-                    return false;
-                case chunk_lookup_result::not_used:
-                    break;
-            }
-        }
-        ensure_sorted();
-        if constexpr ( kUseThreadChunkHint ) {
-            static thread_local size_type hint{};
-            auto const keys{ chunks_.keys() };
-            auto const count{ keys.size() };
-            // p is the lower bound of `chunk` iff it sits between the keys around it
-            auto const is_lower_bound{ [&]( size_type const p ) noexcept {
-                return ( p == count || keys[ p ] >= chunk ) && ( p == 0 || keys[ p - 1 ] < chunk );
-            } };
-            size_type pos{ hint };
-            if ( pos > count || !is_lower_bound( pos ) ) {
-                ++pos;
-                if ( pos > count || !is_lower_bound( pos ) ) { pos = lower_bound( chunk ); }
-            }
-            hint = pos;
-            if ( pos == count || keys[ pos ] != chunk ) { return false; }
-            return detail::container_contains( chunks_.slot( pos ), layout_type::low_key( value ) );
-        }
         auto const pos{ lower_bound( chunk ) };
         if ( pos == chunks_.size() || chunks_.key( pos ) != chunk ) { return false; }
-        note_hot_chunk( pos );
         return detail::container_contains( chunks_.slot( pos ), layout_type::low_key( value ) );
     }
 
     [[nodiscard]] bool contains_bulk( bulk_context & ctx, key_type const value ) const noexcept {
         auto const chunk{ layout_type::chunk_key( value ) };
-        if constexpr ( kUseSingletonChunkMap ) {
-            auto const it{ singleton_chunks_.find( chunk ) };
-            if ( it != singleton_chunks_.end() ) {
-                ctx.reset();
-                return singleton_contains( it->second, layout_type::low_key( value ) );
-            }
-        }
         if (
             ctx.index != invalid_index &&
             ctx.index < chunks_.size() &&
@@ -758,26 +596,13 @@ public:
             ctx.chunk = chunk;
             return detail::container_contains( chunks_.slot( ctx.index ), layout_type::low_key( value ) );
         }
-
-        if constexpr ( kUseChunkHashMap ) {
-            ensure_chunk_index_map();
-            auto const it{ chunk_index_map_().find( chunk ) };
-            if ( it == chunk_index_map_().end() ) {
-                ctx.reset();
-                return false;
-            }
-            ctx.chunk = chunk;
-            ctx.index = it->second;
-        } else {
-            ensure_sorted();
-            auto const pos{ lower_bound_outlined( chunk ) };
-            if ( pos == chunks_.size() || chunks_.key( pos ) != chunk ) {
-                ctx.reset();
-                return false;
-            }
-            ctx.chunk = chunk;
-            ctx.index = pos;
+        auto const pos{ lower_bound_outlined( chunk ) };
+        if ( pos == chunks_.size() || chunks_.key( pos ) != chunk ) {
+            ctx.reset();
+            return false;
         }
+        ctx.chunk = chunk;
+        ctx.index = pos;
         return detail::container_contains( chunks_.slot( ctx.index ), layout_type::low_key( value ) );
     }
 
@@ -788,7 +613,7 @@ public:
     // The context-hit lane is the whole function for a run of adds into one
     // chunk, as the reference's add_bulk_impl is: the cached chunk is checked
     // and the value goes straight into its container. Everything else (a new
-    // chunk, a singleton, the hot-index search) is the shared add_impl.
+    // chunk) is the shared add_impl.
     // [croaring-ref] deps/croaring/src/roaring.c:add_bulk_impl
     [[nodiscard]] bool add_bulk( bulk_context & ctx, key_type const value ) {
         auto const chunk{ layout_type::chunk_key( value ) };
@@ -803,9 +628,6 @@ public:
                     return true;
                 }
             }
-            bool const was_tombstone{
-                kUseLazyTombstoning && tombstone_count_ != 0 && detail::container_size( slot ) == 0
-            };
             auto const added{
                 ctx.payload_private
                     ? detail::container_add_already_private( slot, low )
@@ -814,7 +636,6 @@ public:
             if ( !added ) { return false; }
             ctx.payload_private = true;
             ++size_;
-            if ( was_tombstone ) { --tombstone_count_; }
             promote_if_needed( slot );
             return true;
         }
@@ -824,112 +645,14 @@ public:
     [[nodiscard]] bool remove( key_type const value ) {
         auto const chunk{ layout_type::chunk_key( value ) };
         auto const low{ layout_type::low_key( value ) };
-        if constexpr ( kUseSingletonChunkMap ) {
-            auto singleton_it{ singleton_chunks_.find( chunk ) };
-            if ( singleton_it != singleton_chunks_.end() ) {
-                if ( !singleton_remove( singleton_it->second, low ) ) {
-                    return false;
-                }
-                invalidate_singleton_read_index();
-                --size_;
-                if ( singleton_it->second.count == 0 ) {
-                    singleton_chunks_.erase( singleton_it );
-                }
-                return true;
-            }
-        }
-
-        size_type pos;
-        if constexpr ( kUseChunkHashMap ) {
-            // O(1) hash-map lookup path (handles both sorted and unsorted chunks).
-            if ( chunk_index_map_valid_ ) {
-                auto const it{ chunk_index_map_().find( chunk ) };
-                if ( it == chunk_index_map_().end() ) { return false; }
-                pos = it->second;
-            } else if constexpr ( !kUseLazySort ) {
-                // Always sorted when lazy-sort is off; use lower_bound with lazy rebuild.
-                static constexpr std::uint32_t kLazyMapBuildThreshold{ 2 };
-                if ( ++removes_since_structural_add_ >= kLazyMapBuildThreshold ) {
-                    ensure_chunk_index_map();
-                    auto const it{ chunk_index_map_().find( chunk ) };
-                    if ( it == chunk_index_map_().end() ) { return false; }
-                    pos = it->second;
-                } else {
-                    pos = lower_bound( chunk );
-                    if ( pos == chunks_.size() || chunks_.key( pos ) != chunk ) { return false; }
-                }
-            } else if ( chunks_sorted_ ) {
-                // Map invalid but chunks sorted; lazy rebuild threshold logic.
-                static constexpr std::uint32_t kLazyMapBuildThreshold{ 2 };
-                if ( ++removes_since_structural_add_ >= kLazyMapBuildThreshold ) {
-                    ensure_chunk_index_map();
-                    auto const it{ chunk_index_map_().find( chunk ) };
-                    if ( it == chunk_index_map_().end() ) { return false; }
-                    pos = it->second;
-                } else {
-                    pos = lower_bound( chunk );
-                    if ( pos == chunks_.size() || chunks_.key( pos ) != chunk ) { return false; }
-                }
-            } else {
-                // Unsorted chunks + invalid map: must rebuild map.
-                ensure_chunk_index_map();
-                auto const it{ chunk_index_map_().find( chunk ) };
-                if ( it == chunk_index_map_().end() ) { return false; }
-                pos = it->second;
-            }
-        } else {
-            // CRoaring-style: always-sorted chunks, O(log n) binary search.
-            size_type hot_index{};
-            if ( try_hot_chunk_index( chunk, hot_index ) ) {
-                pos = hot_index;
-            } else if ( try_chunk_index_lookup( chunk, hot_index, true ) == chunk_lookup_result::found ) {
-                pos = hot_index;
-            } else {
-                pos = lower_bound( chunk );
-                if ( pos == chunks_.size() || chunks_.key( pos ) != chunk ) { return false; }
-            }
-        }
-        auto const removed{ detail::container_remove( chunks_.slot( pos ), low ) };
-        if ( !removed ) { return false; }
+        auto const pos{ lower_bound( chunk ) };
+        if ( pos == chunks_.size() || chunks_.key( pos ) != chunk ) { return false; }
+        if ( !detail::container_remove( chunks_.slot( pos ), low ) ) { return false; }
 
         --size_;
-        note_hot_chunk( pos );
-        if constexpr ( kUseSingletonChunkMap ) {
-            if (
-                detail::container_size( chunks_.slot( pos ) ) <= singleton_chunk_demote_threshold
-            ) {
-                auto entry{ singleton_from_container( chunks_.slot( pos ) ) };
-                if ( entry.count != 0 ) {
-                    singleton_chunks_.emplace( chunks_.key( pos ), std::move( entry ) );
-                    invalidate_singleton_read_index();
-                    chunks_.erase( pos );
-                    invalidate_chunk_index_map();
-                    return true;
-                }
-            }
-        }
         if ( detail::container_size( chunks_.slot( pos ) ) == 0 ) {
-            if constexpr ( kUseLazyTombstoning ) {
-                ++tombstone_count_;
-                if ( tombstone_count_ * 2 > static_cast<std::uint32_t>( chunks_.size() ) ) {
-                    compact_tombstones();
-                }
-                // Don't invalidate hash map: key→index remains valid for tombstone entries.
-            } else {
-                // Parity shape: erase immediately.
-                // [croaring-ref] deps/croaring/src/roaring_array.c:ra_remove_at_index
-                if constexpr ( kUseFrontTombstones ) {
-                    // Batched front compaction: avoid O(n^2) memmove when
-                    // removing monotonically from the front.
-                    if ( pos == front_tombstones_ ) {
-                        ++front_tombstones_;
-                        compact_front_tombstones( false );
-                        return true;
-                    }
-                }
-                chunks_.erase( pos );
-                invalidate_chunk_index_map();
-            }
+            // [croaring-ref] deps/croaring/src/roaring_array.c:ra_remove_at_index
+            chunks_.erase( pos );
         }
         return true;
     }
@@ -938,14 +661,6 @@ public:
     [[nodiscard]] bool try_remove( key_type const value ) { return remove( value ); }
 
     [[nodiscard]] bool intersects( bitmap const & other ) const noexcept {
-        if constexpr ( kUseSingletonChunkMap ) {
-            materialize_singleton_chunks();
-            other.materialize_singleton_chunks();
-        }
-        compact_front_tombstones( true );
-        other.compact_front_tombstones( true );
-        ensure_sorted();
-        other.ensure_sorted();
 
         size_type left{ 0 };
         size_type right{ 0 };
@@ -968,10 +683,6 @@ public:
     }
 
     [[ gnu::hot ]] void add_many_sorted( std::span<key_type const> const sorted_values ) {
-        if constexpr ( kUseSingletonChunkMap ) {
-            materialize_singleton_chunks();
-        }
-        compact_front_tombstones( true );
         if ( sorted_values.empty() ) {
             return;
         }
@@ -983,62 +694,18 @@ public:
                 return;
             }
 
-            // If chunks are sorted (or lazy sort is off), use lower_bound+insert.
-            // Otherwise use hash map to append without O(n) shifting.
-            size_type pos;
-            if constexpr ( !kUseLazySort ) {
-                // Always sorted path.
-                pos = lower_bound( current_chunk );
-                if ( pos == chunks_.size() || chunks_.key( pos ) != current_chunk ) {
-                    chunks_.insert( pos, current_chunk, make_policy_container_from_sorted_values(
-                        { grouped_values.data(), grouped_values.size() },
-                        array_to_bitset_threshold
-                    ) );
-                    size_ += grouped_values.size();
-                } else {
-                    bool const was_tombstone{ kUseLazyTombstoning && tombstone_count_ != 0 && detail::container_size( chunks_.slot( pos ) ) == 0 };
-                    size_ += detail::container_add_sorted(
-                        chunks_.slot( pos ), { grouped_values.data(), grouped_values.size() }
-                    );
-                    if ( was_tombstone ) { --tombstone_count_; }
-                    promote_if_needed( chunks_.slot( pos ) );
-                }
-            } else if ( chunks_sorted_ ) {
-                pos = lower_bound( current_chunk );
-                if ( pos == chunks_.size() || chunks_.key( pos ) != current_chunk ) {
-                    chunks_.insert( pos, current_chunk, make_policy_container_from_sorted_values(
-                        { grouped_values.data(), grouped_values.size() },
-                        array_to_bitset_threshold
-                    ) );
-                    size_ += grouped_values.size();
-                } else {
-                    bool const was_tombstone{ tombstone_count_ != 0 && detail::container_size( chunks_.slot( pos ) ) == 0 };
-                    size_ += detail::container_add_sorted(
-                        chunks_.slot( pos ), { grouped_values.data(), grouped_values.size() }
-                    );
-                    if ( was_tombstone ) { --tombstone_count_; }
-                    promote_if_needed( chunks_.slot( pos ) );
-                }
+            auto const pos{ lower_bound( current_chunk ) };
+            if ( pos == chunks_.size() || chunks_.key( pos ) != current_chunk ) {
+                chunks_.insert( pos, current_chunk, make_policy_container_from_sorted_values(
+                    { grouped_values.data(), grouped_values.size() },
+                    array_to_bitset_threshold
+                ) );
+                size_ += grouped_values.size();
             } else {
-                // Chunks unsorted; check hash map or append
-                ensure_chunk_index_map();
-                auto const it{ chunk_index_map_().find( current_chunk ) };
-                if ( it != chunk_index_map_().end() ) {
-                    pos = it->second;
-                    bool const was_tombstone{ tombstone_count_ != 0 && detail::container_size( chunks_.slot( pos ) ) == 0 };
-                    size_ += detail::container_add_sorted(
-                        chunks_.slot( pos ), { grouped_values.data(), grouped_values.size() }
-                    );
-                    if ( was_tombstone ) { --tombstone_count_; }
-                    promote_if_needed( chunks_.slot( pos ) );
-                } else {
-                    chunks_.push_back( current_chunk, make_policy_container_from_sorted_values(
-                        { grouped_values.data(), grouped_values.size() },
-                        array_to_bitset_threshold
-                    ) );
-                    size_ += grouped_values.size();
-                    chunk_index_map_().emplace( current_chunk, chunks_.size() - 1 );
-                }
+                size_ += detail::container_add_sorted(
+                    chunks_.slot( pos ), { grouped_values.data(), grouped_values.size() }
+                );
+                promote_if_needed( chunks_.slot( pos ) );
             }
 
             grouped_values.clear();
@@ -1060,17 +727,9 @@ public:
         }
 
         flush_group();
-        if constexpr ( kUseLazySort ) {
-            chunks_sorted_ = false;  // Mark chunks as potentially unsorted after add_many
-        }
-        invalidate_chunk_index_map();
     }
 
     [[ gnu::hot ]] void remove_many_sorted( std::span<key_type const> const sorted_values ) {
-        if constexpr ( kUseSingletonChunkMap ) {
-            materialize_singleton_chunks();
-        }
-        compact_front_tombstones( true );
         if ( sorted_values.empty() ) {
             return;
         }
@@ -1097,13 +756,7 @@ public:
                     }
                 }
                 if ( detail::container_size( chunks_.slot( pos ) ) == 0 ) {
-                    if constexpr ( kUseLazyTombstoning ) {
-                        ++tombstone_count_;
-                    } else {
-                        chunks_.erase( pos );
-                        // Note: lower_bound in next iteration is still valid since
-                        // remove_many_sorted works in sorted order (monotone increasing chunks).
-                    }
+                    chunks_.erase( pos );
                 } else {
                     chunks_.slot( pos ) = optimize_container_for_policy( std::move( chunks_.slot( pos ) ) );
                 }
@@ -1128,15 +781,6 @@ public:
         }
 
         flush_group();
-        if constexpr ( kUseLazyTombstoning ) {
-            if ( tombstone_count_ * 2 > static_cast<std::uint32_t>( chunks_.size() ) ) {
-                compact_tombstones();
-            } else {
-                invalidate_chunk_index_map();
-            }
-        } else {
-            invalidate_chunk_index_map();
-        }
     }
 
     template <std::ranges::input_range Range>
@@ -1189,7 +833,6 @@ public:
 
         chunks_.clear();
         size_ = 0;
-        tombstone_count_ = 0;
         if ( sorted_values.empty() ) {
             return;
         }
@@ -1222,36 +865,24 @@ public:
             }
         }
         flush_group();
-        invalidate_chunk_index_map();
     }
 
     void add_closed_range( key_type const begin_value, key_type const end_value ) {
         apply_closed_range_operation( begin_value, end_value, detail::range_operation::add );
-        invalidate_chunk_index_map();
     }
 
     void remove_closed_range( key_type const begin_value, key_type const end_value ) {
         apply_closed_range_operation( begin_value, end_value, detail::range_operation::remove );
-        if ( tombstone_count_ * 2 > static_cast<std::uint32_t>( chunks_.size() ) ) {
-            compact_tombstones();
-        } else {
-            invalidate_chunk_index_map();
-        }
     }
 
     void flip_closed_range( key_type const begin_value, key_type const end_value ) {
         apply_closed_range_operation( begin_value, end_value, detail::range_operation::flip );
-        invalidate_chunk_index_map();
     }
 
     template <typename F>
     void for_each( F && f ) const {
-        if constexpr ( kUseSingletonChunkMap ) {
-            materialize_singleton_chunks();
-        }
         // Values come out in order, so the chunks must be in order first: a wide
         // chunk key defers the sort until a path needs it, and this is such a path.
-        ensure_sorted();
         for ( size_type index{ 0 }; index < chunks_.size(); ++index ) {
             auto const chunk_key{ chunks_.key( index ) };
             detail::container_for_each( chunks_.slot( index ), [&]( low_type const low ) {
@@ -1267,12 +898,8 @@ public:
     // page faults of a fresh one on every call.
     // [croaring-ref] deps/croaring/src/roaring.c:roaring_bitmap_to_uint32_array
     [[ gnu::hot ]] std::size_t to_array_into( std::span<key_type> const out ) const {
-        if constexpr ( kUseSingletonChunkMap ) {
-            materialize_singleton_chunks();
-        }
         // Values come out in order, so the chunks must be in order first: a wide
         // chunk key defers the sort until a path needs it, and this is such a path.
-        ensure_sorted();
         assert( out.size() >= size_ );
         auto * cursor{ out.data() };
         auto * const end{ out.data() + out.size() };
@@ -1431,12 +1058,8 @@ public:
     // Not noexcept: ordering the chunks of a wide-key bitmap allocates, and this is
     // where a deferred sort comes due. end() stays noexcept - it reads nothing.
     [[nodiscard]] const_iterator begin() const {
-        if constexpr ( kUseSingletonChunkMap ) {
-            materialize_singleton_chunks();
-        }
         // Values come out in order, so the chunks must be in order first: a wide
         // chunk key defers the sort until a path needs it, and this is such a path.
-        ensure_sorted();
         if ( empty() ) {
             return end();
         }
@@ -1449,42 +1072,15 @@ public:
 
     void swap( bitmap & other ) noexcept {
         chunks_.swap( other.chunks_ );
-        if constexpr ( kUseSingletonChunkMap ) {
-            singleton_chunks_.swap( other.singleton_chunks_ );
-        }
-        // The chunk-index cache exists (adaptively, past the probe threshold)
-        // even when kUseChunkHashMap == false — its state must follow the
-        // chunks_ it indexes or a swapped-in bitmap would consult the other
-        // bitmap's (still-valid-flagged) index.
-        chunk_index_map_box_.swap( other.chunk_index_map_box_ );
-        std::swap( chunk_index_map_valid_, other.chunk_index_map_valid_ );
-        std::swap( chunk_index_lookup_probes_, other.chunk_index_lookup_probes_ );
-        std::swap( hot_chunk_index_, other.hot_chunk_index_ );
-        std::swap( front_tombstones_, other.front_tombstones_ );
-        std::swap( removes_since_structural_add_, other.removes_since_structural_add_ );
-        if constexpr ( kUseLazySort ) {
-            std::swap( chunks_sorted_, other.chunks_sorted_ );
-        }
-        if constexpr ( kUseLazyTombstoning ) {
-            std::swap( tombstone_count_, other.tombstone_count_ );
-        }
         std::swap( size_, other.size_ );
     }
 
     [[ gnu::hot ]] void intersect_into( bitmap const & other, bitmap & scratch ) const {
-        if constexpr ( kUseSingletonChunkMap ) {
-            materialize_singleton_chunks();
-            other.materialize_singleton_chunks();
-        }
         if ( this == &other ) {
             scratch = *this;
             return;
         }
 
-        compact_front_tombstones( true );
-        other.compact_front_tombstones( true );
-        ensure_sorted();
-        other.ensure_sorted();
 
         scratch.clear_keep_capacity();
 
@@ -1494,19 +1090,11 @@ public:
     }
 
     [[ gnu::hot ]] void union_into( bitmap const & other, bitmap & scratch ) const {
-        if constexpr ( kUseSingletonChunkMap ) {
-            materialize_singleton_chunks();
-            other.materialize_singleton_chunks();
-        }
         if ( this == &other ) {
             scratch = *this;
             return;
         }
 
-        compact_front_tombstones( true );
-        other.compact_front_tombstones( true );
-        ensure_sorted();
-        other.ensure_sorted();
 
         scratch.clear_keep_capacity();
         scratch.chunks_.reserve( chunks_.size() + other.chunks_.size() );
@@ -1594,23 +1182,14 @@ public:
             }
             ++right;
         }
-        scratch.invalidate_chunk_index_map();
     }
 
     [[ gnu::hot ]] void difference_into( bitmap const & other, bitmap & scratch ) const {
-        if constexpr ( kUseSingletonChunkMap ) {
-            materialize_singleton_chunks();
-            other.materialize_singleton_chunks();
-        }
         if ( this == &other ) {
             scratch.clear_keep_capacity();
             return;
         }
 
-        compact_front_tombstones( true );
-        other.compact_front_tombstones( true );
-        ensure_sorted();
-        other.ensure_sorted();
 
         scratch.clear_keep_capacity();
         scratch.chunks_.reserve( chunks_.size() );
@@ -1699,7 +1278,6 @@ public:
             }
             ++left;
         }
-        scratch.invalidate_chunk_index_map();
     }
 
     // Shared union merge. When `lazy` is true, same-key bitset×bitset chunks are
@@ -1711,13 +1289,6 @@ public:
     // checks are kept in both modes — they read operand cardinalities, which are
     // always valid (only the accumulator's bitsets are lazily dirtied).
     [[ gnu::hot ]] bitmap & union_merge( bitmap const & other, bool const lazy ) {
-        if constexpr ( kUseSingletonChunkMap ) {
-            materialize_singleton_chunks();
-            other.materialize_singleton_chunks();
-        }
-        compact_front_tombstones( true );
-        other.compact_front_tombstones( true );
-        compact_tombstones();  // Ensure no tombstones in our chunk vector before merge
         detail::chunk_store<layout_type, CowPolicy> merged;
         merged.reserve( chunks_.size() + other.chunks_.size() );
         detail::small_array_values<low_type> array_union_scratch;
@@ -1888,7 +1459,6 @@ public:
         }
 
         chunks_ = std::move( merged );
-        invalidate_chunk_index_map();
         return *this;
     }
 
@@ -1939,21 +1509,12 @@ public:
     // once the right side is exhausted). Materializing bit_andnot is unsupported
     // (no caller; the arr\arr arm below is in-place only).
     [[ gnu::hot ]] bitmap & combine( bitmap const & other, detail::set_operation const op, bitmap * const out = nullptr ) {
-        if constexpr ( kUseSingletonChunkMap ) {
-            materialize_singleton_chunks();
-            other.materialize_singleton_chunks();
-        }
-        compact_front_tombstones( true );
-        other.compact_front_tombstones( true );
         auto const in_place           { out == nullptr };
         auto const keep_unmatched_left{ op == detail::set_operation::bit_andnot };
 #if FRSR_ROARING_COMBINE_STATS
         detail::combine_stats().record_call( chunks_.size(), other.chunks_.size() );
 #endif
         assert( ( in_place || !keep_unmatched_left ) && "materializing subtract has no caller/arm" );
-        if ( in_place && keep_unmatched_left ) {
-            compact_tombstones();  // Ensure no tombstones carried into the subtraction result
-        }
 
         size_type write{ 0 };
         size_type left{ 0 };
@@ -2489,9 +2050,7 @@ public:
 
         if ( in_place ) {
             chunks_.truncate_retiring( write );
-            invalidate_chunk_index_map();
         } else {
-            out->invalidate_chunk_index_map();
         }
         return *this;
     }
@@ -2515,13 +2074,6 @@ public:
     // profiler-confirmed core-bound / per-call-alloc cost that dominated the N-way union.
     // [croaring-ref] deps/croaring/src/roaring.c:roaring_bitmap_lazy_or_inplace
     [[ gnu::hot ]] void bulk_or_inplace( bitmap const & other ) {
-        if constexpr ( kUseSingletonChunkMap ) {
-            materialize_singleton_chunks();
-            other.materialize_singleton_chunks();
-        }
-        compact_front_tombstones( true );
-        other.compact_front_tombstones( true );
-        compact_tombstones();
         auto const & rhs{ other.chunks_ };
         size_type pos1{ 0 };
         size_type pos2{ 0 };
@@ -2616,7 +2168,6 @@ public:
             }
             ++pos2;
         }
-        invalidate_chunk_index_map();
     }
 
     // Lazy accumulation step: OR `other` in, deferring the per-bitset popcount.
@@ -2630,9 +2181,6 @@ public:
     // CRoaring's explicit run_optimize() and must stay caller-requested-only).
     void bulk_or_finish() noexcept {
         repair_cardinality();
-        if constexpr ( kUseSingletonChunkMap ) {
-            materialize_singleton_chunks();
-        }
         for ( auto & slot : chunks_.slots() ) {
             slot = optimize_container_for_policy( std::move( slot ) );
         }
@@ -2643,9 +2191,6 @@ public:
     // never be re-chosen, so every such container would be materialized out and
     // re-encoded on the caller's next optimize().
     void bulk_or_finish_keep_bitsets() noexcept {
-        if constexpr ( kUseSingletonChunkMap ) {
-            materialize_singleton_chunks();
-        }
         repair_cardinality();  // bulk_or_intermediate left bitset cardinalities stale
         for ( auto & slot : chunks_.slots() ) {
             slot = optimize_container_keep_bitsets_for_policy<detail::run_selection_eager>( std::move( slot ) );
@@ -2658,9 +2203,6 @@ public:
     // than bulk_or_finish(), which applies the ambient storage policy to every
     // slot and needlessly scans dense bitsets for run encoding.
     void bulk_or_repair_after_lazy() noexcept {
-        if constexpr ( kUseSingletonChunkMap ) {
-            materialize_singleton_chunks();
-        }
         repair_cardinality();
         for ( auto & slot : chunks_.slots() ) {
             if ( slot.holds_bitset() && slot.cardinality() <= array_to_bitset_threshold ) {
@@ -2890,11 +2432,6 @@ private:
             if ( operand == nullptr ) {
                 continue;
             }
-            if constexpr ( kUseSingletonChunkMap ) {
-                operand->materialize_singleton_chunks();
-            }
-            operand->compact_front_tombstones( true );
-            operand->ensure_sorted();
             if ( operand->chunks_.size() == 0 ) {
                 return;
             }
@@ -3173,9 +2710,6 @@ public:
     }
 
     void promote_large_arrays( std::uint16_t const threshold = static_cast<std::uint16_t>( array_to_bitset_threshold ) ) {
-        if constexpr ( kUseSingletonChunkMap ) {
-            materialize_singleton_chunks();
-        }
         for ( auto & slot : chunks_.slots() ) {
             if ( slot.holds_array() && slot.count() >= threshold ) {
                 if constexpr ( supports_bitset_container ) {
@@ -3197,9 +2731,6 @@ public:
     // request, exactly like CRoaring never auto-run-encodes except via an
     // explicit run_optimize() call.
     void optimize() {
-        if constexpr ( kUseSingletonChunkMap ) {
-            materialize_singleton_chunks();
-        }
         for ( auto & slot : chunks_.slots() ) {
             slot = optimize_container_for_policy<detail::run_selection_eager>( std::move( slot ) );
         }
@@ -3226,9 +2757,6 @@ public:
     // real in principle but was not observed to matter. Do not cite this as a
     // speed optimization without measuring it.
     void optimize_keep_bitsets() {
-        if constexpr ( kUseSingletonChunkMap ) {
-            materialize_singleton_chunks();
-        }
         for ( auto & slot : chunks_.slots() ) {
             if constexpr ( supports_bitset_container && uses_default_container_set ) {
                 if ( slot.holds_bitset() ) {
@@ -3270,17 +2798,11 @@ public:
     // — a marginal run container costs more in consumers' run×array/run×bitset
     // kernels than it saves in bytes, so the caller sets the bar.
     void optimize_run_shaped( std::size_t const min_mean_run_length ) {
-        if constexpr ( kUseSingletonChunkMap ) {
-            materialize_singleton_chunks();
-        }
         for ( auto & slot : chunks_.slots() ) {
             if ( slot.holds_run() ) {
                 continue;
             }
             auto const cardinality{ detail::container_size( slot ) };
-            if ( cardinality == 0 ) {
-                continue;  // lazy-removal tombstone
-            }
             // runs * min_mean_run_length <= cardinality  ⇔  runs <= cardinality / min_mean_run_length
             auto const max_runs{ cardinality / min_mean_run_length };
             auto const runs{
@@ -3423,16 +2945,6 @@ private:
     );
 
     using chunk_store_type = detail::chunk_store<layout_type, CowPolicy>;
-    static constexpr std::uint8_t singleton_chunk_capacity{ 8 };
-    struct singleton_chunk_entry {
-        std::array<low_type, singleton_chunk_capacity> lows{};
-        std::uint8_t count{};
-    };
-#ifdef FRSR_USE_BOOST_FLAT_MAP
-    using singleton_chunk_map = boost::unordered_flat_map<chunk_type, singleton_chunk_entry>;
-#else
-    using singleton_chunk_map = std::unordered_map<chunk_type, singleton_chunk_entry>;
-#endif
 
     // Index of the first live entry with key >= chunk (chunks_.size() if none):
     // a binary search over the dense SoA keys[] array only. A pure read - the
@@ -3443,7 +2955,7 @@ private:
     // the reference's tree-shaped index gets from its fan-out.
     [[nodiscard]] size_type lower_bound( chunk_type const chunk ) const noexcept {
         auto const keys{ chunks_.keys() };
-        auto const first{ keys.begin() + static_cast<std::ptrdiff_t>( front_tombstones_ ) };
+        auto const first{ keys.begin() };
 #if defined( FRSR_ROARING_HAS_PSI_VM )
         auto const pos{ psi::vm::prefetching_lower_bound( first, keys.end(), chunk ) };
 #else
@@ -3458,34 +2970,8 @@ private:
         return lower_bound( chunk );
     }
 
-    // Single funnel for every hot-slot store, so the parity build provably
-    // performs no write at all (rather than relying on the optimizer to sink a
-    // dead store). Const because contains() must stay a read-only operation.
-    void note_hot_chunk( size_type const index ) const noexcept {
-        if constexpr ( kUseHotChunkIndex ) { hot_chunk_index_ = index; }
-        else { (void)index; }
-    }
-
-    [[nodiscard]] bool try_hot_chunk_index( chunk_type const chunk, size_type & index ) const noexcept {
-        if constexpr ( !kUseHotChunkIndex ) { (void)chunk; (void)index; return false; }
-        else {
-        if ( hot_chunk_index_ == invalid_index ) {
-            return false;
-        }
-        if ( hot_chunk_index_ >= chunks_.size() ) {
-            return false;
-        }
-        if ( hot_chunk_index_ < front_tombstones_ ) {
-            return false;
-        }
-        if ( chunks_.key( hot_chunk_index_ ) != chunk ) {
-            return false;
-        }
-        index = hot_chunk_index_;
-        return true;
-        }
-    }
-
+    // Whether the chunk next to (or before) anchor_index holds `chunk`: the
+    // sequential-access probe of a bulk context.
     [[nodiscard]] bool try_adjacent_chunk_index(
         chunk_type const chunk,
         size_type const anchor_index,
@@ -3501,7 +2987,7 @@ private:
                 result_index = next;
                 return true;
             }
-        } else if ( chunk < current_key && anchor_index > front_tombstones_ ) {
+        } else if ( chunk < current_key && anchor_index > 0 ) {
             auto const prev{ anchor_index - 1U };
             if ( chunks_.key( prev ) == chunk ) {
                 result_index = prev;
@@ -3509,354 +2995,6 @@ private:
             }
         }
         return false;
-    }
-
-    void compact_front_tombstones( bool const force ) const {
-        // Compiled out in the parity shape, which is what keeps the const_cast
-        // below off every const query path (intersects, set-op const RHS, ...).
-        if constexpr ( !kUseFrontTombstones ) { (void)force; return; } else {
-        if ( front_tombstones_ == 0 ) {
-            return;
-        }
-        if ( !force && front_tombstones_ < front_tombstone_compact_threshold ) {
-            return;
-        }
-        auto & mutable_chunks = const_cast<chunk_store_type &>( chunks_ );
-        mutable_chunks.erase_front( front_tombstones_ );
-        front_tombstones_ = 0;
-        chunk_index_map_valid_ = false;
-        hot_chunk_index_ = invalid_index;
-        }
-    }
-
-    void invalidate_chunk_index_map() const noexcept {
-        hot_chunk_index_ = invalid_index;
-        chunk_index_map_valid_ = false;
-        chunk_index_lookup_probes_ = 0;
-    }
-
-    // With kUseLazySort off (every key width) the chunk table is always sorted and
-    // this compiles to nothing, so no const operation modifies the bitmap. It is
-    // the one place a const call would otherwise sort in place, which would be a
-    // data race between concurrent readers.
-    void ensure_sorted() const {
-        if constexpr ( kUseLazySort ) {
-            if ( chunks_sorted_ ) { return; }
-            auto & mutable_chunks = const_cast<chunk_store_type &>( chunks_ );
-            mutable_chunks.sort_by_key();
-            chunks_sorted_ = true;
-            chunk_index_map_valid_ = false;  // Indices changed; map must be rebuilt on next access
-        }
-    }
-
-    void ensure_chunk_index_map() const {
-        if ( chunk_index_map_valid_ ) { return; }
-        ensure_sorted();
-        auto & map{ chunk_index_map_() };
-        map.clear();
-        map.reserve( chunks_.size() );
-        for ( size_type i = 0; i < chunks_.size(); ++i ) {
-            map.emplace( chunks_.key( i ), i );
-        }
-        chunk_index_map_valid_ = true;
-        chunk_index_lookup_probes_ = 0;
-    }
-
-    // A chunk-index lookup answers three ways: the map is not in use and the
-    // caller must resolve the chunk itself, the map is in use and the chunk is
-    // absent, or the chunk was found. Same shape as singleton_lookup_result.
-    enum class chunk_lookup_result : std::uint8_t {
-        not_used,
-        missing,
-        found
-    };
-
-    [[nodiscard]] chunk_lookup_result try_chunk_index_lookup(
-        chunk_type const chunk,
-        size_type & index,
-        bool const allow_build
-    ) const {
-        // The adaptive chunk-index map is the kUseChunkHashMap feature. It used
-        // to be reachable regardless of that flag (a runtime size threshold was
-        // the only gate), which silently put a lazily-allocated unordered_map —
-        // and a mutable probe counter — on the "parity baseline" lookup path
-        // that CRoaring resolves with a plain binary search.
-        if constexpr ( !kUseChunkHashMap ) {
-            (void)chunk; (void)index; (void)allow_build;
-            return chunk_lookup_result::not_used;
-        } else {
-        if ( chunks_.size() < chunk_index_lookup_threshold ) {
-            return chunk_lookup_result::not_used;
-        }
-        if ( !chunk_index_map_valid_ ) {
-            if ( !allow_build ) {
-                return chunk_lookup_result::not_used;
-            }
-            if ( ++chunk_index_lookup_probes_ < chunk_index_probe_build_threshold ) {
-                return chunk_lookup_result::not_used;
-            }
-            ensure_chunk_index_map();
-        }
-        auto const it{ chunk_index_map_().find( chunk ) };
-        if ( it == chunk_index_map_().end() ) {
-            // A valid map indexes every chunk - a structural add inserts into it
-            // and everything else invalidates it - so a miss is the answer, not a
-            // reason to search the chunk array. remove() and contains_bulk()
-            // already read it that way.
-            return chunk_lookup_result::missing;
-        }
-        index = it->second;
-        return chunk_lookup_result::found;
-        }
-    }
-
-    [[nodiscard]] static bool singleton_contains( singleton_chunk_entry const & entry, low_type const low ) noexcept {
-        for ( std::uint8_t i = 0; i < entry.count; ++i ) {
-            if ( entry.lows[ i ] == low ) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    enum class singleton_add_result : std::uint8_t {
-        inserted,
-        duplicate,
-        full
-    };
-
-    enum class singleton_lookup_result : std::uint8_t {
-        not_used,
-        missing,
-        found
-    };
-
-    [[nodiscard]] static singleton_add_result singleton_add( singleton_chunk_entry & entry, low_type const low ) noexcept {
-        std::uint8_t pos{};
-        while ( pos < entry.count && entry.lows[ pos ] < low ) {
-            ++pos;
-        }
-        if ( pos < entry.count && entry.lows[ pos ] == low ) {
-            return singleton_add_result::duplicate;
-        }
-        if ( entry.count >= singleton_chunk_capacity ) {
-            return singleton_add_result::full;
-        }
-        for ( std::uint8_t i = entry.count; i > pos; --i ) {
-            entry.lows[ i ] = entry.lows[ i - 1 ];
-        }
-        entry.lows[ pos ] = low;
-        ++entry.count;
-        return singleton_add_result::inserted;
-    }
-
-    [[nodiscard]] static bool singleton_remove( singleton_chunk_entry & entry, low_type const low ) noexcept {
-        std::uint8_t pos{ singleton_chunk_capacity };
-        for ( std::uint8_t i = 0; i < entry.count; ++i ) {
-            if ( entry.lows[ i ] == low ) {
-                pos = i;
-                break;
-            }
-        }
-        if ( pos == singleton_chunk_capacity ) {
-            return false;
-        }
-        for ( std::uint8_t i = pos + 1; i < entry.count; ++i ) {
-            entry.lows[ i - 1 ] = entry.lows[ i ];
-        }
-        --entry.count;
-        return true;
-    }
-
-    [[nodiscard]] static singleton_chunk_entry singleton_from_container( handle_type const & container ) {
-        singleton_chunk_entry entry{};
-        auto next{ detail::container_first( container ) };
-        while ( next && entry.count < singleton_chunk_capacity ) {
-            entry.lows[ entry.count++ ] = *next;
-            next = detail::container_next_after( container, *next );
-        }
-        return entry;
-    }
-
-    void invalidate_singleton_read_index() const noexcept {
-        if constexpr ( kUseSingletonChunkMap ) {
-        singleton_read_index_valid_ = false;
-        singleton_read_index_probes_ = 0;
-        hot_singleton_read_index_ = invalid_index;
-        }
-    }
-
-    void reset_singleton_read_index_empty() const noexcept {
-        if constexpr ( kUseSingletonChunkMap ) {
-        singleton_read_index_.clear();
-        singleton_read_index_valid_ = true;
-        singleton_read_index_probes_ = 0;
-        hot_singleton_read_index_ = invalid_index;
-        }
-    }
-
-    void note_singleton_insert( chunk_type const chunk, singleton_chunk_entry const & entry ) const {
-        if constexpr ( !kUseSingletonChunkMap ) { return; } else {
-        if ( !singleton_read_index_valid_ ) {
-            if ( singleton_chunks_.size() == 1 ) {
-                reset_singleton_read_index_empty();
-                singleton_read_index_.emplace_back( chunk, entry );
-            }
-            return;
-        }
-        if ( singleton_read_index_.empty() || singleton_read_index_.back().first < chunk ) {
-            singleton_read_index_.emplace_back( chunk, entry );
-            hot_singleton_read_index_ = invalid_index;
-            return;
-        }
-        invalidate_singleton_read_index();
-        }
-    }
-
-    void ensure_singleton_read_index() const {
-        if constexpr ( !kUseSingletonChunkMap ) { return; } else {
-        if ( singleton_read_index_valid_ ) {
-            return;
-        }
-        auto & mutable_index{ const_cast<decltype(singleton_read_index_)&>( singleton_read_index_ ) };
-        mutable_index.clear();
-        mutable_index.reserve( static_cast<std::uint32_t>( singleton_chunks_.size() ) );
-        for ( auto const & [key, entry] : singleton_chunks_ ) {
-            mutable_index.emplace_back( key, entry );
-        }
-        std::ranges::sort( mutable_index, {}, &std::pair<chunk_type, singleton_chunk_entry>::first );
-        singleton_read_index_valid_ = true;
-        singleton_read_index_probes_ = 0;
-        hot_singleton_read_index_ = invalid_index;
-        }
-    }
-
-    [[nodiscard]] singleton_lookup_result try_singleton_read_index_lookup(
-        chunk_type const chunk,
-        singleton_chunk_entry const *& entry,
-        bool const allow_build
-    ) const {
-        if constexpr ( !kUseSingletonChunkMap ) {
-            return singleton_lookup_result::not_used;
-        } else {
-        if ( singleton_chunks_.size() < singleton_read_index_threshold ) {
-            return singleton_lookup_result::not_used;
-        }
-        if ( !singleton_read_index_valid_ ) {
-            if ( !allow_build ) {
-                return singleton_lookup_result::not_used;
-            }
-            if ( ++singleton_read_index_probes_ < singleton_read_index_probe_build_threshold ) {
-                return singleton_lookup_result::not_used;
-            }
-            ensure_singleton_read_index();
-        }
-        if ( hot_singleton_read_index_ != invalid_index && hot_singleton_read_index_ < singleton_read_index_.size() ) {
-            auto const current_key{ singleton_read_index_[ hot_singleton_read_index_ ].first };
-            if ( current_key == chunk ) {
-                entry = &singleton_read_index_[ hot_singleton_read_index_ ].second;
-                return singleton_lookup_result::found;
-            }
-            if ( chunk > current_key ) {
-                auto const next{ hot_singleton_read_index_ + 1U };
-                if ( next < singleton_read_index_.size() && singleton_read_index_[ next ].first == chunk ) {
-                    hot_singleton_read_index_ = next;
-                    entry = &singleton_read_index_[ next ].second;
-                    return singleton_lookup_result::found;
-                }
-            } else if ( hot_singleton_read_index_ > 0 ) {
-                auto const prev{ hot_singleton_read_index_ - 1U };
-                if ( singleton_read_index_[ prev ].first == chunk ) {
-                    hot_singleton_read_index_ = prev;
-                    entry = &singleton_read_index_[ prev ].second;
-                    return singleton_lookup_result::found;
-                }
-            }
-        }
-        auto const it{
-            std::lower_bound(
-                singleton_read_index_.begin(),
-                singleton_read_index_.end(),
-                chunk,
-                []( auto const & current, chunk_type const key ) { return current.first < key; }
-            )
-        };
-        if ( it == singleton_read_index_.end() || it->first != chunk ) {
-            return singleton_lookup_result::missing;
-        }
-        hot_singleton_read_index_ = static_cast<size_type>( it - singleton_read_index_.begin() );
-        entry = &it->second;
-        return singleton_lookup_result::found;
-        }
-    }
-
-    void materialize_singleton_chunks() const {
-        if constexpr ( !kUseSingletonChunkMap ) { return; } else {
-        if ( singleton_chunks_.empty() ) { return; }
-        auto & mutable_chunks{ const_cast<chunk_store_type &>( chunks_ ) };
-        chunk_store_type merged;
-        merged.reserve( mutable_chunks.size() + singleton_chunks_.size() );
-
-        detail::heap_vector<std::pair<chunk_type, singleton_chunk_entry>> sorted_singletons;
-        sorted_singletons.reserve( static_cast<std::uint32_t>( singleton_chunks_.size() ) );
-        for ( auto const & [key, low] : singleton_chunks_ ) {
-            sorted_singletons.emplace_back( key, low );
-        }
-        std::ranges::sort( sorted_singletons, {}, &std::pair<chunk_type, singleton_chunk_entry>::first );
-
-        size_type chunk_index{ 0 };
-        auto const chunk_count{ mutable_chunks.size() };
-        auto single_it{ sorted_singletons.begin() };
-        auto const single_end{ sorted_singletons.end() };
-
-        while ( chunk_index != chunk_count && single_it != single_end ) {
-            if ( single_it->first < mutable_chunks.key( chunk_index ) ) {
-                merged.push_back(
-                    single_it->first,
-                    handle_type::make_array_from_sorted(
-                        { single_it->second.lows.data(), single_it->second.count }
-                    )
-                );
-                ++single_it;
-            } else {
-                merged.push_back( mutable_chunks.key( chunk_index ), std::move( mutable_chunks.slot( chunk_index ) ) );
-                ++chunk_index;
-            }
-        }
-        while ( chunk_index != chunk_count ) {
-            merged.push_back( mutable_chunks.key( chunk_index ), std::move( mutable_chunks.slot( chunk_index ) ) );
-            ++chunk_index;
-        }
-        while ( single_it != single_end ) {
-            merged.push_back(
-                single_it->first,
-                handle_type::make_array_from_sorted(
-                    { single_it->second.lows.data(), single_it->second.count }
-                )
-            );
-            ++single_it;
-        }
-
-        mutable_chunks.swap( merged );
-        auto & mutable_singletons{ const_cast<decltype(singleton_chunks_)&>( singleton_chunks_ ) };
-        mutable_singletons.clear();
-        reset_singleton_read_index_empty();
-        invalidate_chunk_index_map();
-        }
-    }
-
-    void compact_tombstones() {
-        if constexpr ( !kUseLazyTombstoning ) { return; }
-        if ( tombstone_count_ == 0 ) { return; }
-        if constexpr ( kUseLazySort ) {
-            if ( !chunks_sorted_ ) { ensure_sorted(); }
-        }
-        chunks_.erase_slots_if( []( handle_type const & slot ) {
-            return detail::container_size( slot ) == 0;
-        } );
-        tombstone_count_ = 0;
-        removes_since_structural_add_ = 0;
-        invalidate_chunk_index_map();
     }
 
     // Fast container creation from an owned array handle: skips run detection for hot
@@ -4175,7 +3313,6 @@ private:
 
         chunks_.clear();
         size_ = 0;
-        tombstone_count_ = 0;
         chunks_.reserve( buckets.size() );
         for ( auto & bucket : buckets ) {
             std::ranges::sort( bucket.lows );
@@ -4206,7 +3343,6 @@ private:
             size_ += detail::container_size( container );
             chunks_.push_back( bucket.key, std::move( container ) );
         }
-        invalidate_chunk_index_map();
         return true;
     }
 
@@ -4269,7 +3405,6 @@ private:
                     run.cardinality = static_cast<typename detail::run_container<layout_type>::cardinality_type>( bitset_cardinality );
                     chunks_.push_back( chunk, detail::handle_from_run_container<layout_type, CowPolicy>( run ) );
                     size_ = bitset_cardinality;
-                    invalidate_chunk_index_map();
                     return true;
                 } else if constexpr ( !supports_bitset_container ) {
                     return false;
@@ -4282,7 +3417,6 @@ private:
                 if ( bitset_cardinality >= array_to_bitset_threshold && bitset_bytes <= array_bytes ) {
                     size_ = bitset_cardinality;
                     chunks_.push_back( chunk, std::move( bitset_handle ) );
-                    invalidate_chunk_index_map();
                     return true;
                 }
             }
@@ -4294,98 +3428,8 @@ private:
     [[nodiscard]] bool add_impl( key_type const value, bulk_context * const ctx ) {
         auto const chunk{ layout_type::chunk_key( value ) };
         auto const low{ layout_type::low_key( value ) };
-        if constexpr ( kUseSingletonChunkMap ) {
-            auto singleton_it{ singleton_chunks_.find( chunk ) };
-            if ( singleton_it != singleton_chunks_.end() ) {
-                switch ( singleton_add( singleton_it->second, low ) ) {
-                    case singleton_add_result::inserted:
-                        invalidate_singleton_read_index();
-                        ++size_;
-                        if ( ctx != nullptr ) {
-                            ctx->chunk = chunk;
-                            ctx->index = invalid_index;
-                            ctx->payload_private = false;
-                        }
-                        return true;
-                    case singleton_add_result::duplicate:
-                        return false;
-                    case singleton_add_result::full:
-                        break;
-                }
-                auto const existing{ singleton_it->second };
-                singleton_chunks_.erase( singleton_it );
-                invalidate_singleton_read_index();
-                auto const sorted_pos{ lower_bound( chunk ) };
-                handle_type array_handle;
-                auto array{ array_handle.as_array() };
-                auto const insert_pos{
-                    std::lower_bound( existing.lows.begin(), existing.lows.begin() + existing.count, low )
-                };
-                auto const inserted_index{
-                    static_cast<std::size_t>( insert_pos - existing.lows.begin() )
-                };
-                array.values.resize_uninitialized( existing.count + 1U );
-                for ( std::uint8_t i = 0; i < existing.count; ++i ) {
-                    auto const dest_index{ static_cast<std::size_t>( i ) + ( i >= inserted_index ? 1U : 0U ) };
-                    array.values[ dest_index ] = existing.lows[ i ];
-                }
-                array.values[ inserted_index ] = low;
-                array.sync_header();
-                chunks_.insert( sorted_pos, chunk, std::move( array_handle ) );
-                if ( ctx != nullptr ) {
-                    ctx->chunk = chunk;
-                    ctx->index = sorted_pos;
-                    ctx->payload_private = false;
-                }
-                note_hot_chunk( sorted_pos );
-                ++size_;
-                return true;
-            }
-
-            size_type sorted_pos;
-            size_type indexed_pos{};
-            if ( try_chunk_index_lookup( chunk, indexed_pos, false ) == chunk_lookup_result::found ) {
-                sorted_pos = indexed_pos;
-            } else {
-                sorted_pos = lower_bound( chunk );
-            }
-            if ( sorted_pos == chunks_.size() || chunks_.key( sorted_pos ) != chunk ) {
-                singleton_chunk_entry entry{};
-                entry.lows[ 0 ] = low;
-                entry.count = 1;
-                singleton_chunks_.emplace( chunk, entry );
-                note_singleton_insert( chunk, entry );
-                ++size_;
-                if ( ctx != nullptr ) {
-                    ctx->chunk = chunk;
-                    ctx->index = invalid_index;
-                    ctx->slot  = nullptr;
-                    ctx->payload_private = false;
-                }
-                return true;
-            } else {
-                if ( ctx != nullptr ) {
-                    ctx->chunk = chunk;
-                    ctx->index = sorted_pos;
-                    ctx->payload_private = false;
-                }
-                note_hot_chunk( sorted_pos );
-                bool const was_tombstone{
-                    kUseLazyTombstoning && tombstone_count_ != 0 &&
-                    detail::container_size( chunks_.slot( sorted_pos ) ) == 0
-                };
-                auto const added{ detail::container_add( chunks_.slot( sorted_pos ), low ) };
-                if ( !added ) { return false; }
-                ++size_;
-                if ( was_tombstone ) { --tombstone_count_; }
-                promote_if_needed( chunks_.slot( sorted_pos ) );
-                return true;
-            }
-        }
 
         size_type pos;
-        bool found_existing{ false };
-        bool structural_insert{ false };
         bool ctx_payload_private{ false };
         if (
             ctx != nullptr &&
@@ -4394,76 +3438,15 @@ private:
             chunks_.key( ctx->index ) == chunk
         ) {
             pos = ctx->index;
-            found_existing = true;
             ctx_payload_private = ctx->payload_private;
-        } else if constexpr ( kUseChunkHashMap ) {
-            // Fast path for already-added chunks via hash map.
-            ensure_chunk_index_map();
-            auto const it{ chunk_index_map_().find( chunk ) };
-            if ( it != chunk_index_map_().end() ) {
-                pos = it->second;
-                found_existing = true;
-            } else if constexpr ( kUseLazySort ) {
-                // New chunk: push_back (O(1)), update map. An append breaks the key
-                // order only when the new key sits below the one already last, and
-                // that is what the flag records. A monotone build - values arriving
-                // in order, which is the shape a bulk load has - therefore stays
-                // sorted, and the paths that would otherwise sort a million chunks
-                // to make progress (the tombstone compaction, the index rebuild)
-                // find nothing to do.
-                auto const appended_in_order{ chunks_.size() == 0 || chunks_.key( chunks_.size() - 1 ) < chunk };
-                chunks_.push_back( chunk, handle_type{} );
-                pos = chunks_.size() - 1;
-                if ( !appended_in_order ) { chunks_sorted_ = false; }
-                removes_since_structural_add_ = 0;
-                chunk_index_map_().emplace( chunk, chunks_.size() - 1 );
-            } else {
-                // Hash map lookup but always-sorted: sorted insert, then invalidate map.
-                auto const sorted_pos{ lower_bound( chunk ) };
-                chunks_.insert( sorted_pos, chunk, handle_type{} );
-                pos = sorted_pos;
-                invalidate_chunk_index_map();
-            }
         } else {
-            // CRoaring-style: O(log n) binary search + O(n) sorted insert.
-            size_type hot_index{};
-            if ( try_hot_chunk_index( chunk, hot_index ) ) {
-                pos = hot_index;
-                found_existing = true;
-            } else if ( try_chunk_index_lookup( chunk, hot_index, false ) == chunk_lookup_result::found ) {
-                pos = hot_index;
-                found_existing = true;
-            } else {
-                auto const sorted_pos{ lower_bound( chunk ) };
-                if ( sorted_pos != chunks_.size() && chunks_.key( sorted_pos ) == chunk ) {
-                    pos = sorted_pos;
-                    found_existing = true;
-                } else {
-                    // If remove() left a front tombstone window and there are no active
-                    // chunks, reuse the last tombstone slot instead of growing + shifting.
-                    if (
-                        kUseFrontTombstones &&
-                        front_tombstones_ != 0 &&
-                        sorted_pos == chunks_.size() &&
-                        sorted_pos == front_tombstones_
-                    ) {
-                        --front_tombstones_;
-                        pos = front_tombstones_;
-                        chunks_.set_key( pos, chunk );
-                        chunks_.slot( pos ) = handle_type{};
-                        structural_insert = true;
-                    } else {
-                        chunks_.insert( sorted_pos, chunk, handle_type{} );
-                        pos = sorted_pos;
-                        structural_insert = true;
-                    }
-                }
+            // CRoaring-style: O(log n) binary search + sorted insert.
+            pos = lower_bound( chunk );
+            if ( pos == chunks_.size() || chunks_.key( pos ) != chunk ) {
+                chunks_.insert( pos, chunk, handle_type{} );
             }
         }
 
-        if ( structural_insert ) {
-            invalidate_chunk_index_map();
-        }
         if ( ctx != nullptr ) {
             ctx->chunk = chunk;
             ctx->index = pos;
@@ -4473,13 +3456,7 @@ private:
             // and no copy can intervene before the next call on this context.
             ctx->payload_private = true;
         }
-        note_hot_chunk( pos );
 
-        bool const was_tombstone{
-            kUseLazyTombstoning && found_existing &&
-            tombstone_count_ != 0 &&
-            detail::container_size( chunks_.slot( pos ) ) == 0
-        };
         auto const added{
             ctx_payload_private
                 ? detail::container_add_already_private( chunks_.slot( pos ), low )
@@ -4488,10 +3465,7 @@ private:
         if ( !added ) { return false; }
 
         ++size_;
-        if ( was_tombstone ) { --tombstone_count_; }
         promote_if_needed( chunks_.slot( pos ) );
-        // No invalidate here: adding to an existing chunk doesn't shift any
-        // chunk's index, so the key→index map remains valid.
         return true;
     }
 
@@ -4519,9 +3493,6 @@ private:
         key_type const end_value,
         detail::range_operation const operation
     ) {
-        if constexpr ( kUseSingletonChunkMap ) {
-            materialize_singleton_chunks();
-        }
         if ( begin_value > end_value ) {
             return;
         }
@@ -4548,32 +3519,10 @@ private:
         low_type const low_end,
         detail::range_operation const operation
     ) {
-        size_type pos;
-        if constexpr ( !kUseLazySort ) {
-            // Always sorted: use lower_bound.
-            pos = lower_bound( chunk );
-            if ( pos == chunks_.size() || chunks_.key( pos ) != chunk ) {
-                if ( operation == detail::range_operation::remove ) { return; }
-                chunks_.insert( pos, chunk, handle_type{} );
-                invalidate_chunk_index_map();
-            }
-        } else if ( chunks_sorted_ ) {
-            pos = lower_bound( chunk );
-            if ( pos == chunks_.size() || chunks_.key( pos ) != chunk ) {
-                if ( operation == detail::range_operation::remove ) { return; }
-                chunks_.insert( pos, chunk, handle_type{} );
-            }
-        } else {
-            ensure_chunk_index_map();
-            auto const it{ chunk_index_map_().find( chunk ) };
-            if ( it != chunk_index_map_().end() ) {
-                pos = it->second;
-            } else {
-                if ( operation == detail::range_operation::remove ) { return; }
-                chunks_.push_back( chunk, handle_type{} );
-                pos = chunks_.size() - 1;
-                chunk_index_map_().emplace( chunk, chunks_.size() - 1 );
-            }
+        auto pos{ lower_bound( chunk ) };
+        if ( pos == chunks_.size() || chunks_.key( pos ) != chunk ) {
+            if ( operation == detail::range_operation::remove ) { return; }
+            chunks_.insert( pos, chunk, handle_type{} );
         }
 
         auto const previous_size{ detail::container_size( chunks_.slot( pos ) ) };
@@ -4588,162 +3537,11 @@ private:
             size_ -= previous_size - updated_size;
         }
         if ( updated_size == 0 ) {
-            if constexpr ( kUseLazyTombstoning ) {
-                ++tombstone_count_;
-            } else {
-                chunks_.erase( pos );
-                invalidate_chunk_index_map();
-            }
+            chunks_.erase( pos );
         }
     }
-
-    // ── Feature flags ─────────────────────────────────────────────────────────
-    // All false ⇒ the plain CRoaring strategy: always-sorted chunks, O(log n)
-    // binary-search lookup, immediate erase, no singleton-chunk staging. This is
-    // the parity baseline — frsr must match CRoaring here before any of the novel
-    // optimizations below are enabled to try to beat it.
-    // The three chunk-array flags below are off for every key width: a wide key
-    // gets the same always-sorted chunk array and pure binary-search reads as a
-    // narrow one, so every const query is a pure read (CRoaring's guarantee that
-    // concurrent readers of an unmodified bitmap are safe). They may be re-enabled
-    // for wide keys only as opt-in features that keep const reads pure, i.e. all
-    // lazy state is repaired inside non-const operations.
-    // Note: kUseLazySort requires kUseChunkHashMap (unsorted chunks need the map).
-    // Same split as kUseLazyTombstoning below, for the other half of the flat
-    // chunk map's O(n) per chunk: INSERTING a chunk in the middle of a sorted
-    // array memmoves its tail. Append-then-defer-the-sort with a hash-map lookup
-    // removes that, at the cost of a hash probe per chunk lookup and a sort at
-    // the first ordered walk - which for a 16-bit chunk key (bounded at 65536
-    // chunks, and the ordered walks are the hot path) is the wrong trade, and
-    // for a wider key is decisive: an insert/remove mix over a wide key space
-    // goes 5.55 -> 0.024 us per value, and 100k scattered inserts 0.031 ->
-    // 0.017, i.e. 14x AHEAD of the reference implementation's 64-bit map where
-    // the flat array was 16x behind it.
-    static constexpr bool kUseLazySort        = false; // defer chunk sort to set-op paths
-    static constexpr bool kUseChunkHashMap    = false; // hash-map chunk lookup vs binary search
-    // Erasing an emptied chunk memmoves the tail of the chunk array, so removing
-    // many chunks is quadratic in the chunk count. How much that matters depends
-    // entirely on how wide the chunk key is:
-    //   - a 16-bit chunk key (any key type up to 32 bits) bounds the chunk count
-    //     at 65536, and tombstones make every later walk skip dead slots - which
-    //     costs the batch-remove and sparse set-operation bands 1.35-1.75x. Off.
-    //   - a wider chunk key has no such bound, and the quadratic erase dominates:
-    //     measured on a 10 000-chunk remove-all, 6.18 -> 0.031 us per value, i.e.
-    //     ~197x, which also puts it 1.6x ahead of the reference implementation's
-    //     64-bit map instead of ~120x behind it.
-    static constexpr bool kUseLazyTombstoning = false; // mark-erased vs immediate erase
-    // Novel: remember the last resolved chunk slot and probe it (plus its two
-    // neighbours) before the binary search. CRoaring has no analog on the plain
-    // lookup path — it keeps this amortization opt-in via roaring_bulk_context_t
-    // (our bulk_context / contains_bulk), so the library never guesses the
-    // caller's access pattern. With this off, contains() is a *pure* read: no
-    // store to a mutable member, hence no write-sharing between threads that
-    // hold the same bitmap by const reference.
-    static constexpr bool kUseHotChunkIndex   = false; // novel: implicit last-chunk cache in contains()
-    // Novel, opt-in: the same guess kept per thread instead of in the bitmap. A
-    // lookup tries the chunk position the calling thread resolved last (and its
-    // successor, for ascending probes) and only searches when the guess does not
-    // verify against the keys, so the guess can be stale or belong to another
-    // bitmap and the answer is still exact. Nothing is stored to the bitmap, so
-    // concurrent readers stay safe; it trades a thread-local access on every
-    // lookup for skipping the search on sequential access.
-#ifdef FRSR_ROARING_THREAD_CHUNK_HINT
-    static constexpr bool kUseThreadChunkHint = true;
-#else
-    static constexpr bool kUseThreadChunkHint = false;
-#endif
-    // Novel: when remove() empties the front-most chunk, mark it instead of
-    // erasing, and batch the erase (avoids O(n^2) memmove on monotonic
-    // front-removal). CRoaring erases immediately (ra_remove_at_index). The
-    // batching is why compact_front_tombstones() has to const_cast and
-    // structurally erase from *const* query paths — intersects(), and every
-    // set op, force it on their const RHS. With this off the deferral never
-    // happens, front_tombstones_ stays 0, and those const paths mutate nothing,
-    // restoring CRoaring's documented "concurrent access to the same bitmap is
-    // safe as long as you do not modify it" guarantee.
-    static constexpr bool kUseFrontTombstones = false; // novel: batched front-chunk erase
-    // Novel: stage sparse single-key chunks in a side map to cut add()/remove()
-    // cost on random workloads (no CRoaring analog). To re-enable in the beat phase,
-    // gate on uint32/uint64 key_type (the staging assumes a 16-bit chunk-key split):
-    //   = !kUseLazySort && !kUseChunkHashMap && !kUseLazyTombstoning &&
-    //     ( std::same_as<key_type, std::uint32_t> || std::same_as<key_type, std::uint64_t> )
-    static constexpr bool kUseSingletonChunkMap = false;
-    static constexpr std::uint8_t singleton_chunk_demote_threshold{ singleton_chunk_capacity };
-    static constexpr size_type chunk_index_lookup_threshold{ 512 };
-    static constexpr std::uint32_t chunk_index_probe_build_threshold{ 8 };
-    static constexpr size_type singleton_read_index_threshold{ 16384 };
-    static constexpr std::uint32_t singleton_read_index_probe_build_threshold{ 8 };
-    static_assert( !kUseLazySort || kUseChunkHashMap,
-        "kUseLazySort requires kUseChunkHashMap" );
-    // ─────────────────────────────────────────────────────────────────────────
 
     chunk_store_type chunks_;
-#ifdef FRSR_USE_BOOST_FLAT_MAP
-    using chunk_index_map_type = boost::unordered_flat_map<chunk_type, size_type>;
-#else
-    using chunk_index_map_type = std::unordered_map<chunk_type, size_type>;
-#endif
-    // Boxed: the adaptive chunk-index cache is built only for large bitmaps
-    // (past chunk_index_lookup_threshold probes), so the common small bitmap
-    // pays one pointer of footprint instead of the whole map object (48 B),
-    // keeping sizeof(bitmap) lean for by-value storage in flat containers.
-    mutable std::unique_ptr<chunk_index_map_type> chunk_index_map_box_{};
-    [[nodiscard]] chunk_index_map_type & chunk_index_map_() const {
-        if ( !chunk_index_map_box_ ) [[unlikely]] {
-            chunk_index_map_box_ = std::make_unique<chunk_index_map_type>();
-        }
-        return *chunk_index_map_box_;
-    }
-#if defined( _MSC_VER )
-#   define FRSR_NO_UNIQUE_ADDRESS [[msvc::no_unique_address]]
-#else
-#   define FRSR_NO_UNIQUE_ADDRESS [[no_unique_address]]
-#endif
-    // Flags-off bookkeeping members are empty feature_field stand-ins (see detail::
-    // feature_field): with every novel flag currently off these collapse to zero
-    // footprint under [[no_unique_address]], shrinking the by-value bitmap that a
-    // downstream N-way AND fold and every downstream bitmap-wrapper copy move
-    // around, WITHOUT guarding their many use sites. The map *box* itself stays a
-    // live unique_ptr — its
-    // machinery (ensure/chunk_index_map_) is only reached from kUseChunkHashMap-
-    // guarded call sites, so no body needs conditioning.
-    FRSR_NO_UNIQUE_ADDRESS mutable detail::feature_field<bool,          kUseChunkHashMap, false> chunk_index_map_valid_{};
-    FRSR_NO_UNIQUE_ADDRESS mutable detail::feature_field<std::uint32_t, kUseChunkHashMap       > chunk_index_lookup_probes_{};
-    static constexpr std::uint32_t front_tombstone_compact_threshold{ 4096 };
-    FRSR_NO_UNIQUE_ADDRESS mutable detail::feature_field<std::uint32_t, kUseFrontTombstones     > front_tombstones_{};
-    // The singleton-chunk staging state exists only when the feature flag is on:
-    // with kUseSingletonChunkMap == false these members would be pure dead
-    // footprint (~80 B of the handle) copied/moved with every bitmap and padding
-    // out by-value storage of bitmaps in flat containers, so they are compiled
-    // out to empty stand-ins ([[msvc::no_unique_address]] keeps them size-free
-    // under the MSVC ABI clang-cl targets; plain [[no_unique_address]] is a
-    // no-op there).
-    struct empty_member_stub {};
-    template <typename T> using iff_singleton_map = std::conditional_t<kUseSingletonChunkMap, T, empty_member_stub>;
-    static constexpr iff_singleton_map<size_type> initial_hot_singleton_read_index() noexcept {
-        if constexpr ( kUseSingletonChunkMap ) { return invalid_index; }
-        else                                   { return {};            }
-    }
-    FRSR_NO_UNIQUE_ADDRESS mutable iff_singleton_map<singleton_chunk_map> singleton_chunks_{};
-    FRSR_NO_UNIQUE_ADDRESS mutable iff_singleton_map<detail::heap_vector<std::pair<chunk_type, singleton_chunk_entry>>> singleton_read_index_{};
-    FRSR_NO_UNIQUE_ADDRESS mutable iff_singleton_map<bool> singleton_read_index_valid_{};
-    FRSR_NO_UNIQUE_ADDRESS mutable iff_singleton_map<std::uint32_t> singleton_read_index_probes_{};
-    FRSR_NO_UNIQUE_ADDRESS mutable iff_singleton_map<size_type> hot_singleton_read_index_{ initial_hot_singleton_read_index() };
-    FRSR_NO_UNIQUE_ADDRESS mutable detail::feature_field<size_type, kUseHotChunkIndex, invalid_index> hot_chunk_index_{};
-    // Counts consecutive remove() calls since the last structural add (chunk insert).
-    // When this reaches the lazy-build threshold we rebuild the map so bulk-remove
-    // sessions amortise to O(1) per remove, while alternating add/remove patterns
-    // avoid O(n) map rebuilds.  Reset to 0 by add_impl() new-chunk inserts and by
-    // compact_tombstones() (both change vector structure / indices).
-    FRSR_NO_UNIQUE_ADDRESS mutable detail::feature_field<std::uint32_t, kUseChunkHashMap> removes_since_structural_add_{};
-    // Tracks whether chunks_ needs sorting. When true, any set operation or iteration
-    // path must call ensure_sorted() before proceeding. This defers expensive O(n log n)
-    // sorts from hot add() paths to less-hot set-operation paths.
-    // Invariant: always true when kUseLazySort == false.
-    FRSR_NO_UNIQUE_ADDRESS mutable detail::feature_field<bool, kUseLazySort, true> chunks_sorted_{};
-    // Non-zero only when kUseLazyTombstoning == true.
-    FRSR_NO_UNIQUE_ADDRESS detail::feature_field<std::uint32_t, kUseLazyTombstoning> tombstone_count_{};
-#undef FRSR_NO_UNIQUE_ADDRESS
     size_type size_{};
 };
 
