@@ -2154,12 +2154,34 @@ public:
                     // Direct-init (not assignment into a pre-declared handle): the prvalue
                     // return is elided straight into `container`, halving the
                     // copy_fields_from traffic vs move-assigning into an already-live handle.
-                    auto container{ combine_bitset_bitset_for_policy(
-                        std::as_const( left_container ).as_bitset(),
-                        right_container.as_bitset(),
-                        op,
-                        result_chunks.take_retired( detail::container_kind::bitset )
-                    ) };
+                    auto container{ [ & ]() -> handle_type {
+                        // Opt-in (tuning.hpp): a materializing AND counts the common bits first and, below the
+                        // array limit, extracts them straight from the operands' words, as the reference does,
+                        // instead of writing an intermediate bitset. The in-place walk keeps its accumulators.
+                        if constexpr ( detail::kAndDemotesSparseBitsets ) {
+                            if ( !in_place && op == detail::set_operation::bit_and ) {
+                                auto const left_bitset { std::as_const( left_container ).as_bitset() };
+                                auto const right_bitset{ right_container.as_bitset() };
+                                auto const cardinality { detail::and_popcount_words( left_bitset.words.begin(), right_bitset.words.begin(), left_bitset.words.size() ) };
+                                if ( cardinality < array_to_bitset_threshold ) {
+                                    auto array{ detail::intersect_bitset_bitset_to_array<layout_type, CowPolicy>(
+                                        left_bitset, right_bitset, cardinality, result_chunks.take_retired( detail::container_kind::array )
+                                    ) };
+                                    if constexpr ( uses_default_container_set ) {
+                                        return array;
+                                    } else {
+                                        return optimize_container_for_policy( std::move( array ) );
+                                    }
+                                }
+                            }
+                        }
+                        return combine_bitset_bitset_for_policy(
+                            std::as_const( left_container ).as_bitset(),
+                            right_container.as_bitset(),
+                            op,
+                            result_chunks.take_retired( detail::container_kind::bitset )
+                        );
+                    }() };
                     // AND results NOT demoted (measured): the in-place fold walk is
                     // where the run-heavy witness's AND-fold accumulator lives —
                     // demoting it to array cost ~12% regardless of threshold or
@@ -3917,9 +3939,10 @@ private:
     // the reference decides it: a total below the bitset threshold bounds the
     // result below it too, so the union is merged straight into a retired (or
     // fresh) array payload — the kernel sizes that payload for its own worst case,
-    // store slack included. A larger total is merged into `scratch`, whose exact
-    // size then picks array or bitset. A retired payload is only ever a sole-owned
-    // one, so it never aliases an operand the kernel is still reading.
+    // store slack included. A larger total may well be a bitset, so both arrays are
+    // scattered straight into one (demoted to an array if the shared values leave
+    // it below the limit). A retired payload is only ever a sole-owned one, so it
+    // never aliases an operand the kernel is still reading.
     // [croaring-ref] deps/croaring/src/containers/mixed_union.c:array_array_container_union
     [[nodiscard]] static handle_type make_array_union_container_reusing(
         detail::chunk_store<layout_type, CowPolicy> & store,
@@ -3934,8 +3957,16 @@ private:
             result_array.sync_header();
             return result_handle;
         }
-        detail::union_array_array_to_vector<layout_type>( lhs, rhs, scratch );
-        return make_fast_container_from_scratch_reusing( store, scratch );
+        if constexpr ( supports_bitset_container ) {
+            // The union may still fall below the limit (shared values): demote, as the reference does.
+            return demote_sparse_bitset(
+                detail::bitset_handle_from_array_union<layout_type, CowPolicy>( lhs, rhs, store.take_retired( detail::container_kind::bitset ) ),
+                store
+            );
+        } else {
+            detail::union_array_array_to_vector<layout_type>( lhs, rhs, scratch );
+            return make_fast_container_from_scratch_reusing( store, scratch );
+        }
     }
 
     // ForcedRunSelectionPolicy defaults to the bitmap's own ambient RunSelectionPolicy

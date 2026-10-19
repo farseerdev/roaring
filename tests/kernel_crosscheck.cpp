@@ -8,6 +8,7 @@
 #include <roaring/roaring.h>
 
 #include <bit>
+#include <set>
 
 namespace {
 
@@ -160,6 +161,79 @@ TEST( KernelCrosscheck, BitsetAndBitsetAcrossDensities ) {
             { auto t{ a }; t &= b; EXPECT_TRUE( same_contents( t, croaring{ roaring_bitmap_and( ca.r, cb.r ) } ) ); }
             EXPECT_EQ( a.intersects( b ), roaring_bitmap_intersect( ca.r, cb.r ) );
         }
+    }
+}
+
+// Interleaved, blocky and nested value sets, whose merges exercise the block shortcuts of the scalar kernels,
+// and unions whose total crosses the array limit.
+TEST( KernelCrosscheck, ArrayArrayOperationsInterleavedAndBlocky ) {
+    std::mt19937_64 rng{ 0x1417E8 };
+    constexpr std::uint32_t base{ 9U << 16 };
+    auto const blocky{ [ & ]( std::size_t const n, unsigned const stride ) {
+        std::set<std::uint32_t> chosen;
+        while ( chosen.size() < n ) {
+            auto const start{ static_cast<std::uint32_t>( rng() % ( 65536 - 16 * stride ) ) };
+            auto const length{ 1 + rng() % 9 };
+            for ( std::uint32_t i{ 0 }; i < length && chosen.size() < n; ++i ) { chosen.insert( base + start + i * stride ); }
+        }
+        return Values32{ chosen.begin(), chosen.end() };
+    } };
+    constexpr std::size_t sizes[]{ 4, 9, 33, 100, 500, 2000, 3000, 4000 };
+    for ( int trial{ 0 }; trial < 600; ++trial ) {
+        auto const na{ sizes[ rng() % std::size( sizes ) ] };
+        auto const nb{ sizes[ rng() % std::size( sizes ) ] };
+        auto const stride_a{ 1U + static_cast<unsigned>( rng() % 3 ) };
+        auto const stride_b{ 1U + static_cast<unsigned>( rng() % 3 ) };
+        auto va{ blocky( na, stride_a ) };
+        auto vb{ blocky( nb, stride_b ) };
+        if ( rng() % 3 == 0 ) { vb.insert( vb.end(), va.begin(), va.begin() + static_cast<std::ptrdiff_t>( va.size() / 2 ) ); vb = sorted_unique( std::move( vb ) ); }
+        SCOPED_TRACE( ::testing::Message() << "trial " << trial << " a " << va.size() << " b " << vb.size() );
+        auto const a{ make_ours( va, false ) };
+        auto const b{ make_ours( vb, false ) };
+        auto const ca{ make_theirs( va, false ) };
+        auto const cb{ make_theirs( vb, false ) };
+
+        EXPECT_TRUE( same_contents( a | b, croaring{ roaring_bitmap_or( ca.r, cb.r ) } ) ) << "or";
+        { auto t{ a }; t |= b; EXPECT_TRUE( same_contents( t, croaring{ roaring_bitmap_or( ca.r, cb.r ) } ) ) << "or inplace"; }
+        { auto t{ b }; t |= a; EXPECT_TRUE( same_contents( t, croaring{ roaring_bitmap_or( ca.r, cb.r ) } ) ) << "or inplace swapped"; }
+        EXPECT_TRUE( same_contents( a & b, croaring{ roaring_bitmap_and( ca.r, cb.r ) } ) ) << "and";
+        { auto t{ a }; t &= b; EXPECT_TRUE( same_contents( t, croaring{ roaring_bitmap_and( ca.r, cb.r ) } ) ) << "and inplace"; }
+        EXPECT_TRUE( same_contents( a - b, croaring{ roaring_bitmap_andnot( ca.r, cb.r ) } ) ) << "andnot";
+        { auto t{ a }; t -= b; EXPECT_TRUE( same_contents( t, croaring{ roaring_bitmap_andnot( ca.r, cb.r ) } ) ) << "andnot inplace"; }
+        EXPECT_EQ( a.intersects( b ), roaring_bitmap_intersect( ca.r, cb.r ) );
+    }
+}
+
+// Bitset operands whose words differ wildly in density: empty stretches, full words, sparse and dense words in
+// one block, so the operands settle as bitsets or arrays and the AND's result runs from nothing to a bitset.
+TEST( KernelCrosscheck, BitsetAndBitsetMixedWordDensities ) {
+    std::mt19937_64 rng{ 0x31DD };
+    for ( int trial{ 0 }; trial < 200; ++trial ) {
+        std::array<std::uint64_t, 1024> wa{}, wb{};
+        auto const thinning{ static_cast<unsigned>( rng() % 9 ) };
+        auto const empty_one_in{ 1U + static_cast<unsigned>( rng() % 12 ) };
+        for ( std::size_t i{ 0 }; i < 1024; ++i ) {
+            if ( rng() % empty_one_in == 0 ) { continue; }
+            wa[ i ] = rng() | rng() | rng();
+            wb[ i ] = rng();
+            for ( unsigned k{ 0 }; k < thinning; ++k ) { wb[ i ] &= rng(); }
+        }
+        auto const expand{ [ & ]( auto const & words ) {
+            Values32 v;
+            for ( std::size_t i{ 0 }; i < words.size(); ++i ) {
+                for ( auto w{ words[ i ] }; w != 0; w &= w - 1 ) { v.push_back( 0x40000U + static_cast<std::uint32_t>( i * 64 + std::countr_zero( w ) ) ); }
+            }
+            return v;
+        } };
+        auto const va{ expand( wa ) }, vb{ expand( wb ) };
+        SCOPED_TRACE( ::testing::Message() << "trial " << trial << " thinning " << thinning << " empty 1/" << empty_one_in );
+        auto const a{ make_ours( va, false ) }, b{ make_ours( vb, false ) };
+        auto const ca{ make_theirs( va, false ) }, cb{ make_theirs( vb, false ) };
+        EXPECT_TRUE( same_contents( a & b, croaring{ roaring_bitmap_and( ca.r, cb.r ) } ) ) << "and";
+        { auto t{ a }; t &= b; EXPECT_TRUE( same_contents( t, croaring{ roaring_bitmap_and( ca.r, cb.r ) } ) ) << "and inplace"; }
+        EXPECT_TRUE( same_contents( a - b, croaring{ roaring_bitmap_andnot( ca.r, cb.r ) } ) ) << "andnot";
+        EXPECT_TRUE( same_contents( a | b, croaring{ roaring_bitmap_or( ca.r, cb.r ) } ) ) << "or";
+        EXPECT_EQ( a.intersects( b ), roaring_bitmap_intersect( ca.r, cb.r ) );
     }
 }
 

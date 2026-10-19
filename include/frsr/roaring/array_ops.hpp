@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cassert>
 #include <bit>
 #include <cstddef>
 #include <cstdint>
@@ -656,6 +657,144 @@ inline std::size_t intersect_sorted_uint16(
 // threshold = 64;` in array_container_intersection).
 inline constexpr std::size_t kSkewedIntersectRatioThreshold{ 64 };
 
+// Hybrid branchless scalar merges of two sorted arrays. A branch per value mispredicts about once per value
+// on sets that interleave unpredictably, so while four values remain on each side the merge first looks for a
+// block of four to handle at once (all below the other side's current value, or equal to the other side's next
+// four), which is common and well predicted on clustered data; otherwise it takes four branchless steps.
+// [croaring-ref] deps/croaring/src/array_util.c:intersect_uint16, union_uint16, difference_uint16
+// A tail copy: both pointers may be null for an empty tail, which memmove does not allow.
+template <typename T>
+[[ gnu::always_inline ]] inline void move_tail( T * const to, T const * const from, std::size_t const count ) noexcept {
+    if ( count != 0 ) { std::memmove( to, from, count * sizeof( T ) ); }
+}
+
+template <typename T>
+[[ gnu::always_inline ]] inline bool equal_blocks4( T const * const a, T const * const b ) noexcept {
+    return std::memcmp( a, b, 4 * sizeof( T ) ) == 0;
+}
+
+// Every write goes to out[ k.. ] with k <= i, so `out` may be `a`, but not `b`.
+template <typename T>
+[[ gnu::hot ]] inline std::size_t intersect_sorted_scalar(
+    T const * const a, std::size_t const sa,
+    T const * const b, std::size_t const sb,
+    T * const out
+) noexcept {
+    assert( out != b || a == b );
+    std::size_t i{ 0 }, j{ 0 }, k{ 0 };
+    while ( i + 4 <= sa && j + 4 <= sb ) {
+        if ( a[ i + 3 ] < b[ j ] ) {
+            i += 4;
+        } else if ( b[ j + 3 ] < a[ i ] ) {
+            j += 4;
+        } else if ( equal_blocks4( a + i, b + j ) ) {
+            std::memmove( out + k, a + i, 4 * sizeof( T ) );
+            k += 4;
+            i += 4;
+            j += 4;
+        } else {
+            for ( int step{ 0 }; step < 4; ++step ) {
+                T const x{ a[ i ] }, y{ b[ j ] };
+                out[ k ] = x;
+                k += ( x == y );
+                i += ( x <= y );
+                j += ( x >= y );
+            }
+        }
+    }
+    while ( i < sa && j < sb ) {
+        T const x{ a[ i ] }, y{ b[ j ] };
+        out[ k ] = x;
+        k += ( x == y );
+        i += ( x <= y );
+        j += ( x >= y );
+    }
+    return k;
+}
+
+// `out` has sa + sb slots; it may start up to sb values before `a` (the in-place union layout): every write
+// lands before out + i + sb.
+template <typename T>
+[[ gnu::hot ]] inline std::size_t union_sorted_scalar(
+    T const * const a, std::size_t const sa,
+    T const * const b, std::size_t const sb,
+    T * const out
+) noexcept {
+    std::size_t i{ 0 }, j{ 0 }, k{ 0 };
+    while ( i + 4 <= sa && j + 4 <= sb ) {
+        if ( a[ i + 3 ] < b[ j ] ) {
+            std::memmove( out + k, a + i, 4 * sizeof( T ) );
+            k += 4;
+            i += 4;
+        } else if ( b[ j + 3 ] < a[ i ] ) {
+            std::memmove( out + k, b + j, 4 * sizeof( T ) );
+            k += 4;
+            j += 4;
+        } else if ( equal_blocks4( a + i, b + j ) ) {
+            std::memmove( out + k, a + i, 4 * sizeof( T ) );
+            k += 4;
+            i += 4;
+            j += 4;
+        } else {
+            for ( int step{ 0 }; step < 4; ++step ) {
+                T const x{ a[ i ] }, y{ b[ j ] };
+                out[ k++ ] = x < y ? x : y;
+                i += ( x <= y );
+                j += ( x >= y );
+            }
+        }
+    }
+    while ( i < sa && j < sb ) {
+        T const x{ a[ i ] }, y{ b[ j ] };
+        out[ k++ ] = x < y ? x : y;
+        i += ( x <= y );
+        j += ( x >= y );
+    }
+    move_tail( out + k, a + i, sa - i );
+    k += sa - i;
+    move_tail( out + k, b + j, sb - j );
+    return k + ( sb - j );
+}
+
+// Every write goes to out[ k.. ] with k <= i, so `out` may be `a`.
+template <typename T>
+[[ gnu::hot ]] inline std::size_t difference_sorted_scalar(
+    T const * const a, std::size_t const sa,
+    T const * const b, std::size_t const sb,
+    T * const out
+) noexcept {
+    std::size_t i{ 0 }, j{ 0 }, k{ 0 };
+    while ( i + 4 <= sa && j + 4 <= sb ) {
+        if ( a[ i + 3 ] < b[ j ] ) {
+            std::memmove( out + k, a + i, 4 * sizeof( T ) );
+            k += 4;
+            i += 4;
+        } else if ( b[ j + 3 ] < a[ i ] ) {
+            j += 4;
+        } else if ( equal_blocks4( a + i, b + j ) ) {
+            i += 4;
+            j += 4;
+        } else {
+            for ( int step{ 0 }; step < 4; ++step ) {
+                T const x{ a[ i ] }, y{ b[ j ] };
+                out[ k ] = x;
+                k += ( x < y );
+                i += ( x <= y );
+                j += ( x >= y );
+            }
+        }
+    }
+    while ( i < sa && j < sb ) {
+        T const x{ a[ i ] }, y{ b[ j ] };
+        out[ k ] = x;
+        k += ( x < y );
+        i += ( x <= y );
+        j += ( x >= y );
+    }
+    move_tail( out + k, a + i, sa - i );
+    return k + ( sa - i );
+}
+
 // OutVector: a small_array_values scratch or a handle's payload_vector (direct write).
 template <typename Layout, typename OutVector, typename CowPolicy = cow_value_semantics>
 [[ gnu::hot ]] inline void combine_array_array_into(
@@ -666,26 +805,10 @@ template <typename Layout, typename OutVector, typename CowPolicy = cow_value_se
 ) {
     auto const * li{ lhs.values.data() };
     auto const * ri{ rhs.values.data() };
-    auto const * const li_end{ li + lhs.values.size() };
-    auto const * const ri_end{ ri + rhs.values.size() };
 
     if ( op == set_operation::bit_or ) {
         resize_uninitialized( result, lhs.values.size() + rhs.values.size() );
-        auto * out{ result.data() };
-        while ( li != li_end && ri != ri_end ) {
-            if ( *li < *ri ) {
-                *out++ = *li++;
-            } else if ( *ri < *li ) {
-                *out++ = *ri++;
-            } else {
-                *out++ = *li;
-                ++li;
-                ++ri;
-            }
-        }
-        out = std::copy( li, li_end, out );
-        out = std::copy( ri, ri_end, out );
-        result.resize( static_cast<std::uint32_t>( out - result.data() ) );
+        result.resize( static_cast<std::uint32_t>( union_sorted_scalar( li, lhs.values.size(), ri, rhs.values.size(), result.data() ) ) );
         return;
     }
 
@@ -753,36 +876,12 @@ template <typename Layout, typename OutVector, typename CowPolicy = cow_value_se
         }
 #endif
         resize_uninitialized( result, std::min( lhs.values.size(), rhs.values.size() ) );
-        auto * out{ result.data() };
-        while ( li != li_end && ri != ri_end ) {
-            if ( *li < *ri ) {
-                ++li;
-            } else if ( *ri < *li ) {
-                ++ri;
-            } else {
-                *out++ = *li;
-                ++li;
-                ++ri;
-            }
-        }
-        result.resize( static_cast<std::uint32_t>( out - result.data() ) );
+        result.resize( static_cast<std::uint32_t>( intersect_sorted_scalar( li, lhs.values.size(), ri, rhs.values.size(), result.data() ) ) );
         return;
     }
 
     resize_uninitialized( result, lhs.values.size() );
-    auto * out{ result.data() };
-    while ( li != li_end && ri != ri_end ) {
-        if ( *li < *ri ) {
-            *out++ = *li++;
-        } else if ( *ri < *li ) {
-            ++ri;
-        } else {
-            ++li;
-            ++ri;
-        }
-    }
-    out = std::copy( li, li_end, out );
-    result.resize( static_cast<std::uint32_t>( out - result.data() ) );
+    result.resize( static_cast<std::uint32_t>( difference_sorted_scalar( li, lhs.values.size(), ri, rhs.values.size(), result.data() ) ) );
 }
 
 template <typename Layout, typename CowPolicy = cow_value_semantics>
@@ -800,21 +899,11 @@ template <typename Layout, typename CowPolicy = cow_value_semantics>
 // alias the inputs' unread parts and has sa + sb slots). Returns the count.
 // [croaring-ref] deps/croaring/src/array_util.c:union_uint16
 [[ gnu::hot ]] inline std::size_t union_sorted_uint16_scalar(
-    std::uint16_t const * a, std::size_t const sa,
-    std::uint16_t const * b, std::size_t const sb,
+    std::uint16_t const * const a, std::size_t const sa,
+    std::uint16_t const * const b, std::size_t const sb,
     std::uint16_t * const out
 ) noexcept {
-    auto const * const a_end{ a + sa };
-    auto const * const b_end{ b + sb };
-    auto * o{ out };
-    while ( a != a_end && b != b_end ) {
-        if      ( *a < *b ) { *o++ = *a++; }
-        else if ( *b < *a ) { *o++ = *b++; }
-        else                { *o++ = *a++; ++b; }
-    }
-    o = std::copy( a, a_end, o );
-    o = std::copy( b, b_end, o );
-    return static_cast<std::size_t>( o - out );
+    return union_sorted_scalar( a, sa, b, sb, out );
 }
 
 #if FRSR_ROARING_X86_V4
@@ -1049,27 +1138,9 @@ template <typename Layout, typename OutVector, typename CowPolicy = cow_value_se
     }
 #endif
     resize_uninitialized( out, lhs.values.size() + rhs.values.size() );
-
-    auto const * li{ lhs.values.data() };
-    auto const * ri{ rhs.values.data() };
-    auto const * const li_end{ li + lhs.values.size() };
-    auto const * const ri_end{ ri + rhs.values.size() };
-    auto * out_it{ out.data() };
-
-    while ( li != li_end && ri != ri_end ) {
-        if ( *li < *ri ) {
-            *out_it++ = *li++;
-        } else if ( *ri < *li ) {
-            *out_it++ = *ri++;
-        } else {
-            *out_it++ = *li;
-            ++li;
-            ++ri;
-        }
-    }
-    out_it = std::copy( li, li_end, out_it );
-    out_it = std::copy( ri, ri_end, out_it );
-    out.resize( static_cast<std::uint32_t>( out_it - out.data() ) );
+    out.resize( static_cast<std::uint32_t>( union_sorted_scalar(
+        lhs.values.data(), lhs.values.size(), rhs.values.data(), rhs.values.size(), out.data()
+    ) ) );
 }
 
 // Above this result size the in-place intersection stops paying for itself: its
@@ -1145,24 +1216,7 @@ template <typename Layout, typename CowPolicy = cow_value_semantics>
         return;
     }
 #endif
-    // Scalar in-place merge (out <= li always).
-    auto const * li{ a };
-    auto const * ri{ b };
-    auto const * const li_end{ li + sa };
-    auto const * const ri_end{ ri + sb };
-    auto * out{ a };
-    while ( li != li_end && ri != ri_end ) {
-        if ( *li < *ri ) {
-            ++li;
-        } else if ( *ri < *li ) {
-            ++ri;
-        } else {
-            *out++ = *li;
-            ++li;
-            ++ri;
-        }
-    }
-    finish( static_cast<std::size_t>( out - a ) );
+    finish( intersect_sorted_scalar( static_cast<typename Layout::low_type const *>( a ), sa, b, sb, a ) );
 }
 
 // True in-place difference: the write cursor can never pass the read cursor
@@ -1173,28 +1227,10 @@ template <typename Layout, typename CowPolicy = cow_value_semantics>
     array_ref<Layout, CowPolicy> lhs,
     array_cref<Layout, CowPolicy> const rhs
 ) {
-    auto       * const a{ lhs.values.data() };
-    auto const * li{ a };
-    auto const * ri{ rhs.values.data() };
-    auto const * const li_end{ li + lhs.values.size() };
-    auto const * const ri_end{ ri + rhs.values.size() };
-    auto * out{ a };
-
-    while ( li != li_end && ri != ri_end ) {
-        if ( *li < *ri ) {
-            *out++ = *li++;
-        } else if ( *ri < *li ) {
-            ++ri;
-        } else {
-            ++li;
-            ++ri;
-        }
-    }
-    if ( out != li ) {
-        std::memmove( out, li, static_cast<std::size_t>( li_end - li ) * sizeof( *a ) );
-    }
-    out += li_end - li;
-    lhs.values.resize_uninitialized( static_cast<std::uint32_t>( out - a ) );
+    auto * const a{ lhs.values.data() };
+    lhs.values.resize_uninitialized( static_cast<std::uint32_t>(
+        difference_sorted_scalar( static_cast<typename Layout::low_type const *>( a ), lhs.values.size(), rhs.values.data(), rhs.values.size(), a )
+    ) );
     lhs.sync_header();
 }
 
@@ -1221,25 +1257,9 @@ template <typename Layout, typename OutVector, typename CowPolicy = cow_value_se
     }
 #endif
     resize_uninitialized( out, lhs.values.size() );
-
-    auto const * li{ lhs.values.data() };
-    auto const * ri{ rhs.values.data() };
-    auto const * const li_end{ li + lhs.values.size() };
-    auto const * const ri_end{ ri + rhs.values.size() };
-    auto * out_it{ out.data() };
-
-    while ( li != li_end && ri != ri_end ) {
-        if ( *li < *ri ) {
-            *out_it++ = *li++;
-        } else if ( *ri < *li ) {
-            ++ri;
-        } else {
-            ++li;
-            ++ri;
-        }
-    }
-    out_it = std::copy( li, li_end, out_it );
-    out.resize( static_cast<std::uint32_t>( out_it - out.data() ) );
+    out.resize( static_cast<std::uint32_t>( difference_sorted_scalar(
+        lhs.values.data(), lhs.values.size(), rhs.values.data(), rhs.values.size(), out.data()
+    ) ) );
 }
 
 // array∩run written directly into caller-supplied output (same OutVector
