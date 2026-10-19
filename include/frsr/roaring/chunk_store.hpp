@@ -1,133 +1,81 @@
 #pragma once
 
+#include <frsr/roaring/chunk_array.hpp>
 #include <frsr/roaring/container_handle.hpp>
 #include <frsr/roaring/containers.hpp>
 
-#include <algorithm>
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
-#include <cstring>
 #include <memory>
-#include <new>
-#include <span>
 #include <utility>
-
-#if defined( FRSR_ROARING_HAS_PSI_VM )
-#   include <psi/vm/containers/lookup.hpp>
-#endif
 
 namespace frsr::roaring::detail {
 
-// SoA chunk storage: the sorted chunk keys live in their own dense array so the
-// merge/lookup key walks touch only keys[] (2-8 B stride) and dereference the
-// parallel 32 B container handle in slots[] on a key match only. Parallel-array
-// invariant: the two arrays share one size at every public-API boundary.
+// The chunk table of a bitmap: its chunk keys in ascending order, each with the container handle of
+// the chunk. What holds them depends on the width of the chunk key. A 16-bit chunk key (any key type
+// up to 32 bits) bounds the table at 65536 entries, which a sorted array serves best: contiguous,
+// searched by a binary search, and just what the reference uses. A wider chunk key has no such
+// bound, and an array's insertions and removals, which shift its tail, become the cost of the
+// bitmap; those keys live in a B+ tree instead.
 //
-// Both arrays live in ONE allocation, exactly as the reference lays out its
-// roaring_array_t: the handles first, the keys behind them at the capacity
-// boundary. Producing a result bitmap therefore costs one allocation and one
-// free for its chunk table, not one per array, and growth relocates both arrays
-// with a single trip through the allocator. (Two separate growth-managed
-// vectors measured as the largest fixed per-result cost the library pays.)
-// [croaring-ref] deps/croaring/include/roaring/containers/containers.h: roaring_array_t{keys;containers;typecodes}
-// [croaring-ref] deps/croaring/src/roaring_array.c: ra_init_with_capacity / realloc_array (one bigalloc)
+// Whichever it is, the table is walked through cursors, searched without writing anything (so
+// concurrent readers of one table are safe), and rewritten by appenders and a rewriter, never by
+// position.
+//
+// Beside the live entries the store keeps a pool of parked payloads for scratch reuse (see
+// clear_retiring_slots), always a flat array.
 template <typename Layout, typename CowPolicy = cow_value_semantics>
 class chunk_store {
 public:
     using chunk_type  = typename Layout::chunk_type;
     using handle_type = container_handle<Layout, CowPolicy>;
 
-    // The public API stays in std::size_t and narrows here (chunk counts are
-    // bounded far below 2^32).
-    using index_type = std::uint32_t;
-    [[nodiscard]] static constexpr index_type idx( std::size_t const index ) noexcept { return static_cast<index_type>( index ); }
+private:
+    static constexpr bool wide{ false };
+    using flat_table = chunk_array<chunk_type, handle_type>;
+    using live_table = flat_table;
 
-    [[nodiscard]] std::size_t size () const noexcept { return live_.size_;      }
-    [[nodiscard]] bool        empty() const noexcept { return live_.size_ == 0; }
+public:
+    using cursor = typename live_table::cursor;
+
+    [[nodiscard]] std::size_t size () const noexcept { return live_.size();  }
+    [[nodiscard]] bool        empty() const noexcept { return live_.empty(); }
 
     // Structure generation: advances whenever a live slot may have moved or
-    // died (relocation, insert, erase, compaction, sort, swap, clear), so a
+    // died (relocation, insert, erase, compaction, swap, clear), so a
     // caller holding a pointer to a slot can tell in one compare whether it is
     // still the slot it took. Appends that do not relocate leave it alone.
     [[nodiscard]] std::uint32_t generation() const noexcept { return generation_; }
 
-    // A position in the table, in ascending key order; end() is the position past the last
-    // entry. A cursor stays valid until generation() advances. Every walk over the table goes
-    // through cursors, never through a number: where an entry lives is the table's business.
-    class cursor {
-    public:
-        constexpr cursor() noexcept = default;
-        constexpr cursor & operator++() noexcept { ++index_; return *this; }
-        [[nodiscard]] friend constexpr bool operator==( cursor, cursor ) noexcept = default;
-
-    private:
-        friend class chunk_store;
-        constexpr explicit cursor( index_type const index ) noexcept : index_{ index } {}
-        index_type index_{ 0 };
-    };
-
-    [[nodiscard]] cursor begin() const noexcept { return cursor{ 0 }; }
-    [[nodiscard]] cursor end  () const noexcept { return cursor{ live_.size_ }; }
+    [[nodiscard]] cursor begin() const noexcept { return live_.begin(); }
+    [[nodiscard]] cursor end  () const noexcept { return live_.end(); }
     // The final entry. The table must not be empty.
-    [[nodiscard]] cursor last () const noexcept { assert( live_.size_ != 0 ); return cursor{ live_.size_ - 1 }; }
-
+    [[nodiscard]] cursor last () const noexcept { return live_.last(); }
     // The entry before `at` (end() included), which must not be begin().
-    [[nodiscard]] cursor prev( cursor const at ) const noexcept { assert( at.index_ != 0 ); return cursor{ at.index_ - 1 }; }
+    [[nodiscard]] cursor prev( cursor const at ) const noexcept { return live_.prev( at ); }
 
     // The entry at `at`, which must not be end().
-    [[nodiscard]] chunk_type key( cursor const at ) const noexcept { assert( at.index_ < live_.size_ ); return live_.keys()[ at.index_ ]; }
+    [[nodiscard]] chunk_type key( cursor const at ) const noexcept { return static_cast<chunk_type>( live_.key( at ) ); }
+    [[nodiscard]] handle_type       & slot( cursor const at )       noexcept { return live_.slot( at ); }
+    [[nodiscard]] handle_type const & slot( cursor const at ) const noexcept { return live_.slot( at ); }
 
-    [[nodiscard]] handle_type       & slot( cursor const at )       noexcept { assert( at.index_ < live_.size_ ); return live_.slots()[ at.index_ ]; }
-    [[nodiscard]] handle_type const & slot( cursor const at ) const noexcept { assert( at.index_ < live_.size_ ); return live_.slots()[ at.index_ ]; }
-
-    // The first entry whose key is not below `key` (end() if there is none): a binary search
-    // over the dense keys array only. A pure read - the search keeps no state between calls,
-    // which is what lets concurrent readers share the table. With psi::vm the search is the
-    // branchless one that prefetches both candidates of the next step: a lookup into a large
-    // table is a chain of dependent cache misses, and overlapping them is what the reference's
-    // tree-shaped index gets from its fan-out.
-    [[nodiscard]] cursor lower_bound( chunk_type const key ) const noexcept {
-        auto const * const first{ live_.keys() };
-        auto const * const last { first + live_.size_ };
-#if defined( FRSR_ROARING_HAS_PSI_VM )
-        auto const position{ psi::vm::prefetching_lower_bound( first, last, key ) };
-#else
-        auto const position{ std::lower_bound( first, last, key ) };
-#endif
-        return cursor{ static_cast<index_type>( position - first ) };
-    }
+    // The first entry whose key is not below `key` (end() if there is none). A pure read.
+    [[nodiscard]] cursor lower_bound( chunk_type const key ) const noexcept { return live_.lower_bound( key ); }
 
     // lower_bound() for a caller that already stands at `from` and only moves forward (a
-    // leapfrogging walk over several tables): the first entry at or after `from` whose key is
-    // not below `key`. Gallops from `from`, so the cost follows the distance travelled.
-    [[nodiscard]] cursor lower_bound( chunk_type const key, cursor const from ) const noexcept {
-        auto const n{ live_.size_ };
-        auto const * const keys{ live_.keys() };
-        auto low{ from.index_ };
-        if ( low >= n || !( keys[ low ] < key ) ) {
-            return cursor{ low < n ? low : n };
-        }
-        auto step{ index_type{ 1 } };
-        while ( low + step < n && keys[ low + step ] < key ) {   // keys[ low ] < key throughout
-            low  += step;
-            step <<= 1;
-        }
-        auto high{ std::min( low + step, n ) };                  // keys[ high ] >= key, or high == n
-        while ( low + 1 < high ) {
-            auto const mid{ low + ( high - low ) / 2 };
-            ( keys[ mid ] < key ? low : high ) = mid;
-        }
-        return cursor{ high };
-    }
+    // leapfrogging walk over several tables).
+    [[nodiscard]] cursor lower_bound( chunk_type const key, cursor const from ) const noexcept { return live_.lower_bound( key, from ); }
 
-    [[nodiscard]] std::span<handle_type      > slots()       noexcept { return { live_.slots(), live_.size_ }; }
-    [[nodiscard]] std::span<handle_type const> slots() const noexcept { return { live_.slots(), live_.size_ }; }
+    // The handles in key order.
+    [[nodiscard]] auto slots()       noexcept { return live_.slots(); }
+    [[nodiscard]] auto slots() const noexcept { return std::as_const( live_ ).slots(); }
 
-    // Storage footprint of the parallel arrays themselves (not the spilled payloads).
-    [[nodiscard]] std::size_t entry_bytes() const noexcept {
-        return size() * ( sizeof( chunk_type ) + sizeof( handle_type ) );
-    }
+    // Storage footprint of the table itself (not the spilled payloads).
+    [[nodiscard]] std::size_t entry_bytes() const noexcept { return live_.node_bytes(); }
+
+    // Checks the structural invariants; the first one that does not hold, or nullptr.
+    [[nodiscard]] char const * validate() const noexcept { return live_.validate(); }
 
     // Compaction (bitmap::shrink_to_fit): releases the parked scratch payloads
     // and the chunk table's spare capacity. Scratch reuse repopulates on the
@@ -140,10 +88,12 @@ public:
         ++generation_;
     }
 
+    // Makes room for `capacity` entries ahead of an append run. A tree grows by node and has no use for it.
     void reserve( std::size_t const capacity ) {
-        if ( idx( capacity ) > live_.capacity_ ) {
-            live_.reserve( idx( capacity ) );
-            ++generation_;
+        if constexpr ( !wide ) {
+            if ( live_.reserve( capacity ) ) { ++generation_; }
+        } else {
+            (void)capacity;
         }
     }
 
@@ -178,15 +128,24 @@ public:
     // Scratch payload reuse (CRoaring persistent-dst analog, see
     // container_handle::offers_reusable_payload): logically empties the store
     // but parks the current slots — payloads intact — for take_retired() to
-    // hand back to the next run's materializing sites. The swap also recycles
-    // the previous generation's retired table back as the live one, so the
-    // chunk table itself keeps its capacity across runs too.
+    // hand back to the next run's materializing sites. A flat table swaps with
+    // the pool, which also recycles the previous generation's pool back as the
+    // live table, so the chunk table itself keeps its capacity across runs too.
+    // A tree moves its handles into the pool and frees its nodes.
     void clear_retiring_slots() noexcept {
         retired_.destroy_all();
         // An empty live table has nothing to park, and keeps its capacity: the
         // fresh result of every materializing operator arrives here empty.
-        if ( live_.size_ != 0 ) {
-            live_.swap( retired_ );
+        if ( live_.size() != 0 ) {
+            if constexpr ( wide ) {
+                retired_.reserve( live_.size() );
+                for ( auto & slot : live_.slots() ) {
+                    retired_.push_back( chunk_type{}, std::move( slot ) );
+                }
+                live_.destroy_all();
+            } else {
+                live_.swap( retired_ );
+            }
         }
         retired_array_next_ = retired_bitset_next_ = 0;
         ++generation_;
@@ -202,10 +161,10 @@ public:
     // to grow an allocation.
     template <typename E = typename Layout::low_type>
     [[nodiscard]] std::uint32_t retired_capacity( container_kind const kind ) const noexcept {
-        auto cursor{ ( kind == container_kind::bitset ) ? retired_bitset_next_ : retired_array_next_ };
-        auto const * const retired{ retired_.slots() };
-        while ( cursor < retired_.size_ ) {
-            auto const & candidate{ retired[ cursor++ ] };
+        auto next{ ( kind == container_kind::bitset ) ? retired_bitset_next_ : retired_array_next_ };
+        auto const * const retired{ retired_.data() };
+        while ( next < retired_.size() ) {
+            auto const & candidate{ retired[ next++ ] };
             if ( candidate.offers_reusable_payload( kind ) ) {
                 return candidate.template payload_capacity<E>();
             }
@@ -223,10 +182,10 @@ public:
     // uninitialized storage or a handle that owns no payload: the handle is
     // constructed over it without its destructor running.
     handle_type & take_retired_into( handle_type * const destination, container_kind const kind ) noexcept {
-        auto & cursor{ kind == container_kind::bitset ? retired_bitset_next_ : retired_array_next_ };
-        auto * const retired{ retired_.slots() };
-        while ( cursor < retired_.size_ ) {
-            auto & candidate{ retired[ cursor++ ] };
+        auto & next{ kind == container_kind::bitset ? retired_bitset_next_ : retired_array_next_ };
+        auto * const retired{ retired_.data() };
+        while ( next < retired_.size() ) {
+            auto & candidate{ retired[ next++ ] };
             if ( candidate.offers_reusable_payload( kind ) ) {
                 auto & handle{ *std::construct_at( destination, std::move( candidate ) ) };
                 if ( kind == container_kind::bitset ) { handle.reset_for_bitset_reuse(); }
@@ -237,24 +196,23 @@ public:
         return *std::construct_at( destination );
     }
 
-    // In-slot construction for a table filled by appends into capacity reserved
-    // beforehand (the destination of a materializing combine): open_back() yields
-    // the storage past the last entry, the caller constructs and fills a handle
-    // there (take_retired_into), and commit_back() makes it the last entry under
-    // `key` — a finished container is never moved into the table. Neither call
-    // relocates, so the opened handle stays put between the two as long as
-    // nothing else appends meanwhile, and generation() does not advance (as for a
-    // non-relocating push_back). The opened slot is not part of the table until
-    // committed: a caller that abandons it must leave it owning no payload.
-    [[nodiscard]] handle_type * open_back() noexcept {
-        assert( live_.size_ < live_.capacity_ && "open_back() needs reserved capacity" );
-        return live_.slots() + live_.size_;
+    // In-slot construction for a table filled by appends (the destination of a materializing
+    // combine): open_back() yields the storage past the last entry, the caller constructs and fills
+    // a handle there (take_retired_into), and commit_back() makes it the last entry under `key` —
+    // a finished container is never moved into the table. A flat table must have reserved the
+    // capacity beforehand; neither call relocates then, so the opened handle stays put between the
+    // two as long as nothing else appends meanwhile, and generation() does not advance (as for a
+    // non-relocating push_back). The opened slot is not part of the table until committed: a caller
+    // that abandons it must leave it owning no payload.
+    [[nodiscard]] handle_type * open_back() {
+        bool moved;
+        auto * const slot{ live_.open_back( moved ) };
+        if ( moved ) [[unlikely]] { ++generation_; }
+        return slot;
     }
 
-    void commit_back( chunk_type const key ) noexcept {
-        assert( live_.size_ < live_.capacity_ );
-        live_.keys()[ live_.size_ ] = key;
-        ++live_.size_;
+    void commit_back( chunk_type const key ) {
+        live_.commit_back( key );
     }
 
     // Parks a consumed handle's payload for take_retired() instead of freeing
@@ -274,44 +232,30 @@ public:
     // operations, &= and -=): the walk visits the entries in key order and, for each, either
     // keeps it (put back as it is, or as the walk modified it in place) or replaces it; every
     // entry it does not mention is dropped. The payloads that would be freed are retired for
-    // take_retired() instead. The rewritten entries are always behind the walk, so no entry is
-    // overwritten before it has been read. finish() ends the rewrite and must be called once.
+    // take_retired() instead. finish() ends the rewrite and must be called once.
     class rewriter {
     public:
-        explicit rewriter( chunk_store & store ) noexcept : store_{ &store }, write_{ store.begin() } {}
+        explicit rewriter( chunk_store & store ) noexcept : store_{ &store }, inner_{ store.live_, retire_into{ &store } } {}
 
         // The entry at `from`, which the walk has finished with, is kept.
-        void keep( cursor const from ) {
-            if ( write_ != from ) {
-                store_->live_.keys()[ write_.index_ ] = store_->live_.keys()[ from.index_ ];
-                store_->retire( std::move( store_->live_.slots()[ write_.index_ ] ) );
-                store_->live_.slots()[ write_.index_ ] = std::move( store_->live_.slots()[ from.index_ ] );
-                ++store_->generation_;
-            }
-            ++write_;
-        }
+        void keep( cursor const from ) { inner_.keep( from ); }
 
         // The walk's current entry is replaced by (key, container).
-        void put( chunk_type const key, handle_type && container ) {
-            store_->live_.keys()[ write_.index_ ] = key;
-            store_->retire( std::move( store_->live_.slots()[ write_.index_ ] ) );
-            store_->live_.slots()[ write_.index_ ] = std::move( container );
-            ++write_;
-        }
+        void put( chunk_type const key, handle_type && container ) { inner_.put( key, std::move( container ) ); }
 
         void finish() {
-            for ( auto i{ write_.index_ }; i < store_->live_.size_; ++i ) {
-                store_->retire( std::move( store_->live_.slots()[ i ] ) );
-            }
-            if ( write_.index_ != store_->live_.size_ ) {
-                store_->live_.erase( write_.index_, store_->live_.size_ );
-                ++store_->generation_;
-            }
+            inner_.finish();
+            ++store_->generation_;
         }
 
     private:
-        chunk_store * store_;
-        cursor        write_;
+        struct retire_into {
+            chunk_store * store;
+            void operator()( handle_type && handle ) const { store->retire( std::move( handle ) ); }
+        };
+
+        chunk_store *                                          store_;
+        typename live_table::template rewriter<retire_into>    inner_;
     };
 
     void swap( chunk_store & other ) noexcept {
@@ -325,226 +269,30 @@ public:
 
     template <typename Handle>
     void push_back( chunk_type const key, Handle && handle ) {
-        if ( live_.size_ == live_.capacity_ ) [[unlikely]] { ++generation_; }   // this append relocates
-        live_.push_back( key, std::forward<Handle>( handle ) );
+        if ( live_.push_back( key, std::forward<Handle>( handle ) ) ) [[unlikely]] { ++generation_; }   // this append relocated
     }
 
     // Inserts before `at` (the lower_bound of `key`) and returns the position of the new entry.
     template <typename Handle>
     cursor insert( cursor const at, chunk_type const key, Handle && handle ) {
-        live_.insert( at.index_, key, std::forward<Handle>( handle ) );
+        auto const inserted{ live_.insert( at, key, std::forward<Handle>( handle ) ) };
         ++generation_;
-        return at;
+        return inserted;
     }
 
     // Removes the entry at `at` and returns the position of the entry that followed it.
     cursor erase( cursor const at ) {
-        live_.erase( at.index_, at.index_ + 1 );
+        auto const following{ live_.erase( at ) };
         ++generation_;
-        return at;
+        return following;
     }
 
 private:
-    // The single-allocation chunk table: `capacity_` handles, then
-    // `capacity_` keys. sizeof( handle_type ) is a multiple of every key
-    // width's alignment, so the key array needs no padding. Both halves are
-    // held as typed pointers (the key pointer is derived once, on relocation)
-    // so a key or slot read is one load; deriving it from the capacity on each
-    // read would reload the capacity after every handle store, which may alias
-    // a same-width integer.
-    struct table {
-        static_assert( sizeof( handle_type ) % alignof( chunk_type ) == 0 );
-        static_assert( handle_type::is_trivially_moveable ); // relocation below is a memcpy
-
-        handle_type * slots_   { nullptr };
-        chunk_type  * keys_    { nullptr };
-        index_type    size_    { 0 };
-        index_type    capacity_{ 0 };
-
-        table() noexcept = default;
-        table( table && other ) noexcept { steal( other ); }
-        table & operator=( table && other ) noexcept {
-            if ( this != &other ) [[likely]] {
-                release();
-                steal( other );
-            }
-            return *this;
-        }
-        table( table const & ) = delete;
-        table & operator=( table const & ) = delete;
-        ~table() noexcept { release(); }
-
-        void steal( table & other ) noexcept {
-            slots_    = std::exchange( other.slots_   , nullptr );
-            keys_     = std::exchange( other.keys_    , nullptr );
-            size_     = std::exchange( other.size_    , 0 );
-            capacity_ = std::exchange( other.capacity_, 0 );
-        }
-
-        // Four field exchanges: the generation swap (temp + two move-assigns,
-        // each releasing an already-empty table) showed up as a tenth of a
-        // small-result band.
-        [[gnu::always_inline]] void swap( table & other ) noexcept {
-            std::swap( slots_   , other.slots_    );
-            std::swap( keys_    , other.keys_     );
-            std::swap( size_    , other.size_     );
-            std::swap( capacity_, other.capacity_ );
-        }
-
-        [[nodiscard]] handle_type       * slots()       noexcept { return slots_; }
-        [[nodiscard]] handle_type const * slots() const noexcept { return slots_; }
-        [[nodiscard]] chunk_type        * keys ()       noexcept { return keys_ ; }
-        [[nodiscard]] chunk_type  const * keys () const noexcept { return keys_ ; }
-
-        [[nodiscard]] static constexpr std::size_t keys_offset( index_type const capacity ) noexcept { return std::size_t{ capacity } * sizeof( handle_type ); }
-        [[nodiscard]] static constexpr std::size_t bytes_for  ( index_type const capacity ) noexcept { return std::size_t{ capacity } * ( sizeof( handle_type ) + sizeof( chunk_type ) ); }
-
-        void reserve( index_type const capacity ) {
-            if ( capacity > capacity_ ) {
-                relocate( capacity );
-            }
-        }
-
-        template <typename Handle>
-        void push_back( chunk_type const key, Handle && handle ) {
-            if ( size_ == capacity_ ) [[unlikely]] {
-                insert_growing( size_, key, std::forward<Handle>( handle ) );
-                return;
-            }
-            new ( slots_ + size_ ) handle_type{ std::forward<Handle>( handle ) };
-            keys_[ size_ ] = key;
-            ++size_;
-        }
-
-        template <typename Handle>
-        void insert( index_type const index, chunk_type const key, Handle && handle ) {
-            if ( size_ == capacity_ ) [[unlikely]] {
-                insert_growing( index, key, std::forward<Handle>( handle ) );
-                return;
-            }
-            open_gap( index );
-            new ( slots_ + index ) handle_type{ std::forward<Handle>( handle ) };
-            keys_[ index ] = key;
-            ++size_;
-        }
-
-        // The growing arm of push_back/insert, kept out of line: the source may
-        // live in this very table, which the relocation would move from under
-        // it, so it is materialized before the table grows. Only this (cold)
-        // path pays for that copy; the common append constructs straight into
-        // the slot.
-        template <typename Handle>
-        [[using gnu: cold, noinline]] void insert_growing( index_type const index, chunk_type const key, Handle && handle ) {
-            handle_type value{ std::forward<Handle>( handle ) };
-            grow( size_ + 1 );
-            open_gap( index );
-            new ( slots_ + index ) handle_type{ std::move( value ) };
-            keys_[ index ] = key;
-            ++size_;
-        }
-
-        // Shifts [index, size_) up by one (both arrays, memmove: trivially
-        // moveable handles). Requires size_ < capacity_.
-        void open_gap( index_type const index ) noexcept {
-            auto const tail{ std::size_t{ size_ } - index };
-            std::memmove( slots_ + index + 1, slots_ + index, tail * sizeof( handle_type ) );
-            std::memmove( keys_  + index + 1, keys_  + index, tail * sizeof( chunk_type  ) );
-        }
-
-        // Destroys [first, last) and closes the gap.
-        void erase( index_type const first, index_type const last ) noexcept {
-            for ( auto i{ first }; i < last; ++i ) {
-                slots()[ i ].~handle_type();
-            }
-            auto const tail{ std::size_t{ size_ } - last };
-            std::memmove( slots() + first, slots() + last, tail * sizeof( handle_type ) );
-            std::memmove( keys () + first, keys () + last, tail * sizeof( chunk_type  ) );
-            size_ -= ( last - first );
-        }
-
-        void destroy_all() noexcept {
-            for ( index_type i{ 0 }; i < size_; ++i ) {
-                slots()[ i ].~handle_type();
-            }
-            size_ = 0;
-        }
-
-        void release() noexcept {
-            destroy_all();
-            if ( slots_ ) {
-                free_block( reinterpret_cast<std::byte *>( slots_ ) );
-                slots_    = nullptr;
-                keys_     = nullptr;
-                capacity_ = 0;
-            }
-        }
-
-        void shrink_to_fit() {
-            if ( size_ == 0 ) {
-                release();
-            } else if ( size_ < capacity_ ) {
-                relocate( size_ );
-            }
-        }
-
-        void copy_from( table const & other ) {
-            destroy_all();
-            reserve( other.size_ );
-            std::memcpy( keys(), other.keys(), std::size_t{ other.size_ } * sizeof( chunk_type ) );
-            // size_ tracks each constructed handle so a throwing clone leaves
-            // the table consistent.
-            for ( ; size_ < other.size_; ++size_ ) {
-                new ( slots() + size_ ) handle_type{ other.slots()[ size_ ] };
-            }
-        }
-
-        // [croaring-ref] roaring_array.c extend_array: double while small, 5/4 past 1024.
-        [[using gnu: cold, noinline]] void grow( index_type const required ) {
-            auto const geometric{ capacity_ < 1024 ? capacity_ * 2 : capacity_ + capacity_ / 4 };
-            relocate( std::max( { required, geometric, index_type{ 4 } } ) );
-        }
-
-        // Both arrays move to a fresh block of `capacity` entries (never below
-        // size_): handles by memcpy (trivially moveable), keys likewise.
-        void relocate( index_type const capacity ) {
-            auto * const fresh{ allocate_block( bytes_for( capacity ) ) };
-            auto * const fresh_slots{ reinterpret_cast<handle_type *>( fresh ) };
-            auto * const fresh_keys { reinterpret_cast<chunk_type  *>( fresh + keys_offset( capacity ) ) };
-            if ( size_ != 0 ) {
-                std::memcpy( fresh_slots, slots_, std::size_t{ size_ } * sizeof( handle_type ) );
-                std::memcpy( fresh_keys , keys_ , std::size_t{ size_ } * sizeof( chunk_type  ) );
-            }
-            if ( slots_ ) {
-                free_block( reinterpret_cast<std::byte *>( slots_ ) );
-            }
-            slots_    = fresh_slots;
-            keys_     = fresh_keys;
-            capacity_ = capacity;
-        }
-
-        [[nodiscard]] static std::byte * allocate_block( std::size_t const bytes ) {
-#if FRSR_ROARING_HAS_MIMALLOC
-            auto * const block{ static_cast<std::byte *>( mi_malloc( bytes ) ) };
-            if ( block == nullptr ) [[unlikely]] { throw std::bad_alloc{}; }
-            return block;
-#else
-            return static_cast<std::byte *>( ::operator new( bytes ) );
-#endif
-        }
-        static void free_block( std::byte * const block ) noexcept {
-#if FRSR_ROARING_HAS_MIMALLOC
-            mi_free( block );
-#else
-            ::operator delete( block );
-#endif
-        }
-    };
-
-    table live_;
+    live_table live_;
     // Scratch payload reuse (clear_retiring_slots / retire / take_retired):
     // consumed slots offered for in-place rebuild; per-kind claim cursors. Only
     // the handle half of this table is meaningful.
-    table retired_;
+    flat_table retired_;
     std::uint32_t retired_array_next_ { 0 };
     std::uint32_t retired_bitset_next_{ 0 };
     std::uint32_t generation_         { 0 };
