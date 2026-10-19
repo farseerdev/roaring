@@ -15,6 +15,7 @@
 #include <cassert>
 #include <cstdint>
 #include <limits>
+#include <type_traits>
 
 namespace frsr::roaring::detail {
 
@@ -261,6 +262,46 @@ inline std::uint32_t * extract_setbits_uint32(
     return out;
 }
 
+// The same decoder for the words of (words1 AND words2), given the number of common bits `card` and writing
+// exactly that many values. There is no `word != 0` test: on a sparse intersection about half the words are
+// zero and the test mispredicts about once per value; with an empty word the masked store writes nothing and
+// the output advances by zero. It stops once all `card` values are written, since a masked store with an empty
+// mask still takes a slow microcode assist when it touches a page that was never written, such as one past
+// the end of `out`.
+// [croaring-ref] deps/croaring/src/bitset_util.c:bitset_extract_intersection_setbits_avx512_uint16
+FRSR_ROARING_X86_V4_KERNEL
+inline std::size_t extract_intersection_setbits_uint16(
+    std::uint64_t const * const words1, std::uint64_t const * const words2, std::size_t const n,
+    std::uint16_t * out, std::size_t const card
+) noexcept {
+    alignas( 64 ) static constexpr std::uint8_t index_table[ 64 ]{
+         0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15,
+        16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
+        32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47,
+        48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63
+    };
+    auto const * const start{ out };
+    auto const * const end  { out + card };
+    __m512i       base   { _mm512_setzero_si512() };
+    __m512i const inc64  { _mm512_set1_epi16( 64 ) };
+    __m512i const indices{ _mm512_load_si512( index_table ) };
+    FRSR_ROARING_LOOP_ALIGN for ( std::size_t i{ 0 }; i < n && out < end; ++i ) {
+        std::uint64_t const w{ words1[ i ] & words2[ i ] };
+        auto const count{ static_cast<unsigned>( std::popcount( w ) ) };
+        __m512i const packed{ _mm512_maskz_compress_epi8( static_cast<__mmask64>( w ), indices ) };
+        std::uint64_t const lanes{ count == 64U ? ~std::uint64_t{ 0 } : ( std::uint64_t{ 1 } << count ) - 1U };
+        _mm512_mask_storeu_epi16( out, static_cast<__mmask32>( lanes ),
+            _mm512_add_epi16( base, _mm512_cvtepu8_epi16( _mm512_castsi512_si256( packed ) ) ) );
+        if ( count > 32U ) {
+            _mm512_mask_storeu_epi16( out + 32, static_cast<__mmask32>( lanes >> 32U ),
+                _mm512_add_epi16( base, _mm512_cvtepu8_epi16( _mm512_extracti64x4_epi64( packed, 1 ) ) ) );
+        }
+        out += count;
+        base = _mm512_add_epi16( base, inc64 );
+    }
+    return static_cast<std::size_t>( out - start );
+}
+
 } // namespace x86_v4
 #endif // FRSR_ROARING_X86_V4
 
@@ -371,6 +412,116 @@ template <typename Layout, typename CowPolicy = cow_value_semantics>
             word &= word - 1;
         }
     }
+    array.sync_header();
+    return result;
+}
+
+// Decodes the words of (words1 AND words2) from word `index` onward into ascending values, four words at a time,
+// writing K values per word unconditionally and advancing only past the real ones, so there is no data-dependent
+// branch unless a word holds more than K bits. The trailing-zero count of (w | 1 << 63) is that of w when
+// w != 0, and 63 (a harmless value, overwritten later) when w == 0. A group of four empty words is skipped by
+// one branch: rare, and so well predicted, on random data, common on clustered data. The unconditional writes
+// land up to K - 1 values past the last real one, so it stops while 256 slots of slack (64 for each word of a
+// group) remain in `out`; the caller finishes with the plain loop.
+// [croaring-ref] deps/croaring/src/bitset_util.c:extract_intersection_branchless_K
+template <unsigned K, typename T>
+[[ gnu::always_inline ]] inline std::size_t extract_intersection_setbits_branchless(
+    std::uint64_t const * const words1, std::uint64_t const * const words2, std::size_t const n,
+    T * const out, std::size_t const card, std::size_t & index, std::uint32_t & base
+) noexcept {
+    std::size_t pos{ 0 };
+    auto j{ index };
+    auto b{ base };
+    for ( ; j + 4 <= n && pos + 256 <= card; j += 4, b += 256 ) {
+        std::uint64_t group[ 4 ];
+        for ( unsigned g{ 0 }; g < 4; ++g ) { group[ g ] = words1[ j + g ] & words2[ j + g ]; }
+        if ( ( group[ 0 ] | group[ 1 ] | group[ 2 ] | group[ 3 ] ) == 0 ) { continue; }
+        for ( unsigned g{ 0 }; g < 4; ++g ) {
+            auto w{ group[ g ] };
+            auto const word_base{ b + 64 * g };
+            for ( unsigned k{ 0 }; k < K; ++k ) {
+                out[ pos ] = static_cast<T>( word_base + static_cast<std::uint32_t>( std::countr_zero( w | ( std::uint64_t{ 1 } << 63 ) ) ) );
+                pos += ( w != 0 );
+                w &= w - 1;
+            }
+            while ( w != 0 ) {
+                out[ pos++ ] = static_cast<T>( word_base + static_cast<std::uint32_t>( std::countr_zero( w ) ) );
+                w &= w - 1;
+            }
+        }
+    }
+    index = j;
+    base = b;
+    return pos;
+}
+
+// The portable extraction of the `card` set bits of (words1 AND words2) as ascending values into `out`, which
+// holds exactly `card`. The number of values written per word follows the density: about 2.5 times the average
+// word's, so a word with more bits than that (handled by a branch) is rare; past 1.6 bits per word writing 8
+// costs more than the occasional branch, so 4 serve up to 3 bits per word.
+// [croaring-ref] deps/croaring/src/bitset_util.c:bitset_extract_intersection_setbits_uint16_with_card
+template <typename T>
+inline void extract_intersection_setbits_portable(
+    std::uint64_t const * const words1, std::uint64_t const * const words2, std::size_t const n,
+    T * const out, std::size_t const card
+) noexcept {
+    std::size_t index{ 0 };
+    std::uint32_t base{ 0 };
+    std::size_t pos;
+    if ( card * 5 < n * 2 ) {
+        pos = extract_intersection_setbits_branchless<1>( words1, words2, n, out, card, index, base );
+    } else if ( card * 5 < n * 4 ) {
+        pos = extract_intersection_setbits_branchless<2>( words1, words2, n, out, card, index, base );
+    } else if ( card < n * 3 ) {
+        pos = extract_intersection_setbits_branchless<4>( words1, words2, n, out, card, index, base );
+    } else {
+        pos = extract_intersection_setbits_branchless<8>( words1, words2, n, out, card, index, base );
+    }
+    for ( ; index < n && pos < card; ++index, base += 64 ) {
+        for ( auto w{ words1[ index ] & words2[ index ] }; w != 0; w &= w - 1 ) {
+            out[ pos++ ] = static_cast<T>( base + static_cast<std::uint32_t>( std::countr_zero( w ) ) );
+        }
+    }
+    assert( pos == card );
+}
+
+// The same, on the best arm of this CPU: the AVX-512 VBMI2 decoder where there is one.
+template <typename T>
+inline void extract_intersection_setbits(
+    std::uint64_t const * const words1, std::uint64_t const * const words2, std::size_t const n,
+    T * const out, std::size_t const card
+) noexcept {
+#if FRSR_ROARING_X86_V4
+    if constexpr ( std::is_same_v<T, std::uint16_t> ) {
+        if ( have_x86_v4() ) {
+            [[maybe_unused]] auto const written{ x86_v4::extract_intersection_setbits_uint16( words1, words2, n, out, card ) };
+            assert( written == card );
+            return;
+        }
+    }
+#endif
+    extract_intersection_setbits_portable( words1, words2, n, out, card );
+}
+
+// The array result of a bitset-and-bitset whose `cardinality` (from and_popcount_words) is below the array limit,
+// extracted straight from the operands' words: no intermediate bitset is written. `reuse` is a retired payload.
+// [croaring-ref] deps/croaring/src/containers/mixed_intersection.c:bitset_bitset_container_intersection
+template <typename Layout, typename CowPolicy = cow_value_semantics>
+[[nodiscard]] inline container_handle<Layout, CowPolicy> intersect_bitset_bitset_to_array(
+    bitset_cref<Layout, CowPolicy> const lhs,
+    bitset_cref<Layout, CowPolicy> const rhs,
+    std::size_t const cardinality,
+    container_handle<Layout, CowPolicy> && reuse = {}
+) {
+    if ( cardinality == 0 ) {
+        return container_handle<Layout, CowPolicy>{};
+    }
+    auto result{ reuse.holds_array() ? std::move( reuse ) : container_handle<Layout, CowPolicy>{} };
+    auto array{ result.as_array() };
+    auto const & a{ lhs.words.as_array() };
+    auto const & b{ rhs.words.as_array() };
+    resize_uninitialized( array.values, cardinality );
+    extract_intersection_setbits( a.data(), b.data(), a.size(), array.values.data(), cardinality );
     array.sync_header();
     return result;
 }

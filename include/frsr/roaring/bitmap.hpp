@@ -2154,12 +2154,34 @@ public:
                     // Direct-init (not assignment into a pre-declared handle): the prvalue
                     // return is elided straight into `container`, halving the
                     // copy_fields_from traffic vs move-assigning into an already-live handle.
-                    auto container{ combine_bitset_bitset_for_policy(
-                        std::as_const( left_container ).as_bitset(),
-                        right_container.as_bitset(),
-                        op,
-                        result_chunks.take_retired( detail::container_kind::bitset )
-                    ) };
+                    auto container{ [ & ]() -> handle_type {
+                        // Opt-in (tuning.hpp): a materializing AND counts the common bits first and, below the
+                        // array limit, extracts them straight from the operands' words, as the reference does,
+                        // instead of writing an intermediate bitset. The in-place walk keeps its accumulators.
+                        if constexpr ( detail::kAndDemotesSparseBitsets ) {
+                            if ( !in_place && op == detail::set_operation::bit_and ) {
+                                auto const left_bitset { std::as_const( left_container ).as_bitset() };
+                                auto const right_bitset{ right_container.as_bitset() };
+                                auto const cardinality { detail::and_popcount_words( left_bitset.words.begin(), right_bitset.words.begin(), left_bitset.words.size() ) };
+                                if ( cardinality < array_to_bitset_threshold ) {
+                                    auto array{ detail::intersect_bitset_bitset_to_array<layout_type, CowPolicy>(
+                                        left_bitset, right_bitset, cardinality, result_chunks.take_retired( detail::container_kind::array )
+                                    ) };
+                                    if constexpr ( uses_default_container_set ) {
+                                        return array;
+                                    } else {
+                                        return optimize_container_for_policy( std::move( array ) );
+                                    }
+                                }
+                            }
+                        }
+                        return combine_bitset_bitset_for_policy(
+                            std::as_const( left_container ).as_bitset(),
+                            right_container.as_bitset(),
+                            op,
+                            result_chunks.take_retired( detail::container_kind::bitset )
+                        );
+                    }() };
                     // AND results NOT demoted (measured): the in-place fold walk is
                     // where the run-heavy witness's AND-fold accumulator lives —
                     // demoting it to array cost ~12% regardless of threshold or

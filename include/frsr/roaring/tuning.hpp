@@ -101,4 +101,20 @@ inline constexpr bool kSimdArrayIntersect{ true };
 // verdict.
 inline constexpr bool kSimdArrayIntersectNeon{ true };
 
+// A materializing bitset AND (`a & b`) whose result holds fewer values than the array limit: when true it
+// counts the common bits first and extracts them straight from the operands' words into an array container,
+// as the reference does (intersect_bitset_bitset_to_array, bitset_ops.hpp); when false it writes the
+// intermediate bitset in one fused AND + store + popcount pass and leaves the result a bitset.
+//
+// DEFAULT OFF. The extra read-only counting pass makes every dense result ~7% slower, and the sparse result
+// the extraction is for is the slow side of the trade: extracting 1024 or 2048 values costs ~1.3 us per chunk
+// pair against 0.22 us for the fused pass that leaves them in a bitset, so the paired bands with one or two
+// bits per word go from ~7x faster than the reference to parity. Only an operand-clustered result (a few
+// full words) gains, and by 8%. The in-place AND walk never demotes either way, its accumulators staying
+// bitsets. Flip it, and A/B the BitsetAndBitset bands, to match the reference's result container kind.
+#ifndef FRSR_ROARING_AND_DEMOTES_SPARSE_BITSETS
+#   define FRSR_ROARING_AND_DEMOTES_SPARSE_BITSETS 0
+#endif
+inline constexpr bool kAndDemotesSparseBitsets{ FRSR_ROARING_AND_DEMOTES_SPARSE_BITSETS != 0 };
+
 } // namespace frsr::roaring::detail
