@@ -6,6 +6,7 @@
 // usage: frsr_roaring_wide_key_bench [--count N]... [--pattern dense|sparse|random]...
 //                                    [--band substring] [--reps R] [--arm frsr|r64]
 //                                    [--scatter-cap N] [--lookups-only|--mutations-only]
+//                                    [--narrow]   (32-bit lookup bands only: bitmap<uint32_t> vs roaring_bitmap_t)
 //
 // Chunk keys are even (2*i, scaled by the pattern) so that the odd chunk keys in
 // between are absent inside the stored range: a miss probe has to search, not just
@@ -24,6 +25,7 @@
 #include <vector>
 
 #if FRSR_ROARING_HAS_CROARING
+#include <roaring/roaring.h>
 #include <roaring/roaring64.h>
 #endif
 
@@ -126,6 +128,14 @@ void run_lookup_bands( config const & cfg, pattern const p, std::size_t const re
             } ) };
             report( bd.band, "frsr", p, n, ns );
         }
+        if ( selected( cfg, "containsBulkAsc", "frsr" ) ) {
+            auto const ns{ best_ns_per_op( cfg.reps, pr.asc_hit.size() * 5, [&] {
+                u64 hits{};
+                for ( int rep{ 0 }; rep < 5; ++rep ) { frsr_bitmap::bulk_context ctx; for ( auto const v : pr.asc_hit ) { hits += b.contains_bulk( ctx, v ); } }
+                return hits;
+            } ) };
+            report( "containsBulkAsc", "frsr", p, n, ns );
+        }
     };
     frsr_bands();
 #if FRSR_ROARING_HAS_CROARING
@@ -142,6 +152,14 @@ void run_lookup_bands( config const & cfg, pattern const p, std::size_t const re
                 return hits;
             } ) };
             report( bd.band, "r64", p, n, ns );
+        }
+        if ( selected( cfg, "containsBulkAsc", "r64" ) ) {
+            auto const ns{ best_ns_per_op( cfg.reps, pr.asc_hit.size() * 5, [&] {
+                u64 hits{};
+                for ( int rep{ 0 }; rep < 5; ++rep ) { roaring64_bulk_context_t ctx{}; for ( auto const v : pr.asc_hit ) { hits += roaring64_bitmap_contains_bulk( r, &ctx, v ); } }
+                return hits;
+            } ) };
+            report( "containsBulkAsc", "r64", p, n, ns );
         }
         roaring64_bitmap_free( r );
     }
@@ -238,13 +256,49 @@ void run_mutation_bands( config const & cfg, pattern const p, std::size_t const 
 #endif
 }
 
+// The 32-bit counterpart of the lookup bands: bitmap<uint32_t> against roaring_bitmap_t, whose
+// chunk table holds at most 65536 sorted 16-bit keys. Chunk keys are even; value = chunk << 16 | 7.
+void run_narrow_lookup_bands( config const & cfg, std::size_t const requested ) {
+    auto const n{ std::min<std::size_t>( requested, 32768 ) };
+    std::vector<std::uint32_t> present, absent, shuffled;
+    for ( std::size_t i{ 0 }; i < n; ++i ) { present.push_back( static_cast<std::uint32_t>( ( 2 * i << 16 ) | 7 ) ); }
+    shuffled = present;
+    std::shuffle( shuffled.begin(), shuffled.end(), std::mt19937_64{ 5 } );
+    for ( auto const v : shuffled ) { absent.push_back( v + ( 1u << 16 ) ); }
+    struct { char const * band; std::vector<std::uint32_t> const * v; } const bands[]{
+        { "containsAscHit", &present }, { "containsRndHit", &shuffled }, { "containsRndMiss", &absent } };
+    auto const report32{ [&]( char const * band, char const * arm, double ns ) {
+        std::printf( "%-18s %-5s %-6s n=%-8zu %9.2f ns/op\n", band, arm, "narrow", n, ns ); std::fflush( stdout ); } };
+    {
+        frsr::roaring::bitmap<std::uint32_t> b;
+        for ( auto const v : present ) { (void)b.add( v ); }
+        for ( auto const & bd : bands ) {
+            if ( !selected( cfg, bd.band, "frsr32" ) ) { continue; }
+            report32( bd.band, "frsr32", best_ns_per_op( cfg.reps, bd.v->size() * 20, [&] {
+                u64 hits{}; for ( int rep{ 0 }; rep < 20; ++rep ) { for ( auto const v : *bd.v ) { hits += b.contains( v ); } } return hits; } ) );
+        }
+    }
+#if FRSR_ROARING_HAS_CROARING
+    {
+        auto * r{ roaring_bitmap_create() };
+        for ( auto const v : present ) { roaring_bitmap_add( r, v ); }
+        for ( auto const & bd : bands ) {
+            if ( !selected( cfg, bd.band, "r32" ) ) { continue; }
+            report32( bd.band, "r32", best_ns_per_op( cfg.reps, bd.v->size() * 20, [&] {
+                u64 hits{}; for ( int rep{ 0 }; rep < 20; ++rep ) { for ( auto const v : *bd.v ) { hits += roaring_bitmap_contains( r, v ); } } return hits; } ) );
+        }
+        roaring_bitmap_free( r );
+    }
+#endif
+}
+
 } // namespace
 
 int main( int argc, char ** argv ) {
     config cfg;
     std::vector<std::size_t> counts;
     std::vector<pattern> patterns;
-    bool mutations{ true }, lookups{ true };
+    bool mutations{ true }, lookups{ true }, narrow{ false };
     for ( int i{ 1 }; i < argc; ++i ) {
         std::string const a{ argv[ i ] };
         auto const next{ [&] { return i + 1 < argc ? std::string{ argv[ ++i ] } : std::string{}; } };
@@ -254,11 +308,13 @@ int main( int argc, char ** argv ) {
         else if ( a == "--arm"     ) { cfg.arm_filter = next(); }
         else if ( a == "--scatter-cap" ) { cfg.scatter_cap = std::strtoull( next().c_str(), nullptr, 10 ); }
         else if ( a == "--reps"    ) { cfg.reps = std::atoi( next().c_str() ); }
+        else if ( a == "--narrow"  ) { narrow = true; }
         else if ( a == "--lookups-only"   ) { mutations = false; }
         else if ( a == "--mutations-only" ) { lookups = false; }
     }
     if ( counts.empty() ) { counts = { 1000, 100000, 1000000 }; }
     if ( patterns.empty() ) { patterns = { pattern::dense, pattern::sparse, pattern::random }; }
+    if ( narrow ) { for ( auto const n : counts ) { run_narrow_lookup_bands( cfg, n ); } return 0; }
     for ( auto const p : patterns ) {
         for ( auto const n : counts ) {
             if ( lookups   ) { run_lookup_bands  ( cfg, p, n ); }
