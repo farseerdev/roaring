@@ -1,6 +1,7 @@
 #pragma once
 
 #include <frsr/roaring/chunk_array.hpp>
+#include <frsr/roaring/chunk_tree.hpp>
 #include <frsr/roaring/container_handle.hpp>
 #include <frsr/roaring/containers.hpp>
 
@@ -31,10 +32,13 @@ public:
     using chunk_type  = typename Layout::chunk_type;
     using handle_type = container_handle<Layout, CowPolicy>;
 
+    // A chunk key wider than 16 bits.
+    static constexpr bool wide{ sizeof( chunk_type ) > sizeof( std::uint16_t ) };
+    static_assert( !wide || Layout::key_bits - Layout::low_bits < 63, "a wide chunk key must stay below the tree's pad" );
+
 private:
-    static constexpr bool wide{ false };
     using flat_table = chunk_array<chunk_type, handle_type>;
-    using live_table = flat_table;
+    using live_table = std::conditional_t<wide, chunk_tree<handle_type>, flat_table>;
 
 public:
     using cursor = typename live_table::cursor;

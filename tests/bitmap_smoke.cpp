@@ -80,6 +80,44 @@ TEST(FrsrRoaringSmoke, BulkContextSurvivesChunkTableChanges) {
     bulk_context_survives_chunk_table_changes<frsr::roaring::bitmap<std::uint64_t>>();
 }
 
+// An intersection whose last pair has no common value abandons the container slot it opened for it,
+// which on a full chunk table leaves a new empty last leaf behind. Whatever is asked of the result
+// afterwards, that leaf must not show.
+TEST(FrsrRoaringSmoke, AnIntersectionThatEndsOnAnEmptyPairLeavesACleanWideKeyResult) {
+    using Wide = frsr::roaring::bitmap<std::uint64_t>;
+    constexpr std::uint64_t span{ 1ULL << 16 };
+    Wide a, b;
+    for ( std::uint64_t chunk{ 0 }; chunk < 15; ++chunk ) {
+        (void)a.add( chunk * span + 5 );
+        (void)b.add( chunk * span + 5 );
+    }
+    (void)a.add( 15 * span + 7 );                                   // the last pair has nothing in common
+    (void)b.add( 15 * span + 9 );
+    Wide result{ a & b };
+    ASSERT_TRUE( result.validate() == nullptr ) << result.validate();
+    ASSERT_EQ( result.size(), 15U );
+    EXPECT_TRUE( result.remove( 14 * span + 5 ) );                  // the real last leaf now ends below the gap
+    ASSERT_TRUE( result.validate() == nullptr ) << result.validate();
+    Wide probe;
+    for ( std::uint64_t chunk{ 0 }; chunk < 40; ++chunk ) { (void)probe.add( chunk * span + 5 ); }
+    std::array<Wide const *, 2> operands{ &result, &probe };
+    auto const expected{ [&] {
+        std::vector<std::uint64_t> values;
+        for ( std::uint64_t chunk{ 0 }; chunk < 14; ++chunk ) { values.push_back( chunk * span + 5 ); }
+        return values;
+    }() };
+    EXPECT_EQ( Wide::and_many( operands ).to_vector(), expected );
+    EXPECT_EQ( Wide::and_many_cardinality( operands ), expected.size() );
+    EXPECT_TRUE( result.intersects( probe ) );
+    EXPECT_FALSE( result.contains( 14 * span + 5 ) );
+    EXPECT_FALSE( result.contains( 15 * span + 7 ) );
+    EXPECT_EQ( result.to_vector(), expected );
+    EXPECT_EQ( result.back(), expected.back() );
+    std::vector<std::uint64_t> iterated;
+    for ( auto const value : result ) { iterated.push_back( value ); }
+    EXPECT_EQ( iterated, expected );
+}
+
 TEST(FrsrRoaringSmoke, SortedBulkMutationsAndPromotionHelpersWork) {
     TestBitmap bitmap;
     std::vector<std::uint32_t> values;

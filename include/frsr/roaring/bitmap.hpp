@@ -475,6 +475,9 @@ public:
     // result of a set operation settles in is then a function of its cardinality, not of the operation's
     // path. Linear in the bitmap's size: a debugging and testing aid, never a hot-path check.
     [[nodiscard]] char const * validate( bool const canonical_kinds = false ) const noexcept {
+        if ( auto const * const problem{ chunks_.validate() } ) {
+            return problem;
+        }
         size_type total{ 0 };
         chunk_type previous{};
         for ( auto at{ chunks_.begin() }; at != chunks_.end(); ++at ) {

@@ -241,6 +241,7 @@ if(FRSR_ROARING_BUILD_TESTS)
         tests/kernel_coverage.cpp
         tests/contains_states.cpp
         tests/bitmap_const_concurrency.cpp
+        tests/chunk_tree.cpp
     )
     target_link_libraries(frsr_roaring_tests
         PRIVATE
