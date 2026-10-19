@@ -68,8 +68,7 @@ jobs:
           set -eux
           u="${BOOST_VERSION//./_}"
           curl -fsSL "https://archives.boost.io/release/${BOOST_VERSION}/source/boost_${u}.tar.gz" -o boost.tgz
-          mkdir boost && tar -xzf boost.tgz -C boost --strip-components=1 \
-            --wildcards "boost_${u}/boost" "boost_${u}/libs/*/include" 2>/dev/null || tar -xzf boost.tgz -C boost --strip-components=1
+          mkdir boost && tar -xzf boost.tgz -C boost --strip-components=1 "boost_${u}/boost"
           rm boost.tgz
 
       - name: Dependencies next to the checkout
