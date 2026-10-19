@@ -214,6 +214,21 @@ public:
         return insert_staged( at, static_cast<key_t>( key ), staged.bytes );
     }
 
+    // Inserts a copy of every entry of `other` whose key is not held here and for which `wanted`
+    // holds. Each is sought and inserted on its own: a leaf takes an insertion without moving
+    // anything but its own tail. `count` (how many that is) has no use here.
+    template <typename Wanted>
+    void insert_absent_from( chunk_tree const & other, std::uint32_t const /*count*/, Wanted const & wanted ) {
+        assert( this != &other );
+        auto at{ begin() };
+        for ( auto from{ other.begin() }; from != other.end(); ++from ) {
+            auto const key{ other.key( from ) };
+            at = lower_bound( key, at );
+            if ( ( at != end() && this->key( at ) == key ) || !wanted( other.slot( from ) ) ) { continue; }
+            at = insert( at, key, other.slot( from ) );
+        }
+    }
+
     // Removes the entry at `at` and returns the position of the entry that followed it.
     cursor erase( cursor const at ) {
         auto const leaf{ at.leaf_ };

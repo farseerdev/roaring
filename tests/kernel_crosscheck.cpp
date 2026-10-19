@@ -293,4 +293,124 @@ TEST( KernelCrosscheck, BigByFewUnion ) {
     }
 }
 
+// ---- a bitmap with few chunks |= one with many ---------------------------------------------------
+
+// The values of one chunk, in one of several container shapes (array, bitset, a few runs, a full chunk).
+template <typename Key>
+[[nodiscard]] std::vector<Key> chunk_values( Key const chunk, std::size_t const shape, std::mt19937_64 & rng ) {
+    std::vector<Key> out;
+    auto const base{ static_cast<Key>( chunk << 16 ) };
+    switch ( shape % 4 ) {
+        case 0: for ( auto const low : make_pattern( pattern::random, 40, rng ) )   { out.push_back( base + low ); } break;
+        case 1: for ( auto const low : make_pattern( pattern::random, 5000, rng ) ) { out.push_back( base + low ); } break;
+        case 2: for ( std::uint32_t r{ 0 }; r < 5; ++r ) { for ( std::uint32_t k{ 0 }; k < 150; ++k ) { out.push_back( base + r * 5000 + k ); } } break;
+        default: for ( std::uint32_t k{ 0 }; k < 65536; ++k ) { out.push_back( base + k ); } break;
+    }
+    return out;
+}
+
+template <typename Key>
+void check_few_union() {
+    using Bitmap = bitmap<Key>;
+    // Wide keys sit far above 32 bits so that the tree's separators are exercised on high bits.
+    constexpr Key origin{ sizeof( Key ) > 4 ? Key{ 0x5A5A } << 24 : Key{ 100 } };
+    constexpr std::int64_t chunks{ 200 };
+    std::mt19937_64 rng{ 0xFE77 + sizeof( Key ) };
+
+    // Chunk key of slot s: origin + 10 + s. The target holds the even slots 0 .. 2 * chunks - 2.
+    auto const key_of = [ & ]( std::int64_t const slot ) { return static_cast<Key>( origin + static_cast<Key>( 10 + slot ) ); };
+    std::vector<Key> target_values;
+    for ( std::int64_t i{ 0 }; i < chunks; ++i ) {
+        for ( auto const v : chunk_values<Key>( key_of( 2 * i ), static_cast<std::size_t>( i ), rng ) ) { target_values.push_back( v ); }
+    }
+    Bitmap const target{ std::span<Key const>{ target_values } };
+    ASSERT_EQ( target.size(), target_values.size() );
+
+    struct operand_case { char const * name; std::vector<std::int64_t> slots; };
+    std::vector<operand_case> const cases{
+        { "one held",                  { 100 } },
+        { "one between",               { 101 } },
+        { "one below the range",       { -3 } },
+        { "one above the range",       { 2 * chunks + 5 } },
+        { "all held",                  { 20, 100, 398 } },
+        { "all new, interleaved",      { 21, 201, 397 } },
+        { "held and new interleaved",  { 20, 21, 22, 200, 201 } },
+        { "first and last held",       { 0, 398 } },
+        { "new at both ends",          { -4, -2, 399, 401 } },
+        { "held, new, below, above",   { -6, 0, 1, 250, 251, 398, 400, 403 } },
+        { "adjacent new keys",         { 101, 103, 105 } },
+        { "new key in the first gap",  { 1 } },
+    };
+    for ( auto const & c : cases ) {
+        for ( std::size_t const dense : { 0u, 1u } ) {
+            SCOPED_TRACE( ::testing::Message() << c.name << ( dense ? ", dense operand" : ", sparse operand" ) );
+            std::vector<Key> few_values;
+            std::size_t shape{ dense ? 1u : 0u };
+            for ( auto const slot : c.slots ) {
+                for ( auto const v : chunk_values<Key>( key_of( slot ), shape, rng ) ) { few_values.push_back( v ); }
+                shape += dense ? 2 : 1;
+            }
+            few_values = sorted_unique( std::move( few_values ) );
+            Bitmap const few{ std::span<Key const>{ few_values } };
+
+            std::set<Key> oracle{ target_values.begin(), target_values.end() };
+            oracle.insert( few_values.begin(), few_values.end() );
+            std::vector<Key> const expected{ oracle.begin(), oracle.end() };
+
+            auto united{ target };
+            united |= few;
+            ASSERT_TRUE( matches( united, expected ) );
+            EXPECT_TRUE( matches( few, few_values ) ) << "the operand is left alone";
+
+            united |= few;   // repeating it changes nothing
+            EXPECT_TRUE( matches( united, expected ) );
+
+            auto flipped{ few };   // the other way round holds the same set
+            flipped |= target;
+            EXPECT_TRUE( matches( flipped, expected ) );
+        }
+    }
+
+    // an empty operand, an empty target, a self union
+    auto unchanged{ target };
+    unchanged |= Bitmap{};
+    EXPECT_TRUE( matches( unchanged, target_values ) );
+    Bitmap empty;
+    empty |= target;
+    EXPECT_TRUE( matches( empty, target_values ) );
+    auto self{ target };
+    self |= self;
+    EXPECT_TRUE( matches( self, target_values ) );
+}
+
+TEST( KernelCrosscheck, FewChunksUnionedIntoManyContents32 ) { check_few_union<std::uint32_t>(); }
+TEST( KernelCrosscheck, FewChunksUnionedIntoManyContents64 ) { check_few_union<std::uint64_t>(); }
+
+// The same against CRoaring: a target that grows over several rounds of few-chunk operands that land
+// on held keys, between them, below and above.
+TEST( KernelCrosscheck, FewChunksUnionedIntoManyRoundsMatchCRoaring ) {
+    std::mt19937_64 rng{ 0xF3A5 };
+    Values32 target_values;
+    for ( std::uint32_t i{ 0 }; i < 300; ++i ) {
+        for ( auto const v : chunk_values<std::uint32_t>( 5U + 2 * i, i, rng ) ) { target_values.push_back( v ); }
+    }
+    for ( bool const run_optimize : { false, true } ) {
+        auto ours{ make_ours( target_values, run_optimize ) };
+        auto theirs{ make_theirs( target_values, run_optimize ) };
+        for ( int round{ 0 }; round < 40; ++round ) {
+            Values32 few;
+            auto const keys{ 1 + rng() % 8 };
+            for ( std::uint64_t k{ 0 }; k < keys; ++k ) {
+                auto const key{ static_cast<std::uint32_t>( rng() % 700 ) };
+                for ( auto const v : chunk_values<std::uint32_t>( key, rng() % 4, rng ) ) { few.push_back( v ); }
+            }
+            few = sorted_unique( std::move( few ) );
+            SCOPED_TRACE( ::testing::Message() << "round " << round << ", runs " << run_optimize );
+            ours |= make_ours( few, run_optimize && round % 2 );
+            roaring_bitmap_or_inplace( theirs.r, make_theirs( few, run_optimize && round % 2 ).r );
+            ASSERT_TRUE( same_contents( ours, theirs ) );
+        }
+    }
+}
+
 } // namespace

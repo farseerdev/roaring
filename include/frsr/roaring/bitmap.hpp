@@ -1290,6 +1290,127 @@ public:
         }
     }
 
+    // Unites `right_container` into `left_container`, the containers of one key (the result replaces
+    // the left one). A shared left payload is not cloned and then mutated: the union is written
+    // straight into a fresh (or retired, from `store`) payload, as CRoaring's container_or does for a
+    // SHARED container: the clone is a full read+write of the payload that the materializing combine
+    // never pays. Same rule as the general spine's mutate_left (combine()). When `lazy`, bitset
+    // cardinalities are left stale (see union_merge).
+    [[ gnu::always_inline ]] void union_same_key(
+        detail::chunk_store<layout_type, CowPolicy> & store,
+        handle_type & left_container,
+        handle_type const & right_container,
+        bool const lazy,
+        detail::small_array_values<low_type> & array_union_scratch
+    ) {
+        bool const mutate_left{ left_container.payload_is_unshared() };
+        if ( left_container.holds_array() && right_container.holds_array() ) {
+            if ( mutate_left ) {
+                detail::union_array_array_inplace<layout_type>( left_container.as_array(), right_container.as_array() );
+                left_container = make_fast_container( std::move( left_container ) );
+            } else {
+                left_container = make_array_union_container_reusing(
+                    store,
+                    std::as_const( left_container ).as_array(),
+                    right_container.as_array(),
+                    array_union_scratch
+                );
+            }
+            return;
+        }
+        if ( left_container.holds_bitset() && right_container.holds_bitset() ) {
+            if ( !mutate_left ) {
+                // A saturated left is the result, shared as it is: the O(1) analog of the
+                // in-place arm's full-bitset shortcut.
+                if ( left_container.cardinality() != layout_type::word_count * 64U ) {
+                    left_container = combine_bitset_bitset_for_policy(
+                        std::as_const( left_container ).as_bitset(),
+                        right_container.as_bitset(),
+                        detail::set_operation::bit_or,
+                        store.take_retired( detail::container_kind::bitset )
+                    );
+                }
+                return;
+            }
+            auto left_bitset{ left_container.as_bitset() };
+            if ( lazy ) {
+                detail::or_bitset_bitset_inplace_lazy<layout_type>( left_bitset, right_container.as_bitset() );
+            } else {
+                detail::combine_bitset_bitset_inplace<layout_type>( left_bitset, right_container.as_bitset(), detail::set_operation::bit_or );
+            }
+            return;
+        }
+        // Same-key mixed array/bitset in the lazy bulk-union path: accumulate
+        // into a bitset in place, mirroring CRoaring's LAZY_OR_BITSET_CONVERSION
+        // (roaring.c:roaring_bitmap_lazy_or_inplace). Promote the accumulator
+        // (left) to a bitset if it is still an array, then OR the operand into
+        // its existing 8 KB block: no 8 KB copy, no fresh allocation, no
+        // popcount (repaired once at the end), unlike combine_containers_for_policy.
+        // Eager (operator|=) and run-typed operands fall through to the general
+        // path below, which preserves their sparse-result down-conversion.
+        if ( lazy ) {
+            auto const left_is_bitset { left_container.holds_bitset()  };
+            auto const left_is_array  { left_container.holds_array()   };
+            auto const right_is_bitset{ right_container.holds_bitset() };
+            auto const right_is_array { right_container.holds_array()  };
+            if ( ( left_is_bitset || left_is_array ) && ( right_is_bitset || right_is_array ) ) {
+                if ( !left_is_bitset ) {
+                    // std::as_const avoids an unneeded write-barrier clone under a
+                    // refcounted CowPolicy: left_container is about to be wholly
+                    // replaced below, so any clone the mutable as_array() would
+                    // trigger is discarded immediately.
+                    auto const values{ std::as_const( left_container ).as_array().values };
+                    left_container = detail::bitset_handle_from_sorted_values<layout_type, CowPolicy>( { values.data(), values.size() } );
+                }
+                auto left_bitset{ left_container.as_bitset() };
+                if ( right_is_bitset ) {
+                    detail::or_bitset_bitset_inplace_lazy<layout_type>( left_bitset, right_container.as_bitset() );
+                } else {
+                    detail::or_array_into_bitset_inplace_lazy<layout_type>( left_bitset, right_container.as_array() );
+                }
+                return;
+            }
+        }
+        left_container = combine_containers_for_policy( left_container, right_container, detail::set_operation::bit_or );
+    }
+
+    // `|=` of a bitmap with far fewer chunks than this one: each of the other's keys is found by
+    // galloping through our chunk table, the containers of the keys we hold are united in place, and
+    // the keys we lack are inserted into the table in one go (see chunk_store::insert_absent_from),
+    // where the merge would visit and move every chunk we hold.
+    // [croaring-ref] deps/croaring/src/roaring.c:roaring_inplace_union_few
+    [[ gnu::hot ]] bitmap & union_few( bitmap const & other, bool const lazy ) {
+        detail::small_array_values<low_type> array_union_scratch;
+        std::size_t added{ 0 };
+        std::size_t added_size{ 0 };
+        auto at{ chunks_.begin() };
+        for ( auto right{ other.chunks_.begin() }; right != other.chunks_.end(); ++right ) {
+            auto const key{ other.chunks_.key( right ) };
+            at = chunks_.lower_bound( key, at );
+            auto const & right_container{ other.chunks_.slot( right ) };
+            if ( at == chunks_.end() || chunks_.key( at ) != key ) {
+                if ( auto const right_size{ detail::container_size( right_container ) }; right_size != 0 ) {
+                    ++added;
+                    added_size += right_size;
+                }
+                continue;
+            }
+            auto & left_container{ chunks_.slot( at ) };
+            if ( !lazy ) {
+                size_ -= detail::container_size( left_container );
+            }
+            union_same_key( chunks_, left_container, right_container, lazy, array_union_scratch );
+            if ( !lazy ) {
+                size_ += detail::container_size( left_container );
+            }
+        }
+        if ( added != 0 ) {
+            chunks_.insert_absent_from( other.chunks_, added, []( handle_type const & container ) noexcept { return detail::container_size( container ) != 0; } );
+            size_ += added_size;
+        }
+        return *this;
+    }
+
     // Shared union merge. When `lazy` is true, same-key bitset×bitset chunks are
     // OR'd without recomputing cardinality and `size_` is left invalid — the
     // caller MUST call repair_cardinality() afterwards. The N-way bulk-union path
@@ -1299,6 +1420,9 @@ public:
     // checks are kept in both modes — they read operand cardinalities, which are
     // always valid (only the accumulator's bitsets are lazily dirtied).
     [[ gnu::hot ]] bitmap & union_merge( bitmap const & other, bool const lazy ) {
+        if ( std::uint64_t{ other.chunks_.size() } * 32 < chunks_.size() ) {
+            return union_few( other, lazy );
+        }
         detail::chunk_store<layout_type, CowPolicy> merged;
         merged.reserve( chunks_.size() + other.chunks_.size() );
         detail::small_array_values<low_type> array_union_scratch;
@@ -1333,118 +1457,11 @@ public:
 #if FRSR_ROARING_COMBINE_STATS
                 detail::combine_stats().record_pair( left_container, right_container, detail::set_operation::bit_or );
 #endif
-                // A shared left payload is not cloned and then mutated: the union is
-                // written straight into a fresh (or retired) payload, as CRoaring's
-                // container_or does for a SHARED container — the clone is a full
-                // read+write of the payload that the materializing combine never pays.
-                // Same rule as the general spine's mutate_left (combine()).
-                bool const mutate_left{ left_container.payload_is_unshared() };
-                if ( left_container.holds_array() && right_container.holds_array() ) {
-                    if ( mutate_left ) {
-                        detail::union_array_array_inplace<layout_type>( left_container.as_array(), right_container.as_array() );
-                        auto container{ make_fast_container( std::move( left_container ) ) };
-                        if ( !lazy ) {
-                            size_ += detail::container_size( container );
-                        }
-                        merged.push_back( left_key, std::move( container ) );
-                    } else {
-                        auto container{ make_array_union_container_reusing(
-                            merged,
-                            std::as_const( left_container ).as_array(),
-                            right_container.as_array(),
-                            array_union_scratch
-                        ) };
-                        if ( !lazy ) {
-                            size_ += detail::container_size( container );
-                        }
-                        merged.push_back( left_key, std::move( container ) );
-                    }
-                    ++left;
-                    ++right;
-                    continue;
-                }
-                if ( left_container.holds_bitset() && right_container.holds_bitset() ) {
-                    if ( !mutate_left ) {
-                        // A saturated left is the result: share it (a refcount bump), the
-                        // O(1) analog of the in-place arm's full-bitset shortcut.
-                        if ( left_container.cardinality() == layout_type::word_count * 64U ) {
-                            if ( !lazy ) {
-                                size_ += left_container.cardinality();
-                            }
-                            merged.push_back( left_key, left_container );
-                            ++left;
-                            ++right;
-                            continue;
-                        }
-                        auto container{ combine_bitset_bitset_for_policy(
-                            std::as_const( left_container ).as_bitset(),
-                            right_container.as_bitset(),
-                            detail::set_operation::bit_or,
-                            merged.take_retired( detail::container_kind::bitset )
-                        ) };
-                        if ( !lazy ) {
-                            size_ += detail::container_size( container );
-                        }
-                        merged.push_back( left_key, std::move( container ) );
-                        ++left;
-                        ++right;
-                        continue;
-                    }
-                    auto left_bitset{ left_container.as_bitset() };
-                    if ( lazy ) {
-                        detail::or_bitset_bitset_inplace_lazy<layout_type>( left_bitset, right_container.as_bitset() );
-                    } else {
-                        detail::combine_bitset_bitset_inplace<layout_type>( left_bitset, right_container.as_bitset(), detail::set_operation::bit_or );
-                        size_ += left_bitset.size();
-                    }
-                    merged.push_back( left_key, std::move( left_container ) );
-                    ++left;
-                    ++right;
-                    continue;
-                }
-                // Same-key mixed array↔bitset in the lazy bulk-union path: accumulate
-                // into a bitset in place, mirroring CRoaring's LAZY_OR_BITSET_CONVERSION
-                // (roaring.c:roaring_bitmap_lazy_or_inplace). Promote the accumulator
-                // (left) to a bitset if it is still an array, then OR the operand into
-                // its existing 8 KB block — no 8 KB copy, no fresh allocation, no
-                // popcount (repaired once at the end), unlike combine_containers_for_policy.
-                // Eager (operator|=) and run-typed operands fall through to the general
-                // path below, which preserves their sparse-result down-conversion.
-                if ( lazy ) {
-                    auto const left_is_bitset { left_container.holds_bitset()  };
-                    auto const left_is_array  { left_container.holds_array()   };
-                    auto const right_is_bitset{ right_container.holds_bitset() };
-                    auto const right_is_array { right_container.holds_array()  };
-                    if ( ( left_is_bitset || left_is_array ) && ( right_is_bitset || right_is_array ) ) {
-                        if ( !left_is_bitset ) {
-                            // std::as_const avoids an unneeded write-barrier clone under a
-                            // refcounted CowPolicy: left_container is about to be wholly
-                            // replaced below, so any clone the mutable as_array() would
-                            // trigger is discarded immediately.
-                            auto const values{ std::as_const( left_container ).as_array().values };
-                            left_container = detail::bitset_handle_from_sorted_values<layout_type, CowPolicy>( { values.data(), values.size() } );
-                        }
-                        auto left_bitset{ left_container.as_bitset() };
-                        if ( right_is_bitset ) {
-                            detail::or_bitset_bitset_inplace_lazy<layout_type>( left_bitset, right_container.as_bitset() );
-                        } else {
-                            detail::or_array_into_bitset_inplace_lazy<layout_type>( left_bitset, right_container.as_array() );
-                        }
-                        merged.push_back( left_key, std::move( left_container ) );
-                        ++left;
-                        ++right;
-                        continue;
-                    }
-                }
-                auto container{ combine_containers_for_policy(
-                    left_container,
-                    right_container,
-                    detail::set_operation::bit_or
-                ) };
+                union_same_key( merged, left_container, right_container, lazy, array_union_scratch );
                 if ( !lazy ) {
-                    size_ += detail::container_size( container );
+                    size_ += detail::container_size( left_container );
                 }
-                merged.push_back( left_key, std::move( container ) );
+                merged.push_back( left_key, std::move( left_container ) );
                 ++left;
                 ++right;
             }

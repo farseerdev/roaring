@@ -284,6 +284,16 @@ public:
         return inserted;
     }
 
+    // Inserts a copy of every entry of `other` (another store's table, never this one) whose key is
+    // not held here and for which `wanted( handle )` holds; `count` is how many that is. A flat table
+    // is grown once and its tail moved once per run of insertions, from the back; a tree seeks and
+    // inserts each.
+    template <typename Wanted>
+    void insert_absent_from( chunk_store const & other, std::size_t const count, Wanted const & wanted ) {
+        live_.insert_absent_from( other.live_, static_cast<std::uint32_t>( count ), wanted );
+        ++generation_;
+    }
+
     // Removes the entry at `at` and returns the position of the entry that followed it.
     cursor erase( cursor const at ) {
         auto const following{ live_.erase( at ) };
