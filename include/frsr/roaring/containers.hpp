@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cassert>
 #include <concepts>
 #include <cstddef>
 #include <cstring>
@@ -345,6 +346,43 @@ template <typename Layout, typename CowPolicy = cow_value_semantics>
     if ( !sorted_values.empty() ) {
         result.set_endpoints( sorted_values.front(), sorted_values.back() );
     }
+    return result;
+}
+
+// Builds a bitset handle holding the union of two non-empty arrays by scattering both straight into the
+// words, counting the bits the second adds as it goes: no merged intermediate. The caller owns the decision
+// that the union is worth a bitset (its size bound is at or above the array limit) and demotes the result to an
+// array when the count lands below it.
+// [croaring-ref] deps/croaring/src/containers/mixed_union.c:array_array_container_union
+template <typename Layout, typename CowPolicy = cow_value_semantics>
+[[nodiscard]] inline container_handle<Layout, CowPolicy> bitset_handle_from_array_union(
+    array_cref<Layout, CowPolicy> const lhs,
+    array_cref<Layout, CowPolicy> const rhs,
+    container_handle<Layout, CowPolicy> && reuse = {}
+) {
+    assert( !lhs.values.empty() && !rhs.values.empty() );
+    auto result{ [&]() {
+        if ( reuse.holds_bitset() ) {
+            std::memset( reuse.payload_data_raw(), 0, Layout::word_count * sizeof( std::uint64_t ) );
+            return std::move( reuse );
+        }
+        return container_handle<Layout, CowPolicy>::make_bitset_zeroed();
+    }() };
+    auto bitset{ result.as_bitset() };
+    auto & words{ bitset.words.as_array() };
+    auto const set_bit{ [ &words ]( auto const value ) {
+        words[ static_cast<std::size_t>( value ) >> 6U ] |= std::uint64_t{ 1 } << ( static_cast<unsigned>( value ) & 63U );
+    } };
+    for ( auto const value : lhs.values ) { set_bit( value ); }
+    auto cardinality{ lhs.values.size() };
+    for ( auto const value : rhs.values ) {
+        auto & word{ words[ static_cast<std::size_t>( value ) >> 6U ] };
+        auto const mask{ std::uint64_t{ 1 } << ( static_cast<unsigned>( value ) & 63U ) };
+        cardinality += ( word & mask ) == 0;
+        word |= mask;
+    }
+    result.set_cardinality( static_cast<std::uint32_t>( cardinality ) );
+    result.set_endpoints( std::min( lhs.values.front(), rhs.values.front() ), std::max( lhs.values.back(), rhs.values.back() ) );
     return result;
 }
 
@@ -728,6 +766,257 @@ template <typename Layout>
         }
     }
     return lhs;
+}
+
+// ---- range flip ---------------------------------------------------------------
+//
+// The per-form negation over a closed range, as the reference's container_not_range
+// does it: every form has a kernel that works on its own representation and decides
+// its own result form, instead of expanding to words and re-deriving the form.
+
+// The form decision's bitset arm: a result of this cardinality is held as a bitset.
+template <typename Layout>
+[[nodiscard]] constexpr bool is_bitset_cardinality( std::size_t const cardinality, std::size_t const bitset_threshold ) noexcept {
+    return cardinality >= bitset_threshold && Layout::word_count * sizeof( std::uint64_t ) <= cardinality * sizeof( typename Layout::low_type );
+}
+
+// A new run [begin, end] appended after the n runs, merged into the last one when
+// they touch. Returns the new run count.
+template <typename Run>
+[[nodiscard]] inline std::size_t append_run( Run * const runs, std::size_t const n, std::size_t const begin, std::size_t const end ) noexcept {
+    using low_type = decltype( Run::begin );
+    if ( n != 0 && static_cast<std::size_t>( runs[ n - 1 ].end ) + 1U == begin ) {
+        runs[ n - 1 ].end = static_cast<low_type>( end );
+        return n;
+    }
+    runs[ n ] = Run{ static_cast<low_type>( begin ), static_cast<low_type>( end ) };
+    return n + 1U;
+}
+
+// Exclusive-or of the run [begin, end] into the runs built so far, where begin is
+// not below the last run's begin (run_container_smart_append_exclusive).
+template <typename Run>
+[[nodiscard]] inline std::size_t append_run_exclusive( Run * const runs, std::size_t n, std::size_t const begin, std::size_t const end ) noexcept {
+    using low_type = decltype( Run::begin );
+    if ( n == 0 || begin > static_cast<std::size_t>( runs[ n - 1 ].end ) + 1U ) {
+        runs[ n ] = Run{ static_cast<low_type>( begin ), static_cast<low_type>( end ) };
+        return n + 1U;
+    }
+    auto & last{ runs[ n - 1 ] };
+    auto const old_end{ static_cast<std::size_t>( last.end ) };
+    if ( old_end + 1U == begin ) {
+        last.end = static_cast<low_type>( end );
+        return n;
+    }
+    if ( begin == last.begin ) {  // wipes out the previous run
+        if ( end < old_end ) {
+            last = Run{ static_cast<low_type>( end + 1U ), static_cast<low_type>( old_end ) };
+        } else if ( end > old_end ) {
+            last = Run{ static_cast<low_type>( old_end + 1U ), static_cast<low_type>( end ) };
+        } else {
+            --n;
+        }
+        return n;
+    }
+    last.end = static_cast<low_type>( begin - 1U );
+    if ( end < old_end ) {
+        runs[ n ] = Run{ static_cast<low_type>( end + 1U ), static_cast<low_type>( old_end ) };
+        return n + 1U;
+    }
+    if ( end > old_end ) {
+        runs[ n ] = Run{ static_cast<low_type>( old_end + 1U ), static_cast<low_type>( end ) };
+        return n + 1U;
+    }
+    return n;
+}
+
+// Flip of [begin, end] in an array. A result past the bitset threshold with fewer
+// runs than a bitset would take is built as runs straight from the values (the
+// gaps inside the range, the values outside it): array_container_negation_range_to_any.
+template <typename Layout, typename CowPolicy>
+[[nodiscard]] inline container_handle<Layout, CowPolicy> flip_array_range(
+    container_handle<Layout, CowPolicy> const & container,
+    typename Layout::low_type const begin,
+    typename Layout::low_type const end,
+    std::size_t const bitset_threshold
+) {
+    using handle_type = container_handle<Layout, CowPolicy>;
+    using low_type    = typename Layout::low_type;
+    using run_type    = ::frsr::roaring::run<low_type>;
+    auto const view{ container.as_array().values };
+    std::span<low_type const> const values{ view.data(), view.size() };
+    auto const cardinality{ values.size() };
+    auto const first{ std::lower_bound( values.begin(), values.end(), begin ) };
+    auto const last { std::upper_bound( first         , values.end(), end   ) };
+    auto const in_range{ static_cast<std::size_t>( last - first ) };
+    auto const span    { static_cast<std::size_t>( end ) - begin + 1U };
+    auto const new_cardinality{ cardinality - in_range + ( span - in_range ) };
+
+    constexpr auto bitset_bytes{ Layout::word_count * sizeof( std::uint64_t ) };
+    if ( span > cardinality && is_bitset_cardinality<Layout>( span - cardinality, bitset_threshold ) &&
+         ( cardinality + 1U ) * sizeof( run_type ) + sizeof( low_type ) < bitset_bytes )
+    {
+        auto result{ handle_type::make_run() };
+        auto ref{ result.as_run() };
+        ref.runs.resize_uninitialized( static_cast<std::uint32_t>( cardinality + 1U ) );
+        auto * const runs{ ref.runs.data() };
+        std::size_t n{ 0 };
+        auto in{ values.begin() };
+        for ( ; in != first; ++in ) { n = append_run( runs, n, *in, *in ); }
+        std::size_t next{ begin };  // first value of the range not yet decided
+        for ( ; in != last; ++in ) {
+            if ( *in > next ) { n = append_run( runs, n, next, std::size_t{ *in } - 1U ); }
+            next = std::size_t{ *in } + 1U;
+        }
+        if ( next <= end ) { n = append_run( runs, n, next, end ); }
+        for ( ; in != values.end(); ++in ) { n = append_run( runs, n, *in, *in ); }
+        assert( n != 0 );
+        ref.runs.resize_uninitialized( static_cast<std::uint32_t>( n ) );
+        ref.sync_header();
+        return result;
+    }
+
+    if ( is_bitset_cardinality<Layout>( new_cardinality, bitset_threshold ) ) {
+        if ( begin == 0 && end == Layout::low_domain_size - 1U ) {
+            // The negation of a whole array: all bits set, then the values cleared.
+            auto result{ handle_type::make_bitset_uninitialized() };
+            auto & words{ result.as_bitset().words.as_array() };
+            words.fill( std::numeric_limits<std::uint64_t>::max() );
+            for ( auto const value : values ) {
+                words[ static_cast<std::size_t>( value ) >> 6U ] &= ~( std::uint64_t{ 1 } << ( value & 63U ) );
+            }
+            result.set_cardinality( static_cast<std::uint32_t>( new_cardinality ) );
+            result.mark_endpoints_stale();
+            return result;
+        }
+        auto result{ bitset_handle_from_sorted_values<Layout, CowPolicy>( values ) };
+        apply_range_to_words<Layout>( result.as_bitset().words.as_array(), begin, end, range_operation::flip );
+        result.set_cardinality( static_cast<std::uint32_t>( new_cardinality ) );
+        result.mark_endpoints_stale();
+        return result;
+    }
+
+    if ( new_cardinality == 0 ) { return handle_type{}; }
+    auto result{ handle_type::make_array() };
+    auto ref{ result.as_array() };
+    ref.values.resize_uninitialized( static_cast<std::uint32_t>( new_cardinality ) );
+    auto * out{ ref.values.data() };
+    out = std::copy( values.begin(), first, out );
+    auto in{ first };
+    std::size_t value{ begin };
+    for ( ; value <= end && in != last; ++value ) {
+        if ( value != *in ) { *out++ = static_cast<low_type>( value ); } else { ++in; }
+    }
+    for ( ; value <= end; ++value ) { *out++ = static_cast<low_type>( value ); }
+    std::copy( last, values.end(), out );
+    ref.sync_header();
+    return result;
+}
+
+// Flip of [begin, end] in a run container: the range joins the runs as one more
+// exclusive-or append (run_container_negation_range), then the result takes the
+// smallest of the three forms.
+template <typename Layout, typename CowPolicy>
+[[nodiscard]] inline container_handle<Layout, CowPolicy> flip_run_range(
+    container_handle<Layout, CowPolicy> const & container,
+    typename Layout::low_type const begin,
+    typename Layout::low_type const end,
+    std::size_t const bitset_threshold
+) {
+    using handle_type = container_handle<Layout, CowPolicy>;
+    using low_type    = typename Layout::low_type;
+    using run_type    = ::frsr::roaring::run<low_type>;
+    auto const view{ container.as_run().runs };
+    std::span<run_type const> const source{ view.data(), view.size() };
+    auto result{ handle_type::make_run() };
+    auto ref{ result.as_run() };
+    // An exclusive-or with one interval adds at most one run.
+    ref.runs.resize_uninitialized( static_cast<std::uint32_t>( source.size() + 1U ) );
+    auto * const runs{ ref.runs.data() };
+    std::size_t n{ 0 };
+    auto in{ source.begin() };
+    for ( ; in != source.end() && in->begin < begin; ++in ) { runs[ n++ ] = *in; }
+    n = append_run_exclusive( runs, n, begin, end );
+    for ( ; in != source.end(); ++in ) { n = append_run_exclusive( runs, n, in->begin, in->end ); }
+    assert( n <= source.size() + 1U );
+    if ( n == 0 ) { return handle_type{}; }
+    ref.runs.resize_uninitialized( static_cast<std::uint32_t>( n ) );
+    ref.sync_header();
+
+    constexpr auto bitset_bytes{ Layout::word_count * sizeof( std::uint64_t ) };
+    auto const cardinality{ static_cast<std::size_t>( result.cardinality() ) };
+    auto const run_bytes  { n * sizeof( run_type ) + sizeof( low_type ) };
+    auto const array_bytes{ cardinality * sizeof( low_type ) };
+    if ( run_bytes <= std::min( bitset_bytes, array_bytes ) ) { return result; }
+    if ( !is_bitset_cardinality<Layout>( cardinality, bitset_threshold ) ) {
+        return array_handle_from_container<Layout, CowPolicy>( result );
+    }
+    word_array<Layout> words{};
+    for ( auto const & current : std::span<run_type const>{ ref.runs.data(), n } ) {
+        apply_range_to_words<Layout>( words, current.begin, current.end, range_operation::add );
+    }
+    return make_bitset_container_from_words<Layout, CowPolicy>( words );
+}
+
+// Flip of [begin, end] in a bitset: the words flip in place, and the result is an
+// array again once it falls below the bitset threshold.
+template <typename Layout, typename CowPolicy>
+[[nodiscard]] inline container_handle<Layout, CowPolicy> flip_bitset_range(
+    container_handle<Layout, CowPolicy> container,
+    typename Layout::low_type const begin,
+    typename Layout::low_type const end,
+    std::size_t const bitset_threshold
+) {
+    auto & words{ container.as_bitset().words.as_array() };
+    apply_range_to_words<Layout>( words, begin, end, range_operation::flip );
+    auto const cardinality{ std::ranges::fold_left(
+        words, std::size_t{ 0 }, []( std::size_t const acc, std::uint64_t const word ) noexcept { return acc + static_cast<std::size_t>( std::popcount( word ) ); }
+    ) };
+    if ( cardinality == 0 ) { return container_handle<Layout, CowPolicy>{}; }
+    if ( !is_bitset_cardinality<Layout>( cardinality, bitset_threshold ) ) {
+        auto const values{ values_from_words<Layout>( words ) };
+        return container_handle<Layout, CowPolicy>::make_array_from_sorted( { values.data(), values.size() } );
+    }
+    container.set_cardinality( static_cast<std::uint32_t>( cardinality ) );
+    container.mark_endpoints_stale();
+    return container;
+}
+
+// Applies add/remove/flip of the closed range [begin, end] to one chunk's
+// container (an empty handle for an absent chunk).
+template <typename Layout, typename CowPolicy, typename RunSelectionPolicy = run_selection_eager>
+[[nodiscard]] inline container_handle<Layout, CowPolicy> apply_range_to_container(
+    container_handle<Layout, CowPolicy> container,
+    typename Layout::low_type const begin,
+    typename Layout::low_type const end,
+    range_operation const op,
+    std::size_t const bitset_threshold
+) {
+    using handle_type = container_handle<Layout, CowPolicy>;
+    using low_type    = typename Layout::low_type;
+    if ( op != range_operation::flip ) {
+        auto words{ words_from_container<Layout>( container ) };
+        apply_range_to_words<Layout>( words, begin, end, op );
+        return make_container_from_words<Layout, CowPolicy, RunSelectionPolicy>( words, bitset_threshold );
+    }
+    if ( container.cardinality() == 0 ) {
+        // container_range_of_ones: a run, but for the two values an array holds.
+        if ( static_cast<std::size_t>( end ) - begin < 2U ) {
+            std::array<low_type, 2> const values{ begin, end };
+            return handle_type::make_array_from_sorted( { values.data(), begin == end ? 1U : 2U } );
+        }
+        auto result{ handle_type::make_run() };
+        auto ref{ result.as_run() };
+        ref.runs.push_back( ::frsr::roaring::run<low_type>{ begin, end } );
+        ref.sync_header();
+        return result;
+    }
+    switch ( container.kind() ) {
+        case container_kind::array : return flip_array_range <Layout, CowPolicy>( container, begin, end, bitset_threshold );
+        case container_kind::run   : return flip_run_range   <Layout, CowPolicy>( container, begin, end, bitset_threshold );
+        case container_kind::bitset: return flip_bitset_range<Layout, CowPolicy>( std::move( container ), begin, end, bitset_threshold );
+    }
+    std::unreachable();
 }
 
 } // namespace frsr::roaring::detail

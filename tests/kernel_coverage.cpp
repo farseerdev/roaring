@@ -105,6 +105,92 @@ TEST( KernelCoverage, SortedUnionKernelsMatchReference ) {
     }
 }
 
+// The scalar merges, driven directly. Every output is exactly as large as the contract says (a union sa + sb,
+// an intersection min(sa, sb), a difference sa) so a write past it is an out-of-bounds write under ASan, and a
+// guard on both sides catches the rest. The in-place layouts place the output over the first operand (the
+// difference and the intersection) or sb values before it (the union), the shapes the callers use.
+template <typename T, typename Generator>
+void scalar_merges_case( std::uint64_t const seed, Generator && generate ) {
+    std::mt19937_64 rng{ seed };
+    constexpr std::size_t guard{ 8 };
+    constexpr T canary{ static_cast<T>( 0xCAFE ) };
+    constexpr std::size_t sizes[]{ 0, 1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 100, 255, 256, 257, 1000, 4096 };
+    for ( int trial{ 0 }; trial < 1500; ++trial ) {
+        auto const na{ sizes[ rng() % std::size( sizes ) ] };
+        auto const nb{ sizes[ rng() % std::size( sizes ) ] };
+        auto const a{ generate( rng, na ) };
+        auto const b{ generate( rng, nb ) };
+        SCOPED_TRACE( ::testing::Message() << "trial " << trial << " sa " << a.size() << " sb " << b.size() );
+
+        auto const check{ [ & ]( std::vector<T> const & expected, std::size_t const slots, auto && kernel, char const * const what ) {
+            std::vector<T> storage( guard + slots + guard, canary );
+            auto const n{ kernel( storage.data() + guard ) };
+            ASSERT_EQ( n, expected.size() ) << what;
+            EXPECT_TRUE( std::equal( expected.begin(), expected.end(), storage.begin() + guard ) ) << what;
+            EXPECT_TRUE( std::all_of( storage.begin(), storage.begin() + guard, [ & ]( T const v ) { return v == canary; } ) ) << what << ": wrote before the output";
+            EXPECT_TRUE( std::all_of( storage.begin() + guard + slots, storage.end(), [ & ]( T const v ) { return v == canary; } ) ) << what << ": wrote past the output";
+        } };
+        std::vector<T> expected_union, expected_and, expected_sub;
+        std::ranges::set_union( a, b, std::back_inserter( expected_union ) );
+        std::ranges::set_intersection( a, b, std::back_inserter( expected_and ) );
+        std::ranges::set_difference( a, b, std::back_inserter( expected_sub ) );
+
+        check( expected_union, a.size() + b.size(), [ & ]( T * const out ) { return detail::union_sorted_scalar( a.data(), a.size(), b.data(), b.size(), out ); }, "union" );
+        check( expected_and, std::min( a.size(), b.size() ), [ & ]( T * const out ) { return detail::intersect_sorted_scalar( a.data(), a.size(), b.data(), b.size(), out ); }, "intersection" );
+        check( expected_sub, a.size(), [ & ]( T * const out ) { return detail::difference_sorted_scalar( a.data(), a.size(), b.data(), b.size(), out ); }, "difference" );
+
+        // In place over the first operand.
+        {
+            auto t{ a };
+            t.resize( std::max<std::size_t>( t.size(), 1 ) );
+            auto const n{ detail::intersect_sorted_scalar( static_cast<T const *>( t.data() ), a.size(), b.data(), b.size(), t.data() ) };
+            ASSERT_EQ( n, expected_and.size() ) << "intersection in place";
+            EXPECT_TRUE( std::equal( expected_and.begin(), expected_and.end(), t.begin() ) ) << "intersection in place";
+        }
+        {
+            auto t{ a };
+            t.resize( std::max<std::size_t>( t.size(), 1 ) );
+            auto const n{ detail::difference_sorted_scalar( static_cast<T const *>( t.data() ), a.size(), b.data(), b.size(), t.data() ) };
+            ASSERT_EQ( n, expected_sub.size() ) << "difference in place";
+            EXPECT_TRUE( std::equal( expected_sub.begin(), expected_sub.end(), t.begin() ) ) << "difference in place";
+        }
+        // The union written sb values before the first operand, in one buffer: [ room for sb | a ].
+        {
+            std::vector<T> buffer( b.size() + a.size() );
+            std::ranges::copy( a, buffer.begin() + static_cast<std::ptrdiff_t>( b.size() ) );
+            auto const n{ detail::union_sorted_scalar( static_cast<T const *>( buffer.data() + b.size() ), a.size(), b.data(), b.size(), buffer.data() ) };
+            ASSERT_EQ( n, expected_union.size() ) << "union in place";
+            EXPECT_TRUE( std::equal( expected_union.begin(), expected_union.end(), buffer.begin() ) ) << "union in place";
+        }
+    }
+}
+
+// Sorted distinct values made of short consecutive stretches, so the four-value block shortcuts, their
+// fallbacks and the tails all run.
+template <typename T>
+[[nodiscard]] std::vector<T> blocky_values( std::mt19937_64 & rng, std::size_t const n, std::uint64_t const span ) {
+    std::set<T> chosen;
+    while ( chosen.size() < n ) {
+        auto const start{ static_cast<T>( rng() % ( span - 8 ) ) };
+        auto const length{ 1 + rng() % 9 };
+        for ( std::uint64_t i{ 0 }; i < length && chosen.size() < n; ++i ) { chosen.insert( static_cast<T>( start + i ) ); }
+    }
+    return { chosen.begin(), chosen.end() };
+}
+
+TEST( KernelCoverage, ScalarMergesMatchReferenceUint16Random ) {
+    scalar_merges_case<std::uint16_t>( 0x5CA1A2, []( std::mt19937_64 & rng, std::size_t const n ) { return make_pattern( pattern::random, n, rng ); } );
+}
+TEST( KernelCoverage, ScalarMergesMatchReferenceUint16Blocky ) {
+    scalar_merges_case<std::uint16_t>( 0xB10C, []( std::mt19937_64 & rng, std::size_t const n ) { return blocky_values<std::uint16_t>( rng, n, 6000 ); } );
+}
+TEST( KernelCoverage, ScalarMergesMatchReferenceUint16Structured ) {
+    scalar_merges_case<std::uint16_t>( 0x57AC, []( std::mt19937_64 & rng, std::size_t const n ) { return make_pattern( all_patterns[ rng() % 4 ], n, rng ); } );
+}
+TEST( KernelCoverage, ScalarMergesMatchReferenceUint32Blocky ) {
+    scalar_merges_case<std::uint32_t>( 0x32B10C, []( std::mt19937_64 & rng, std::size_t const n ) { return blocky_values<std::uint32_t>( rng, n, 100'000 ); } );
+}
+
 // ---------------------------------------------------------------------------
 // bitset AND bitset -> (usually) array, swept over the result's bits per 64-bit word.
 // ---------------------------------------------------------------------------
@@ -164,6 +250,72 @@ TEST( KernelCoverage, BitsetAndBitsetAcrossDensities ) {
             EXPECT_TRUE( matches( b & a, expected ) ) << "operator& swapped";
             { auto t{ a }; t &= b; EXPECT_TRUE( matches( t, expected ) ) << "operator&="; }
             EXPECT_EQ( a.intersects( b ), !expected.empty() );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The extraction of a bitset intersection straight into an exactly sized array, on every arm: the portable
+// branchless decoder (all four values-per-word variants) and the AVX-512 decoder where the CPU has it.
+// ---------------------------------------------------------------------------
+
+void expect_intersection_extracted( std::array<std::uint64_t, 1024> const & words1, std::array<std::uint64_t, 1024> const & words2, std::size_t const n ) {
+    std::vector<std::uint16_t> expected;
+    for ( std::size_t i{ 0 }; i < n; ++i ) {
+        for ( auto w{ words1[ i ] & words2[ i ] }; w != 0; w &= w - 1 ) { expected.push_back( static_cast<std::uint16_t>( i * 64 + std::countr_zero( w ) ) ); }
+    }
+    constexpr std::size_t guard{ 8 };
+    constexpr std::uint16_t canary{ 0xCAFE };
+    auto const check{ [ & ]( auto && extract, char const * const what ) {
+        std::vector<std::uint16_t> storage( guard + expected.size() + guard, canary );
+        extract( storage.data() + guard );
+        EXPECT_TRUE( std::equal( expected.begin(), expected.end(), storage.begin() + guard ) ) << what;
+        EXPECT_TRUE( std::all_of( storage.begin(), storage.begin() + guard, [ & ]( auto const v ) { return v == canary; } ) ) << what << ": wrote before the output";
+        EXPECT_TRUE( std::all_of( storage.begin() + guard + expected.size(), storage.end(), [ & ]( auto const v ) { return v == canary; } ) ) << what << ": wrote past the output";
+    } };
+    // `n` is also the length of a partial block, so the group tails and the final plain loop run.
+    check( [ & ]( std::uint16_t * const out ) { detail::extract_intersection_setbits_portable( words1.data(), words2.data(), n, out, expected.size() ); }, "portable" );
+    check( [ & ]( std::uint16_t * const out ) { detail::extract_intersection_setbits( words1.data(), words2.data(), n, out, expected.size() ); }, "dispatched" );
+#if FRSR_ROARING_X86_V4
+    if ( detail::have_x86_v4() ) {
+        check( [ & ]( std::uint16_t * const out ) {
+            EXPECT_EQ( detail::x86_v4::extract_intersection_setbits_uint16( words1.data(), words2.data(), n, out, expected.size() ), expected.size() );
+        }, "avx512" );
+    }
+#endif
+}
+
+TEST( KernelCoverage, BitsetIntersectionExtractionAcrossDensities ) {
+    std::mt19937_64 rng{ 0xE57AC7 };
+    for ( bool const clustered : { false, true } ) {
+        for ( unsigned bits{ 1 }; bits <= 64; ++bits ) {
+            SCOPED_TRACE( ::testing::Message() << ( clustered ? "clustered" : "spread" ) << " bits/word " << bits );
+            auto const w{ make_word_pair( bits, clustered, rng ) };
+            expect_intersection_extracted( w.a, w.b, 1024 );
+        }
+    }
+}
+
+// Words of arbitrary density, empty stretches and full words mixed in the same block, and partial lengths.
+TEST( KernelCoverage, BitsetIntersectionExtractionMixedWords ) {
+    std::mt19937_64 rng{ 0x31D };
+    for ( int trial{ 0 }; trial < 600; ++trial ) {
+        std::array<std::uint64_t, 1024> a{}, b{};
+        auto const thinning{ static_cast<unsigned>( rng() % 7 ) };   // how many times b's words are thinned out
+        for ( std::size_t i{ 0 }; i < 1024; ++i ) {
+            switch ( rng() % 6 ) {
+                case 0: break;
+                case 1: a[ i ] = b[ i ] = ~std::uint64_t{ 0 }; break;
+                default:
+                    a[ i ] = rng() | rng();
+                    b[ i ] = rng();
+                    for ( unsigned k{ 0 }; k < thinning; ++k ) { b[ i ] &= rng(); }
+                    break;
+            }
+        }
+        for ( std::size_t const n : { std::size_t{ 1024 }, std::size_t{ 1023 }, std::size_t{ 1021 }, std::size_t{ 37 }, std::size_t{ 4 }, std::size_t{ 3 }, std::size_t{ 1 } } ) {
+            SCOPED_TRACE( ::testing::Message() << "trial " << trial << " thinning " << thinning << " n " << n );
+            expect_intersection_extracted( a, b, n );
         }
     }
 }
@@ -420,6 +572,54 @@ TEST( KernelCoverage, ArrayInplaceUnionWithSpareCapacity ) {
 }
 
 // ---------------------------------------------------------------------------
+// Array | array across the array limit: operand totals on both sides of it, and unions that land on
+// either side of it whatever the total (shared values pull a large total back under it).
+// ---------------------------------------------------------------------------
+
+template <typename Bitmap>
+void array_union_across_limit_case() {
+    std::mt19937_64 rng{ 0x11117 };
+    constexpr std::size_t sizes[]{ 1, 100, 1000, 2000, 2047, 2048, 2049, 3000, 4000, 4095 };
+    constexpr std::uint32_t base{ 7U << 16 };
+    for ( auto const la : sizes ) {
+        for ( auto const lb : sizes ) {
+            for ( unsigned const overlap_percent : { 0U, 25U, 50U, 100U } ) {
+                SCOPED_TRACE( ::testing::Message() << "la " << la << " lb " << lb << " overlap " << overlap_percent << '%' );
+                auto const lows_a{ make_pattern( pattern::random, la, rng ) };
+                auto const shared_count{ std::min( lb * overlap_percent / 100U, la ) };
+                std::vector<std::uint16_t> lows_b;
+                {
+                    auto pool{ lows_a };
+                    std::ranges::shuffle( pool, rng );
+                    lows_b.assign( pool.begin(), pool.begin() + static_cast<std::ptrdiff_t>( shared_count ) );
+                    auto const rest{ random_outside( lb - shared_count, lows_a, rng ) };
+                    lows_b.insert( lows_b.end(), rest.begin(), rest.end() );
+                    std::ranges::sort( lows_b );
+                }
+                auto const va{ in_chunk( lows_a, base ) };
+                auto const vb{ in_chunk( lows_b, base ) };
+                auto const expected{ set_union_of( va, vb ) };
+                auto const a{ build_with_layout<Bitmap>( va, layout::bulk, rng ) };
+                auto const b{ build_with_layout<Bitmap>( vb, layout::bulk, rng ) };
+
+                auto const united{ a | b };
+                ASSERT_TRUE( matches( united, expected ) ) << "operator|";
+                // The result's bounds are what a later operation prunes by.
+                EXPECT_TRUE( united.contains( expected.front() ) );
+                EXPECT_TRUE( united.contains( expected.back() ) );
+                EXPECT_EQ( united.front(), expected.front() );
+                EXPECT_EQ( united.back(), expected.back() );
+                EXPECT_TRUE( matches( united & a, va ) ) << "union & first operand";
+                EXPECT_TRUE( matches( united - b, set_difference_of( expected, vb ) ) ) << "union - second operand";
+            }
+        }
+    }
+}
+
+TEST( KernelCoverage, ArrayUnionAcrossArrayLimit32 )    { array_union_across_limit_case<Bitmap32>(); }
+TEST( KernelCoverage, ArrayUnionAcrossArrayLimitCow32 ) { array_union_across_limit_case<CowBitmap32>(); }
+
+// ---------------------------------------------------------------------------
 // Run counting over sorted values, with and without the early-exit cap.
 // ---------------------------------------------------------------------------
 
@@ -590,6 +790,44 @@ void flip_sparse_case() {
 
 TEST( KernelCoverage, FlipSparseArray32 ) { flip_sparse_case<Bitmap32>(); }
 TEST( KernelCoverage, FlipSparseArray64 ) { flip_sparse_case<Bitmap64>(); }
+
+// Every container form in, every boundary range: absent / array / bitset / run
+// chunks flipped in place, then flipped back. The oracle is a membership map over
+// the five chunks the ranges can touch.
+template <typename Bitmap>
+void flip_forms_case() {
+    using key_type = typename Bitmap::key_type;
+    std::mt19937_64 rng{ 0xF1195 };
+    constexpr key_type base{ key_type{ 3 } << 16 };
+    constexpr key_type window_begin{ base - 65'536 };
+    auto const ranges{ flip_ranges<key_type>( base ) };
+    for ( auto const & source : flip_sources( rng ) ) {
+        auto const values{ in_chunk<key_type>( source.lows, base ) };
+        for ( bool const run_optimized : { false, true } ) {
+            for ( auto const & [first, last] : ranges ) {
+                SCOPED_TRACE( ::testing::Message() << source.name << " range " << first - base << ".." << last - base << " run_optimized " << run_optimized );
+                std::vector<bool> member( 5 * 65'536 );
+                for ( auto const v : values ) { member[ v - window_begin ] = true; }
+                for ( auto v{ first }; v <= last; ++v ) { member[ v - window_begin ] = !member[ v - window_begin ]; }
+                std::vector<key_type> expected;
+                for ( std::size_t i{ 0 }; i < member.size(); ++i ) {
+                    if ( member[ i ] ) { expected.push_back( static_cast<key_type>( window_begin + i ) ); }
+                }
+                Bitmap bm;
+                bm.add_many( values );
+                if ( run_optimized ) { bm.optimize(); }
+                bm.flip_closed_range( first, last );
+                ASSERT_TRUE( matches( bm, expected ) );
+                bm.flip_closed_range( first, last );
+                ASSERT_TRUE( matches( bm, values ) ) << "the second flip must restore the input";
+            }
+        }
+    }
+}
+
+TEST( KernelCoverage, FlipAcrossForms32 ) { flip_forms_case<Bitmap32>(); }
+TEST( KernelCoverage, FlipAcrossForms64 ) { flip_forms_case<Bitmap64>(); }
+TEST( KernelCoverage, FlipAcrossFormsLazyRuns ) { flip_forms_case<LazyCowBitmap32>(); }
 
 // A 64-bit bitmap whose high key bytes are spread widely (so the chunk index has
 // every fan-out), shrunk after most of its chunks were removed.
