@@ -711,6 +711,23 @@ public:
             }
         }
         ensure_sorted();
+        if constexpr ( kUseThreadChunkHint ) {
+            static thread_local size_type hint{};
+            auto const keys{ chunks_.keys() };
+            auto const count{ keys.size() };
+            // p is the lower bound of `chunk` iff it sits between the keys around it
+            auto const is_lower_bound{ [&]( size_type const p ) noexcept {
+                return ( p == count || keys[ p ] >= chunk ) && ( p == 0 || keys[ p - 1 ] < chunk );
+            } };
+            size_type pos{ hint };
+            if ( pos > count || !is_lower_bound( pos ) ) {
+                ++pos;
+                if ( pos > count || !is_lower_bound( pos ) ) { pos = lower_bound( chunk ); }
+            }
+            hint = pos;
+            if ( pos == count || keys[ pos ] != chunk ) { return false; }
+            return detail::container_contains( chunks_.slot( pos ), layout_type::low_key( value ) );
+        }
         auto const pos{ lower_bound( chunk ) };
         if ( pos == chunks_.size() || chunks_.key( pos ) != chunk ) { return false; }
         note_hot_chunk( pos );
@@ -4590,6 +4607,18 @@ private:
     // store to a mutable member, hence no write-sharing between threads that
     // hold the same bitmap by const reference.
     static constexpr bool kUseHotChunkIndex   = false; // novel: implicit last-chunk cache in contains()
+    // Novel, opt-in: the same guess kept per thread instead of in the bitmap. A
+    // lookup tries the chunk position the calling thread resolved last (and its
+    // successor, for ascending probes) and only searches when the guess does not
+    // verify against the keys, so the guess can be stale or belong to another
+    // bitmap and the answer is still exact. Nothing is stored to the bitmap, so
+    // concurrent readers stay safe; it trades a thread-local access on every
+    // lookup for skipping the search on sequential access.
+#ifdef FRSR_ROARING_THREAD_CHUNK_HINT
+    static constexpr bool kUseThreadChunkHint = true;
+#else
+    static constexpr bool kUseThreadChunkHint = false;
+#endif
     // Novel: when remove() empties the front-most chunk, mark it instead of
     // erasing, and batch the erase (avoids O(n^2) memmove on monotonic
     // front-removal). CRoaring erases immediately (ra_remove_at_index). The

@@ -1143,4 +1143,48 @@ TEST(FrsrRoaringSmoke, AddManySortedIntoASharedPayloadLeavesTheCopyAlone) {
     EXPECT_EQ( copy    .size(), values  .size() );
 }
 
+TEST(FrsrRoaringSmoke, ContainsMatchesTheModelForInterleavedBitmapsAndProbeOrders) {
+    // Two bitmaps of different sizes probed in one thread, in ascending, descending,
+    // random and alternating order, with hits, chunk misses (below, between and
+    // above the stored chunks) and container misses: whatever state a lookup keeps
+    // between calls must not change an answer.
+    using wide = frsr::roaring::bitmap<std::uint64_t>;
+    std::mt19937_64 rng{ 17 };
+    std::set<std::uint64_t> model_a, model_b;
+    wide a, b;
+    for ( int i{ 0 }; i != 3000; ++i ) {
+        auto const value{ ( ( rng() % 4000U ) << 16 ) | ( rng() & 0xFFFFU ) };
+        model_a.insert( value ); a.add( value );
+    }
+    for ( int i{ 0 }; i != 40; ++i ) {
+        auto const value{ ( ( rng() % 4000U ) << 16 ) | ( rng() & 0xFFFFU ) };
+        model_b.insert( value ); b.add( value );
+    }
+    std::vector<std::uint64_t> probes;
+    for ( auto const value : model_a ) { probes.push_back( value ); probes.push_back( value + 1 ); probes.push_back( value ^ ( 1ULL << 16 ) ); }
+    for ( auto const value : model_b ) { probes.push_back( value ); probes.push_back( value - 1 ); }
+    probes.push_back( 0 ); probes.push_back( ~std::uint64_t{ 0 } ); probes.push_back( 4000ULL << 16 );
+
+    auto const check = [&]( std::vector<std::uint64_t> const & order ) {
+        for ( auto const value : order ) {
+            EXPECT_EQ( a.contains( value ), model_a.contains( value ) ) << value;
+            EXPECT_EQ( b.contains( value ), model_b.contains( value ) ) << value;
+        }
+    };
+    std::ranges::sort( probes );
+    check( probes );                                   // ascending
+    std::vector<std::uint64_t> descending{ probes.rbegin(), probes.rend() };
+    check( descending );
+    std::ranges::shuffle( probes, rng );
+    check( probes );                                   // random
+    for ( auto const value : probes ) {                // alternating between the two bitmaps
+        EXPECT_EQ( a.contains( value ), model_a.contains( value ) ) << value;
+        EXPECT_EQ( b.contains( value ), model_b.contains( value ) ) << value;
+        EXPECT_EQ( b.contains( value ^ 0xFFFF0000ULL ), model_b.contains( value ^ 0xFFFF0000ULL ) ) << value;
+    }
+    wide const empty;
+    EXPECT_FALSE( empty.contains( 0 ) );
+    EXPECT_FALSE( empty.contains( ~std::uint64_t{ 0 } ) );
+}
+
 } // namespace
