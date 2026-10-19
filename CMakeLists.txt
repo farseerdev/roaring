@@ -237,6 +237,9 @@ if(FRSR_ROARING_BUILD_TESTS)
         tests/borrowed_bitmap.cpp
         tests/cow_semantics.cpp
         tests/cow_bitmap.cpp
+        tests/kernel_coverage.cpp
+        tests/contains_states.cpp
+        tests/bitmap_const_concurrency.cpp
     )
     target_link_libraries(frsr_roaring_tests
         PRIVATE
@@ -256,6 +259,7 @@ if(FRSR_ROARING_BUILD_TESTS)
         add_executable(frsr_roaring_croaring_crosscheck
             tests/bitmap_crosscheck.cpp
             tests/bitmap_full_crosscheck.cpp
+            tests/kernel_crosscheck.cpp
         )
         target_link_libraries(frsr_roaring_croaring_crosscheck
             PRIVATE
