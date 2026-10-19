@@ -244,6 +244,9 @@ typename bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy>::frozen_view b
         if ( !first_chunk && entry.chunk <= previous_chunk ) {
             return {};
         }
+        if ( entry.chunk > std::numeric_limits<chunk_type>::max() ) {
+            return {};  // narrowed to the chunk key type it would alias another chunk
+        }
         first_chunk = false;
         previous_chunk = entry.chunk;
 
