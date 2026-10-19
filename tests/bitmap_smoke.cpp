@@ -46,6 +46,40 @@ TEST(FrsrRoaringSmoke, BulkContextAcceleratesSequentialChunkReuse) {
     EXPECT_FALSE( bitmap.contains_bulk( ctx, 65'539U ) );
 }
 
+// One context is carried across every kind of change to the chunk table: chunks appear before and
+// after the cached one, the cached chunk empties and is erased, and a lookup in between lands on
+// other chunks. Every answer is compared with a model.
+template <typename Bitmap>
+void bulk_context_survives_chunk_table_changes() {
+    using key_type = typename Bitmap::key_type;
+    constexpr key_type chunk_span{ key_type{ 1 } << 16 };
+    std::mt19937_64 rng{ 77 };
+    Bitmap bitmap;
+    std::set<key_type> model;
+    typename Bitmap::bulk_context ctx;
+    auto const pick{ [&] {
+        // few chunks with few values each, so that chunks are created and emptied constantly
+        return static_cast<key_type>( ( rng() % 96 ) * chunk_span + rng() % 6 );
+    } };
+    for ( int step{ 0 }; step < 60'000; ++step ) {
+        auto const value{ pick() };
+        switch ( rng() % 5 ) {
+            case 0: EXPECT_EQ( bitmap.add_bulk( ctx, value ), model.insert( value ).second ) << step; break;
+            case 1: EXPECT_EQ( bitmap.add( value ), model.insert( value ).second ) << step; break;
+            case 2: EXPECT_EQ( bitmap.remove( value ), model.erase( value ) != 0 ) << step; break;
+            default: EXPECT_EQ( bitmap.contains_bulk( ctx, value ), model.contains( value ) ) << step; break;
+        }
+    }
+    EXPECT_EQ( bitmap.size(), model.size() );
+    EXPECT_STREQ( bitmap.validate() == nullptr ? "valid" : bitmap.validate(), "valid" );
+    EXPECT_TRUE( std::ranges::equal( bitmap.to_vector(), model ) );
+}
+
+TEST(FrsrRoaringSmoke, BulkContextSurvivesChunkTableChanges) {
+    bulk_context_survives_chunk_table_changes<TestBitmap>();
+    bulk_context_survives_chunk_table_changes<frsr::roaring::bitmap<std::uint64_t>>();
+}
+
 TEST(FrsrRoaringSmoke, SortedBulkMutationsAndPromotionHelpersWork) {
     TestBitmap bitmap;
     std::vector<std::uint32_t> values;

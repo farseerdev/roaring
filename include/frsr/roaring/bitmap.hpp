@@ -621,6 +621,7 @@ public:
             // inline lane, as the reference's is, before the kind dispatch.
             if ( ctx.payload_private && slot.holds_array() ) [[likely]] {
                 if ( detail::as_array_already_private( slot ).try_append( low ) ) [[likely]] {
+                    ++size_;
                     promote_if_needed( slot );
                     return true;
                 }
