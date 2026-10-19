@@ -72,9 +72,8 @@ public:
     // The final entry. The table must not be empty.
     [[nodiscard]] cursor last () const noexcept { assert( live_.size_ != 0 ); return cursor{ live_.size_ - 1 }; }
 
-    [[nodiscard]] static cursor next( cursor const at ) noexcept { return cursor{ at.index_ + 1 }; }
-    // The entry before `at`, which must not be begin().
-    [[nodiscard]] static cursor prev( cursor const at ) noexcept { assert( at.index_ != 0 ); return cursor{ at.index_ - 1 }; }
+    // The entry before `at` (end() included), which must not be begin().
+    [[nodiscard]] cursor prev( cursor const at ) const noexcept { assert( at.index_ != 0 ); return cursor{ at.index_ - 1 }; }
 
     // The entry at `at`, which must not be end().
     [[nodiscard]] chunk_type key( cursor const at ) const noexcept { assert( at.index_ < live_.size_ ); return live_.keys()[ at.index_ ]; }
@@ -271,34 +270,49 @@ public:
         }
     }
 
-    // move_entry / truncate twins for the in-place combine walk: the payloads
-    // they would free are retired instead.
-    void move_entry_retiring( cursor const to, cursor const from ) {
-        if ( to != from ) {
-            live_.keys()[ to.index_ ] = live_.keys()[ from.index_ ];
-            retire( std::move( live_.slots()[ to.index_ ] ) );
-            live_.slots()[ to.index_ ] = std::move( live_.slots()[ from.index_ ] );
-            ++generation_;
-        }
-    }
+    // The in-place rewrite of the table by the walk that is consuming it (the shrinking set
+    // operations, &= and -=): the walk visits the entries in key order and, for each, either
+    // keeps it (put back as it is, or as the walk modified it in place) or replaces it; every
+    // entry it does not mention is dropped. The payloads that would be freed are retired for
+    // take_retired() instead. The rewritten entries are always behind the walk, so no entry is
+    // overwritten before it has been read. finish() ends the rewrite and must be called once.
+    class rewriter {
+    public:
+        explicit rewriter( chunk_store & store ) noexcept : store_{ &store }, write_{ store.begin() } {}
 
-    // The entry at `at`, already consumed by the walk, becomes (key, container); its old payload is retired.
-    void replace_entry( cursor const at, chunk_type const key, handle_type && container ) {
-        live_.keys()[ at.index_ ] = key;
-        retire( std::move( live_.slots()[ at.index_ ] ) );
-        live_.slots()[ at.index_ ] = std::move( container );
-    }
+        // The entry at `from`, which the walk has finished with, is kept.
+        void keep( cursor const from ) {
+            if ( write_ != from ) {
+                store_->live_.keys()[ write_.index_ ] = store_->live_.keys()[ from.index_ ];
+                store_->retire( std::move( store_->live_.slots()[ write_.index_ ] ) );
+                store_->live_.slots()[ write_.index_ ] = std::move( store_->live_.slots()[ from.index_ ] );
+                ++store_->generation_;
+            }
+            ++write_;
+        }
 
-    // Drops every entry from `first_dead` on.
-    void truncate_retiring( cursor const first_dead ) {
-        for ( auto i{ first_dead.index_ }; i < live_.size_; ++i ) {
-            retire( std::move( live_.slots()[ i ] ) );
+        // The walk's current entry is replaced by (key, container).
+        void put( chunk_type const key, handle_type && container ) {
+            store_->live_.keys()[ write_.index_ ] = key;
+            store_->retire( std::move( store_->live_.slots()[ write_.index_ ] ) );
+            store_->live_.slots()[ write_.index_ ] = std::move( container );
+            ++write_;
         }
-        if ( first_dead.index_ != live_.size_ ) {
-            live_.erase( first_dead.index_, live_.size_ );
-            ++generation_;
+
+        void finish() {
+            for ( auto i{ write_.index_ }; i < store_->live_.size_; ++i ) {
+                store_->retire( std::move( store_->live_.slots()[ i ] ) );
+            }
+            if ( write_.index_ != store_->live_.size_ ) {
+                store_->live_.erase( write_.index_, store_->live_.size_ );
+                ++store_->generation_;
+            }
         }
-    }
+
+    private:
+        chunk_store * store_;
+        cursor        write_;
+    };
 
     void swap( chunk_store & other ) noexcept {
         live_   .swap( other.live_    );

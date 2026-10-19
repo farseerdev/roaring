@@ -362,7 +362,7 @@ public:
         }
 
         void seek_first() noexcept {
-            for ( chunk_ = owner_->chunks_.begin(); chunk_ != owner_->chunks_.end(); chunk_ = chunk_store_type::next( chunk_ ) ) {
+            for ( chunk_ = owner_->chunks_.begin(); chunk_ != owner_->chunks_.end(); ++chunk_ ) {
                 if ( auto const low{ detail::container_first( owner_->chunks_.slot( chunk_ ) ) } ) {
                     current_low_ = low;
                     current_value_ = layout_type::compose( owner_->chunks_.key( chunk_ ), *low );
@@ -383,7 +383,7 @@ public:
                 return;
             }
 
-            for ( chunk_ = chunk_store_type::next( chunk_ ); chunk_ != owner_->chunks_.end(); chunk_ = chunk_store_type::next( chunk_ ) ) {
+            for ( ++chunk_; chunk_ != owner_->chunks_.end(); ++chunk_ ) {
                 if ( auto const low{ detail::container_first( owner_->chunks_.slot( chunk_ ) ) } ) {
                     current_low_ = low;
                     current_value_ = layout_type::compose( owner_->chunks_.key( chunk_ ), *low );
@@ -477,7 +477,7 @@ public:
     [[nodiscard]] char const * validate( bool const canonical_kinds = false ) const noexcept {
         size_type total{ 0 };
         chunk_type previous{};
-        for ( auto at{ chunks_.begin() }; at != chunks_.end(); at = chunk_store_type::next( at ) ) {
+        for ( auto at{ chunks_.begin() }; at != chunks_.end(); ++at ) {
             auto const key{ chunks_.key( at ) };
             if ( at != chunks_.begin() && !( previous < key ) ) {
                 return "chunk keys are not strictly ascending";
@@ -544,7 +544,7 @@ public:
     [[nodiscard]] key_type back() const noexcept {
         auto at{ chunks_.end() };
         while ( at != chunks_.begin() ) {
-            at = chunk_store_type::prev( at );
+            at = chunks_.prev( at );
             auto const & container{ chunks_.slot( at ) };
             auto next{ detail::container_first( container ) };
             if ( !next ) {
@@ -675,15 +675,15 @@ public:
             auto const left_key { chunks_.key( left ) };
             auto const right_key{ other.chunks_.key( right ) };
             if ( left_key < right_key ) {
-                left = chunk_store_type::next( left );
+                ++left;
             } else if ( right_key < left_key ) {
-                right = chunk_store_type::next( right );
+                ++right;
             } else {
                 if ( detail::container_intersects( chunks_.slot( left ), other.chunks_.slot( right ) ) ) {
                     return true;
                 }
-                left  = chunk_store_type::next( left );
-                right = chunk_store_type::next( right );
+                ++left;
+                ++right;
             }
         }
         return false;
@@ -890,7 +890,7 @@ public:
     void for_each( F && f ) const {
         // Values come out in order, so the chunks must be in order first: a wide
         // chunk key defers the sort until a path needs it, and this is such a path.
-        for ( auto at{ chunks_.begin() }; at != chunks_.end(); at = chunk_store_type::next( at ) ) {
+        for ( auto at{ chunks_.begin() }; at != chunks_.end(); ++at ) {
             auto const chunk_key{ chunks_.key( at ) };
             detail::container_for_each( chunks_.slot( at ), [&]( low_type const low ) {
                 f( layout_type::compose( chunk_key, low ) );
@@ -910,7 +910,7 @@ public:
         assert( out.size() >= size_ );
         auto * out_cursor{ out.data() };
         auto * const end{ out.data() + out.size() };
-        for ( auto at{ chunks_.begin() }; at != chunks_.end(); at = chunk_store_type::next( at ) ) {
+        for ( auto at{ chunks_.begin() }; at != chunks_.end(); ++at ) {
             out_cursor = detail::container_decode_into( chunks_.slot( at ), chunks_.key( at ), out_cursor, end );
         }
         return static_cast<std::size_t>( out_cursor - out.data() );
@@ -1523,7 +1523,7 @@ public:
 #endif
         assert( ( in_place || !keep_unmatched_left ) && "materializing subtract has no caller/arm" );
 
-        auto write{ chunks_.begin() };
+        typename chunk_store_type::rewriter rewrite{ chunks_ };
         auto left{ chunks_.begin() };
         auto right{ other.chunks_.begin() };
         if ( in_place ) { size_ = 0; }
@@ -1547,8 +1547,7 @@ public:
                 // Retire (not free) the consumed slot being overwritten: its
                 // payload becomes the next pair's / next call's result buffer
                 // via take_retired (scratch-reuse path).
-                chunks_.replace_entry( write, key, std::move( container ) );
-                ++write;
+                rewrite.put( key, std::move( container ) );
             } else {
                 result_chunks.push_back( key, std::move( container ) );
             }
@@ -1614,8 +1613,7 @@ public:
                     continue;
                 }
                 size_ += detail::container_size( chunks_.slot( left ) );
-                chunks_.move_entry_retiring( write, left );
-                ++write;
+                rewrite.keep( left );
                 ++left;
                 continue;
             }
@@ -1656,8 +1654,7 @@ public:
                     detail::intersect_array_array_inplace<layout_type>( left_container.as_array(), right_container.as_array() );
                     if ( auto const count{ detail::container_size( left_container ) }; count != 0 ) {
                         size_ += count;
-                        chunks_.move_entry_retiring( write, left );
-                        ++write;
+                        rewrite.keep( left );
                     }
                 } else if ( op == detail::set_operation::bit_and ) {
                     // Intersect directly into a fresh result array's storage: array∩array
@@ -1713,8 +1710,7 @@ public:
                     detail::combine_bitset_bitset_inplace<layout_type>( left_bitset, right_container.as_bitset(), op );
                     if ( left_bitset.size() != 0 ) {
                         size_ += left_bitset.size();
-                        chunks_.move_entry_retiring( write, left );
-                        ++write;
+                        rewrite.keep( left );
                     }
                 } else {
                     // Direct-init (not assignment into a pre-declared handle): the prvalue
@@ -1765,8 +1761,7 @@ public:
                         left_array.sync_header();
                     }
                     size_ += left_array.values.size();
-                    chunks_.move_entry_retiring( write, left );
-                    ++write;
+                    rewrite.keep( left );
                 }
                 ++left;
                 continue;
@@ -1784,8 +1779,7 @@ public:
                 if ( !left_array.values.empty() ) {
                     left_array.sync_header();
                     size_ += left_array.values.size();
-                    chunks_.move_entry_retiring( write, left );
-                    ++write;
+                    rewrite.keep( left );
                 }
                 ++left;
                 continue;
@@ -2034,8 +2028,7 @@ public:
                     detail::difference_bitset_array_inplace<layout_type>( left_bitset, right_container.as_array() );
                     if ( left_bitset.size() != 0 ) {
                         size_ += left_bitset.size();
-                        chunks_.move_entry_retiring( write, left );
-                        ++write;
+                        rewrite.keep( left );
                     }
                 }();
                 ++left;
@@ -2054,7 +2047,7 @@ public:
         }
 
         if ( in_place ) {
-            chunks_.truncate_retiring( write );
+            rewrite.finish();
         } else {
         }
         return *this;
@@ -2945,7 +2938,7 @@ private:
                 return true;
             }
         } else if ( chunk < current_key && at != chunks_.begin() ) {
-            auto const before{ chunk_store_type::prev( at ) };
+            auto const before{ chunks_.prev( at ) };
             if ( chunks_.key( before ) == chunk ) {
                 at = before;
                 return true;
