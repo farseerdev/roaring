@@ -1,6 +1,7 @@
 #include <frsr/roaring/bitmap.hpp>
 
 #include <algorithm>
+#include <bit>
 #include <chrono>
 #include <cinttypes>
 #include <cmath>
@@ -9,6 +10,7 @@
 #include <cstdlib>
 #include <functional>
 #include <limits>
+#include <memory>
 #include <numeric>
 #include <optional>
 #include <random>
@@ -7579,6 +7581,626 @@ static void register_benchmarks() {
 
 } // namespace chunk_probe
 
+#if FRSR_ROARING_HAS_CROARING
+
+// ========================================================================
+// Container-kernel bands and random-order contains() probes.
+//
+// Kernel bands: one body per operation, run through every frsr policy combination
+// and both CRoaring arms. Both sides get run-optimized operands (frsr through
+// optimize_keep_bitsets(), the CRoaring run_optimize() analog), and every
+// operation is reduced to a cardinality checksum so no result is dead code.
+//
+// Operations that mutate their left operand start each timed iteration from a copy
+// of it, on both sides, so the copy is part of the measured work for both; the
+// copy_only operation is the control that prices it (copy-on-write arms copy
+// shallowly, the others deeply).
+//
+// Random contains: the existing contains bands walk their keys in ascending order,
+// which an implicit last-chunk cache can win. These probe a precomputed random
+// permutation, so a cache of the previous chunk cannot help, at a chosen hit rate.
+// ========================================================================
+namespace kernel_bands {
+
+using values32 = std::vector<std::uint32_t>;
+using values64 = std::vector<std::uint64_t>;
+using shared_values32 = std::shared_ptr<values32 const>;
+
+// `n` distinct sorted values of one 2^16 chunk.
+static std::vector<std::uint16_t> random_lows( std::mt19937_64 & rng, std::size_t const n ) {
+    std::vector<bool> taken( 65536 );
+    std::vector<std::uint16_t> lows;
+    lows.reserve( n );
+    while ( lows.size() < n ) {
+        auto const v{ static_cast<std::uint16_t>( rng() ) };
+        if ( !taken[ v ] ) { taken[ v ] = true; lows.push_back( v ); }
+    }
+    std::ranges::sort( lows );
+    return lows;
+}
+
+// Sorted values of `chunks` consecutive chunks starting at `first_chunk`, each holding `per_chunk` random values.
+static values32 make_array_chunks( std::mt19937_64 & rng, std::uint32_t const first_chunk, std::size_t const chunks, std::size_t const per_chunk ) {
+    values32 values;
+    for ( std::size_t c = 0; c < chunks; ++c ) {
+        auto const base{ ( first_chunk + static_cast<std::uint32_t>( c ) ) << 16 };
+        for ( auto const low : random_lows( rng, per_chunk ) ) { values.push_back( base + low ); }
+    }
+    return values;
+}
+
+enum class bop : std::uint8_t {
+    and_op, or_op, andnot_op,
+    or_inplace,          // copy of a, then a |= b
+    or_inplace_spare,    // copy of a, one extra value added (the array grows past its size), then a |= b
+    or_inplace_repeat,   // a |= b on the same a every run: b is already contained after the first, no copy
+    flip,                // copy of a, then flip_closed_range
+    copy_only,           // the control for the copying operations
+    to_array,            // every value of a decoded into a reused buffer
+};
+
+struct band {
+    std::string op_name;
+    std::string shape;
+    bop op;
+    shared_values32 a, b;
+    std::uint32_t range_first{}, range_last{};   // flip
+    std::uint32_t spare_value{};                 // or_inplace_spare
+    std::int64_t ops_per_run{ 1 };
+    std::size_t repeat{ 1 };                     // operations per timed run
+    int inner_reps{ 20 };
+    std::string description;
+};
+
+[[nodiscard]] static std::string band_name( char const * const label, band const & d ) {
+    return "kernel/" + std::string( label ) + d.op_name + "/" + d.shape;
+}
+
+template <class Arm>
+struct frsr_band_registrar {
+    using Bitmap = typename Arm::bitmap;
+    struct state {
+        Bitmap a, b;
+        std::vector<std::uint32_t> out;
+    };
+
+    static void run( band const & d ) {
+        Entry e;
+        e.name        = band_name( Arm::label(), d );
+        e.description = "frsr::roaring::bitmap<uint32_t>: " + d.description;
+        e.setup       = [d]() -> void * {
+            auto * const s = new state;
+            s->a.add_many( *d.a );
+            if ( d.b ) { s->b.add_many( *d.b ); }
+            s->a.optimize_keep_bitsets();
+            s->b.optimize_keep_bitsets();
+            s->out.resize( d.a->size() );
+            return s;
+        };
+        e.run = [d]( void * sv ) -> int64_t {
+            auto * const s = static_cast<state *>( sv );
+            std::int64_t checksum = 0;
+            for ( std::size_t i = 0; i < d.repeat; ++i ) {
+                switch ( d.op ) {
+                    case bop::and_op:    { Bitmap const r{ s->a & s->b }; checksum += static_cast<std::int64_t>( r.size() ); break; }
+                    case bop::or_op:     { Bitmap const r{ s->a | s->b }; checksum += static_cast<std::int64_t>( r.size() ); break; }
+                    case bop::andnot_op: { Bitmap const r{ s->a - s->b }; checksum += static_cast<std::int64_t>( r.size() ); break; }
+                    case bop::or_inplace:        { Bitmap t{ s->a }; t |= s->b; checksum += static_cast<std::int64_t>( t.size() ); break; }
+                    case bop::or_inplace_spare:  { Bitmap t{ s->a }; std::ignore = t.add( d.spare_value ); t |= s->b; checksum += static_cast<std::int64_t>( t.size() ); break; }
+                    case bop::or_inplace_repeat: { s->a |= s->b; checksum += static_cast<std::int64_t>( s->a.size() ); break; }
+                    case bop::flip:      { Bitmap t{ s->a }; t.flip_closed_range( d.range_first, d.range_last ); checksum += static_cast<std::int64_t>( t.size() ); break; }
+                    case bop::copy_only: { Bitmap const t{ s->a }; checksum += static_cast<std::int64_t>( t.size() ); break; }
+                    case bop::to_array:  { checksum += static_cast<std::int64_t>( s->a.to_array_into( s->out ) ); break; }
+                }
+            }
+            return checksum;
+        };
+        e.teardown       = []( void * sv ) { delete static_cast<state *>( sv ); };
+        e.ops_per_run    = d.ops_per_run;
+        e.inner_reps     = d.inner_reps;
+        e.reusable_state = true;
+        g_benchmarks.push_back( std::move( e ) );
+    }
+};
+
+struct croaring_handle {
+    roaring_bitmap_t * r{};
+    croaring_handle() = default;
+    explicit croaring_handle( roaring_bitmap_t * raw ) noexcept : r{ raw } {}
+    croaring_handle( croaring_handle const & ) = delete;
+    croaring_handle & operator=( croaring_handle const & ) = delete;
+    ~croaring_handle() { if ( r != nullptr ) { roaring_bitmap_free( r ); } }
+};
+
+template <class Arm>
+struct cpp_band_registrar {
+    struct state {
+        croaring_handle a, b;
+        std::vector<std::uint32_t> out;
+    };
+
+    static void run( band const & d ) {
+        Entry e;
+        e.name        = band_name( Arm::label(), d );
+        e.description = "CRoaring roaring_bitmap_t counterpart: " + d.description;
+        e.setup       = [d]() -> void * {
+            auto * const s = new state;
+            s->a.r = Arm::create();
+            s->b.r = Arm::create();
+            roaring_bitmap_add_many( s->a.r, d.a->size(), d.a->data() );
+            if ( d.b ) { roaring_bitmap_add_many( s->b.r, d.b->size(), d.b->data() ); }
+            roaring_bitmap_run_optimize( s->a.r );
+            roaring_bitmap_run_optimize( s->b.r );
+            s->out.resize( d.a->size() );
+            return s;
+        };
+        e.run = [d]( void * sv ) -> int64_t {
+            auto * const s = static_cast<state *>( sv );
+            std::int64_t checksum = 0;
+            for ( std::size_t i = 0; i < d.repeat; ++i ) {
+                switch ( d.op ) {
+                    case bop::and_op:    { croaring_handle const r{ roaring_bitmap_and( s->a.r, s->b.r ) };    checksum += static_cast<std::int64_t>( roaring_bitmap_get_cardinality( r.r ) ); break; }
+                    case bop::or_op:     { croaring_handle const r{ roaring_bitmap_or( s->a.r, s->b.r ) };     checksum += static_cast<std::int64_t>( roaring_bitmap_get_cardinality( r.r ) ); break; }
+                    case bop::andnot_op: { croaring_handle const r{ roaring_bitmap_andnot( s->a.r, s->b.r ) }; checksum += static_cast<std::int64_t>( roaring_bitmap_get_cardinality( r.r ) ); break; }
+                    case bop::or_inplace:        { croaring_handle const t{ Arm::copy( s->a.r ) }; roaring_bitmap_or_inplace( t.r, s->b.r ); checksum += static_cast<std::int64_t>( roaring_bitmap_get_cardinality( t.r ) ); break; }
+                    case bop::or_inplace_spare:  { croaring_handle const t{ Arm::copy( s->a.r ) }; roaring_bitmap_add( t.r, d.spare_value ); roaring_bitmap_or_inplace( t.r, s->b.r ); checksum += static_cast<std::int64_t>( roaring_bitmap_get_cardinality( t.r ) ); break; }
+                    case bop::or_inplace_repeat: { roaring_bitmap_or_inplace( s->a.r, s->b.r ); checksum += static_cast<std::int64_t>( roaring_bitmap_get_cardinality( s->a.r ) ); break; }
+                    case bop::flip:      { croaring_handle const t{ Arm::copy( s->a.r ) }; roaring_bitmap_flip_inplace_closed( t.r, d.range_first, d.range_last ); checksum += static_cast<std::int64_t>( roaring_bitmap_get_cardinality( t.r ) ); break; }
+                    case bop::copy_only: { croaring_handle const t{ Arm::copy( s->a.r ) }; checksum += static_cast<std::int64_t>( roaring_bitmap_get_cardinality( t.r ) ); break; }
+                    case bop::to_array:  { roaring_bitmap_to_uint32_array( s->a.r, s->out.data() ); checksum += static_cast<std::int64_t>( s->out.size() ); break; }
+                }
+            }
+            return checksum;
+        };
+        e.teardown       = []( void * sv ) { delete static_cast<state *>( sv ); };
+        e.ops_per_run    = d.ops_per_run;
+        e.inner_reps     = d.inner_reps;
+        e.reusable_state = true;
+        g_benchmarks.push_back( std::move( e ) );
+    }
+};
+
+static void register_band( band const & d ) {
+    arms::for_each_frsr<frsr_band_registrar>( d );
+    arms::for_each_croaring<cpp_band_registrar>( d );
+}
+
+[[nodiscard]] static shared_values32 share( values32 && v ) { return std::make_shared<values32 const>( std::move( v ) ); }
+
+// ---- B1: small array containers decoded into one reused buffer -------------------------------
+static void register_small_array_export() {
+    // 4096 containers of 1..16 values, sizes from a fixed LCG, values k*97+c.
+    constexpr std::size_t containers = 4096;
+    values32 values;
+    std::uint32_t seed = 12345;
+    for ( std::size_t c = 0; c < containers; ++c ) {
+        seed = seed * 1103515245u + 12345u;
+        auto const card = 1 + ( ( seed >> 16 ) % 16 );
+        for ( std::uint32_t k = 0; k < card; ++k ) { values.push_back( ( static_cast<std::uint32_t>( c ) << 16 ) + k * 97 + static_cast<std::uint32_t>( c % 1024 ) ); }
+    }
+    band d;
+    d.op_name = "ArrayExportSmall";
+    d.shape = "containers=4096";
+    d.op = bop::to_array;
+    d.a = share( std::move( values ) );
+    d.ops_per_run = static_cast<std::int64_t>( containers );
+    d.inner_reps = 20;
+    d.description = "4096 array containers of 1 to 16 values each decoded into one reused buffer; cost reported per container.";
+    register_band( d );
+}
+
+// ---- B2: bitset AND bitset whose result is (mostly) a sparse array ----------------------------
+// Appends the two operands of one chunk whose intersection holds `bits` bits per 64-bit word, either in whole
+// shared words (clustered) or spread over every word. Outside the shared bits the operands never overlap, and
+// each holds at least a quarter of the remaining bits, so both stay bitsets.
+static void bitset_pair_chunk( std::mt19937_64 & rng, unsigned const bits, bool const clustered, std::size_t const chunk, values32 & a, values32 & b ) {
+    auto const cluster_words = ( bits * 1024U + 32U ) / 64U;
+    auto const base = static_cast<std::uint32_t>( chunk ) << 16;
+    auto const append = [base]( values32 & out, std::size_t const word_index, std::uint64_t word ) {
+        for ( ; word != 0; word &= word - 1 ) { out.push_back( base + static_cast<std::uint32_t>( word_index * 64 + std::countr_zero( word ) ) ); }
+    };
+    for ( std::size_t i = 0; i < 1024; ++i ) {
+        std::uint64_t shared = 0;
+        if ( clustered ) {
+            shared = i < cluster_words ? ~std::uint64_t{ 0 } : 0;
+        } else {
+            while ( static_cast<unsigned>( std::popcount( shared ) ) < bits ) { shared |= std::uint64_t{ 1 } << ( rng() % 64 ); }
+        }
+        auto const split = rng();
+        append( a, i, shared | ( ~shared & split ) );
+        append( b, i, shared | ( ~shared & ~split & rng() ) );
+    }
+}
+
+static void register_bitset_and_to_array() {
+    constexpr std::size_t chunks = 8;
+    for ( bool const clustered : { false, true } ) {
+        for ( unsigned const bits : { 1U, 2U, 4U, 8U, 16U, 32U, 64U } ) {
+            std::mt19937_64 rng{ 0xB175E7 + bits };
+            values32 a, b;
+            for ( std::size_t c = 0; c < chunks; ++c ) { bitset_pair_chunk( rng, bits, clustered, c, a, b ); }
+            band d;
+            d.op_name = "BitsetAndBitset";
+            d.shape = std::string( clustered ? "clustered" : "spread" ) + "/bits_per_word=" + std::to_string( bits );
+            d.op = bop::and_op;
+            d.a = share( std::move( a ) );
+            d.b = share( std::move( b ) );
+            d.ops_per_run = static_cast<std::int64_t>( chunks );
+            d.inner_reps = 20;
+            d.description = "AND of two 8-chunk bitmaps whose containers are bitsets; the result holds " + std::to_string( bits ) +
+                " bits per 64-bit word, " + ( clustered ? "in whole shared words" : "spread over every word" ) + " (an array result for 1 to 4, a bitset above). Cost per chunk pair.";
+            register_band( d );
+        }
+    }
+}
+
+// ---- B3: flip of a sparse array ----------------------------------------------------------------
+static void register_sparse_flip() {
+    for ( std::size_t const card : { std::size_t{ 100 }, std::size_t{ 2046 }, std::size_t{ 4096 } } ) {
+        std::mt19937_64 rng{ 0xF11B + card };
+        auto const values = make_array_chunks( rng, 0, 1, card );
+        for ( bool const multi : { false, true } ) {
+            band d;
+            d.op_name = "FlipSparseArray";
+            d.shape = "card=" + std::to_string( card ) + ( multi ? "/range=three_chunks" : "/range=whole_chunk" );
+            d.op = bop::flip;
+            d.a = share( values32{ values } );
+            d.range_first = 0;
+            d.range_last = multi ? 3 * 65536 - 1 : 65535;
+            d.inner_reps = 20;
+            d.description = "flip_closed_range over " + std::string( multi ? "three chunks" : "the whole chunk" ) + " of a " + std::to_string( card ) +
+                "-value array chunk (the operation starts from a copy of the bitmap on both sides).";
+            register_band( d );
+        }
+    }
+}
+
+// ---- B4: a big bitmap |= a few keys ------------------------------------------------------------
+static void register_big_by_few_or_inplace() {
+    constexpr std::uint32_t target_chunks = 1000;
+    std::mt19937_64 rng{ 0xB16B };
+    values32 target;
+    for ( std::uint32_t i = 0; i < target_chunks; ++i ) {
+        auto const base = ( 10U + 2 * i ) << 16;
+        switch ( i % 4 ) {
+            case 0: for ( auto const low : random_lows( rng, 40 ) )   { target.push_back( base + low ); } break;
+            case 1: for ( auto const low : random_lows( rng, 5000 ) ) { target.push_back( base + low ); } break;
+            case 2: for ( std::uint32_t r = 0; r < 5; ++r ) { for ( std::uint32_t k = 0; k < 150; ++k ) { target.push_back( base + r * 5000 + k ); } } break;
+            default: for ( std::uint32_t k = 1000; k < 3000; ++k ) { target.push_back( base + k ); } break;
+        }
+    }
+    auto const shared_target = share( std::move( target ) );
+    {
+        band d;
+        d.op_name = "BigCopyControl";
+        d.shape = "target_chunks=1000";
+        d.op = bop::copy_only;
+        d.a = shared_target;
+        d.inner_reps = 20;
+        d.description = "copy of the 1000-chunk target alone: the cost the OrInplaceNewKeys bands include.";
+        register_band( d );
+    }
+    for ( std::size_t const keys : { std::size_t{ 1 }, std::size_t{ 4 }, std::size_t{ 16 }, std::size_t{ 32 } } ) {
+        for ( bool const existing : { false, true } ) {
+            values32 few;
+            for ( std::size_t k = 0; k < keys; ++k ) {
+                // new keys fall between the target's (odd), existing ones are its own (even).
+                auto const key = existing ? 10U + 2 * static_cast<std::uint32_t>( ( k * 31 ) % target_chunks ) : 11U + 2 * static_cast<std::uint32_t>( ( k * 31 ) % target_chunks );
+                for ( auto const low : random_lows( rng, 60 ) ) { few.push_back( ( key << 16 ) + low ); }
+            }
+            std::ranges::sort( few );
+            few.erase( std::unique( few.begin(), few.end() ), few.end() );
+            band d;
+            d.op = existing ? bop::or_inplace_repeat : bop::or_inplace;
+            d.op_name = existing ? "OrInplaceExistingKeys" : "OrInplaceNewKeys";
+            d.shape = "target_chunks=1000/keys=" + std::to_string( keys );
+            d.a = shared_target;
+            d.b = share( std::move( few ) );
+            d.inner_reps = 20;
+            d.description = existing
+                ? "a 1000-chunk bitmap |= " + std::to_string( keys ) + " keys it already holds, repeated on the same bitmap (nothing changes after the first run)."
+                : "a copy of a 1000-chunk bitmap |= " + std::to_string( keys ) + " keys between its own (subtract BigCopyControl for the union itself).";
+            register_band( d );
+        }
+    }
+}
+
+// ---- B5/B6: array with array ------------------------------------------------------------------
+// Two single-chunk arrays of `size` values with `overlap_percent` of b taken from a.
+static std::pair<values32, values32> array_pair( std::size_t const size, unsigned const overlap_percent, std::uint64_t const seed ) {
+    std::mt19937_64 rng{ seed };
+    auto const lows_a = random_lows( rng, size );
+    auto const shared = size * overlap_percent / 100;
+    std::vector<bool> taken( 65536 );
+    for ( auto const v : lows_a ) { taken[ v ] = true; }
+    auto shuffled = lows_a;
+    std::ranges::shuffle( shuffled, rng );
+    std::vector<std::uint16_t> lows_b( shuffled.begin(), shuffled.begin() + static_cast<std::ptrdiff_t>( shared ) );
+    while ( lows_b.size() < size ) {
+        auto const v = static_cast<std::uint16_t>( rng() );
+        if ( !taken[ v ] ) { taken[ v ] = true; lows_b.push_back( v ); }
+    }
+    std::ranges::sort( lows_b );
+    values32 a, b;
+    constexpr std::uint32_t base = 3U << 16;
+    for ( auto const v : lows_a ) { a.push_back( base + v ); }
+    for ( auto const v : lows_b ) { b.push_back( base + v ); }
+    return { std::move( a ), std::move( b ) };
+}
+
+static void register_array_array() {
+    for ( std::size_t const size : { std::size_t{ 16 }, std::size_t{ 256 }, std::size_t{ 2000 } } ) {
+        for ( unsigned const overlap : { 0U, 50U, 100U } ) {
+            auto [a, b] = array_pair( size, overlap, 0xA77A7 + size + overlap );
+            auto const sa = share( std::move( a ) );
+            auto const sb = share( std::move( b ) );
+            std::string const shape = "size=" + std::to_string( size ) + "/overlap=" + std::to_string( overlap );
+            for ( bool const spare : { false, true } ) {
+                band d;
+                d.op = spare ? bop::or_inplace_spare : bop::or_inplace;
+                d.op_name = spare ? "ArrayOrInplaceSpare" : "ArrayOrInplace";
+                d.shape = shape;
+                d.a = sa;
+                d.b = sb;
+                d.spare_value = ( 3U << 16 ) + 65535;
+                d.inner_reps = 50;
+                d.description = std::string( "a copy of a " ) + std::to_string( size ) + "-value array chunk" +
+                    ( spare ? ", grown by one extra value (so it holds spare capacity)," : "" ) + " |= another of the same size, " + std::to_string( overlap ) + "% shared.";
+                register_band( d );
+            }
+        }
+    }
+    // The out-of-place forms across sizes: the vectorized union and the scalar merges.
+    for ( std::size_t const size : { std::size_t{ 16 }, std::size_t{ 64 }, std::size_t{ 512 }, std::size_t{ 2048 }, std::size_t{ 4000 } } ) {
+        for ( unsigned const overlap : { 0U, 50U } ) {
+            auto [a, b] = array_pair( size, overlap, 0xBEEF + size + overlap );
+            auto const sa = share( std::move( a ) );
+            auto const sb = share( std::move( b ) );
+            for ( auto const [op, name] : { std::pair{ bop::or_op, "ArrayOr" }, std::pair{ bop::and_op, "ArrayAnd" }, std::pair{ bop::andnot_op, "ArrayAndNot" } } ) {
+                band d;
+                d.op = op;
+                d.op_name = name;
+                d.shape = "size=" + std::to_string( size ) + "/overlap=" + std::to_string( overlap );
+                d.a = sa;
+                d.b = sb;
+                d.inner_reps = 50;
+                d.description = std::string( "out-of-place " ) + name + " of two " + std::to_string( size ) + "-value array chunks, " + std::to_string( overlap ) + "% shared.";
+                register_band( d );
+            }
+        }
+    }
+}
+
+// ---- random-order contains --------------------------------------------------------------------------
+struct probe_set {
+    values64 stored;                  // sorted
+    unsigned hit_percent{};
+};
+
+// 65536 probes in random order: `hit_percent` of them stored values, the rest values that are not
+// (right after a stored one, in a different place of its chunk, or in the neighbouring chunk).
+[[nodiscard]] static values64 make_probes( probe_set const & s, std::uint64_t const seed ) {
+    std::mt19937_64 rng{ seed };
+    auto const & stored = s.stored;
+    // run_end[i]: index just past the run of consecutive stored values that contains stored[i], so the first
+    // absent value at or after a stored one is found in one step however long the run is.
+    std::vector<std::uint32_t> run_end( stored.size() );
+    for ( std::size_t i = stored.size(); i-- > 0; ) {
+        run_end[ i ] = ( i + 1 < stored.size() && stored[ i + 1 ] == stored[ i ] + 1 ) ? run_end[ i + 1 ] : static_cast<std::uint32_t>( i + 1 );
+    }
+    auto const absent_from = [&]( std::uint64_t const v ) {
+        auto const it = std::ranges::lower_bound( stored, v );
+        if ( it == stored.end() || *it != v ) { return v; }
+        return stored[ run_end[ static_cast<std::size_t>( it - stored.begin() ) ] - 1 ] + 1;
+    };
+    values64 probes;
+    probes.reserve( 65536 );
+    for ( std::size_t i = 0; i < 65536; ++i ) {
+        auto const x = stored[ rng() % stored.size() ];
+        if ( rng() % 100 < s.hit_percent ) {
+            probes.push_back( x );
+        } else {
+            switch ( i % 3 ) {
+                case 0:  probes.push_back( absent_from( x + 1 ) ); break;
+                case 1:  probes.push_back( absent_from( x + 32768 ) ); break;
+                default: probes.push_back( absent_from( x + 65536 ) ); break;
+            }
+        }
+    }
+    std::ranges::shuffle( probes, rng );
+    return probes;
+}
+
+template <class Arm>
+struct frsr_contains_lib {
+    using key = typename Arm::bitmap::key_type;
+    using bitmap = typename Arm::bitmap;
+    struct state { bitmap bm; };
+    static std::string label() { return Arm::label(); }
+    static void build( state & s, values64 const & values ) {
+        std::vector<key> converted( values.begin(), values.end() );
+        s.bm.add_many( converted );
+        s.bm.optimize_keep_bitsets();
+    }
+    static bool contains( state const & s, std::uint64_t const v ) { return s.bm.contains( static_cast<key>( v ) ); }
+};
+
+template <class Arm>
+struct croaring_contains_lib {
+    using key = std::uint32_t;
+    struct state { croaring_handle h; };
+    static std::string label() { return Arm::label(); }
+    static void build( state & s, values64 const & values ) {
+        std::vector<std::uint32_t> converted( values.begin(), values.end() );
+        s.h.r = Arm::create();
+        roaring_bitmap_add_many( s.h.r, converted.size(), converted.data() );
+        roaring_bitmap_run_optimize( s.h.r );
+    }
+    static bool contains( state const & s, std::uint64_t const v ) { return roaring_bitmap_contains( s.h.r, static_cast<std::uint32_t>( v ) ); }
+};
+
+struct cpp64_contains_lib {
+    struct state { Roaring64Map m; };
+    static std::string label() { return "cpp"; }
+    static void build( state & s, values64 const & values ) {
+        for ( auto const v : values ) { s.m.add( v ); }
+        s.m.runOptimize();
+    }
+    static bool contains( state const & s, std::uint64_t const v ) { return s.m.contains( v ); }
+};
+
+struct r64_contains_lib {
+    struct handle {
+        roaring64_bitmap_t * r = roaring64_bitmap_create();
+        handle() = default;
+        handle( handle const & ) = delete;
+        ~handle() { roaring64_bitmap_free( r ); }
+    };
+    using state = handle;
+    static std::string label() { return "r64"; }
+    static void build( state & s, values64 const & values ) {
+        for ( auto const v : values ) { roaring64_bitmap_add( s.r, v ); }
+        roaring64_bitmap_run_optimize( s.r );
+    }
+    static bool contains( state const & s, std::uint64_t const v ) { return roaring64_bitmap_contains( s.r, v ); }
+};
+
+constexpr std::size_t kContainsProbesPerRun = 1024;
+
+template <class Lib>
+struct contains_state {
+    typename Lib::state lib;
+    values64 probes;
+    std::size_t position = 0;
+};
+
+// `make_values` builds the sorted stored values when the entry is first set up.
+template <class Lib>
+static void register_random_contains( std::string const & shape, unsigned const hit_percent, std::function<values64()> make_values ) {
+    Entry e;
+    e.name        = "synthetic/" + Lib::label() + "ContainsRandom/" + shape + "/hit=" + std::to_string( hit_percent );
+    e.description = "contains() on probes taken in a random order from a precomputed permutation (a cache of the previous chunk cannot help), " +
+        std::to_string( hit_percent ) + "% of them stored values; cost per probe.";
+    e.setup = [make_values, hit_percent]() -> void * {
+        auto * const s = new contains_state<Lib>;
+        probe_set set;
+        set.stored = make_values();
+        set.hit_percent = hit_percent;
+        Lib::build( s->lib, set.stored );
+        s->probes = make_probes( set, 0x5eed + hit_percent );
+        return s;
+    };
+    e.run = []( void * sv ) -> int64_t {
+        auto * const s = static_cast<contains_state<Lib> *>( sv );
+        std::int64_t checksum = 0;
+        auto i = s->position;
+        for ( std::size_t k = 0; k < kContainsProbesPerRun; ++k ) {
+            checksum += Lib::contains( s->lib, s->probes[ i ] ) ? 1 : 0;
+            i = ( i + 1 ) & 65535;
+        }
+        s->position = i;
+        return checksum;
+    };
+    e.teardown       = []( void * sv ) { delete static_cast<contains_state<Lib> *>( sv ); };
+    e.ops_per_run    = static_cast<std::int64_t>( kContainsProbesPerRun );
+    e.inner_reps     = 20;
+    e.reusable_state = true;
+    g_benchmarks.push_back( std::move( e ) );
+}
+
+template <class Arm>
+struct frsr32_contains_registrar {
+    static void run( std::string const & shape, unsigned hit, std::function<values64()> const & make ) { register_random_contains<frsr_contains_lib<Arm>>( shape, hit, make ); }
+};
+template <class Arm>
+struct cpp32_contains_registrar {
+    static void run( std::string const & shape, unsigned hit, std::function<values64()> const & make ) { register_random_contains<croaring_contains_lib<Arm>>( shape, hit, make ); }
+};
+template <class Arm>
+struct frsr64_contains_registrar {
+    static void run( std::string const & shape, unsigned hit, std::function<values64()> const & make ) { register_random_contains<frsr_contains_lib<Arm>>( shape, hit, make ); }
+};
+
+static void register_random_contains_32( std::string const & shape, unsigned const hit, std::function<values64()> const & make ) {
+    arms::for_each_frsr<frsr32_contains_registrar>( shape, hit, make );
+    arms::for_each_croaring<cpp32_contains_registrar>( shape, hit, make );
+}
+
+static void register_random_contains_64( std::string const & shape, unsigned const hit, std::function<values64()> const & make ) {
+    arms::for_each_frsr64<frsr64_contains_registrar>( shape, hit, make );
+    register_random_contains<cpp64_contains_lib>( shape, hit, make );
+    register_random_contains<r64_contains_lib>( shape, hit, make );
+}
+
+// Which container kind the chunks of a stored set hold.
+enum class chunk_kind : std::uint8_t { arrays, bitsets, runs, mixed };
+
+[[nodiscard]] static char const * kind_name( chunk_kind const k ) {
+    switch ( k ) {
+        case chunk_kind::arrays:  return "array";
+        case chunk_kind::bitsets: return "bitset";
+        case chunk_kind::runs:    return "run";
+        case chunk_kind::mixed:   return "mixed";
+    }
+    return "?";
+}
+
+// `chunks` chunks whose keys are `chunk_stride` apart, in the given kind.
+[[nodiscard]] static values64 make_kind_values( chunk_kind const kind, std::size_t const chunks, std::uint64_t const chunk_stride ) {
+    std::mt19937_64 rng{ 0xC0DE + chunks };
+    values64 values;
+    for ( std::size_t c = 0; c < chunks; ++c ) {
+        auto const base = ( static_cast<std::uint64_t>( c ) * chunk_stride ) << 16;
+        auto const which = kind == chunk_kind::mixed ? static_cast<chunk_kind>( c % 3 ) : kind;
+        switch ( which ) {
+            case chunk_kind::arrays:  for ( auto const low : random_lows( rng, 64 ) )   { values.push_back( base + low ); } break;
+            case chunk_kind::bitsets: for ( auto const low : random_lows( rng, 5000 ) ) { values.push_back( base + low ); } break;
+            default: for ( std::uint32_t r = 0; r < 3; ++r ) { for ( std::uint32_t k = 0; k < 2000; ++k ) { values.push_back( base + r * 20000 + k ); } } break;
+        }
+    }
+    return values;
+}
+
+static void register_random_contains_bands() {
+    // count x step grid, like the ascending bands. 32-bit keys stop where count * step leaves the key space.
+    for ( auto const count : { std::size_t{ 1'000 }, std::size_t{ 100'000 }, std::size_t{ 1'000'000 } } ) {
+        for ( auto const step : { std::uint64_t{ 1 }, std::uint64_t{ 65'536 }, std::uint64_t{ 1 } << 32 } ) {
+            for ( unsigned const hit : { 100U, 50U, 0U } ) {
+                auto const make = [count, step]() { values64 v; v.reserve( count ); for ( std::size_t i = 0; i < count; ++i ) { v.push_back( i * step ); } return v; };
+                std::string const shape = "bits=64/count=" + std::to_string( count ) + "/step=" + std::to_string( step );
+                register_random_contains_64( shape, hit, make );
+                if ( count * step < ( std::uint64_t{ 1 } << 32 ) ) {
+                    register_random_contains_32( "bits=32/count=" + std::to_string( count ) + "/step=" + std::to_string( step ), hit, make );
+                }
+            }
+        }
+    }
+    // container kind x chunk count (below and above the 512-chunk index threshold), half of the probes hitting.
+    for ( auto const kind : { chunk_kind::arrays, chunk_kind::bitsets, chunk_kind::runs, chunk_kind::mixed } ) {
+        for ( auto const chunks : { std::size_t{ 128 }, std::size_t{ 2048 } } ) {
+            auto const make32 = [kind, chunks]() { return make_kind_values( kind, chunks, 1 ); };
+            register_random_contains_32( std::string( "bits=32/kind=" ) + kind_name( kind ) + "/chunks=" + std::to_string( chunks ) + "/stride=1", 50, make32 );
+            for ( auto const stride : { std::uint64_t{ 1 }, std::uint64_t{ 1 } << 16 } ) {
+                auto const make64 = [kind, chunks, stride]() { return make_kind_values( kind, chunks, stride ); };
+                register_random_contains_64( std::string( "bits=64/kind=" ) + kind_name( kind ) + "/chunks=" + std::to_string( chunks ) + "/stride=" + std::to_string( stride ), 50, make64 );
+            }
+        }
+    }
+}
+
+static void register_benchmarks() {
+    register_small_array_export();
+    register_bitset_and_to_array();
+    register_sparse_flip();
+    register_big_by_few_or_inplace();
+    register_array_array();
+    register_random_contains_bands();
+}
+
+} // namespace kernel_bands
+
+#endif // FRSR_ROARING_HAS_CROARING
+
 } // namespace
 
 int main(int argc, char *argv[]) {
@@ -7591,6 +8213,7 @@ int main(int argc, char *argv[]) {
     density_contains::register_benchmarks();
     set_ops::register_benchmarks();
     chunk_probe::register_benchmarks();
+    kernel_bands::register_benchmarks();
 #endif
 
     std::string filter;
