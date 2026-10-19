@@ -14,7 +14,10 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <initializer_list>
 #include <random>
+#include <string>
+#include <utility>
 #include <span>
 #include <vector>
 
@@ -205,6 +208,76 @@ template <typename Bitmap>
         }
     }
     return bm;
+}
+
+// ---------------------------------------------------------------------------
+// Range-flip inputs: one chunk in every container form and at the cardinalities
+// where the form decisions flip, and closed ranges whose ends sit on the same
+// boundaries (inside one chunk, ending at a chunk's last value, spilling into
+// the next chunks).
+// ---------------------------------------------------------------------------
+
+struct flip_source {
+    std::string name;
+    std::vector<std::uint16_t> lows;
+};
+
+[[nodiscard]] inline std::vector<std::uint16_t> values_of_spans( std::initializer_list<std::pair<std::uint32_t, std::uint32_t>> const spans ) {
+    std::vector<std::uint16_t> values;
+    for ( auto const [first, last] : spans ) {
+        for ( auto v{ first }; v <= last; ++v ) { values.push_back( static_cast<std::uint16_t>( v ) ); }
+    }
+    return values;
+}
+
+[[nodiscard]] inline std::vector<flip_source> flip_sources( std::mt19937_64 & rng ) {
+    std::vector<flip_source> sources;
+    sources.push_back( { "absent", {} } );
+    for ( std::size_t const n : { 1, 2, 3, 100, 2045, 2046, 2047, 2048, 4095, 4096 } ) {
+        sources.push_back( { "array/" + std::to_string( n ), make_pattern( pattern::random, n, rng ) } );
+    }
+    for ( auto const pat : { pattern::one_run, pattern::every_third } ) {
+        sources.push_back( { std::string{ "structured/" } + name_of( pat ), make_pattern( pat, 3000, rng ) } );
+    }
+    for ( std::size_t const n : { 4097, 10'000, 32'768, 60'000, 65'535, 65'536 } ) {
+        std::vector<std::uint16_t> all( chunk_span );  // n distinct values by a partial shuffle
+        for ( std::size_t i{ 0 }; i < chunk_span; ++i ) { all[ i ] = static_cast<std::uint16_t>( i ); }
+        std::ranges::shuffle( all, rng );
+        all.resize( n );
+        std::ranges::sort( all );
+        sources.push_back( { "bitset/" + std::to_string( n ), std::move( all ) } );
+    }
+    sources.push_back( { "runs/one-wide", values_of_spans( { { 100, 65'000 } } ) } );
+    sources.push_back( { "runs/touching-both-ends", values_of_spans( { { 0, 40 }, { 5000, 5100 }, { 65'400, 65'535 } } ) } );
+    sources.push_back( { "runs/few", values_of_spans( { { 10, 20 }, { 500, 900 }, { 4096, 4200 }, { 30'000, 40'000 } } ) } );
+    {
+        std::vector<std::uint16_t> values;
+        for ( std::uint32_t start{ 7 }; start + 40 < chunk_span; start += 1000 ) {
+            for ( std::uint32_t v{ start }; v < start + 40; ++v ) { values.push_back( static_cast<std::uint16_t>( v ) ); }
+        }
+        sources.push_back( { "runs/many-short", std::move( values ) } );
+    }
+    return sources;
+}
+
+// Closed ranges [first, last] over the chunk at `base` (a multiple of 65536) and
+// its neighbours.
+template <typename Key>
+[[nodiscard]] std::vector<std::pair<Key, Key>> flip_ranges( Key const base ) {
+    constexpr std::uint32_t offsets[]{ 0, 1, 2, 63, 64, 2046, 2047, 4096, 32'767, 65'534, 65'535 };
+    constexpr std::uint32_t ends[]{ 65'536, 65'536 + 65'535, 2 * 65'536 + 1'000, 2 * 65'536 + 65'535 };
+    std::vector<std::pair<Key, Key>> ranges;
+    for ( auto const first : offsets ) {
+        for ( auto const last : offsets ) {
+            if ( first <= last ) { ranges.emplace_back( static_cast<Key>( base + first ), static_cast<Key>( base + last ) ); }
+        }
+        for ( auto const end : ends ) {
+            ranges.emplace_back( static_cast<Key>( base + first ), static_cast<Key>( base + end ) );
+        }
+    }
+    ranges.emplace_back( base - 1, base + 65'535 + 1 );
+    ranges.emplace_back( base - 65'536, base + 2 * 65'536 - 1 );
+    return ranges;
 }
 
 } // namespace frsr::roaring::kernel_test

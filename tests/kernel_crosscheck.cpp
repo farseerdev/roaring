@@ -108,6 +108,26 @@ TEST( KernelCrosscheck, FlipSparseArray ) {
     }
 }
 
+TEST( KernelCrosscheck, FlipAcrossForms ) {
+    std::mt19937_64 rng{ 0xF1195 };
+    constexpr std::uint32_t base{ 3U << 16 };
+    auto const ranges{ flip_ranges<std::uint32_t>( base ) };
+    for ( auto const & source : flip_sources( rng ) ) {
+        auto const values{ in_chunk<std::uint32_t>( source.lows, base ) };
+        for ( bool const run_optimize : { false, true } ) {
+            for ( auto const & [first, last] : ranges ) {
+                SCOPED_TRACE( ::testing::Message() << source.name << " range " << first - base << ".." << last - base << " runs " << run_optimize );
+                auto ours{ make_ours( values, run_optimize ) };
+                auto theirs{ make_theirs( values, run_optimize ) };
+                ours.flip_closed_range( first, last );
+                roaring_bitmap_flip_inplace_closed( theirs.r, first, last );
+                ASSERT_TRUE( same_contents( ours, theirs ) );
+                ASSERT_EQ( ours.validate( false ), nullptr );
+            }
+        }
+    }
+}
+
 TEST( KernelCrosscheck, BitsetAndBitsetAcrossDensities ) {
     std::mt19937_64 rng{ 0xB175E7 };
     auto const expand{ []( auto const & words ) {

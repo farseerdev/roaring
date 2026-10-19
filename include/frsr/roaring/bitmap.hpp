@@ -4577,9 +4577,13 @@ private:
         }
 
         auto const previous_size{ detail::container_size( chunks_.slot( pos ) ) };
-        auto words{ detail::words_from_container<layout_type>( chunks_.slot( pos ) ) };
-        detail::apply_range_to_words<layout_type>( words, low_begin, low_end, operation );
-        chunks_.slot( pos ) = make_container_from_words_for_policy( words );
+        {
+            auto & slot{ chunks_.slot( pos ) };
+            slot = detail::apply_range_to_container<layout_type, CowPolicy, RunSelectionPolicy>( std::move( slot ), low_begin, low_end, operation, array_to_bitset_threshold );
+            if constexpr ( !uses_default_container_set ) {
+                slot = optimize_container_for_policy( std::move( slot ) );
+            }
+        }
         auto const updated_size{ detail::container_size( chunks_.slot( pos ) ) };
 
         if ( updated_size > previous_size ) {
