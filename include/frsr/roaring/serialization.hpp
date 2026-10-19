@@ -1,8 +1,10 @@
 #pragma once
 
 // Out-of-line definitions of frsr::roaring::bitmap's serialization members.
-// Two formats: the portable add()-replay format (serialize_to_vm_vector /
-// deserialize_from_vm_vector) and the zero-copy frozen format
+// Three formats: the standard Roaring portable format (portable_serialize /
+// portable_deserialize, container-level and interoperable with CRoaring), the
+// add()-replay format (serialize_to_vm_vector / deserialize_from_vm_vector) and
+// the zero-copy frozen format
 // (serialize_frozen_to_vm_vector + frozen_view + materialize). The nested
 // wire-format types (serialized_header, frozen_header, frozen_chunk_index,
 // frozen_container_kind, frozen_view), the magic constants and the payload-layout
@@ -17,8 +19,10 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <bit>
 #include <cstring>
 #include <limits>
+#include <optional>
 #include <span>
 #if defined(_M_X64) || defined(__x86_64__) || defined(__i386__)
 #include <immintrin.h>
@@ -504,6 +508,456 @@ bool bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy>::frozen_view::run_
         return false;
     }
     return value <= runs[ static_cast<std::uint32_t>( index ) ].end;
+}
+
+// ---- standard Roaring portable format ---------------------------------------
+// [croaring-ref] deps/croaring/src/roaring_array.c: ra_portable_serialize / ra_portable_deserialize
+// [croaring-ref] deps/croaring/src/roaring64.c: roaring64_bitmap_portable_serialize / _deserialize_safe
+
+namespace detail {
+
+inline constexpr std::uint32_t portable_cookie_no_run{ 12346U };
+inline constexpr std::uint32_t portable_cookie_with_run{ 12347U };
+// Below this many containers a run-carrying bitmap omits the offset header.
+inline constexpr std::uint32_t portable_no_offset_threshold{ 4U };
+// A non-run container is an array up to and including this cardinality, a bitset above it:
+// the reader derives the kind from the descriptive header alone.
+inline constexpr std::uint32_t portable_array_max_cardinality{ 4096U };
+inline constexpr std::size_t   portable_bitset_bytes{ 8192U };
+
+static_assert( std::endian::native == std::endian::little, "the portable format is little-endian; no byte swapping is implemented" );
+
+enum class portable_kind : std::uint8_t { array, bitset, run };
+
+struct portable_wire {
+    portable_kind kind;
+    std::uint32_t cardinality;
+    std::size_t   bytes;
+};
+
+// The wire kind follows the cardinality, not the in-memory kind, for non-run
+// containers: an in-memory array above 4096 values (or a bitset at or below it)
+// is re-encoded so the output is what the reference would hold.
+template <typename Handle>
+[[nodiscard]] inline portable_wire portable_wire_of( Handle const & container ) noexcept {
+    auto const cardinality{ container.cardinality() };
+    if ( container.holds_run() ) {
+        return { portable_kind::run, cardinality, sizeof( std::uint16_t ) + std::size_t{ container.count() } * 2U * sizeof( std::uint16_t ) };
+    }
+    if ( cardinality > portable_array_max_cardinality ) {
+        return { portable_kind::bitset, cardinality, portable_bitset_bytes };
+    }
+    return { portable_kind::array, cardinality, std::size_t{ cardinality } * sizeof( std::uint16_t ) };
+}
+
+inline void portable_put( std::byte * & out, std::uint16_t const value ) noexcept {
+    std::memcpy( out, &value, sizeof( value ) );
+    out += sizeof( value );
+}
+inline void portable_put( std::byte * & out, std::uint32_t const value ) noexcept {
+    std::memcpy( out, &value, sizeof( value ) );
+    out += sizeof( value );
+}
+template <typename T>
+[[nodiscard]] inline T portable_get( std::byte const * const in ) noexcept {
+    T value;
+    std::memcpy( &value, in, sizeof( value ) );
+    return value;
+}
+
+template <typename Handle>
+[[nodiscard]] inline std::byte * portable_write_container( Handle const & container, portable_wire const & wire, std::byte * out ) noexcept {
+    switch ( wire.kind ) {
+        case portable_kind::run: {
+            auto const view{ container.as_run() };
+            portable_put( out, static_cast<std::uint16_t>( view.runs.size() ) );
+            for ( auto const & run : std::span{ view.runs.data(), view.runs.size() } ) {
+                portable_put( out, static_cast<std::uint16_t>( run.begin ) );
+                portable_put( out, static_cast<std::uint16_t>( run.end - run.begin ) );
+            }
+            return out;
+        }
+        case portable_kind::array:
+            if ( container.holds_array() ) {
+                auto const view{ container.as_array() };
+                std::memcpy( out, view.values.data(), wire.bytes );
+                return out + wire.bytes;
+            } else {
+                auto const view{ container.as_bitset() };
+                auto const & words{ view.words.as_array() };
+                for ( std::size_t index{ 0 }; index < words.size(); ++index ) {
+                    auto word{ words[ index ] };
+                    while ( word != 0 ) {
+                        portable_put( out, static_cast<std::uint16_t>( index * 64U + static_cast<unsigned>( std::countr_zero( word ) ) ) );
+                        word &= word - 1;
+                    }
+                }
+                return out;
+            }
+        case portable_kind::bitset:
+            if ( container.holds_bitset() ) {
+                auto const view{ container.as_bitset() };
+                std::memcpy( out, view.words.as_array().data(), portable_bitset_bytes );
+            } else {
+                // Only a cardinality above 4096 reaches here, i.e. an oversized in-memory array.
+                std::memset( out, 0, portable_bitset_bytes );
+                auto const view{ container.as_array() };
+                for ( auto const value : std::span{ view.values.data(), view.values.size() } ) {
+                    out[ value >> 3U ] |= static_cast<std::byte>( 1U << ( value & 7U ) );
+                }
+            }
+            return out + portable_bitset_bytes;
+    }
+    std::unreachable();
+}
+
+} // namespace detail
+
+template <std::unsigned_integral Key, typename ContainerSet, typename CowPolicy, typename RunSelectionPolicy>
+    requires detail::valid_container_set<Key, ContainerSet>
+typename bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy>::portable_plan bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy>::portable_plan_for( size_type const first, size_type const last ) const noexcept {
+    portable_plan plan;
+    for ( auto index{ first }; index < last; ++index ) {
+        auto const & slot{ chunks_.slot( index ) };
+        if ( detail::container_size( slot ) == 0 ) {
+            continue;
+        }
+        ++plan.containers;
+        plan.has_run |= slot.holds_run();
+        plan.payload_bytes += detail::portable_wire_of( slot ).bytes;
+    }
+    // Run-carrying: cookie (carries the count), run flags, key+cardinality pairs, offsets
+    // only from four containers up. Otherwise: cookie, count, pairs, offsets.
+    if ( plan.has_run ) {
+        plan.header_bytes = 4U + ( ( std::size_t{ plan.containers } + 7U ) / 8U ) + 4U * std::size_t{ plan.containers }
+                          + ( plan.containers >= detail::portable_no_offset_threshold ? 4U * std::size_t{ plan.containers } : 0U );
+    } else {
+        plan.header_bytes = 8U + 8U * std::size_t{ plan.containers };
+    }
+    return plan;
+}
+
+template <std::unsigned_integral Key, typename ContainerSet, typename CowPolicy, typename RunSelectionPolicy>
+    requires detail::valid_container_set<Key, ContainerSet>
+std::byte * bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy>::portable_write_32( size_type const first, size_type const last, portable_plan const & plan, std::byte * out ) const noexcept {
+    auto const count{ plan.containers };
+    if ( plan.has_run ) {
+        detail::portable_put( out, detail::portable_cookie_with_run | ( ( count - 1U ) << 16 ) );
+        auto const flag_bytes{ ( count + 7U ) / 8U };
+        std::memset( out, 0, flag_bytes );
+        std::uint32_t position{ 0 };
+        for ( auto index{ first }; index < last; ++index ) {
+            auto const & slot{ chunks_.slot( index ) };
+            if ( detail::container_size( slot ) == 0 ) {
+                continue;
+            }
+            if ( slot.holds_run() ) {
+                out[ position / 8U ] |= static_cast<std::byte>( 1U << ( position % 8U ) );
+            }
+            ++position;
+        }
+        out += flag_bytes;
+    } else {
+        detail::portable_put( out, detail::portable_cookie_no_run );
+        detail::portable_put( out, count );
+    }
+    for ( auto index{ first }; index < last; ++index ) {
+        auto const & slot{ chunks_.slot( index ) };
+        if ( detail::container_size( slot ) == 0 ) {
+            continue;
+        }
+        detail::portable_put( out, static_cast<std::uint16_t>( chunks_.key( index ) ) );
+        detail::portable_put( out, static_cast<std::uint16_t>( slot.cardinality() - 1U ) );
+    }
+    if ( !plan.has_run || count >= detail::portable_no_offset_threshold ) {
+        auto offset{ plan.header_bytes };
+        for ( auto index{ first }; index < last; ++index ) {
+            auto const & slot{ chunks_.slot( index ) };
+            if ( detail::container_size( slot ) == 0 ) {
+                continue;
+            }
+            detail::portable_put( out, static_cast<std::uint32_t>( offset ) );
+            offset += detail::portable_wire_of( slot ).bytes;
+        }
+    }
+    for ( auto index{ first }; index < last; ++index ) {
+        auto const & slot{ chunks_.slot( index ) };
+        if ( detail::container_size( slot ) == 0 ) {
+            continue;
+        }
+        out = detail::portable_write_container( slot, detail::portable_wire_of( slot ), out );
+    }
+    return out;
+}
+
+template <std::unsigned_integral Key, typename ContainerSet, typename CowPolicy, typename RunSelectionPolicy>
+    requires detail::valid_container_set<Key, ContainerSet>
+std::size_t bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy>::portable_size_in_bytes() const requires ( std::numeric_limits<Key>::digits >= 32 ) {
+    static_assert( std::numeric_limits<key_type>::digits == 32 || std::numeric_limits<key_type>::digits == 64, "the portable format is defined for 32- and 64-bit keys" );
+    if constexpr ( kUseSingletonChunkMap ) {
+        materialize_singleton_chunks();
+    }
+    ensure_sorted();
+
+    if constexpr ( std::numeric_limits<key_type>::digits == 32 ) {
+        auto const plan{ portable_plan_for( 0, chunks_.size() ) };
+        return plan.header_bytes + plan.payload_bytes;
+    } else {
+        std::size_t total{ sizeof( std::uint64_t ) };
+        for ( size_type first{ 0 }; first < chunks_.size(); ) {
+            auto const high{ chunks_.key( first ) >> 16 };
+            auto last{ first + 1 };
+            while ( last < chunks_.size() && ( chunks_.key( last ) >> 16 ) == high ) {
+                ++last;
+            }
+            auto const plan{ portable_plan_for( first, last ) };
+            if ( plan.containers != 0 ) {
+                total += sizeof( std::uint32_t ) + plan.header_bytes + plan.payload_bytes;
+            }
+            first = last;
+        }
+        return total;
+    }
+}
+
+template <std::unsigned_integral Key, typename ContainerSet, typename CowPolicy, typename RunSelectionPolicy>
+    requires detail::valid_container_set<Key, ContainerSet>
+std::size_t bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy>::portable_serialize( std::span<std::byte> const out ) const requires ( std::numeric_limits<Key>::digits >= 32 ) {
+    static_assert( std::numeric_limits<key_type>::digits == 32 || std::numeric_limits<key_type>::digits == 64, "the portable format is defined for 32- and 64-bit keys" );
+    if constexpr ( kUseSingletonChunkMap ) {
+        materialize_singleton_chunks();
+    }
+    ensure_sorted();
+    assert( out.size() >= portable_size_in_bytes() );
+
+    auto * cursor{ out.data() };
+    if constexpr ( std::numeric_limits<key_type>::digits == 32 ) {
+        cursor = portable_write_32( 0, chunks_.size(), portable_plan_for( 0, chunks_.size() ), cursor );
+    } else {
+        // Bucket count first (a bucket is a run of chunks sharing the high 32 bits and
+        // holding at least one non-empty container), then the buckets in key order.
+        std::uint64_t buckets{ 0 };
+        for ( size_type first{ 0 }; first < chunks_.size(); ) {
+            auto const high{ chunks_.key( first ) >> 16 };
+            auto last{ first + 1 };
+            while ( last < chunks_.size() && ( chunks_.key( last ) >> 16 ) == high ) {
+                ++last;
+            }
+            buckets += portable_plan_for( first, last ).containers != 0;
+            first = last;
+        }
+        std::memcpy( cursor, &buckets, sizeof( buckets ) );
+        cursor += sizeof( buckets );
+        for ( size_type first{ 0 }; first < chunks_.size(); ) {
+            auto const high{ chunks_.key( first ) >> 16 };
+            auto last{ first + 1 };
+            while ( last < chunks_.size() && ( chunks_.key( last ) >> 16 ) == high ) {
+                ++last;
+            }
+            auto const plan{ portable_plan_for( first, last ) };
+            if ( plan.containers != 0 ) {
+                detail::portable_put( cursor, static_cast<std::uint32_t>( high ) );
+                cursor = portable_write_32( first, last, plan, cursor );
+            }
+            first = last;
+        }
+    }
+    return static_cast<std::size_t>( cursor - out.data() );
+}
+
+template <std::unsigned_integral Key, typename ContainerSet, typename CowPolicy, typename RunSelectionPolicy>
+    requires detail::valid_container_set<Key, ContainerSet>
+bool bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy>::portable_read_32(
+    std::byte const * & cursor, std::byte const * const end, chunk_type const high_bits, bitmap & result, std::size_t & total
+) {
+    using namespace detail;
+    auto const * p{ cursor };
+    auto const available{ [&] { return static_cast<std::size_t>( end - p ); } };
+
+    if ( available() < sizeof( std::uint32_t ) ) {
+        return false;
+    }
+    auto const cookie{ portable_get<std::uint32_t>( p ) };
+    p += sizeof( cookie );
+    bool has_run;
+    std::size_t count;
+    if ( ( cookie & 0xFFFFU ) == portable_cookie_with_run ) {
+        has_run = true;
+        count = ( cookie >> 16 ) + 1U;
+    } else if ( cookie == portable_cookie_no_run ) {
+        has_run = false;
+        if ( available() < sizeof( std::uint32_t ) ) {
+            return false;
+        }
+        count = portable_get<std::uint32_t>( p );
+        p += sizeof( std::uint32_t );
+        if ( count > 65536U ) {
+            return false;
+        }
+    } else {
+        return false;
+    }
+
+    // `count` <= 65536 here, so none of the header arithmetic below can overflow.
+    std::byte const * run_flags{ nullptr };
+    if ( has_run ) {
+        auto const flag_bytes{ ( count + 7U ) / 8U };
+        if ( available() < flag_bytes ) {
+            return false;
+        }
+        run_flags = p;
+        p += flag_bytes;
+    }
+    if ( available() < count * 4U ) {
+        return false;
+    }
+    auto const * const descriptive{ p };
+    p += count * 4U;
+    if ( !has_run || count >= portable_no_offset_threshold ) {
+        // The offsets are redundant with the descriptive header and are not read (as in
+        // the reference): the payloads are consumed back to back.
+        if ( available() < count * 4U ) {
+            return false;
+        }
+        p += count * 4U;
+    }
+
+    if ( result.chunks_.size() == 0 ) {
+        result.chunks_.reserve( count );
+    }
+    std::int32_t previous_key{ -1 };
+    for ( std::size_t k{ 0 }; k < count; ++k ) {
+        auto const key{ portable_get<std::uint16_t>( descriptive + 4U * k ) };
+        if ( std::int32_t{ key } <= previous_key ) {
+            return false;
+        }
+        previous_key = key;
+        std::uint32_t const cardinality{ std::uint32_t{ portable_get<std::uint16_t>( descriptive + 4U * k + 2U ) } + 1U };
+        bool const is_run{ has_run && ( ( std::to_integer<unsigned>( run_flags[ k / 8U ] ) >> ( k % 8U ) ) & 1U ) != 0 };
+
+        handle_type container;
+        if ( is_run ) {
+            if ( available() < sizeof( std::uint16_t ) ) {
+                return false;
+            }
+            std::size_t const run_count{ portable_get<std::uint16_t>( p ) };
+            p += sizeof( std::uint16_t );
+            if ( run_count == 0 || available() < run_count * 4U ) {
+                return false;
+            }
+            container = handle_type::make_run();
+            auto view{ container.as_run() };
+            view.runs.resize_uninitialized( static_cast<std::uint32_t>( run_count ) );
+            auto * const dst{ view.runs.data() };
+            std::uint32_t covered{ 0 };
+            std::int32_t previous_end{ -1 };
+            std::size_t written{ 0 };
+            for ( std::size_t r{ 0 }; r < run_count; ++r, p += 4 ) {
+                std::int32_t const begin{ portable_get<std::uint16_t>( p ) };
+                std::int32_t const run_end{ begin + portable_get<std::uint16_t>( p + 2 ) };
+                if ( run_end > 0xFFFF || begin <= previous_end ) {
+                    return false;   // out of the 16-bit domain, unsorted or overlapping
+                }
+                covered += static_cast<std::uint32_t>( run_end - begin + 1 );
+                if ( begin == previous_end + 1 && written != 0 ) {
+                    // Adjacent runs are one run here (the writer is allowed to leave them split).
+                    dst[ written - 1 ].end = static_cast<low_type>( run_end );
+                } else {
+                    dst[ written++ ] = { static_cast<low_type>( begin ), static_cast<low_type>( run_end ) };
+                }
+                previous_end = run_end;
+            }
+            if ( covered != cardinality ) {
+                return false;
+            }
+            view.runs.resize_uninitialized( static_cast<std::uint32_t>( written ) );
+            container.set_cardinality( cardinality );
+            container.set_endpoints( dst[ 0 ].begin, dst[ written - 1 ].end );
+        } else if ( cardinality > portable_array_max_cardinality ) {
+            if ( available() < portable_bitset_bytes ) {
+                return false;
+            }
+            container = handle_type::make_bitset_uninitialized();
+            std::memcpy( container.payload_data_raw(), p, portable_bitset_bytes );
+            p += portable_bitset_bytes;
+            auto const * const words{ static_cast<std::uint64_t const *>( container.payload_data_raw() ) };
+            if ( popcount_words( words, layout_type::word_count ) != cardinality ) {
+                return false;
+            }
+            container.set_cardinality( cardinality );
+        } else {
+            if ( available() < std::size_t{ cardinality } * sizeof( std::uint16_t ) ) {
+                return false;
+            }
+            container = handle_type::make_array();
+            auto array{ container.as_array() };
+            array.values.resize_uninitialized( cardinality );
+            auto * const dst{ array.values.data() };
+            std::memcpy( dst, p, std::size_t{ cardinality } * sizeof( std::uint16_t ) );
+            p += std::size_t{ cardinality } * sizeof( std::uint16_t );
+            // Branch-free so the strictly-increasing check vectorizes.
+            std::uint32_t unordered{ 0 };
+            for ( std::uint32_t i{ 1 }; i < cardinality; ++i ) {
+                unordered |= std::uint32_t{ dst[ i - 1 ] >= dst[ i ] };
+            }
+            if ( unordered != 0 ) {
+                return false;
+            }
+            array.sync_header();
+        }
+        total += cardinality;
+        result.chunks_.push_back( static_cast<chunk_type>( high_bits | key ), std::move( container ) );
+    }
+    cursor = p;
+    return true;
+}
+
+template <std::unsigned_integral Key, typename ContainerSet, typename CowPolicy, typename RunSelectionPolicy>
+    requires detail::valid_container_set<Key, ContainerSet>
+std::optional<bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy>> bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy>::portable_deserialize( std::span<std::byte const> const in ) requires ( std::numeric_limits<Key>::digits >= 32 ) {
+    static_assert( std::numeric_limits<key_type>::digits == 32 || std::numeric_limits<key_type>::digits == 64, "the portable format is defined for 32- and 64-bit keys" );
+    bitmap result;
+    std::size_t total{ 0 };
+    auto const * cursor{ in.data() };
+    auto const * const end{ in.data() + in.size() };
+
+    if constexpr ( std::numeric_limits<key_type>::digits == 32 ) {
+        if ( !portable_read_32( cursor, end, chunk_type{ 0 }, result, total ) ) {
+            return std::nullopt;
+        }
+    } else {
+        if ( in.size() < sizeof( std::uint64_t ) ) {
+            return std::nullopt;
+        }
+        auto const buckets{ detail::portable_get<std::uint64_t>( cursor ) };
+        cursor += sizeof( std::uint64_t );
+        // Every bucket costs at least its key and a minimal 32-bit bitmap header.
+        if ( buckets > std::numeric_limits<std::uint32_t>::max() || buckets > static_cast<std::size_t>( end - cursor ) / 12U ) {
+            return std::nullopt;
+        }
+        std::int64_t previous_high{ -1 };
+        for ( std::uint64_t bucket{ 0 }; bucket < buckets; ++bucket ) {
+            if ( static_cast<std::size_t>( end - cursor ) < sizeof( std::uint32_t ) ) {
+                return std::nullopt;
+            }
+            auto const high{ detail::portable_get<std::uint32_t>( cursor ) };
+            cursor += sizeof( std::uint32_t );
+            if ( std::int64_t{ high } <= previous_high ) {
+                return std::nullopt;
+            }
+            previous_high = high;
+            if ( !portable_read_32( cursor, end, static_cast<chunk_type>( chunk_type{ high } << 16 ), result, total ) ) {
+                return std::nullopt;
+            }
+        }
+    }
+
+    result.size_ = total;
+    if constexpr ( kUseLazySort ) {
+        result.chunks_sorted_ = true;
+    }
+    result.invalidate_chunk_index_map();
+    return result;
 }
 
 } // namespace frsr::roaring
