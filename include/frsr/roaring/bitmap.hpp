@@ -41,6 +41,7 @@
 #include <vector>   // the serialized_byte_vector fallback uses std::vector even with psi::vm present
 #ifdef FRSR_ROARING_HAS_PSI_VM
 #   include <psi/vm/containers/small_vector.hpp>
+#   include <psi/vm/containers/lookup.hpp>
 #   ifdef FRSR_ROARING_ENABLE_VM_VECTOR_SERIALIZATION
 #       include <psi/vm/containers/vm_vector.hpp>
 #   endif
@@ -263,6 +264,23 @@ inline combine_stats_t & combine_stats() noexcept { static combine_stats_t s; re
 // behavior byte-for-byte. Opt into run_selection_lazy (CRoaring parity: never
 // auto-picks run encoding outside optimize()/optimize_for_storage()) explicitly,
 // as a downstream consumer's bitmap wrapper does.
+//
+// Concurrency. Any number of threads may read one bitmap at the same time as long
+// as none of them modifies it, for every key width - the guarantee the reference
+// implementation's bitmaps give. A const member function stores nothing to the
+// bitmap: point queries (contains, and contains_bulk with a context private to the
+// calling thread), cardinality, iteration, conversion to a vector, and
+// the set operations that read this bitmap as an operand (the result is a new
+// bitmap owned by the caller). Copying a const bitmap is such a read, and so is a
+// set operation whose result shares chunk payloads with its operands, for the
+// value-semantics and the atomic-refcount CowPolicy; the unsynchronized-refcount
+// policy updates a plain shared count on both, so there those need one thread at
+// a time. Anything that can modify the bitmap - every non-const member - needs
+// exclusive access, and a bulk_context is the caller's own state: it is not shared
+// between threads.
+// The chunk table is therefore always kept sorted and is searched, never cached or
+// indexed lazily from a const path; a lookup accelerator may be added only if all of
+// its state is repaired inside non-const operations.
 template <
     std::unsigned_integral Key,
     typename ContainerSet = default_container_set<Key>,
@@ -735,7 +753,7 @@ public:
             ctx.index = it->second;
         } else {
             ensure_sorted();
-            auto const pos{ lower_bound( chunk ) };
+            auto const pos{ lower_bound_outlined( chunk ) };
             if ( pos == chunks_.size() || chunks_.key( pos ) != chunk ) {
                 ctx.reset();
                 return false;
@@ -909,8 +927,8 @@ public:
         }
         compact_front_tombstones( true );
         other.compact_front_tombstones( true );
-        const_cast<bitmap*>(this)->ensure_sorted();
-        const_cast<bitmap*>(&other)->ensure_sorted();
+        ensure_sorted();
+        other.ensure_sorted();
 
         size_type left{ 0 };
         size_type right{ 0 };
@@ -1428,8 +1446,8 @@ public:
 
         compact_front_tombstones( true );
         other.compact_front_tombstones( true );
-        const_cast<bitmap*>(this)->ensure_sorted();
-        const_cast<bitmap*>(&other)->ensure_sorted();
+        ensure_sorted();
+        other.ensure_sorted();
 
         scratch.clear_keep_capacity();
 
@@ -1450,8 +1468,8 @@ public:
 
         compact_front_tombstones( true );
         other.compact_front_tombstones( true );
-        const_cast<bitmap*>(this)->ensure_sorted();
-        const_cast<bitmap*>(&other)->ensure_sorted();
+        ensure_sorted();
+        other.ensure_sorted();
 
         scratch.clear_keep_capacity();
         scratch.chunks_.reserve( chunks_.size() + other.chunks_.size() );
@@ -1554,8 +1572,8 @@ public:
 
         compact_front_tombstones( true );
         other.compact_front_tombstones( true );
-        const_cast<bitmap*>(this)->ensure_sorted();
-        const_cast<bitmap*>(&other)->ensure_sorted();
+        ensure_sorted();
+        other.ensure_sorted();
 
         scratch.clear_keep_capacity();
         scratch.chunks_.reserve( chunks_.size() );
@@ -2839,7 +2857,7 @@ private:
                 operand->materialize_singleton_chunks();
             }
             operand->compact_front_tombstones( true );
-            const_cast<bitmap *>( operand )->ensure_sorted();
+            operand->ensure_sorted();
             if ( operand->chunks_.size() == 0 ) {
                 return;
             }
@@ -3367,12 +3385,27 @@ private:
 #endif
 
     // Index of the first live entry with key >= chunk (chunks_.size() if none):
-    // a branch-light binary search over the dense SoA keys[] array only.
+    // a binary search over the dense SoA keys[] array only. A pure read - the
+    // search keeps no state between calls, which is what lets concurrent readers
+    // share the bitmap. With psi::vm the search is the branchless one that
+    // prefetches both candidates of the next step: a lookup into a large chunk
+    // table is a chain of dependent cache misses, and overlapping them is what
+    // the reference's tree-shaped index gets from its fan-out.
     [[nodiscard]] size_type lower_bound( chunk_type const chunk ) const noexcept {
         auto const keys{ chunks_.keys() };
         auto const first{ keys.begin() + static_cast<std::ptrdiff_t>( front_tombstones_ ) };
+#if defined( FRSR_ROARING_HAS_PSI_VM )
+        auto const pos{ psi::vm::prefetching_lower_bound( first, keys.end(), chunk ) };
+#else
         auto const pos{ std::lower_bound( first, keys.end(), chunk ) };
+#endif
         return static_cast<size_type>( pos - keys.begin() );
+    }
+
+    // lower_bound() out of line, for call sites whose fast path is something else
+    // (a bulk context hit): keeps the search loop out of their hot code.
+    [[nodiscard, gnu::noinline]] size_type lower_bound_outlined( chunk_type const chunk ) const noexcept {
+        return lower_bound( chunk );
     }
 
     // Single funnel for every hot-slot store, so the parity build provably
@@ -3452,13 +3485,18 @@ private:
         chunk_index_lookup_probes_ = 0;
     }
 
+    // With kUseLazySort off (every key width) the chunk table is always sorted and
+    // this compiles to nothing, so no const operation modifies the bitmap. It is
+    // the one place a const call would otherwise sort in place, which would be a
+    // data race between concurrent readers.
     void ensure_sorted() const {
-        if constexpr ( !kUseLazySort ) { return; } // always sorted when lazy sort is off
-        if ( chunks_sorted_ ) { return; }
-        auto & mutable_chunks = const_cast<chunk_store_type &>( chunks_ );
-        mutable_chunks.sort_by_key();
-        chunks_sorted_ = true;
-        chunk_index_map_valid_ = false;  // Indices changed; map must be rebuilt on next access
+        if constexpr ( kUseLazySort ) {
+            if ( chunks_sorted_ ) { return; }
+            auto & mutable_chunks = const_cast<chunk_store_type &>( chunks_ );
+            mutable_chunks.sort_by_key();
+            chunks_sorted_ = true;
+            chunk_index_map_valid_ = false;  // Indices changed; map must be rebuilt on next access
+        }
     }
 
     void ensure_chunk_index_map() const {
