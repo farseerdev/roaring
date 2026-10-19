@@ -591,6 +591,44 @@ void flip_sparse_case() {
 TEST( KernelCoverage, FlipSparseArray32 ) { flip_sparse_case<Bitmap32>(); }
 TEST( KernelCoverage, FlipSparseArray64 ) { flip_sparse_case<Bitmap64>(); }
 
+// Every container form in, every boundary range: absent / array / bitset / run
+// chunks flipped in place, then flipped back. The oracle is a membership map over
+// the five chunks the ranges can touch.
+template <typename Bitmap>
+void flip_forms_case() {
+    using key_type = typename Bitmap::key_type;
+    std::mt19937_64 rng{ 0xF1195 };
+    constexpr key_type base{ key_type{ 3 } << 16 };
+    constexpr key_type window_begin{ base - 65'536 };
+    auto const ranges{ flip_ranges<key_type>( base ) };
+    for ( auto const & source : flip_sources( rng ) ) {
+        auto const values{ in_chunk<key_type>( source.lows, base ) };
+        for ( bool const run_optimized : { false, true } ) {
+            for ( auto const & [first, last] : ranges ) {
+                SCOPED_TRACE( ::testing::Message() << source.name << " range " << first - base << ".." << last - base << " run_optimized " << run_optimized );
+                std::vector<bool> member( 5 * 65'536 );
+                for ( auto const v : values ) { member[ v - window_begin ] = true; }
+                for ( auto v{ first }; v <= last; ++v ) { member[ v - window_begin ] = !member[ v - window_begin ]; }
+                std::vector<key_type> expected;
+                for ( std::size_t i{ 0 }; i < member.size(); ++i ) {
+                    if ( member[ i ] ) { expected.push_back( static_cast<key_type>( window_begin + i ) ); }
+                }
+                Bitmap bm;
+                bm.add_many( values );
+                if ( run_optimized ) { bm.optimize(); }
+                bm.flip_closed_range( first, last );
+                ASSERT_TRUE( matches( bm, expected ) );
+                bm.flip_closed_range( first, last );
+                ASSERT_TRUE( matches( bm, values ) ) << "the second flip must restore the input";
+            }
+        }
+    }
+}
+
+TEST( KernelCoverage, FlipAcrossForms32 ) { flip_forms_case<Bitmap32>(); }
+TEST( KernelCoverage, FlipAcrossForms64 ) { flip_forms_case<Bitmap64>(); }
+TEST( KernelCoverage, FlipAcrossFormsLazyRuns ) { flip_forms_case<LazyCowBitmap32>(); }
+
 // A 64-bit bitmap whose high key bytes are spread widely (so the chunk index has
 // every fan-out), shrunk after most of its chunks were removed.
 TEST( KernelCoverage, ShrinkToFitSpreadHighKeys64 ) {
