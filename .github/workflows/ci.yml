@@ -1,0 +1,117 @@
+name: ci
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  BOOST_VERSION: 1.92.0
+  CROARING_REF: v5.3.0
+  # the dependencies the headers include, at the commits the library is developed against
+  PSIHA_PINS: >-
+    build=fc1bc9c2bfa157f1eb2537881d124afb039bd20a
+    config_ex=a507c71bac7160e5d356a089aa67ada987d180a9
+    err=7addb45147ad2dd2f8ea161fec9ed78c28c666ba
+    functionoid=01d8f6f01741cea8492de0804efa532726f16cea
+    pimpl=4227f019dac27b91649219537e15ca3e2b0e49a7
+    std_fix=aa31c8c563c45b9b20403fb2c12e2937c70c7bbf
+    vm=add4575947e9c02ecda2cd4e356e23c32cd1bcec
+
+jobs:
+  linux:
+    name: ${{ matrix.compiler }} / ${{ matrix.sbo == 'on' && 'inline buffers' || 'no inline buffers' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [ clang-22, gcc-15 ]
+        sbo: [ off, on ]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: roaring
+
+      - name: Compiler
+        run: |
+          set -eux
+          case "${{ matrix.compiler }}" in
+            clang-*)
+              v="${{ matrix.compiler }}"; v="${v#clang-}"
+              curl -fsSL https://apt.llvm.org/llvm.sh -o llvm.sh
+              sudo bash llvm.sh "$v"
+              sudo apt-get install -y --no-install-recommends "clang-tools-$v" "lld-$v" || true
+              echo "CC=clang-$v" >> "$GITHUB_ENV"; echo "CXX=clang++-$v" >> "$GITHUB_ENV" ;;
+            gcc-*)
+              v="${{ matrix.compiler }}"; v="${v#gcc-}"
+              sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
+              sudo apt-get update
+              sudo apt-get install -y --no-install-recommends "g++-$v"
+              echo "CC=gcc-$v" >> "$GITHUB_ENV"; echo "CXX=g++-$v" >> "$GITHUB_ENV" ;;
+          esac
+          sudo apt-get install -y --no-install-recommends ninja-build cmake
+
+      - name: Boost headers
+        id: boost
+        uses: actions/cache@v4
+        with:
+          path: boost
+          key: boost-${{ env.BOOST_VERSION }}-headers
+      - name: Fetch Boost headers
+        if: steps.boost.outputs.cache-hit != 'true'
+        run: |
+          set -eux
+          u="${BOOST_VERSION//./_}"
+          curl -fsSL "https://archives.boost.io/release/${BOOST_VERSION}/source/boost_${u}.tar.gz" -o boost.tgz
+          mkdir boost && tar -xzf boost.tgz -C boost --strip-components=1 \
+            --wildcards "boost_${u}/boost" "boost_${u}/libs/*/include" 2>/dev/null || tar -xzf boost.tgz -C boost --strip-components=1
+          rm boost.tgz
+
+      - name: Dependencies next to the checkout
+        run: |
+          set -eux
+          git clone --depth 1 --branch "$CROARING_REF" https://github.com/RoaringBitmap/CRoaring.git croaring
+          mkdir psiha
+          for pin in $PSIHA_PINS; do
+            name="${pin%%=*}"; sha="${pin##*=}"
+            git init -q "psiha/$name"
+            git -C "psiha/$name" fetch -q --depth 1 "https://github.com/psiha/$name.git" "$sha"
+            git -C "psiha/$name" checkout -q FETCH_HEAD
+          done
+          # psi::vm declares this out of line; its compiled library, which defines it, is not part of
+          # this build (serialization is off), so the one definition the headers need is built here.
+          cat > psivm_shim.cpp <<'CPP'
+          #include <stdexcept>
+          namespace psi::vm::detail {
+          [[noreturn]] void throw_length_error()
+          {
+              throw std::length_error{ "psi::vm: requested size exceeds the allocator's addressable byte range" };
+          }
+          }
+          CPP
+          "$CXX" -std=c++23 -O2 -fPIC -c psivm_shim.cpp -o psivm_shim.o
+
+      - name: Configure
+        run: |
+          set -eux
+          flags=""; [ "${{ matrix.sbo }}" = off ] && flags="-DFRSR_ROARING_NO_SBO=1"
+          cmake -S roaring -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER="$CC" -DCMAKE_CXX_COMPILER="$CXX" \
+            -DBoost_ROOT="$PWD/boost" "-DCMAKE_CXX_FLAGS=$flags" \
+            "-DCMAKE_CXX_STANDARD_LIBRARIES=$PWD/psivm_shim.o" \
+            -DFRSR_ROARING_ADD_LOCAL_CROARING_TARGET=ON -DFRSR_ROARING_BUILD_TESTS=ON \
+            -DFRSR_ROARING_BUILD_CROARING_CROSSCHECK=ON -DFRSR_ROARING_BUILD_BENCHMARKS=OFF
+
+      - name: Build
+        run: cmake --build build --target frsr_roaring_tests frsr_roaring_croaring_crosscheck
+
+      - name: Test
+        working-directory: build
+        run: |
+          ./frsr_roaring_tests --gtest_brief=1
+          ./frsr_roaring_croaring_crosscheck --gtest_brief=1
