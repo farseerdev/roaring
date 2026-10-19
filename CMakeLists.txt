@@ -257,6 +257,7 @@ if(FRSR_ROARING_BUILD_TESTS)
         add_executable(frsr_roaring_croaring_crosscheck
             tests/bitmap_crosscheck.cpp
             tests/bitmap_full_crosscheck.cpp
+            tests/portable_interop.cpp
         )
         target_link_libraries(frsr_roaring_croaring_crosscheck
             PRIVATE

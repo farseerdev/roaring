@@ -1260,6 +1260,8 @@ struct serStateFrsr {
 #else
     std::vector<std::byte> serialized;
 #endif
+    // Standard portable format buffer (sized once in setup, like the reference arms').
+    std::vector<std::byte> portable;
 };
 
 // A rep is a timed region of its own - one run() between one clock pair - so the
@@ -1285,21 +1287,22 @@ struct synthetic_frsr_PortableSerialize_registrar {
             Entry e;
             e.name = std::string("synthetic/") + Arm::label() + "PortableSerialize/" + ptag;
             e.description =
-                "frsr portable serialize: materialize native vm-backed "
-                "wire format into a vm_vector<byte>.";
+                "frsr portable serialize: one portable_serialize() call "
+                "per measured iteration into a buffer preallocated in "
+                "setup (standard Roaring portable format; the bitmap is "
+                "not run-optimized, as in the reference arms).";
             e.setup = [count, step]() -> void * {
                 auto *s = new serStateFrsr<Arm>;
                 for (size_t i = 0; i < count; ++i) {
                     auto const v = static_cast<std::uint64_t>(i) * step;
                     s->r.add(v);
                 }
-                s->r.optimize_for_storage();
+                s->portable.resize(s->r.portable_size_in_bytes());
                 return s;
             };
             e.run = [](void *sv) -> int64_t {
                 auto *s = static_cast<serStateFrsr<Arm> *>(sv);
-                s->r.serialize_to_vm_vector(s->serialized);
-                return static_cast<int64_t>(s->serialized.size());
+                return static_cast<int64_t>(s->r.portable_serialize(s->portable));
             };
             e.teardown = [](void *sv) {
                 delete static_cast<serStateFrsr<Arm> *>(sv);
@@ -1360,21 +1363,22 @@ struct synthetic_frsr_PortableDeserialize_registrar {
             Entry e;
             e.name = std::string("synthetic/") + Arm::label() + "PortableDeserialize/" + ptag;
             e.description =
-                "frsr portable deserialize from native vm-backed wire "
-                "format prepared once in setup.";
+                "frsr portable deserialize: validating portable_deserialize() "
+                "of a standard portable buffer prepared once in setup "
+                "(not run-optimized, as in the reference arms).";
             e.setup = [count, step]() -> void * {
                 auto *s = new serStateFrsr<Arm>;
                 for (size_t i = 0; i < count; ++i) {
                     s->r.add(static_cast<std::uint64_t>(i) * step);
                 }
-                s->r.serialize_to_vm_vector(s->serialized);
+                s->portable.resize(s->r.portable_size_in_bytes());
+                s->r.portable_serialize(s->portable);
                 return s;
             };
             e.run = [](void *sv) -> int64_t {
                 auto *s = static_cast<serStateFrsr<Arm> *>(sv);
-                TestBitmap64 roundtrip =
-                    TestBitmap64::deserialize_from_vm_vector(s->serialized);
-                return static_cast<int64_t>(roundtrip.size());
+                auto roundtrip = TestBitmap64::portable_deserialize(s->portable);
+                return roundtrip ? static_cast<int64_t>(roundtrip->size()) : -1;
             };
             e.teardown = [](void *sv) {
                 delete static_cast<serStateFrsr<Arm> *>(sv);

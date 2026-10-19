@@ -1398,6 +1398,26 @@ public:
 
     [[nodiscard]] static bitmap deserialize_frozen_from_vm_vector( serialized_byte_vector const & in );
 
+    // The standard Roaring portable format (https://github.com/RoaringBitmap/RoaringFormatSpec):
+    // 32-bit key bitmaps are byte-compatible with roaring_bitmap_portable_serialize,
+    // 64-bit key bitmaps with roaring64_bitmap_portable_serialize (u64 bucket count,
+    // then per distinct high 32 bits: the u32 key and a 32-bit portable bitmap of the
+    // low 32 bits). Work is O(containers + payload bytes): array and bitset payloads
+    // are copied whole, run payloads are re-encoded (begin,end) <-> (begin,length-1)
+    // per run; no value is visited. Little-endian hosts only.
+    //
+    // portable_serialize() needs `out.size() >= portable_size_in_bytes()` (programming
+    // error otherwise) and returns the number of bytes written (== the size query).
+    // portable_deserialize() never trusts the input: every length is checked against
+    // `in` before it is read, keys and array values must be strictly increasing, runs
+    // in range, bitset popcounts equal the declared cardinalities. It returns nullopt
+    // on any violation; bytes after the encoded bitmap are ignored.
+    [[nodiscard]] std::size_t portable_size_in_bytes() const requires ( std::numeric_limits<Key>::digits >= 32 );
+
+    std::size_t portable_serialize( std::span<std::byte> out ) const requires ( std::numeric_limits<Key>::digits >= 32 );
+
+    [[nodiscard]] static std::optional<bitmap> portable_deserialize( std::span<std::byte const> in ) requires ( std::numeric_limits<Key>::digits >= 32 );
+
     template <typename F>
     [[nodiscard]] bool iterate( F && f ) const {
         for ( auto const value : *this ) {
@@ -3388,6 +3408,19 @@ private:
         }
         return 0U;
     }
+
+    // ---- portable (standard Roaring) format helpers; defined in serialization.hpp ----
+    struct portable_plan {
+        std::uint32_t containers{};   // non-empty containers in the range
+        bool          has_run{};
+        std::size_t   header_bytes{};
+        std::size_t   payload_bytes{};
+    };
+    [[nodiscard]] portable_plan portable_plan_for( size_type first, size_type last ) const noexcept;
+    std::byte * portable_write_32( size_type first, size_type last, portable_plan const & plan, std::byte * out ) const noexcept;
+    [[nodiscard]] static bool portable_read_32(
+        std::byte const * & cursor, std::byte const * end, chunk_type high_bits, bitmap & result, std::size_t & total
+    );
 
     using chunk_store_type = detail::chunk_store<layout_type, CowPolicy>;
     static constexpr std::uint8_t singleton_chunk_capacity{ 8 };
