@@ -10,9 +10,12 @@
 #include <cstring>
 #include <memory>
 #include <new>
-#include <numeric>
 #include <span>
 #include <utility>
+
+#if defined( FRSR_ROARING_HAS_PSI_VM )
+#   include <psi/vm/containers/lookup.hpp>
+#endif
 
 namespace frsr::roaring::detail {
 
@@ -49,13 +52,76 @@ public:
     // still the slot it took. Appends that do not relocate leave it alone.
     [[nodiscard]] std::uint32_t generation() const noexcept { return generation_; }
 
-    [[nodiscard]] chunk_type key( std::size_t const index ) const noexcept { return live_.keys()[ idx( index ) ]; }
-    void set_key( std::size_t const index, chunk_type const key ) noexcept { live_.keys()[ idx( index ) ] = key; }
+    // A position in the table, in ascending key order; end() is the position past the last
+    // entry. A cursor stays valid until generation() advances. Every walk over the table goes
+    // through cursors, never through a number: where an entry lives is the table's business.
+    class cursor {
+    public:
+        constexpr cursor() noexcept = default;
+        constexpr cursor & operator++() noexcept { ++index_; return *this; }
+        [[nodiscard]] friend constexpr bool operator==( cursor, cursor ) noexcept = default;
 
-    [[nodiscard]] handle_type       & slot( std::size_t const index )       noexcept { return live_.slots()[ idx( index ) ]; }
-    [[nodiscard]] handle_type const & slot( std::size_t const index ) const noexcept { return live_.slots()[ idx( index ) ]; }
+    private:
+        friend class chunk_store;
+        constexpr explicit cursor( index_type const index ) noexcept : index_{ index } {}
+        index_type index_{ 0 };
+    };
 
-    [[nodiscard]] std::span<chunk_type  const> keys () const noexcept { return { live_.keys (), live_.size_ }; }
+    [[nodiscard]] cursor begin() const noexcept { return cursor{ 0 }; }
+    [[nodiscard]] cursor end  () const noexcept { return cursor{ live_.size_ }; }
+    // The final entry. The table must not be empty.
+    [[nodiscard]] cursor last () const noexcept { assert( live_.size_ != 0 ); return cursor{ live_.size_ - 1 }; }
+
+    [[nodiscard]] static cursor next( cursor const at ) noexcept { return cursor{ at.index_ + 1 }; }
+    // The entry before `at`, which must not be begin().
+    [[nodiscard]] static cursor prev( cursor const at ) noexcept { assert( at.index_ != 0 ); return cursor{ at.index_ - 1 }; }
+
+    // The entry at `at`, which must not be end().
+    [[nodiscard]] chunk_type key( cursor const at ) const noexcept { assert( at.index_ < live_.size_ ); return live_.keys()[ at.index_ ]; }
+
+    [[nodiscard]] handle_type       & slot( cursor const at )       noexcept { assert( at.index_ < live_.size_ ); return live_.slots()[ at.index_ ]; }
+    [[nodiscard]] handle_type const & slot( cursor const at ) const noexcept { assert( at.index_ < live_.size_ ); return live_.slots()[ at.index_ ]; }
+
+    // The first entry whose key is not below `key` (end() if there is none): a binary search
+    // over the dense keys array only. A pure read - the search keeps no state between calls,
+    // which is what lets concurrent readers share the table. With psi::vm the search is the
+    // branchless one that prefetches both candidates of the next step: a lookup into a large
+    // table is a chain of dependent cache misses, and overlapping them is what the reference's
+    // tree-shaped index gets from its fan-out.
+    [[nodiscard]] cursor lower_bound( chunk_type const key ) const noexcept {
+        auto const * const first{ live_.keys() };
+        auto const * const last { first + live_.size_ };
+#if defined( FRSR_ROARING_HAS_PSI_VM )
+        auto const position{ psi::vm::prefetching_lower_bound( first, last, key ) };
+#else
+        auto const position{ std::lower_bound( first, last, key ) };
+#endif
+        return cursor{ static_cast<index_type>( position - first ) };
+    }
+
+    // lower_bound() for a caller that already stands at `from` and only moves forward (a
+    // leapfrogging walk over several tables): the first entry at or after `from` whose key is
+    // not below `key`. Gallops from `from`, so the cost follows the distance travelled.
+    [[nodiscard]] cursor lower_bound( chunk_type const key, cursor const from ) const noexcept {
+        auto const n{ live_.size_ };
+        auto const * const keys{ live_.keys() };
+        auto low{ from.index_ };
+        if ( low >= n || !( keys[ low ] < key ) ) {
+            return cursor{ low < n ? low : n };
+        }
+        auto step{ index_type{ 1 } };
+        while ( low + step < n && keys[ low + step ] < key ) {   // keys[ low ] < key throughout
+            low  += step;
+            step <<= 1;
+        }
+        auto high{ std::min( low + step, n ) };                  // keys[ high ] >= key, or high == n
+        while ( low + 1 < high ) {
+            auto const mid{ low + ( high - low ) / 2 };
+            ( keys[ mid ] < key ? low : high ) = mid;
+        }
+        return cursor{ high };
+    }
+
     [[nodiscard]] std::span<handle_type      > slots()       noexcept { return { live_.slots(), live_.size_ }; }
     [[nodiscard]] std::span<handle_type const> slots() const noexcept { return { live_.slots(), live_.size_ }; }
 
@@ -207,20 +273,31 @@ public:
 
     // move_entry / truncate twins for the in-place combine walk: the payloads
     // they would free are retired instead.
-    void move_entry_retiring( std::size_t const to, std::size_t const from ) {
+    void move_entry_retiring( cursor const to, cursor const from ) {
         if ( to != from ) {
-            live_.keys()[ idx( to ) ] = live_.keys()[ idx( from ) ];
-            retire( std::move( live_.slots()[ idx( to ) ] ) );
-            live_.slots()[ idx( to ) ] = std::move( live_.slots()[ idx( from ) ] );
+            live_.keys()[ to.index_ ] = live_.keys()[ from.index_ ];
+            retire( std::move( live_.slots()[ to.index_ ] ) );
+            live_.slots()[ to.index_ ] = std::move( live_.slots()[ from.index_ ] );
             ++generation_;
         }
     }
 
-    void truncate_retiring( std::size_t const count ) {
-        for ( auto i{ count }; i < size(); ++i ) {
-            retire( std::move( live_.slots()[ idx( i ) ] ) );
+    // The entry at `at`, already consumed by the walk, becomes (key, container); its old payload is retired.
+    void replace_entry( cursor const at, chunk_type const key, handle_type && container ) {
+        live_.keys()[ at.index_ ] = key;
+        retire( std::move( live_.slots()[ at.index_ ] ) );
+        live_.slots()[ at.index_ ] = std::move( container );
+    }
+
+    // Drops every entry from `first_dead` on.
+    void truncate_retiring( cursor const first_dead ) {
+        for ( auto i{ first_dead.index_ }; i < live_.size_; ++i ) {
+            retire( std::move( live_.slots()[ i ] ) );
         }
-        truncate( count );
+        if ( first_dead.index_ != live_.size_ ) {
+            live_.erase( first_dead.index_, live_.size_ );
+            ++generation_;
+        }
     }
 
     void swap( chunk_store & other ) noexcept {
@@ -238,81 +315,19 @@ public:
         live_.push_back( key, std::forward<Handle>( handle ) );
     }
 
+    // Inserts before `at` (the lower_bound of `key`) and returns the position of the new entry.
     template <typename Handle>
-    void insert( std::size_t const index, chunk_type const key, Handle && handle ) {
-        live_.insert( idx( index ), key, std::forward<Handle>( handle ) );
+    cursor insert( cursor const at, chunk_type const key, Handle && handle ) {
+        live_.insert( at.index_, key, std::forward<Handle>( handle ) );
         ++generation_;
+        return at;
     }
 
-    void erase( std::size_t const index ) {
-        live_.erase( idx( index ), idx( index ) + 1 );
+    // Removes the entry at `at` and returns the position of the entry that followed it.
+    cursor erase( cursor const at ) {
+        live_.erase( at.index_, at.index_ + 1 );
         ++generation_;
-    }
-
-    // In-place compaction support for the shrinking set-ops (&=, -=): the entry
-    // at `from` moves down to `to` (to <= from always holds on those walks).
-    void move_entry( std::size_t const to, std::size_t const from ) {
-        if ( to != from ) {
-            live_.keys ()[ idx( to ) ] = live_.keys()[ idx( from ) ];
-            live_.slots()[ idx( to ) ] = std::move( live_.slots()[ idx( from ) ] );
-            ++generation_;
-        }
-    }
-
-    void truncate( std::size_t const count ) {
-        if ( idx( count ) != live_.size_ ) {
-            live_.erase( idx( count ), live_.size_ );
-            ++generation_;
-        }
-    }
-
-    void erase_front( std::size_t const count ) {
-        if ( count != 0 ) {
-            live_.erase( 0, idx( count ) );
-            ++generation_;
-        }
-    }
-
-    // Stable-compacts away every entry whose slot satisfies the predicate
-    // (the SoA analog of remove_if over the entry vector).
-    template <typename Pred>
-    void erase_slots_if( Pred && pred ) {
-        auto * const keys { live_.keys () };
-        auto * const slots{ live_.slots() };
-        index_type out{ 0 };
-        for ( index_type in{ 0 }; in < live_.size_; ++in ) {
-            if ( !pred( std::as_const( slots[ in ] ) ) ) {
-                if ( out != in ) {
-                    keys [ out ] = keys[ in ];
-                    slots[ out ] = std::move( slots[ in ] );
-                }
-                ++out;
-            }
-        }
-        truncate( out );
-        ++generation_;
-    }
-
-    // Permutation sort over both arrays (cold: only the lazy-sort configuration
-    // ever leaves the store unsorted).
-    void sort_by_key() {
-        auto const n{ live_.size_ };
-        heap_vector<std::uint32_t> permutation;
-        permutation.resize( n );
-        std::iota( permutation.begin(), permutation.end(), 0U );
-        auto const * const keys{ live_.keys() };
-        std::ranges::sort( permutation, [=]( std::uint32_t const lhs, std::uint32_t const rhs ) {
-            return keys[ lhs ] < keys[ rhs ];
-        } );
-
-        table sorted;
-        sorted.reserve( n );
-        auto * const slots{ live_.slots() };
-        for ( auto const index : permutation ) {
-            sorted.push_back( keys[ index ], std::move( slots[ index ] ) );
-        }
-        live_ = std::move( sorted );
-        ++generation_;
+        return at;
     }
 
 private:

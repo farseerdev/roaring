@@ -131,8 +131,8 @@ void bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy>::serialize_frozen_
         sizeof( frozen_header ) + static_cast<std::size_t>( chunk_count ) * sizeof( frozen_chunk_index )
     };
     std::uint32_t frozen_index{};
-    for ( size_type chunk_index{ 0 }; chunk_index < chunks_.size(); ++chunk_index ) {
-        auto const & container{ chunks_.slot( chunk_index ) };
+    for ( auto chunk_at{ chunks_.begin() }; chunk_at != chunks_.end(); ++chunk_at ) {
+        auto const & container{ chunks_.slot( chunk_at ) };
         if ( detail::container_size( container ) == 0 ) {
             continue;
         }
@@ -140,7 +140,7 @@ void bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy>::serialize_frozen_
         auto const [alignment, payload_size] = frozen_payload_layout( container );
         payload_offset = align_up( payload_offset, alignment );
         auto & frozen_chunk{ index[ frozen_index++ ] };
-        frozen_chunk.chunk = static_cast<std::uint64_t>( chunks_.key( chunk_index ) );
+        frozen_chunk.chunk = static_cast<std::uint64_t>( chunks_.key( chunk_at ) );
         frozen_chunk.payload_offset = static_cast<std::uint32_t>( payload_offset );
         frozen_chunk.payload_bytes = static_cast<std::uint32_t>( payload_size );
 
@@ -599,9 +599,9 @@ template <typename Handle>
 
 template <std::unsigned_integral Key, typename ContainerSet, typename CowPolicy, typename RunSelectionPolicy>
     requires detail::valid_container_set<Key, ContainerSet>
-typename bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy>::portable_plan bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy>::portable_plan_for( size_type const first, size_type const last ) const noexcept {
+typename bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy>::portable_plan bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy>::portable_plan_for( chunk_cursor const first, chunk_cursor const last ) const noexcept {
     portable_plan plan;
-    for ( auto index{ first }; index < last; ++index ) {
+    for ( auto index{ first }; index != last; ++index ) {
         auto const & slot{ chunks_.slot( index ) };
         if ( detail::container_size( slot ) == 0 ) {
             continue;
@@ -623,14 +623,14 @@ typename bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy>::portable_plan
 
 template <std::unsigned_integral Key, typename ContainerSet, typename CowPolicy, typename RunSelectionPolicy>
     requires detail::valid_container_set<Key, ContainerSet>
-std::byte * bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy>::portable_write_32( size_type const first, size_type const last, portable_plan const & plan, std::byte * out ) const noexcept {
+std::byte * bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy>::portable_write_32( chunk_cursor const first, chunk_cursor const last, portable_plan const & plan, std::byte * out ) const noexcept {
     auto const count{ plan.containers };
     if ( plan.has_run ) {
         detail::portable_put( out, detail::portable_cookie_with_run | ( ( count - 1U ) << 16 ) );
         auto const flag_bytes{ ( count + 7U ) / 8U };
         std::memset( out, 0, flag_bytes );
         std::uint32_t position{ 0 };
-        for ( auto index{ first }; index < last; ++index ) {
+        for ( auto index{ first }; index != last; ++index ) {
             auto const & slot{ chunks_.slot( index ) };
             if ( detail::container_size( slot ) == 0 ) {
                 continue;
@@ -645,7 +645,7 @@ std::byte * bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy>::portable_w
         detail::portable_put( out, detail::portable_cookie_no_run );
         detail::portable_put( out, count );
     }
-    for ( auto index{ first }; index < last; ++index ) {
+    for ( auto index{ first }; index != last; ++index ) {
         auto const & slot{ chunks_.slot( index ) };
         if ( detail::container_size( slot ) == 0 ) {
             continue;
@@ -655,7 +655,7 @@ std::byte * bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy>::portable_w
     }
     if ( !plan.has_run || count >= detail::portable_no_offset_threshold ) {
         auto offset{ plan.header_bytes };
-        for ( auto index{ first }; index < last; ++index ) {
+        for ( auto index{ first }; index != last; ++index ) {
             auto const & slot{ chunks_.slot( index ) };
             if ( detail::container_size( slot ) == 0 ) {
                 continue;
@@ -664,7 +664,7 @@ std::byte * bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy>::portable_w
             offset += detail::portable_wire_of( slot ).bytes;
         }
     }
-    for ( auto index{ first }; index < last; ++index ) {
+    for ( auto index{ first }; index != last; ++index ) {
         auto const & slot{ chunks_.slot( index ) };
         if ( detail::container_size( slot ) == 0 ) {
             continue;
@@ -680,14 +680,15 @@ std::size_t bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy>::portable_s
     static_assert( std::numeric_limits<key_type>::digits == 32 || std::numeric_limits<key_type>::digits == 64, "the portable format is defined for 32- and 64-bit keys" );
 
     if constexpr ( std::numeric_limits<key_type>::digits == 32 ) {
-        auto const plan{ portable_plan_for( 0, chunks_.size() ) };
+        auto const plan{ portable_plan_for( chunks_.begin(), chunks_.end() ) };
         return plan.header_bytes + plan.payload_bytes;
     } else {
         std::size_t total{ sizeof( std::uint64_t ) };
-        for ( size_type first{ 0 }; first < chunks_.size(); ) {
+        for ( auto first{ chunks_.begin() }; first != chunks_.end(); ) {
             auto const high{ chunks_.key( first ) >> 16 };
-            auto last{ first + 1 };
-            while ( last < chunks_.size() && ( chunks_.key( last ) >> 16 ) == high ) {
+            auto last{ first };
+            ++last;
+            while ( last != chunks_.end() && ( chunks_.key( last ) >> 16 ) == high ) {
                 ++last;
             }
             auto const plan{ portable_plan_for( first, last ) };
@@ -708,15 +709,16 @@ std::size_t bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy>::portable_s
 
     auto * cursor{ out.data() };
     if constexpr ( std::numeric_limits<key_type>::digits == 32 ) {
-        cursor = portable_write_32( 0, chunks_.size(), portable_plan_for( 0, chunks_.size() ), cursor );
+        cursor = portable_write_32( chunks_.begin(), chunks_.end(), portable_plan_for( chunks_.begin(), chunks_.end() ), cursor );
     } else {
         // Bucket count first (a bucket is a run of chunks sharing the high 32 bits and
         // holding at least one non-empty container), then the buckets in key order.
         std::uint64_t buckets{ 0 };
-        for ( size_type first{ 0 }; first < chunks_.size(); ) {
+        for ( auto first{ chunks_.begin() }; first != chunks_.end(); ) {
             auto const high{ chunks_.key( first ) >> 16 };
-            auto last{ first + 1 };
-            while ( last < chunks_.size() && ( chunks_.key( last ) >> 16 ) == high ) {
+            auto last{ first };
+            ++last;
+            while ( last != chunks_.end() && ( chunks_.key( last ) >> 16 ) == high ) {
                 ++last;
             }
             buckets += portable_plan_for( first, last ).containers != 0;
@@ -724,10 +726,11 @@ std::size_t bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy>::portable_s
         }
         std::memcpy( cursor, &buckets, sizeof( buckets ) );
         cursor += sizeof( buckets );
-        for ( size_type first{ 0 }; first < chunks_.size(); ) {
+        for ( auto first{ chunks_.begin() }; first != chunks_.end(); ) {
             auto const high{ chunks_.key( first ) >> 16 };
-            auto last{ first + 1 };
-            while ( last < chunks_.size() && ( chunks_.key( last ) >> 16 ) == high ) {
+            auto last{ first };
+            ++last;
+            while ( last != chunks_.end() && ( chunks_.key( last ) >> 16 ) == high ) {
                 ++last;
             }
             auto const plan{ portable_plan_for( first, last ) };

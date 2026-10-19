@@ -259,14 +259,15 @@ public:
     using default_container_set_type = default_container_set<key_type>;
 
 private:
-    using handle_type = detail::container_handle<layout_type, CowPolicy>;
+    using handle_type      = detail::container_handle<layout_type, CowPolicy>;
+    using chunk_store_type = detail::chunk_store<layout_type, CowPolicy>;
+    using chunk_cursor     = typename chunk_store_type::cursor;
 
 public:
 
     static constexpr size_type array_to_bitset_threshold{
         layout_type::low_domain_size >= 1024 ? layout_type::low_domain_size / 16 : 64
     };
-    static constexpr size_type invalid_index{ std::numeric_limits<size_type>::max() };
 
     struct container_statistics {
         size_type array_containers{};
@@ -298,7 +299,8 @@ public:
     // exclusive lock, readers copy under a shared one.
     struct bulk_context {
         chunk_type chunk{};
-        size_type index{ invalid_index };
+        chunk_cursor at{};
+        bool located{ false };      // `at` holds the chunk's position (revalidated by key on use)
         bool payload_private{ false };
         // The resolved slot itself, as the reference caches its container: valid
         // while `generation` still matches the chunk store's (no slot has moved
@@ -306,7 +308,7 @@ public:
         handle_type * slot{ nullptr };
         std::uint32_t generation{ 0 };
 
-        void reset() noexcept { index = invalid_index; payload_private = false; slot = nullptr; }
+        void reset() noexcept { located = false; payload_private = false; slot = nullptr; }
     };
 
     class const_iterator {
@@ -332,7 +334,7 @@ public:
         }
 
         [[nodiscard]] friend bool operator==( const_iterator const & lhs, const_iterator const & rhs ) noexcept {
-            return lhs.owner_ == rhs.owner_ && lhs.chunk_index_ == rhs.chunk_index_ && lhs.current_low_ == rhs.current_low_;
+            return lhs.owner_ == rhs.owner_ && lhs.chunk_ == rhs.chunk_ && lhs.current_low_ == rhs.current_low_;
         }
 
     private:
@@ -351,16 +353,16 @@ public:
 
         void finish() noexcept {
             owner_ = nullptr;
-            chunk_index_ = 0;
+            chunk_ = chunk_cursor{};
             current_low_.reset();
             current_value_ = {};
         }
 
         void seek_first() noexcept {
-            for ( chunk_index_ = 0; chunk_index_ < owner_->chunks_.size(); ++chunk_index_ ) {
-                if ( auto const low{ detail::container_first( owner_->chunks_.slot( chunk_index_ ) ) } ) {
+            for ( chunk_ = owner_->chunks_.begin(); chunk_ != owner_->chunks_.end(); chunk_ = chunk_store_type::next( chunk_ ) ) {
+                if ( auto const low{ detail::container_first( owner_->chunks_.slot( chunk_ ) ) } ) {
                     current_low_ = low;
-                    current_value_ = layout_type::compose( owner_->chunks_.key( chunk_index_ ), *low );
+                    current_value_ = layout_type::compose( owner_->chunks_.key( chunk_ ), *low );
                     return;
                 }
             }
@@ -372,16 +374,16 @@ public:
                 return;
             }
 
-            if ( auto const next_low{ detail::container_next_after( owner_->chunks_.slot( chunk_index_ ), *current_low_ ) } ) {
+            if ( auto const next_low{ detail::container_next_after( owner_->chunks_.slot( chunk_ ), *current_low_ ) } ) {
                 current_low_ = next_low;
-                current_value_ = layout_type::compose( owner_->chunks_.key( chunk_index_ ), *next_low );
+                current_value_ = layout_type::compose( owner_->chunks_.key( chunk_ ), *next_low );
                 return;
             }
 
-            for ( ++chunk_index_; chunk_index_ < owner_->chunks_.size(); ++chunk_index_ ) {
-                if ( auto const low{ detail::container_first( owner_->chunks_.slot( chunk_index_ ) ) } ) {
+            for ( chunk_ = chunk_store_type::next( chunk_ ); chunk_ != owner_->chunks_.end(); chunk_ = chunk_store_type::next( chunk_ ) ) {
+                if ( auto const low{ detail::container_first( owner_->chunks_.slot( chunk_ ) ) } ) {
                     current_low_ = low;
-                    current_value_ = layout_type::compose( owner_->chunks_.key( chunk_index_ ), *low );
+                    current_value_ = layout_type::compose( owner_->chunks_.key( chunk_ ), *low );
                     return;
                 }
             }
@@ -390,7 +392,7 @@ public:
         }
 
         bitmap const * owner_{};
-        size_type chunk_index_{};
+        chunk_cursor chunk_{};
         std::optional<low_type> current_low_{};
         value_type current_value_{};
     };
@@ -472,13 +474,13 @@ public:
     [[nodiscard]] char const * validate( bool const canonical_kinds = false ) const noexcept {
         size_type total{ 0 };
         chunk_type previous{};
-        for ( size_type index{ 0 }; index < chunks_.size(); ++index ) {
-            auto const key{ chunks_.key( index ) };
-            if ( index != 0 && !( previous < key ) ) {
+        for ( auto at{ chunks_.begin() }; at != chunks_.end(); at = chunk_store_type::next( at ) ) {
+            auto const key{ chunks_.key( at ) };
+            if ( at != chunks_.begin() && !( previous < key ) ) {
                 return "chunk keys are not strictly ascending";
             }
             previous = key;
-            auto const & slot{ chunks_.slot( index ) };
+            auto const & slot{ chunks_.slot( at ) };
             auto const cardinality{ static_cast<size_type>( slot.cardinality() ) };
             if ( cardinality == 0 ) {
                 return "a chunk holds an empty container";
@@ -537,10 +539,10 @@ public:
     }
     [[nodiscard]] key_type front() const noexcept { return *begin(); }
     [[nodiscard]] key_type back() const noexcept {
-        auto chunk_index{ chunks_.size() };
-        while ( chunk_index > 0 ) {
-            --chunk_index;
-            auto const & container{ chunks_.slot( chunk_index ) };
+        auto at{ chunks_.end() };
+        while ( at != chunks_.begin() ) {
+            at = chunk_store_type::prev( at );
+            auto const & container{ chunks_.slot( at ) };
             auto next{ detail::container_first( container ) };
             if ( !next ) {
                 continue;
@@ -548,7 +550,7 @@ public:
             while ( auto const after{ detail::container_next_after( container, *next ) } ) {
                 next = after;
             }
-            return layout_type::compose( chunks_.key( chunk_index ), *next );
+            return layout_type::compose( chunks_.key( at ), *next );
         }
         return {};
     }
@@ -574,36 +576,31 @@ public:
     // roaring_bitmap_contains_bulk, mirrored here by contains_bulk.
     [[nodiscard]] bool contains( key_type const value ) const noexcept {
         auto const chunk{ layout_type::chunk_key( value ) };
-        auto const pos{ lower_bound( chunk ) };
-        if ( pos == chunks_.size() || chunks_.key( pos ) != chunk ) { return false; }
-        return detail::container_contains( chunks_.slot( pos ), layout_type::low_key( value ) );
+        auto const at{ chunks_.lower_bound( chunk ) };
+        if ( at == chunks_.end() || chunks_.key( at ) != chunk ) { return false; }
+        return detail::container_contains( chunks_.slot( at ), layout_type::low_key( value ) );
     }
 
     [[nodiscard]] bool contains_bulk( bulk_context & ctx, key_type const value ) const noexcept {
         auto const chunk{ layout_type::chunk_key( value ) };
-        if (
-            ctx.index != invalid_index &&
-            ctx.index < chunks_.size() &&
-            chunks_.key( ctx.index ) == chunk
-        ) {
-            return detail::container_contains( chunks_.slot( ctx.index ), layout_type::low_key( value ) );
+        if ( ctx.located && ctx.at != chunks_.end() ) {
+            if ( chunks_.key( ctx.at ) == chunk ) {
+                return detail::container_contains( chunks_.slot( ctx.at ), layout_type::low_key( value ) );
+            }
+            if ( try_adjacent_chunk( chunk, ctx.at ) ) {
+                ctx.chunk = chunk;
+                return detail::container_contains( chunks_.slot( ctx.at ), layout_type::low_key( value ) );
+            }
         }
-        if (
-            ctx.index != invalid_index &&
-            ctx.index < chunks_.size() &&
-            try_adjacent_chunk_index( chunk, ctx.index, ctx.index )
-        ) {
-            ctx.chunk = chunk;
-            return detail::container_contains( chunks_.slot( ctx.index ), layout_type::low_key( value ) );
-        }
-        auto const pos{ lower_bound_outlined( chunk ) };
-        if ( pos == chunks_.size() || chunks_.key( pos ) != chunk ) {
+        auto const at{ lower_bound_outlined( chunk ) };
+        if ( at == chunks_.end() || chunks_.key( at ) != chunk ) {
             ctx.reset();
             return false;
         }
-        ctx.chunk = chunk;
-        ctx.index = pos;
-        return detail::container_contains( chunks_.slot( ctx.index ), layout_type::low_key( value ) );
+        ctx.chunk   = chunk;
+        ctx.at      = at;
+        ctx.located = true;
+        return detail::container_contains( chunks_.slot( at ), layout_type::low_key( value ) );
     }
 
     [[nodiscard]] bool add( key_type const value ) {
@@ -645,14 +642,14 @@ public:
     [[nodiscard]] bool remove( key_type const value ) {
         auto const chunk{ layout_type::chunk_key( value ) };
         auto const low{ layout_type::low_key( value ) };
-        auto const pos{ lower_bound( chunk ) };
-        if ( pos == chunks_.size() || chunks_.key( pos ) != chunk ) { return false; }
-        if ( !detail::container_remove( chunks_.slot( pos ), low ) ) { return false; }
+        auto const at{ chunks_.lower_bound( chunk ) };
+        if ( at == chunks_.end() || chunks_.key( at ) != chunk ) { return false; }
+        if ( !detail::container_remove( chunks_.slot( at ), low ) ) { return false; }
 
         --size_;
-        if ( detail::container_size( chunks_.slot( pos ) ) == 0 ) {
+        if ( detail::container_size( chunks_.slot( at ) ) == 0 ) {
             // [croaring-ref] deps/croaring/src/roaring_array.c:ra_remove_at_index
-            chunks_.erase( pos );
+            chunks_.erase( at );
         }
         return true;
     }
@@ -662,21 +659,21 @@ public:
 
     [[nodiscard]] bool intersects( bitmap const & other ) const noexcept {
 
-        size_type left{ 0 };
-        size_type right{ 0 };
-        while ( left != chunks_.size() && right != other.chunks_.size() ) {
+        auto left { chunks_.begin() };
+        auto right{ other.chunks_.begin() };
+        while ( left != chunks_.end() && right != other.chunks_.end() ) {
             auto const left_key { chunks_.key( left ) };
             auto const right_key{ other.chunks_.key( right ) };
             if ( left_key < right_key ) {
-                ++left;
+                left = chunk_store_type::next( left );
             } else if ( right_key < left_key ) {
-                ++right;
+                right = chunk_store_type::next( right );
             } else {
                 if ( detail::container_intersects( chunks_.slot( left ), other.chunks_.slot( right ) ) ) {
                     return true;
                 }
-                ++left;
-                ++right;
+                left  = chunk_store_type::next( left );
+                right = chunk_store_type::next( right );
             }
         }
         return false;
@@ -694,18 +691,18 @@ public:
                 return;
             }
 
-            auto const pos{ lower_bound( current_chunk ) };
-            if ( pos == chunks_.size() || chunks_.key( pos ) != current_chunk ) {
-                chunks_.insert( pos, current_chunk, make_policy_container_from_sorted_values(
+            auto const at{ chunks_.lower_bound( current_chunk ) };
+            if ( at == chunks_.end() || chunks_.key( at ) != current_chunk ) {
+                chunks_.insert( at, current_chunk, make_policy_container_from_sorted_values(
                     { grouped_values.data(), grouped_values.size() },
                     array_to_bitset_threshold
                 ) );
                 size_ += grouped_values.size();
             } else {
                 size_ += detail::container_add_sorted(
-                    chunks_.slot( pos ), { grouped_values.data(), grouped_values.size() }
+                    chunks_.slot( at ), { grouped_values.data(), grouped_values.size() }
                 );
-                promote_if_needed( chunks_.slot( pos ) );
+                promote_if_needed( chunks_.slot( at ) );
             }
 
             grouped_values.clear();
@@ -741,9 +738,9 @@ public:
                 return;
             }
 
-            auto const pos{ lower_bound( current_chunk ) };
-            if ( pos != chunks_.size() && chunks_.key( pos ) == current_chunk ) {
-                auto & slot{ chunks_.slot( pos ) };
+            auto const at{ chunks_.lower_bound( current_chunk ) };
+            if ( at != chunks_.end() && chunks_.key( at ) == current_chunk ) {
+                auto & slot{ chunks_.slot( at ) };
                 if ( slot.holds_array() ) {
                     // One merge walk over the array for the whole group; the
                     // per-value remove is a lower_bound + memmove each.
@@ -755,10 +752,10 @@ public:
                         }
                     }
                 }
-                if ( detail::container_size( chunks_.slot( pos ) ) == 0 ) {
-                    chunks_.erase( pos );
+                if ( detail::container_size( chunks_.slot( at ) ) == 0 ) {
+                    chunks_.erase( at );
                 } else {
-                    chunks_.slot( pos ) = optimize_container_for_policy( std::move( chunks_.slot( pos ) ) );
+                    chunks_.slot( at ) = optimize_container_for_policy( std::move( chunks_.slot( at ) ) );
                 }
             }
 
@@ -883,9 +880,9 @@ public:
     void for_each( F && f ) const {
         // Values come out in order, so the chunks must be in order first: a wide
         // chunk key defers the sort until a path needs it, and this is such a path.
-        for ( size_type index{ 0 }; index < chunks_.size(); ++index ) {
-            auto const chunk_key{ chunks_.key( index ) };
-            detail::container_for_each( chunks_.slot( index ), [&]( low_type const low ) {
+        for ( auto at{ chunks_.begin() }; at != chunks_.end(); at = chunk_store_type::next( at ) ) {
+            auto const chunk_key{ chunks_.key( at ) };
+            detail::container_for_each( chunks_.slot( at ), [&]( low_type const low ) {
                 f( layout_type::compose( chunk_key, low ) );
             } );
         }
@@ -901,12 +898,12 @@ public:
         // Values come out in order, so the chunks must be in order first: a wide
         // chunk key defers the sort until a path needs it, and this is such a path.
         assert( out.size() >= size_ );
-        auto * cursor{ out.data() };
+        auto * out_cursor{ out.data() };
         auto * const end{ out.data() + out.size() };
-        for ( size_type index{ 0 }; index < chunks_.size(); ++index ) {
-            cursor = detail::container_decode_into( chunks_.slot( index ), chunks_.key( index ), cursor, end );
+        for ( auto at{ chunks_.begin() }; at != chunks_.end(); at = chunk_store_type::next( at ) ) {
+            out_cursor = detail::container_decode_into( chunks_.slot( at ), chunks_.key( at ), out_cursor, end );
         }
-        return static_cast<std::size_t>( cursor - out.data() );
+        return static_cast<std::size_t>( out_cursor - out.data() );
     }
 
     [[nodiscard]] detail::heap_vector<key_type> to_vector() const {
@@ -1103,9 +1100,9 @@ public:
         detail::combine_stats().record_call( chunks_.size(), other.chunks_.size() );
 #endif
 
-        size_type left{ 0 };
-        size_type right{ 0 };
-        while ( left != chunks_.size() && right != other.chunks_.size() ) {
+        auto left{ chunks_.begin() };
+        auto right{ other.chunks_.begin() };
+        while ( left != chunks_.end() && right != other.chunks_.end() ) {
             auto const left_key { chunks_.key( left ) };
             auto const right_key{ other.chunks_.key( right ) };
             if ( left_key < right_key ) {
@@ -1166,7 +1163,7 @@ public:
             }
         }
 
-        while ( left != chunks_.size() ) {
+        while ( left != chunks_.end() ) {
             auto const & left_container{ chunks_.slot( left ) };
             if ( detail::container_size( left_container ) != 0 ) {
                 scratch.size_ += detail::container_size( left_container );
@@ -1174,7 +1171,7 @@ public:
             }
             ++left;
         }
-        while ( right != other.chunks_.size() ) {
+        while ( right != other.chunks_.end() ) {
             auto const & right_container{ other.chunks_.slot( right ) };
             if ( detail::container_size( right_container ) != 0 ) {
                 scratch.size_ += detail::container_size( right_container );
@@ -1194,15 +1191,15 @@ public:
         scratch.clear_keep_capacity();
         scratch.chunks_.reserve( chunks_.size() );
 
-        size_type left{ 0 };
-        size_type right{ 0 };
-        while ( left != chunks_.size() ) {
+        auto left{ chunks_.begin() };
+        auto right{ other.chunks_.begin() };
+        while ( left != chunks_.end() ) {
             auto const left_key{ chunks_.key( left ) };
-            while ( right != other.chunks_.size() && other.chunks_.key( right ) < left_key ) {
+            while ( right != other.chunks_.end() && other.chunks_.key( right ) < left_key ) {
                 ++right;
             }
 
-            if ( right == other.chunks_.size() || left_key < other.chunks_.key( right ) ) {
+            if ( right == other.chunks_.end() || left_key < other.chunks_.key( right ) ) {
                 auto const & left_container{ chunks_.slot( left ) };
                 if ( detail::container_size( left_container ) != 0 ) {
                     scratch.size_ += detail::container_size( left_container );
@@ -1296,10 +1293,10 @@ public:
         detail::combine_stats().record_call( chunks_.size(), other.chunks_.size() );
 #endif
 
-        size_type left{ 0 };
-        size_type right{ 0 };
+        auto left{ chunks_.begin() };
+        auto right{ other.chunks_.begin() };
         size_ = 0;
-        while ( left != chunks_.size() && right != other.chunks_.size() ) {
+        while ( left != chunks_.end() && right != other.chunks_.end() ) {
             auto const left_key { chunks_.key( left ) };
             auto const right_key{ other.chunks_.key( right ) };
             if ( left_key < right_key ) {
@@ -1440,14 +1437,14 @@ public:
             }
         }
 
-        while ( left != chunks_.size() ) {
+        while ( left != chunks_.end() ) {
             if ( !lazy ) {
                 size_ += detail::container_size( chunks_.slot( left ) );
             }
             merged.push_back( chunks_.key( left ), std::move( chunks_.slot( left ) ) );
             ++left;
         }
-        while ( right != other.chunks_.size() ) {
+        while ( right != other.chunks_.end() ) {
             auto const & right_container{ other.chunks_.slot( right ) };
             if ( detail::container_size( right_container ) != 0 ) {
                 if ( !lazy ) {
@@ -1516,9 +1513,9 @@ public:
 #endif
         assert( ( in_place || !keep_unmatched_left ) && "materializing subtract has no caller/arm" );
 
-        size_type write{ 0 };
-        size_type left{ 0 };
-        size_type right{ 0 };
+        auto write{ chunks_.begin() };
+        auto left{ chunks_.begin() };
+        auto right{ other.chunks_.begin() };
         if ( in_place ) { size_ = 0; }
         auto & result_size { in_place ? size_    : out->size_    };
         auto & result_chunks{ in_place ? chunks_ : out->chunks_ };
@@ -1537,12 +1534,10 @@ public:
 #endif
             result_size += count;
             if ( in_place ) {
-                chunks_.set_key( write, key );
                 // Retire (not free) the consumed slot being overwritten: its
                 // payload becomes the next pair's / next call's result buffer
                 // via take_retired (scratch-reuse path).
-                chunks_.retire( std::move( chunks_.slot( write ) ) );
-                chunks_.slot( write ) = std::move( container );
+                chunks_.replace_entry( write, key, std::move( container ) );
                 ++write;
             } else {
                 result_chunks.push_back( key, std::move( container ) );
@@ -1594,15 +1589,15 @@ public:
             result.handle = nullptr;
         } };
 
-        while ( left != chunks_.size() ) {
+        while ( left != chunks_.end() ) {
             auto const left_key{ chunks_.key( left ) };
-            while ( right != other.chunks_.size() && other.chunks_.key( right ) < left_key ) {
+            while ( right != other.chunks_.end() && other.chunks_.key( right ) < left_key ) {
                 ++right;
             }
 
-            if ( right == other.chunks_.size() || left_key < other.chunks_.key( right ) ) {
+            if ( right == other.chunks_.end() || left_key < other.chunks_.key( right ) ) {
                 if ( !keep_unmatched_left ) {
-                    if ( right == other.chunks_.size() ) {
+                    if ( right == other.chunks_.end() ) {
                         break;  // bit_and: nothing to the right can match — drop the remainder via truncate
                     }
                     ++left;
@@ -2075,9 +2070,9 @@ public:
     // [croaring-ref] deps/croaring/src/roaring.c:roaring_bitmap_lazy_or_inplace
     [[ gnu::hot ]] void bulk_or_inplace( bitmap const & other ) {
         auto const & rhs{ other.chunks_ };
-        size_type pos1{ 0 };
-        size_type pos2{ 0 };
-        while ( pos1 < chunks_.size() && pos2 < rhs.size() ) {
+        auto pos1{ chunks_.begin() };
+        auto pos2{ rhs.begin() };
+        while ( pos1 != chunks_.end() && pos2 != rhs.end() ) {
             auto const left_key { chunks_.key( pos1 ) };
             auto const right_key{ rhs.key( pos2 ) };
             if ( left_key < right_key ) {
@@ -2086,7 +2081,7 @@ public:
             }
             if ( right_key < left_key ) {  // other-only key: splice a copy in (rare on the leading edge)
                 if ( detail::container_size( rhs.slot( pos2 ) ) != 0 ) {
-                    chunks_.insert( pos1, right_key, rhs.slot( pos2 ) );
+                    pos1 = chunks_.insert( pos1, right_key, rhs.slot( pos2 ) );
                     ++pos1;
                 }
                 ++pos2;
@@ -2162,7 +2157,7 @@ public:
             ++pos2;
         }
         // Tail: append other's remaining chunks (copies).
-        while ( pos2 < rhs.size() ) {
+        while ( pos2 != rhs.end() ) {
             if ( detail::container_size( rhs.slot( pos2 ) ) != 0 ) {
                 chunks_.push_back( rhs.key( pos2 ), rhs.slot( pos2 ) );
             }
@@ -2392,26 +2387,6 @@ private:
             : data{ n <= inline_.size() ? inline_.data() : ( heap_ = std::make_unique<T[]>( n ), heap_.get() ) } {}
     };
 
-    // The first index at or after `from` whose chunk key is not below `key` (size() if there is none).
-    [[nodiscard]] static size_type and_many_gallop( bitmap const & bm, size_type const from, chunk_type const key ) noexcept {
-        auto const n{ bm.chunks_.size() };
-        if ( from >= n || !( bm.chunks_.key( from ) < key ) ) {
-            return from < n ? from : n;
-        }
-        auto low { from };       // key( low ) < key
-        auto step{ size_type{ 1 } };
-        while ( low + step < n && bm.chunks_.key( low + step ) < key ) {
-            low  += step;
-            step <<= 1;
-        }
-        auto high{ std::min( low + step, n ) };  // key( high ) >= key, or high == n
-        while ( low + 1 < high ) {
-            auto const mid{ low + ( high - low ) / 2 };
-            ( bm.chunks_.key( mid ) < key ? low : high ) = mid;
-        }
-        return high;
-    }
-
     // Calls chunk( key, handles ) for every chunk key every operand holds a live container for, in
     // ascending key order, with `handles` ordered by ascending container cardinality. chunk returns
     // false to stop the walk.
@@ -2425,7 +2400,7 @@ private:
             return;
         }
         and_many_buffer<bitmap const *>      ops    { count };
-        and_many_buffer<size_type>           cursors{ count };
+        and_many_buffer<chunk_cursor>         cursors{ count };
         and_many_buffer<handle_type const *> handles{ count };
         count = 0;
         for ( auto const * const operand : operands ) {
@@ -2436,7 +2411,7 @@ private:
                 return;
             }
             ops.data[ count ]     = operand;
-            cursors.data[ count ] = 0;
+            cursors.data[ count ] = operand->chunks_.begin();
             ++count;
         }
 
@@ -2447,16 +2422,16 @@ private:
         for ( std::size_t j{ 0 }; j < count; ++j ) {
             auto const & chunks{ ops.data[ j ]->chunks_ };
             if ( chunks.size() < ops.data[ driver ]->chunks_.size() ) { driver = j; }
-            lowest  = std::max( lowest , chunks.key( 0 ) );
-            highest = std::min( highest, chunks.key( chunks.size() - 1 ) );
+            lowest  = std::max( lowest , chunks.key( chunks.begin() ) );
+            highest = std::min( highest, chunks.key( chunks.last() ) );
         }
         if ( highest < lowest ) {
             return;
         }
 
         auto const & driving{ *ops.data[ driver ] };
-        auto const   driving_size{ driving.chunks_.size() };
-        for ( auto at{ and_many_gallop( driving, 0, lowest ) }; at < driving_size; ++at ) {
+        auto at{ driving.chunks_.lower_bound( lowest, driving.chunks_.begin() ) };
+        while ( at != driving.chunks_.end() ) {
             auto const key{ driving.chunks_.key( at ) };
             if ( highest < key ) {
                 break;
@@ -2464,23 +2439,19 @@ private:
             bool all_present{ true };
             for ( std::size_t j{ 0 }; j < count; ++j ) {
                 auto const & bm{ *ops.data[ j ] };
-                auto const   index{ and_many_gallop( bm, cursors.data[ j ], key ) };
-                cursors.data[ j ] = index;
-                if ( index == bm.chunks_.size() ) {
+                auto const   found_at{ bm.chunks_.lower_bound( key, cursors.data[ j ] ) };
+                cursors.data[ j ] = found_at;
+                if ( found_at == bm.chunks_.end() ) {
                     return;  // nothing at or above this key in this operand: nothing further can intersect
                 }
-                auto const found{ bm.chunks_.key( index ) };
+                auto const found{ bm.chunks_.key( found_at ) };
                 if ( found != key ) {
                     // leapfrog: the driver jumps to the operand's next key
-                    at = and_many_gallop( driving, at + 1, found ) - 1;
+                    at = driving.chunks_.lower_bound( found, at );
                     all_present = false;
                     break;
                 }
-                handles.data[ j ] = &bm.chunks_.slot( index );
-                if ( detail::container_size( *handles.data[ j ] ) == 0 ) {
-                    all_present = false;  // a lazily erased slot
-                    break;
-                }
+                handles.data[ j ] = &bm.chunks_.slot( found_at );
             }
             if ( !all_present ) {
                 continue;
@@ -2496,6 +2467,7 @@ private:
             if ( !chunk( key, std::span<handle_type const * const>{ handles.data, count } ) ) {
                 return;
             }
+            ++at;
         }
     }
 
@@ -2938,59 +2910,34 @@ private:
         std::size_t   header_bytes{};
         std::size_t   payload_bytes{};
     };
-    [[nodiscard]] portable_plan portable_plan_for( size_type first, size_type last ) const noexcept;
-    std::byte * portable_write_32( size_type first, size_type last, portable_plan const & plan, std::byte * out ) const noexcept;
+    [[nodiscard]] portable_plan portable_plan_for( chunk_cursor first, chunk_cursor last ) const noexcept;
+    std::byte * portable_write_32( chunk_cursor first, chunk_cursor last, portable_plan const & plan, std::byte * out ) const noexcept;
     [[nodiscard]] static bool portable_read_32(
         std::byte const * & cursor, std::byte const * end, chunk_type high_bits, bitmap & result, std::size_t & total
     );
 
-    using chunk_store_type = detail::chunk_store<layout_type, CowPolicy>;
-
-    // Index of the first live entry with key >= chunk (chunks_.size() if none):
-    // a binary search over the dense SoA keys[] array only. A pure read - the
-    // search keeps no state between calls, which is what lets concurrent readers
-    // share the bitmap. With psi::vm the search is the branchless one that
-    // prefetches both candidates of the next step: a lookup into a large chunk
-    // table is a chain of dependent cache misses, and overlapping them is what
-    // the reference's tree-shaped index gets from its fan-out.
-    [[nodiscard]] size_type lower_bound( chunk_type const chunk ) const noexcept {
-        auto const keys{ chunks_.keys() };
-        auto const first{ keys.begin() };
-#if defined( FRSR_ROARING_HAS_PSI_VM )
-        auto const pos{ psi::vm::prefetching_lower_bound( first, keys.end(), chunk ) };
-#else
-        auto const pos{ std::lower_bound( first, keys.end(), chunk ) };
-#endif
-        return static_cast<size_type>( pos - keys.begin() );
-    }
 
     // lower_bound() out of line, for call sites whose fast path is something else
     // (a bulk context hit): keeps the search loop out of their hot code.
-    [[nodiscard, gnu::noinline]] size_type lower_bound_outlined( chunk_type const chunk ) const noexcept {
-        return lower_bound( chunk );
+    [[nodiscard, gnu::noinline]] chunk_cursor lower_bound_outlined( chunk_type const chunk ) const noexcept {
+        return chunks_.lower_bound( chunk );
     }
 
-    // Whether the chunk next to (or before) anchor_index holds `chunk`: the
-    // sequential-access probe of a bulk context.
-    [[nodiscard]] bool try_adjacent_chunk_index(
-        chunk_type const chunk,
-        size_type const anchor_index,
-        size_type & result_index
-    ) const noexcept {
-        if ( anchor_index == invalid_index || anchor_index >= chunks_.size() ) {
-            return false;
-        }
-        auto const current_key{ chunks_.key( anchor_index ) };
+    // Whether the entry next to (or before) `at` holds `chunk`: the sequential-access
+    // probe of a bulk context. On success `at` moves onto it. `at` must not be end().
+    [[nodiscard]] bool try_adjacent_chunk( chunk_type const chunk, chunk_cursor & at ) const noexcept {
+        auto const current_key{ chunks_.key( at ) };
         if ( chunk > current_key ) {
-            auto const next{ anchor_index + 1U };
-            if ( next < chunks_.size() && chunks_.key( next ) == chunk ) {
-                result_index = next;
+            auto following{ at };
+            ++following;
+            if ( following != chunks_.end() && chunks_.key( following ) == chunk ) {
+                at = following;
                 return true;
             }
-        } else if ( chunk < current_key && anchor_index > 0 ) {
-            auto const prev{ anchor_index - 1U };
-            if ( chunks_.key( prev ) == chunk ) {
-                result_index = prev;
+        } else if ( chunk < current_key && at != chunks_.begin() ) {
+            auto const before{ chunk_store_type::prev( at ) };
+            if ( chunks_.key( before ) == chunk ) {
+                at = before;
                 return true;
             }
         }
@@ -3429,28 +3376,29 @@ private:
         auto const chunk{ layout_type::chunk_key( value ) };
         auto const low{ layout_type::low_key( value ) };
 
-        size_type pos;
+        chunk_cursor at;
         bool ctx_payload_private{ false };
         if (
             ctx != nullptr &&
-            ctx->index != invalid_index &&
-            ctx->index < chunks_.size() &&
-            chunks_.key( ctx->index ) == chunk
+            ctx->located &&
+            ctx->at != chunks_.end() &&
+            chunks_.key( ctx->at ) == chunk
         ) {
-            pos = ctx->index;
+            at = ctx->at;
             ctx_payload_private = ctx->payload_private;
         } else {
             // CRoaring-style: O(log n) binary search + sorted insert.
-            pos = lower_bound( chunk );
-            if ( pos == chunks_.size() || chunks_.key( pos ) != chunk ) {
-                chunks_.insert( pos, chunk, handle_type{} );
+            at = chunks_.lower_bound( chunk );
+            if ( at == chunks_.end() || chunks_.key( at ) != chunk ) {
+                at = chunks_.insert( at, chunk, handle_type{} );
             }
         }
 
         if ( ctx != nullptr ) {
-            ctx->chunk = chunk;
-            ctx->index = pos;
-            ctx->slot  = &chunks_.slot( pos );
+            ctx->chunk   = chunk;
+            ctx->at      = at;
+            ctx->located = true;
+            ctx->slot    = &chunks_.slot( at );
             ctx->generation = chunks_.generation();
             // The add below makes this payload private (or already found it so),
             // and no copy can intervene before the next call on this context.
@@ -3459,13 +3407,13 @@ private:
 
         auto const added{
             ctx_payload_private
-                ? detail::container_add_already_private( chunks_.slot( pos ), low )
-                : detail::container_add               ( chunks_.slot( pos ), low )
+                ? detail::container_add_already_private( chunks_.slot( at ), low )
+                : detail::container_add               ( chunks_.slot( at ), low )
         };
         if ( !added ) { return false; }
 
         ++size_;
-        promote_if_needed( chunks_.slot( pos ) );
+        promote_if_needed( chunks_.slot( at ) );
         return true;
     }
 
@@ -3519,17 +3467,17 @@ private:
         low_type const low_end,
         detail::range_operation const operation
     ) {
-        auto pos{ lower_bound( chunk ) };
-        if ( pos == chunks_.size() || chunks_.key( pos ) != chunk ) {
+        auto at{ chunks_.lower_bound( chunk ) };
+        if ( at == chunks_.end() || chunks_.key( at ) != chunk ) {
             if ( operation == detail::range_operation::remove ) { return; }
-            chunks_.insert( pos, chunk, handle_type{} );
+            at = chunks_.insert( at, chunk, handle_type{} );
         }
 
-        auto const previous_size{ detail::container_size( chunks_.slot( pos ) ) };
-        auto words{ detail::words_from_container<layout_type>( chunks_.slot( pos ) ) };
+        auto const previous_size{ detail::container_size( chunks_.slot( at ) ) };
+        auto words{ detail::words_from_container<layout_type>( chunks_.slot( at ) ) };
         detail::apply_range_to_words<layout_type>( words, low_begin, low_end, operation );
-        chunks_.slot( pos ) = make_container_from_words_for_policy( words );
-        auto const updated_size{ detail::container_size( chunks_.slot( pos ) ) };
+        chunks_.slot( at ) = make_container_from_words_for_policy( words );
+        auto const updated_size{ detail::container_size( chunks_.slot( at ) ) };
 
         if ( updated_size > previous_size ) {
             size_ += updated_size - previous_size;
@@ -3537,7 +3485,7 @@ private:
             size_ -= previous_size - updated_size;
         }
         if ( updated_size == 0 ) {
-            chunks_.erase( pos );
+            chunks_.erase( at );
         }
     }
 
