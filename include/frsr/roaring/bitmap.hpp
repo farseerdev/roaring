@@ -3917,9 +3917,10 @@ private:
     // the reference decides it: a total below the bitset threshold bounds the
     // result below it too, so the union is merged straight into a retired (or
     // fresh) array payload — the kernel sizes that payload for its own worst case,
-    // store slack included. A larger total is merged into `scratch`, whose exact
-    // size then picks array or bitset. A retired payload is only ever a sole-owned
-    // one, so it never aliases an operand the kernel is still reading.
+    // store slack included. A larger total may well be a bitset, so both arrays are
+    // scattered straight into one (demoted to an array if the shared values leave
+    // it below the limit). A retired payload is only ever a sole-owned one, so it
+    // never aliases an operand the kernel is still reading.
     // [croaring-ref] deps/croaring/src/containers/mixed_union.c:array_array_container_union
     [[nodiscard]] static handle_type make_array_union_container_reusing(
         detail::chunk_store<layout_type, CowPolicy> & store,
@@ -3934,8 +3935,16 @@ private:
             result_array.sync_header();
             return result_handle;
         }
-        detail::union_array_array_to_vector<layout_type>( lhs, rhs, scratch );
-        return make_fast_container_from_scratch_reusing( store, scratch );
+        if constexpr ( supports_bitset_container ) {
+            // The union may still fall below the limit (shared values): demote, as the reference does.
+            return demote_sparse_bitset(
+                detail::bitset_handle_from_array_union<layout_type, CowPolicy>( lhs, rhs, store.take_retired( detail::container_kind::bitset ) ),
+                store
+            );
+        } else {
+            detail::union_array_array_to_vector<layout_type>( lhs, rhs, scratch );
+            return make_fast_container_from_scratch_reusing( store, scratch );
+        }
     }
 
     // ForcedRunSelectionPolicy defaults to the bitmap's own ambient RunSelectionPolicy

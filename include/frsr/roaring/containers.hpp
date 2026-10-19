@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cassert>
 #include <concepts>
 #include <cstddef>
 #include <cstring>
@@ -345,6 +346,43 @@ template <typename Layout, typename CowPolicy = cow_value_semantics>
     if ( !sorted_values.empty() ) {
         result.set_endpoints( sorted_values.front(), sorted_values.back() );
     }
+    return result;
+}
+
+// Builds a bitset handle holding the union of two non-empty arrays by scattering both straight into the
+// words, counting the bits the second adds as it goes: no merged intermediate. The caller owns the decision
+// that the union is worth a bitset (its size bound is at or above the array limit) and demotes the result to an
+// array when the count lands below it.
+// [croaring-ref] deps/croaring/src/containers/mixed_union.c:array_array_container_union
+template <typename Layout, typename CowPolicy = cow_value_semantics>
+[[nodiscard]] inline container_handle<Layout, CowPolicy> bitset_handle_from_array_union(
+    array_cref<Layout, CowPolicy> const lhs,
+    array_cref<Layout, CowPolicy> const rhs,
+    container_handle<Layout, CowPolicy> && reuse = {}
+) {
+    assert( !lhs.values.empty() && !rhs.values.empty() );
+    auto result{ [&]() {
+        if ( reuse.holds_bitset() ) {
+            std::memset( reuse.payload_data_raw(), 0, Layout::word_count * sizeof( std::uint64_t ) );
+            return std::move( reuse );
+        }
+        return container_handle<Layout, CowPolicy>::make_bitset_zeroed();
+    }() };
+    auto bitset{ result.as_bitset() };
+    auto & words{ bitset.words.as_array() };
+    auto const set_bit{ [ &words ]( auto const value ) {
+        words[ static_cast<std::size_t>( value ) >> 6U ] |= std::uint64_t{ 1 } << ( static_cast<unsigned>( value ) & 63U );
+    } };
+    for ( auto const value : lhs.values ) { set_bit( value ); }
+    auto cardinality{ lhs.values.size() };
+    for ( auto const value : rhs.values ) {
+        auto & word{ words[ static_cast<std::size_t>( value ) >> 6U ] };
+        auto const mask{ std::uint64_t{ 1 } << ( static_cast<unsigned>( value ) & 63U ) };
+        cardinality += ( word & mask ) == 0;
+        word |= mask;
+    }
+    result.set_cardinality( static_cast<std::uint32_t>( cardinality ) );
+    result.set_endpoints( std::min( lhs.values.front(), rhs.values.front() ), std::max( lhs.values.back(), rhs.values.back() ) );
     return result;
 }
 
