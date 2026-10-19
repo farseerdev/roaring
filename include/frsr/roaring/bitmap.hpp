@@ -1209,6 +1209,9 @@ public:
         if constexpr ( kUseSingletonChunkMap ) {
             materialize_singleton_chunks();
         }
+        // Values come out in order, so the chunks must be in order first: a wide
+        // chunk key defers the sort until a path needs it, and this is such a path.
+        ensure_sorted();
         for ( size_type index{ 0 }; index < chunks_.size(); ++index ) {
             auto const chunk_key{ chunks_.key( index ) };
             detail::container_for_each( chunks_.slot( index ), [&]( low_type const low ) {
@@ -1227,6 +1230,9 @@ public:
         if constexpr ( kUseSingletonChunkMap ) {
             materialize_singleton_chunks();
         }
+        // Values come out in order, so the chunks must be in order first: a wide
+        // chunk key defers the sort until a path needs it, and this is such a path.
+        ensure_sorted();
         assert( out.size() >= size_ );
         auto * cursor{ out.data() };
         auto * const end{ out.data() + out.size() };
@@ -1362,10 +1368,15 @@ public:
         return true;
     }
 
-    [[nodiscard]] const_iterator begin() const noexcept {
+    // Not noexcept: ordering the chunks of a wide-key bitmap allocates, and this is
+    // where a deferred sort comes due. end() stays noexcept - it reads nothing.
+    [[nodiscard]] const_iterator begin() const {
         if constexpr ( kUseSingletonChunkMap ) {
             materialize_singleton_chunks();
         }
+        // Values come out in order, so the chunks must be in order first: a wide
+        // chunk key defers the sort until a path needs it, and this is such a path.
+        ensure_sorted();
         if ( empty() ) {
             return end();
         }
