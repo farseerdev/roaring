@@ -161,6 +161,39 @@ TEST(ChunkTree, RandomOperationsAgainstAModel) {
     }
 }
 
+TEST(ChunkTree, LookupsAgreeWithTheModelAtEveryHeight) {
+    // sizes that put the tree at one, two, three and four levels of nodes, built by appending and by scattered insertion
+    for ( std::uint64_t const count : { 14ULL, 15ULL, 16ULL, 240ULL, 700ULL, 4'000ULL, 12'000ULL, 40'000ULL, 130'000ULL } ) {
+        for ( bool const scattered : { false, true } ) {
+            std::mt19937_64 rng{ count };
+            tree t;
+            model m;
+            std::vector<std::uint64_t> keys( count );
+            for ( std::uint64_t k{ 0 }; k < count; ++k ) { keys[ k ] = 4 * k + 2; }
+            if ( scattered ) {
+                std::ranges::shuffle( keys, rng );
+                for ( auto const k : keys ) { t.insert( t.lower_bound( k ), k, make( tag_for( k ) ) ); m[ k ] = tag_for( k ); }
+            } else {
+                for ( auto const k : keys ) { t.push_back( k, make( tag_for( k ) ) ); m[ k ] = tag_for( k ); }
+            }
+            ASSERT_EQ( t.validate(), nullptr ) << count;
+            auto const top{ 4 * count + 6 };
+            for ( std::uint64_t probe{ 0 }; probe < top; probe += 1 + rng() % 5 ) { check_lower_bound( t, m, probe ); }
+            for ( int i{ 0 }; i < 20'000; ++i ) {
+                auto const probe{ rng() % ( top + 8 ) };
+                check_lower_bound( t, m, probe );
+                if ( HasFatalFailure() ) { return; }
+            }
+            check_lower_bound( t, m, std::uint64_t{ 1 } << 47 );
+            // erase a scattered third and look again: separators outlive their keys
+            std::ranges::shuffle( keys, rng );
+            for ( std::size_t i{ 0 }; i < keys.size() / 3; ++i ) { take( t, m, keys[ i ] ); }
+            ASSERT_EQ( t.validate(), nullptr ) << count;
+            for ( int i{ 0 }; i < 20'000; ++i ) { check_lower_bound( t, m, rng() % ( top + 8 ) ); }
+        }
+    }
+}
+
 TEST(ChunkTree, AppendersBuildFullLeavesAndAbandonedOpensLeaveNothing) {
     for ( std::uint32_t const count : { 1U, 2U, 4U, 5U, 8U, 9U, 15U, 16U, 30U, 31U, 255U, 256U, 257U, 4000U } ) {
         tree t;

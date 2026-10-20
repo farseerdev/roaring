@@ -39,13 +39,26 @@ template <unsigned Width>
 [[nodiscard, gnu::always_inline]] inline unsigned count_below( std::int64_t const * const keys, std::int64_t const key ) noexcept {
     static_assert( Width % 4 == 0 );
     auto const probe{ _mm256_set1_epi64x( key ) };
-    unsigned count{ 0 };
-    for ( unsigned i{ 0 }; i < Width; i += 4 ) {
-        auto const mask{ _mm256_movemask_pd( _mm256_castsi256_pd(
-            _mm256_cmpgt_epi64( probe, _mm256_loadu_si256( reinterpret_cast<__m256i const *>( keys + i ) ) ) ) ) };
-        count += static_cast<unsigned>( std::popcount( static_cast<unsigned>( mask ) ) );
+    auto const below{ [&]( unsigned const i ) noexcept {
+        return _mm256_cmpgt_epi64( probe, _mm256_loadu_si256( reinterpret_cast<__m256i const *>( keys + i ) ) );
+    } };
+    if constexpr ( Width % 16 == 0 ) {
+        // sixteen keys narrow into one vector of bytes, two bytes per key, so one mask and one
+        // popcount serve them all instead of one of each per four keys
+        unsigned long long mask{ 0 };
+        for ( unsigned i{ 0 }; i < Width; i += 16 ) {
+            auto const lo{ _mm256_packs_epi32( below( i      ), below( i + 4  ) ) };
+            auto const hi{ _mm256_packs_epi32( below( i + 8  ), below( i + 12 ) ) };
+            mask |= static_cast<unsigned long long>( static_cast<unsigned>( _mm256_movemask_epi8( _mm256_packs_epi16( lo, hi ) ) ) ) << ( i * 2 );
+        }
+        return static_cast<unsigned>( std::popcount( mask ) ) / 2;
+    } else {
+        unsigned count{ 0 };
+        for ( unsigned i{ 0 }; i < Width; i += 4 ) {
+            count += static_cast<unsigned>( std::popcount( static_cast<unsigned>( _mm256_movemask_pd( _mm256_castsi256_pd( below( i ) ) ) ) ) );
+        }
+        return count;
     }
-    return count;
 }
 #else
 // A branchless binary search over a fixed power-of-two width.
@@ -704,25 +717,11 @@ private:
             default: assert( cap == leaf_capacity ); return count_below<16>( leaf, probe );
         }
     }
-    // Asks for the child pointers of an inner node while its separators are being compared: the
-    // pointer to follow is only known after the compare, and fetching it then would be a second,
-    // dependent trip to memory at every level.
-    static void prefetch_children( inner_node const * const inner ) noexcept {
-#if defined( __GNUC__ ) || defined( __clang__ )
-        auto const * const at{ reinterpret_cast<char const *>( inner ) };
-        constexpr auto first{ inner_keys * sizeof( key_t ) / 64 };
-        constexpr auto last { ( inner_keys * sizeof( key_t ) + ( inner_keys + 1 ) * sizeof( void * ) - 1 ) / 64 };
-        for ( auto line{ first }; line <= last; ++line ) { __builtin_prefetch( at + line * 64 ); }
-#else
-        (void)inner;
-#endif
-    }
     // The leaf `probe` belongs to. A pure read.
     [[nodiscard]] leaf_ptr descend( key_t const probe ) const noexcept {
         auto node{ root_ };
         for ( unsigned level{ height_ }; level != 0; --level ) {
             auto const * const inner{ static_cast<inner_node const *>( node ) };
-            prefetch_children( inner );
             node = inner->child[ count_below<inner_keys>( inner->keys, probe + 1 ) ];   // the separators <= probe
         }
         return static_cast<leaf_ptr>( node );
@@ -731,7 +730,6 @@ private:
         auto node{ root_ };
         for ( unsigned level{ height_ }; level != 0; --level ) {
             auto * const inner{ static_cast<inner_node *>( node ) };
-            prefetch_children( inner );
             auto const child{ count_below<inner_keys>( inner->keys, probe + 1 ) };
             path.node [ level - 1 ] = inner;
             path.child[ level - 1 ] = child;
