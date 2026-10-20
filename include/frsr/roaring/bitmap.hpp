@@ -799,9 +799,6 @@ public:
         if ( try_add_many_single_chunk_dense( values ) ) {
             return;
         }
-        if ( try_add_many_grouped_by_chunk( values ) ) {
-            return;
-        }
 
         detail::heap_vector<key_type> sorted_values;
         if constexpr ( requires { std::ranges::size( values ); } ) {
@@ -3265,86 +3262,6 @@ private:
         } else {
             return optimize_container_for_policy( std::move( container ) );
         }
-    }
-
-    template <std::ranges::input_range Range>
-        requires std::convertible_to<std::ranges::range_reference_t<Range>, key_type>
-    [[nodiscard]] bool try_add_many_grouped_by_chunk( Range && values ) {
-        if ( !empty() ) {
-            return false;
-        }
-
-        if constexpr ( !requires { std::ranges::size( values ); } ) {
-            return false;
-        }
-
-        auto const count{ std::ranges::size( values ) };
-        if ( count < 128U || count > 2048U ) {
-            return false;
-        }
-
-        struct chunk_bucket {
-            chunk_type key{};
-            detail::small_array_values<low_type> lows;
-        };
-
-        detail::heap_vector<chunk_bucket> buckets;
-        buckets.reserve( static_cast<std::uint32_t>( std::min<std::size_t>( count / 8U, 128U ) ) );
-        for ( auto && value : values ) {
-            auto const full_value{ static_cast<key_type>( value ) };
-            auto const chunk{ layout_type::chunk_key( full_value ) };
-            auto const low{ layout_type::low_key( full_value ) };
-
-            auto const it{ std::find_if( buckets.begin(), buckets.end(), [chunk]( chunk_bucket const & bucket ) {
-                return bucket.key == chunk;
-            } ) };
-            if ( it == buckets.end() ) {
-                auto & bucket{ buckets.emplace_back( chunk_bucket{ .key = chunk, .lows = {} } ) };
-                bucket.lows.reserve( 16U );
-                bucket.lows.push_back( low );
-            } else {
-                it->lows.push_back( low );
-            }
-        }
-        if ( buckets.empty() ) {
-            return true;
-        }
-
-        std::ranges::sort( buckets, {}, &chunk_bucket::key );
-
-        chunks_.clear();
-        size_ = 0;
-        chunks_.reserve( buckets.size() );
-        for ( auto & bucket : buckets ) {
-            std::ranges::sort( bucket.lows );
-            auto const unique_end{ std::unique( bucket.lows.begin(), bucket.lows.end() ) };
-            bucket.lows.erase( unique_end, bucket.lows.end() );
-            if ( bucket.lows.empty() ) {
-                continue;
-            }
-
-            handle_type container;
-            if constexpr ( uses_default_container_set ) {
-                if ( bucket.lows.size() < 64U ) {
-                    container = handle_type::make_array_from_sorted(
-                        { bucket.lows.data(), bucket.lows.size() }
-                    );
-                } else {
-                    container = make_policy_container_from_sorted_vector(
-                        std::move( bucket.lows ),
-                        array_to_bitset_threshold
-                    );
-                }
-            } else {
-                container = make_policy_container_from_sorted_vector(
-                    std::move( bucket.lows ),
-                    array_to_bitset_threshold
-                );
-            }
-            size_ += detail::container_size( container );
-            chunks_.push_back( bucket.key, std::move( container ) );
-        }
-        return true;
     }
 
     template <std::ranges::input_range Range>
