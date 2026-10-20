@@ -1328,4 +1328,49 @@ TEST(FrsrRoaringSmoke, ContainsMatchesTheModelForInterleavedBitmapsAndProbeOrder
     EXPECT_FALSE( empty.contains( ~std::uint64_t{ 0 } ) );
 }
 
+template <typename Bitmap, typename Key = typename Bitmap::key_type>
+Bitmap make_mixed_chunks( std::uint32_t const chunk_count ) {
+    Bitmap result;
+    for ( std::uint32_t chunk{ 0 }; chunk < chunk_count; ++chunk ) {
+        Key const base{ static_cast<Key>( chunk ) << 16 };
+        switch ( chunk % 3 ) {
+            case 0: for ( std::uint32_t i{ 0 }; i < 10; ++i ) { result.add( base + i * 7 ); } break;
+            case 1: for ( std::uint32_t i{ 0 }; i < 20'000; ++i ) { result.add( base + ( i * 3 ) % 65'536 ); } break;
+            default: for ( std::uint32_t i{ 0 }; i < 30'000; ++i ) { result.add( base + i ); } break;
+        }
+    }
+    result.optimize_for_storage();
+    return result;
+}
+
+TEST(FrsrRoaringSmoke, EstimatedDataByteSizeIsZeroForAnEmptyBitmap) {
+    EXPECT_EQ( TestBitmap{}.estimated_data_byte_size(), 0U );
+    EXPECT_EQ( frsr::roaring::bitmap<std::uint64_t>{}.estimated_data_byte_size(), 0U );
+}
+
+TEST(FrsrRoaringSmoke, EstimatedDataByteSizeIsExactUpToEightChunks) {
+    for ( std::uint32_t chunks{ 1 }; chunks <= 8; ++chunks ) {
+        auto const bitmap{ make_mixed_chunks<TestBitmap>( chunks ) };
+        // Each sampled chunk is read once, so a uniform bitmap is exact and a mixed one is exact only when
+        // every chunk is sampled: eight chunks or fewer, one step each.
+        EXPECT_EQ( bitmap.estimated_data_byte_size(), bitmap.data_byte_size() ) << chunks << " chunks";
+    }
+}
+
+TEST(FrsrRoaringSmoke, EstimatedDataByteSizeTracksDataByteSizeForManyMixedChunks) {
+    for ( std::uint32_t const chunks : { 64U, 200U, 1'000U } ) {
+        auto const bitmap{ make_mixed_chunks<TestBitmap>( chunks ) };
+        auto const actual   { static_cast<double>( bitmap.data_byte_size() ) };
+        auto const estimated{ static_cast<double>( bitmap.estimated_data_byte_size() ) };
+        EXPECT_GT( estimated, actual / 4 ) << chunks << " chunks";
+        EXPECT_LT( estimated, actual * 4 ) << chunks << " chunks";
+    }
+}
+
+TEST(FrsrRoaringSmoke, EstimatedDataByteSizeOfAWideKeyBitmapIsDataByteSize) {
+    using wide = frsr::roaring::bitmap<std::uint64_t>;
+    auto const bitmap{ make_mixed_chunks<wide>( 100 ) };
+    EXPECT_EQ( bitmap.estimated_data_byte_size(), bitmap.data_byte_size() );
+}
+
 } // namespace

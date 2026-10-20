@@ -464,6 +464,26 @@ public:
         }
         return total;
     }
+    // data_byte_size() read off at most eight evenly spaced chunks and scaled to the chunk count: a cost
+    // key for ordering a fold when the operands' chunk tables are too long to walk once per call. Exact for
+    // a bitmap of up to eight chunks. Constant time for the flat (16-bit key) table; a wide-key bitmap
+    // has no random access to its chunks and answers with data_byte_size().
+    [[nodiscard]] size_type estimated_data_byte_size() const noexcept {
+        if constexpr ( chunk_store_type::wide ) {
+            return data_byte_size();
+        } else {
+            auto const slots{ chunks_.slots() };
+            auto const n{ slots.size() };
+            if ( n == 0 ) { return 0; }
+            constexpr std::size_t max_samples{ 8 };
+            auto const step{ std::max<std::size_t>( 1, n / max_samples ) };
+            std::size_t sum{ 0 }, taken{ 0 };
+            for ( auto i{ step / 2 }; i < n && taken < max_samples; i += step, ++taken ) {
+                sum += detail::container_byte_size( slots[ i ] );
+            }
+            return static_cast<size_type>( n * chunk_descriptor_bytes + sum * n / taken );
+        }
+    }
     [[nodiscard]] std::uint16_t container_count() const noexcept {
         return static_cast<std::uint16_t>( chunks_.size() );
     }
