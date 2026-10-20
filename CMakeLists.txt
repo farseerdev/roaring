@@ -242,6 +242,7 @@ if(FRSR_ROARING_BUILD_TESTS)
         tests/contains_states.cpp
         tests/bitmap_const_concurrency.cpp
         tests/chunk_tree.cpp
+        tests/interop.cpp
     )
     target_link_libraries(frsr_roaring_tests
         PRIVATE
@@ -263,6 +264,7 @@ if(FRSR_ROARING_BUILD_TESTS)
             tests/bitmap_full_crosscheck.cpp
             tests/portable_interop.cpp
             tests/kernel_crosscheck.cpp
+            tests/interop_crosscheck.cpp
         )
         target_link_libraries(frsr_roaring_croaring_crosscheck
             PRIVATE
