@@ -582,8 +582,8 @@ public:
     // roaring_bitmap_contains_bulk, mirrored here by contains_bulk.
     [[nodiscard]] bool contains( key_type const value ) const noexcept {
         auto const chunk{ layout_type::chunk_key( value ) };
-        auto const at{ chunks_.lower_bound( chunk ) };
-        if ( at == chunks_.end() || chunks_.key( at ) != chunk ) { return false; }
+        auto const at{ chunks_.find( chunk ) };
+        if ( at == chunks_.end() ) { return false; }
         return detail::container_contains( chunks_.slot( at ), layout_type::low_key( value ) );
     }
 
