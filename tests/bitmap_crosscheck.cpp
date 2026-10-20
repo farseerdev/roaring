@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <functional>
 #include <random>
 #include <span>
 #include <tuple>
@@ -905,6 +906,43 @@ TEST(FrsrRoaringCrosscheck, ContainsMatchesCRoaringAcrossChunkTableLengths) {
                 mismatches += bitmap.contains( v ) == roaring_bitmap_contains( reference.bitmap, v ) ? 0 : 1;
             }
             EXPECT_EQ( mismatches, 0U ) << chunks << " chunks, " << ( at_top ? "ending at the top key" : "low keys" );
+        }
+    }
+}
+
+// add_many() on an empty and on a populated bitmap, over input sizes around the
+// sizes a bulk path might special-case, in ascending, descending and shuffled
+// order, spread over one chunk, a few chunks and one chunk per value, with repeats.
+TEST(FrsrRoaringCrosscheck, AddManyMatchesCRoaringAcrossShapes) {
+    std::mt19937 rng{ 0xA5A5A5A5U };
+    for ( auto const count : { 1U, 100U, 127U, 128U, 129U, 1'000U, 2'047U, 2'048U, 2'049U, 5'000U } ) {
+        for ( auto const chunk_spread : { 1U, 7U, 1'000U, 100'000U } ) {
+            for ( auto const order : { 0, 1, 2 } ) {
+                std::vector<std::uint32_t> values;
+                for ( auto i{ 0U }; i < count; ++i ) {
+                    auto const chunk{ order == 0 && chunk_spread >= count ? i : rng() % chunk_spread };
+                    values.push_back( ( chunk << 16 ) | ( rng() & 0xFFFFU ) );
+                }
+                if ( count > 2 ) { values.push_back( values[ 0 ] ); values.push_back( values[ count / 2 ] ); }
+                if ( order == 0 ) { std::sort( values.begin(), values.end() ); }
+                if ( order == 1 ) { std::sort( values.begin(), values.end(), std::greater<>{} ); }
+
+                for ( auto const populated : { false, true } ) {
+                    TestBitmap mine;
+                    roaring_bitmap_holder theirs;
+                    if ( populated ) {
+                        for ( auto const v : { 3U, 70'000U, 5'000'000U, values[ 0 ] ^ 1U } ) {
+                            mine.add( v );
+                            roaring_bitmap_add( theirs.bitmap, v );
+                        }
+                    }
+                    mine.add_many( values );
+                    roaring_bitmap_add_many( theirs.bitmap, values.size(), values.data() );
+
+                    ASSERT_EQ( mine.to_vector(), to_vector( theirs.bitmap ) ) << count << '/' << chunk_spread << '/' << order << '/' << populated;
+                    ASSERT_EQ( mine.size(), roaring_bitmap_get_cardinality( theirs.bitmap ) );
+                }
+            }
         }
     }
 }
