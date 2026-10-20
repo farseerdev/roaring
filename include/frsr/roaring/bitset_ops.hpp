@@ -1163,12 +1163,14 @@ template <typename Layout, typename CowPolicy = cow_value_semantics>
 // the region where it clearly wins.
 inline constexpr std::size_t kScatterGroupingSpanRatio{ 16 };
 
-// Lazy in-place scatter of an array into a bitset: set each array value's bit in
-// lhs.words directly, cardinality left STALE. The mixed-container analog of
-// or_bitset_bitset_inplace_lazy for the N-way bulk-union path — it avoids the 8 KB
-// copy + fresh allocation + popcount a materialized bitset×array combine would
-// incur. Caller must repair cardinality afterwards.
+// In-place scatter of an array into a bitset: set each array value's bit in
+// lhs.words directly. The mixed-container analog of or_bitset_bitset_inplace_lazy
+// for the N-way bulk-union path — it avoids the 8 KB copy + fresh allocation +
+// popcount a materialized bitset×array combine would incur. With `Lazy` the
+// cardinality is left STALE and the caller must repair it afterwards; otherwise it
+// is kept exact by counting the bits that were not yet set.
 // [croaring-ref] deps/croaring/src/containers/mixed_union.c:array_bitset_container_union
+// [croaring-ref] deps/croaring/src/bitset_util.c:bitset_set_list_withcard
 //
 // noinline+cold: the word-grouped body grew this function enough that its
 // presence in the shared header-only set-op spine shifted MidSkewIntersect
@@ -1176,8 +1178,8 @@ inline constexpr std::size_t kScatterGroupingSpanRatio{ 16 };
 // i-cache/layout effect confirmed by fine-bisect (b88dd79 still 0.95×,
 // 1ddde6e alone 1.30×). Keep the scatter out of line and in .text.unlikely
 // so it does not sit next to the materializing AND merge.
-template <typename Layout, typename CowPolicy = cow_value_semantics>
-[[ gnu::noinline, gnu::cold ]] void or_array_into_bitset_inplace_lazy(
+template <bool Lazy, typename Layout, typename CowPolicy = cow_value_semantics>
+[[ gnu::noinline, gnu::cold ]] void or_array_into_bitset_inplace(
     bitset_ref<Layout, CowPolicy> lhs,
     array_cref<Layout, CowPolicy> const rhs
 ) noexcept {
@@ -1187,6 +1189,15 @@ template <typename Layout, typename CowPolicy = cow_value_semantics>
     if ( count == 0 ) [[unlikely]] {
         return;
     }
+    std::size_t gained{ 0 };
+    auto const finish{ [ & ] {
+        if constexpr ( Lazy ) {
+            lhs.mark_cardinality_stale();
+        } else {
+            lhs.cardinality += static_cast<std::uint32_t>( gained );
+        }
+        lhs.mark_endpoints_stale();
+    } };
     // Array payloads are sorted, so the endpoints bound the span in O(1) — the
     // cheapest way to ask "does this array cluster?" without touching the middle.
     auto const span{ static_cast<std::size_t>( values[ count - 1 ] ) - values[ 0 ] + 1U };
@@ -1199,10 +1210,12 @@ template <typename Layout, typename CowPolicy = cow_value_semantics>
                 mask |= std::uint64_t{ 1 } << ( static_cast<unsigned>( values[ index ] ) & 63U );
                 ++index;
             } while ( ( index < count ) && ( ( static_cast<std::size_t>( values[ index ] ) >> 6U ) == word_index ) );
+            if constexpr ( !Lazy ) {
+                gained += static_cast<std::size_t>( std::popcount( mask & ~words[ word_index ] ) );
+            }
             words[ word_index ] |= mask;
         } while ( index < count );
-        lhs.mark_cardinality_stale();
-        lhs.mark_endpoints_stale();
+        finish();
         return;
     }
     // Unrolled by four, as in CRoaring's _asm_bitset_set_list (bitset_util.c).
@@ -1212,9 +1225,13 @@ template <typename Layout, typename CowPolicy = cow_value_semantics>
     // serialising. Written out rather than left to the optimiser because this
     // function is gnu::cold, and a cold function is compiled for size: clang
     // then neither unrolls this loop nor lowers the set to bts.
-    auto const set_bit{ [ &words ]( auto const value ) {
-        words[ static_cast<std::size_t>( value ) >> 6U ] |=
-            std::uint64_t{ 1 } << ( static_cast<unsigned>( value ) & 63U );
+    auto const set_bit{ [ & ]( auto const value ) {
+        auto &       word{ words[ static_cast<std::size_t>( value ) >> 6U ] };
+        auto const   bit { std::uint64_t{ 1 } << ( static_cast<unsigned>( value ) & 63U ) };
+        if constexpr ( !Lazy ) {
+            gained += static_cast<std::size_t>( ( word & bit ) == 0 );
+        }
+        word |= bit;
     } };
     std::size_t scatter{ 0 };
     for ( ; scatter + 4 <= count; scatter += 4 ) {
@@ -1226,8 +1243,7 @@ template <typename Layout, typename CowPolicy = cow_value_semantics>
     for ( ; scatter < count; ++scatter ) {
         set_bit( values[ scatter ] );
     }
-    lhs.mark_cardinality_stale();
-    lhs.mark_endpoints_stale();
+    finish();
 }
 
 } // namespace frsr::roaring::detail

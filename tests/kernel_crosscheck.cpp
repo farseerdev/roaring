@@ -413,4 +413,100 @@ TEST( KernelCrosscheck, FewChunksUnionedIntoManyRoundsMatchCRoaring ) {
     }
 }
 
+// ---- a bitmap |= one of comparable size ----------------------------------------------------------
+
+// Operands with the same chunk count or a few times fewer, so the in-place union walks both tables:
+// every key held (no table change), the first key missing late in the walk, keys only below, only
+// above, and only interleaved with the target's.
+template <typename Key>
+void check_comparable_union() {
+    using Bitmap = bitmap<Key>;
+    constexpr Key origin{ sizeof( Key ) > 4 ? Key{ 0x3C3C } << 24 : Key{ 7 } };
+    constexpr std::int64_t chunks{ 64 };
+    std::mt19937_64 rng{ 0xC0DA + sizeof( Key ) };
+    auto const key_of = [ & ]( std::int64_t const slot ) { return static_cast<Key>( origin + static_cast<Key>( 10 + slot ) ); };
+
+    std::vector<Key> target_values;
+    for ( std::int64_t i{ 0 }; i < chunks; ++i ) {
+        for ( auto const v : chunk_values<Key>( key_of( 2 * i ), static_cast<std::size_t>( i ), rng ) ) { target_values.push_back( v ); }
+    }
+    Bitmap const target{ std::span<Key const>{ target_values } };
+
+    struct operand_case { char const * name; std::vector<std::int64_t> slots; };
+    std::vector<operand_case> cases{
+        { "every key held",              {} },
+        { "every other key held",        {} },
+        { "last key held",               { 2 * chunks - 2 } },
+        { "held then new late",          {} },
+        { "new key first",               { 1, 10, 20 } },
+        { "all below",                   { -9, -8, -7, -5 } },
+        { "all above",                   { 2 * chunks + 1, 2 * chunks + 4, 2 * chunks + 9 } },
+        { "new keys only, interleaved",  { 1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31, 33 } },
+        { "held, then new tail",         { 0, 2, 4, 2 * chunks - 2, 2 * chunks, 2 * chunks + 2 } },
+    };
+    for ( std::int64_t i{ 0 }; i < chunks; ++i )      { cases[ 0 ].slots.push_back( 2 * i ); }
+    for ( std::int64_t i{ 0 }; i < chunks; i += 2 )   { cases[ 1 ].slots.push_back( 2 * i ); }
+    for ( std::int64_t i{ 0 }; i < chunks - 4; ++i )  { cases[ 3 ].slots.push_back( 2 * i ); }
+    cases[ 3 ].slots.push_back( 2 * chunks - 7 );
+    cases[ 3 ].slots.push_back( 2 * chunks + 3 );
+    for ( auto const & c : cases ) {
+        for ( std::size_t const dense : { 0u, 1u } ) {
+            SCOPED_TRACE( ::testing::Message() << c.name << ( dense ? ", dense operand" : ", sparse operand" ) );
+            std::vector<Key> other_values;
+            std::size_t shape{ dense ? 1u : 0u };
+            for ( auto const slot : c.slots ) {
+                for ( auto const v : chunk_values<Key>( key_of( slot ), shape, rng ) ) { other_values.push_back( v ); }
+                shape += dense ? 2 : 1;
+            }
+            other_values = sorted_unique( std::move( other_values ) );
+            Bitmap const other{ std::span<Key const>{ other_values } };
+
+            std::set<Key> oracle{ target_values.begin(), target_values.end() };
+            oracle.insert( other_values.begin(), other_values.end() );
+            std::vector<Key> const expected{ oracle.begin(), oracle.end() };
+
+            auto united{ target };
+            united |= other;
+            ASSERT_TRUE( matches( united, expected ) );
+            EXPECT_TRUE( matches( other, other_values ) ) << "the operand is left alone";
+            EXPECT_EQ( united.size(), expected.size() );
+
+            auto flipped{ other };
+            flipped |= target;
+            EXPECT_TRUE( matches( flipped, expected ) );
+        }
+    }
+}
+
+TEST( KernelCrosscheck, ComparableSizeUnionContents32 ) { check_comparable_union<std::uint32_t>(); }
+TEST( KernelCrosscheck, ComparableSizeUnionContents64 ) { check_comparable_union<std::uint64_t>(); }
+
+// The same against CRoaring over several rounds of operands that hold, miss and interleave with the
+// target's keys.
+TEST( KernelCrosscheck, ComparableSizeUnionRoundsMatchCRoaring ) {
+    std::mt19937_64 rng{ 0xC0DB };
+    Values32 target_values;
+    for ( std::uint32_t i{ 0 }; i < 48; ++i ) {
+        for ( auto const v : chunk_values<std::uint32_t>( 5U + 2 * i, i, rng ) ) { target_values.push_back( v ); }
+    }
+    for ( bool const run_optimize : { false, true } ) {
+        auto ours{ make_ours( target_values, run_optimize ) };
+        auto theirs{ make_theirs( target_values, run_optimize ) };
+        for ( int round{ 0 }; round < 40; ++round ) {
+            Values32 other;
+            auto const keys{ 2 + rng() % 40 };
+            std::set<std::uint32_t> chosen;
+            for ( std::uint64_t k{ 0 }; k < keys; ++k ) { chosen.insert( static_cast<std::uint32_t>( rng() % 120 ) ); }
+            for ( auto const key : chosen ) {
+                for ( auto const v : chunk_values<std::uint32_t>( key, rng() % 4, rng ) ) { other.push_back( v ); }
+            }
+            other = sorted_unique( std::move( other ) );
+            SCOPED_TRACE( ::testing::Message() << "round " << round << ", runs " << run_optimize );
+            ours |= make_ours( other, run_optimize && round % 2 );
+            roaring_bitmap_or_inplace( theirs.r, make_theirs( other, run_optimize && round % 2 ).r );
+            ASSERT_TRUE( same_contents( ours, theirs ) );
+        }
+    }
+}
+
 } // namespace

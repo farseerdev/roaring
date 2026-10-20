@@ -163,8 +163,21 @@ public:
     void insert_absent_from( chunk_array const & other, index_type const count, Wanted const & wanted ) {
         if ( count == 0 ) { return; }
         assert( this != &other );
-        if ( size_ + count > capacity_ ) { grow( size_ + count ); }
         auto const total{ size_ + count };
+        // A table that has to grow is rebuilt in its new block, each run of entries going straight
+        // to its final place, instead of being relocated first and moved again within the block.
+        bool const relocating{ total > capacity_ };
+        std::byte * fresh{ nullptr };
+        auto new_capacity{ capacity_ };
+        auto * dst_slots{ slots_ };
+        auto * dst_keys { keys_ };
+        if ( relocating ) {
+            auto const capacity{ std::max( { total, capacity_ < 1024 ? capacity_ * 2 : capacity_ + capacity_ / 4, index_type{ 4 } } ) };
+            fresh     = allocate_block( bytes_for( capacity ) );
+            dst_slots = reinterpret_cast<handle_type *>( fresh );
+            dst_keys  = reinterpret_cast<chunk_type  *>( fresh + keys_offset( capacity ) );
+            new_capacity = capacity;
+        }
         auto end{ size_ };                              // [ 0, end ) is still in place
         auto dst{ total };                              // [ dst, total ) is final
         try {
@@ -175,18 +188,37 @@ public:
                 handle_type copy{ other.slots_[ j ] };  // may throw: nothing has moved yet for this entry
                 auto const tail{ end - index };
                 dst -= tail;
-                std::memmove( static_cast<void *>( slots_ + dst ), static_cast<void const *>( slots_ + index ), std::size_t{ tail } * sizeof( handle_type ) );
-                std::memmove( keys_ + dst, keys_ + index, std::size_t{ tail } * sizeof( chunk_type ) );
+                std::memmove( static_cast<void *>( dst_slots + dst ), static_cast<void const *>( slots_ + index ), std::size_t{ tail } * sizeof( handle_type ) );
+                std::memmove( dst_keys + dst, keys_ + index, std::size_t{ tail } * sizeof( chunk_type ) );
                 --dst;
-                new ( slots_ + dst ) handle_type{ std::move( copy ) };
-                keys_[ dst ] = key;
+                new ( dst_slots + dst ) handle_type{ std::move( copy ) };
+                dst_keys[ dst ] = key;
                 end = index;
             }
         } catch ( ... ) {
-            close_gap( end, dst, total );
+            if ( relocating ) {
+                // The entries held are still in this table; those of the new block that are not among
+                // them are the copies made so far.
+                for ( auto i{ dst }; i < total; ++i ) {
+                    if ( !std::binary_search( keys_, keys_ + size_, dst_keys[ i ] ) ) { dst_slots[ i ].~handle_type(); }
+                }
+                free_block( fresh );
+            } else {
+                close_gap( end, dst, total );
+            }
             throw;
         }
         assert( dst == end && "the count was exact" );
+        if ( relocating ) {
+            if ( end != 0 ) {
+                std::memcpy( static_cast<void *>( dst_slots ), static_cast<void const *>( slots_ ), std::size_t{ end } * sizeof( handle_type ) );
+                std::memcpy( dst_keys, keys_, std::size_t{ end } * sizeof( chunk_type ) );
+            }
+            if ( slots_ ) { free_block( reinterpret_cast<std::byte *>( slots_ ) ); }
+            slots_    = dst_slots;
+            keys_     = dst_keys;
+            capacity_ = new_capacity;
+        }
         size_ = total;
     }
 

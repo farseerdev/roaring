@@ -1343,6 +1343,14 @@ public:
             }
             return;
         }
+        // An array into an unshared bitset: set its bits in place and count the new ones, as CRoaring's
+        // bitset_container_ior does, rather than materializing a copy of the 8 KB bitset.
+        // [croaring-ref] deps/croaring/src/containers/containers.c:container_ior (BITSET_CONTAINER x ARRAY_CONTAINER)
+        if ( !lazy && mutate_left && left_container.holds_bitset() && right_container.holds_array() ) {
+            auto left_bitset{ left_container.as_bitset() };
+            detail::or_array_into_bitset_inplace<false, layout_type>( left_bitset, right_container.as_array() );
+            return;
+        }
         // Same-key mixed array/bitset in the lazy bulk-union path: accumulate
         // into a bitset in place, mirroring CRoaring's LAZY_OR_BITSET_CONVERSION
         // (roaring.c:roaring_bitmap_lazy_or_inplace). Promote the accumulator
@@ -1369,7 +1377,7 @@ public:
                 if ( right_is_bitset ) {
                     detail::or_bitset_bitset_inplace_lazy<layout_type>( left_bitset, right_container.as_bitset() );
                 } else {
-                    detail::or_array_into_bitset_inplace_lazy<layout_type>( left_bitset, right_container.as_array() );
+                    detail::or_array_into_bitset_inplace<true, layout_type>( left_bitset, right_container.as_array() );
                 }
                 return;
             }
@@ -1426,23 +1434,55 @@ public:
         if ( std::uint64_t{ other.chunks_.size() } * 32 < chunks_.size() ) {
             return union_few( other, lazy );
         }
-        detail::chunk_store<layout_type, CowPolicy> merged;
-        merged.reserve( chunks_.size() + other.chunks_.size() );
         detail::small_array_values<low_type> array_union_scratch;
 #if FRSR_ROARING_COMBINE_STATS
         detail::combine_stats().record_call( chunks_.size(), other.chunks_.size() );
 #endif
 
+        // Walk both tables with the containers of shared keys united in place. The table is
+        // rebuilt only from the first key the other bitmap holds and this one lacks; while none
+        // is met, nothing here moves (`size_` is kept current as the walk goes).
+        // [croaring-ref] deps/croaring/src/roaring.c:roaring_bitmap_or_inplace
         auto left{ chunks_.begin() };
         auto right{ other.chunks_.begin() };
-        size_ = 0;
         while ( left != chunks_.end() && right != other.chunks_.end() ) {
             auto const left_key { chunks_.key( left ) };
             auto const right_key{ other.chunks_.key( right ) };
             if ( left_key < right_key ) {
+                ++left;
+            } else if ( right_key < left_key ) {
+                break;
+            } else {
+                auto       & left_container { chunks_.slot( left ) };
+                auto const & right_container{ other.chunks_.slot( right ) };
+#if FRSR_ROARING_COMBINE_STATS
+                detail::combine_stats().record_pair( left_container, right_container, detail::set_operation::bit_or );
+#endif
                 if ( !lazy ) {
-                    size_ += detail::container_size( chunks_.slot( left ) );
+                    size_ -= detail::container_size( left_container );
                 }
+                union_same_key( chunks_, left_container, right_container, lazy, array_union_scratch );
+                if ( !lazy ) {
+                    size_ += detail::container_size( left_container );
+                }
+                ++left;
+                ++right;
+            }
+        }
+        if ( right == other.chunks_.end() ) {
+            return *this;
+        }
+
+        // The rest of the other bitmap is merged into the rest of this table (or appended to it).
+        detail::chunk_store<layout_type, CowPolicy> merged;
+        merged.reserve( chunks_.size() + other.chunks_.size() );
+        for ( auto kept{ chunks_.begin() }; kept != left; ++kept ) {
+            merged.push_back( chunks_.key( kept ), std::move( chunks_.slot( kept ) ) );
+        }
+        while ( left != chunks_.end() && right != other.chunks_.end() ) {
+            auto const left_key { chunks_.key( left ) };
+            auto const right_key{ other.chunks_.key( right ) };
+            if ( left_key < right_key ) {
                 merged.push_back( left_key, std::move( chunks_.slot( left ) ) );
                 ++left;
             } else if ( right_key < left_key ) {
@@ -1460,6 +1500,9 @@ public:
 #if FRSR_ROARING_COMBINE_STATS
                 detail::combine_stats().record_pair( left_container, right_container, detail::set_operation::bit_or );
 #endif
+                if ( !lazy ) {
+                    size_ -= detail::container_size( left_container );
+                }
                 union_same_key( merged, left_container, right_container, lazy, array_union_scratch );
                 if ( !lazy ) {
                     size_ += detail::container_size( left_container );
@@ -1471,9 +1514,6 @@ public:
         }
 
         while ( left != chunks_.end() ) {
-            if ( !lazy ) {
-                size_ += detail::container_size( chunks_.slot( left ) );
-            }
             merged.push_back( chunks_.key( left ), std::move( chunks_.slot( left ) ) );
             ++left;
         }
@@ -2192,7 +2232,7 @@ public:
                     if ( right_is_bitset ) {
                         detail::or_bitset_bitset_inplace_bulk<layout_type>( left_bitset, right_container.as_bitset() );
                     } else {
-                        detail::or_array_into_bitset_inplace_lazy<layout_type>( left_bitset, right_container.as_array() );
+                        detail::or_array_into_bitset_inplace<true, layout_type>( left_bitset, right_container.as_array() );
                     }
                     ++pos1;
                     ++pos2;
