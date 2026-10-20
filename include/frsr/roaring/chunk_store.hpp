@@ -67,6 +67,9 @@ public:
     // The first entry whose key is not below `key` (end() if there is none). A pure read.
     [[nodiscard]] cursor lower_bound( chunk_type const key ) const noexcept { return live_.lower_bound( key ); }
 
+    // The entry holding `key` (end() if there is none). A pure read.
+    [[nodiscard]] cursor find( chunk_type const key ) const noexcept { return live_.find( key ); }
+
     // lower_bound() for a caller that already stands at `from` and only moves forward (a
     // leapfrogging walk over several tables).
     [[nodiscard]] cursor lower_bound( chunk_type const key, cursor const from ) const noexcept { return live_.lower_bound( key, from ); }

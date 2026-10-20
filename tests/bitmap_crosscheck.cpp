@@ -873,4 +873,40 @@ TEST(FrsrRoaringCrosscheck, AddManySortedGroupsMatchCRoaring) {
     }
 }
 
+// contains() on every chunk-table length from empty to a few hundred entries, probing each held
+// chunk (first, last and between), the chunks around them and the key-space edges.
+TEST(FrsrRoaringCrosscheck, ContainsMatchesCRoaringAcrossChunkTableLengths) {
+    std::mt19937 rng{ 0xC0FFEE };
+    for ( std::uint32_t const chunks : { 0U, 1U, 2U, 3U, 7U, 15U, 16U, 17U, 31U, 32U, 33U, 100U, 257U, 600U } ) {
+        for ( bool const at_top : { false, true } ) {
+            std::vector<std::uint32_t> held;
+            for ( std::uint32_t c{ 0 }; c < chunks; ++c ) {
+                // Every other key is skipped, so each held chunk has an absent neighbour on both sides.
+                auto const key{ at_top ? 0xFFFFU - 2 * ( chunks - 1 - c ) : 2 * c + 1 };
+                held.push_back( ( key << 16 ) | ( rng() & 0xFFFFU ) );
+                held.push_back( ( key << 16 ) | ( rng() & 0xFFFFU ) );
+            }
+            std::ranges::sort( held );
+            TestBitmap bitmap;
+            roaring_bitmap_holder reference;
+            bitmap.add_many( held );
+            roaring_bitmap_add_many( reference.bitmap, held.size(), held.data() );
+
+            std::vector<std::uint32_t> probes{ 0U, 1U, 0xFFFFU, 0x10000U, 0xFFFF0000U, 0xFFFFFFFFU };
+            for ( auto const v : held ) {
+                for ( auto const delta : { -0x10000, -1, 0, 1, 0x10000 } ) {
+                    probes.push_back( v + static_cast<std::uint32_t>( delta ) );
+                }
+                probes.push_back( v ^ 0x8000U );
+            }
+            for ( std::size_t i{ 0 }; i < 2000; ++i ) { probes.push_back( static_cast<std::uint32_t>( rng() ) ); }
+            std::size_t mismatches{ 0 };
+            for ( auto const v : probes ) {
+                mismatches += bitmap.contains( v ) == roaring_bitmap_contains( reference.bitmap, v ) ? 0 : 1;
+            }
+            EXPECT_EQ( mismatches, 0U ) << chunks << " chunks, " << ( at_top ? "ending at the top key" : "low keys" );
+        }
+    }
+}
+
 } // namespace
