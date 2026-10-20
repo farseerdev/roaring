@@ -114,4 +114,26 @@ inline constexpr bool kSimdArrayIntersectNeon{ true };
 #endif
 inline constexpr bool kAndDemotesSparseBitsets{ FRSR_ROARING_AND_DEMOTES_SPARSE_BITSETS != 0 };
 
+// The chunk table of a bitmap with wide (64-bit) keys is a B+ tree; once it holds this many chunks and
+// the chunk keys are spread evenly enough, a flat directory indexed by the high bits of the key takes
+// the place of the inner levels (chunk_tree.hpp, "the leaf directory"). Measured against the tree from
+// a few hundred to a few thousand chunks: lookups of ascending keys are 40% faster, scattered inserts
+// and erases 20-30% faster from about two thousand chunks on, lookups of random keys within 15% either
+// way and building by appends 4-8% slower; below about a thousand chunks the tree is as fast to read
+// and faster to build. Overridable so a test can put every table of a few
+// dozen chunks on the directory.
+#ifndef FRSR_ROARING_CHUNK_DIRECTORY_MIN_ENTRIES
+#   define FRSR_ROARING_CHUNK_DIRECTORY_MIN_ENTRIES 1024
+#endif
+inline constexpr std::uint64_t chunk_directory_min_entries{ FRSR_ROARING_CHUNK_DIRECTORY_MIN_ENTRIES };
+
+// The directory is given up (the tree is rebuilt over the same leaves) when more than this many leaves
+// end in one of its buckets, which is what bounds the leaf chain a lookup walks from its bucket. On
+// evenly spread keys a limit of 3, 6 or 12 measures the same; the limit only decides how much local
+// crowding a directory tolerates before the tree is the better index.
+#ifndef FRSR_ROARING_CHUNK_DIRECTORY_PILE_LIMIT
+#   define FRSR_ROARING_CHUNK_DIRECTORY_PILE_LIMIT 6
+#endif
+inline constexpr unsigned chunk_directory_pile_limit{ FRSR_ROARING_CHUNK_DIRECTORY_PILE_LIMIT };
+
 } // namespace frsr::roaring::detail

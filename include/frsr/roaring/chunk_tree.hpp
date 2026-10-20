@@ -1,6 +1,7 @@
 #pragma once
 
 #include <frsr/roaring/container_handle.hpp>   // FRSR_ROARING_HAS_MIMALLOC
+#include <frsr/roaring/tuning.hpp>
 
 #include <algorithm>
 #include <bit>
@@ -70,15 +71,23 @@ template <unsigned Width>
 }
 #endif
 
-// The sorted chunk table of a bitmap whose chunk keys are wider than 16 bits: a B+ tree with
-// cache-line wide nodes, in place of the always-sorted array a 16-bit key can afford.
+// The sorted chunk table of a bitmap whose chunk keys are wider than 16 bits: cache-line wide
+// leaves in key order, in place of the always-sorted array a 16-bit key can afford, found through
+// one of two indexes.
 //
-// A leaf holds up to 15 entries (a key and the handle), an inner node 16 separators and 17
-// children. A leaf's keys are searched with one fixed-width scan (four vector compares, or four
-// halving steps), an inner node's separators likewise, so a lookup is one scan per level and the
-// levels are few: 15 chunks fit one leaf, a few thousand two levels, a few hundred thousand three.
-// The leaves are linked, so a walk in key order never goes back up. A bitmap of up to 15 chunks is
-// a single leaf that grows like a vector (4, 8, then 15 entries), so a small bitmap stays small.
+// A leaf holds up to 15 entries (a key and the handle). A leaf's keys are searched with one
+// fixed-width scan (four vector compares, or four halving steps). The leaves are linked, so a walk
+// in key order never goes back up. A bitmap of up to 15 chunks is a single leaf that grows like a
+// vector (4, 8, then 15 entries), so a small bitmap stays small.
+//
+// The index over the leaves is either
+//   - a B+ tree: inner nodes of 16 separators and 17 children, one scan per level, so the levels are
+//     few (a few thousand chunks need two, a few hundred thousand three) and any key distribution
+//     is served; or
+//   - a flat directory, for a large table (see tuning.hpp) whose keys are spread evenly: one pointer
+//     per bucket of the key space, so a lookup is one table read and a short walk along the leaf
+//     chain. It replaces the inner levels: only one of the two exists at a time, and a table moves
+//     between them as its keys do ("the leaf directory" below).
 // Every const member is a pure read.
 //
 // Keys are held as signed 64-bit numbers, which is what the vector compares work on: a chunk key
@@ -86,7 +95,7 @@ template <unsigned Width>
 //     [ links, full leaf only ][ c handles, the last one first ][ head: size, capacity ][ keys ]
 // and a leaf is named by the address of its first key, so the keys, the handle at an index and the
 // head sit at fixed distances from it whatever the capacity.
-template <typename Handle>
+template <typename Handle, std::uint64_t DirectoryMinEntries = chunk_directory_min_entries>
 class chunk_tree {
 public:
     using handle_type = Handle;
@@ -176,6 +185,9 @@ public:
 
     [[nodiscard]] std::uint32_t size () const noexcept { return size_; }
     [[nodiscard]] bool          empty() const noexcept { return size_ == 0; }
+    // Whether the flat directory stands in for the inner levels, and the bytes its table holds.
+    [[nodiscard]] bool          indexed() const noexcept { return dir_ != nullptr; }
+    [[nodiscard]] std::size_t   directory_bytes() const noexcept { return dir_buckets_ * sizeof( leaf_ptr ); }
 
     [[nodiscard]] cursor begin() const noexcept { return size_ == 0 ? cursor{} : cursor{ leftmost_leaf(), 0 }; }
     [[nodiscard]] cursor end  () const noexcept { return cursor{}; }
@@ -206,6 +218,16 @@ public:
     [[nodiscard]] cursor lower_bound( key_type const key ) const noexcept {
         if ( root_ == nullptr ) { return end(); }
         auto const probe{ static_cast<key_t>( key ) };
+        if ( dir_ != nullptr ) {
+            auto leaf{ search_start( probe ) };
+            while ( leaf != nullptr ) {
+                auto const index{ count_below<16>( leaf, probe ) };
+                if ( leaf[ index ] != pad ) { return cursor{ leaf, index }; }
+                leaf = links( leaf )[ 0 ];
+                if ( leaf != nullptr && head( leaf ).size == 0 ) [[unlikely]] { break; }   // the empty last leaf of an abandoned open_back()
+            }
+            return end();
+        }
         return seek_in_leaf( descend( probe ), probe );
     }
 
@@ -250,6 +272,7 @@ public:
 
     // Removes the entry at `at` and returns the position of the entry that followed it.
     cursor erase( cursor const at ) {
+        if ( dir_ != nullptr && prepare_erase( at ) ) { return erase_indexed( at ); }
         auto const leaf{ at.leaf_ };
         auto const removed{ leaf[ at.index_ ] };
         leaf_remove( leaf, at.index_ );
@@ -346,15 +369,19 @@ public:
                 moved = true;
             } else {
                 // the last leaf is full: a fresh one is linked behind it and indexed under a
-                // separator that is above everything held and not above the key to come
+                // separator that is above everything held and not above the key to come (the
+                // directory, which has no separators, names the leaf before it instead)
+                prepare_new_last_leaf();
                 auto const separator{ leaf[ head( leaf ).size - 1 ] + 1 };
                 path_t path;
-                descend_rightmost( path );
                 inner_reserve reserve;
-                reserve.fill( inner_nodes_needed( path ) );
+                if ( dir_ == nullptr ) {
+                    descend_rightmost( path );
+                    reserve.fill( inner_nodes_needed( path ) );
+                }
                 leaf = make_leaf( leaf_capacity );
                 link_after( tail_, leaf );
-                insert_in_parent( path, reserve, 0, separator, leaf );
+                if ( dir_ == nullptr ) { insert_in_parent( path, reserve, 0, separator, leaf ); } else { name_leaf( prev_leaf( leaf ) ); }
             }
         }
         return &slot_at( leaf, head( leaf ).size );
@@ -374,6 +401,12 @@ public:
         std::swap( tail_, other.tail_ );
         std::swap( size_, other.size_ );
         std::swap( height_, other.height_ );
+        std::swap( dir_, other.dir_ );
+        std::swap( dir_base_, other.dir_base_ );
+        std::swap( dir_buckets_, other.dir_buckets_ );
+        std::swap( dir_lo_, other.dir_lo_ );
+        std::swap( dir_shift_, other.dir_shift_ );
+        std::swap( next_eval_, other.next_eval_ );
     }
 
     // Gives back the spare capacity: a root leaf shrinks to the smallest size that holds its entries.
@@ -383,11 +416,15 @@ public:
             return;
         }
         if ( head( tail_ ).size == 0 ) {                   // the empty last leaf of an abandoned open_back()
-            path_t path;
-            descend_rightmost( path );
             auto const dropped{ tail_ };
-            unlink( dropped );
-            remove_child( path, 0 );
+            if ( dir_ != nullptr ) {
+                unlink( dropped );                          // the directory never pointed at it
+            } else {
+                path_t path;
+                descend_rightmost( path );
+                unlink( dropped );
+                remove_child( path, 0 );
+            }
             free_leaf_block( dropped );
         }
         if ( height_ != 0 ) { return; }
@@ -400,6 +437,11 @@ public:
 
     // Bytes held by the nodes.
     [[nodiscard]] std::size_t node_bytes() const noexcept {
+        if ( dir_ != nullptr ) {
+            std::size_t total{ dir_buckets_ * sizeof( leaf_ptr ) };
+            for ( auto leaf{ first_leaf() }; leaf != nullptr; leaf = next_leaf( leaf ) ) { total += full_leaf_alloc; }
+            return total;
+        }
         return root_ == nullptr ? 0 : subtree_bytes( root_, height_ );
     }
 
@@ -456,7 +498,7 @@ public:
         size_ = count;
         tail_ = last;
         try {
-            rebuild_levels( first );
+            index_chain( first );
         } catch ( ... ) {
             destroy_chain( first );
             size_ = 0;
@@ -554,7 +596,8 @@ public:
 
     // Checks the structural invariants; the first one that does not hold, or nullptr.
     [[nodiscard]] char const * validate() const noexcept {
-        if ( root_ == nullptr ) { return size_ == 0 && height_ == 0 && tail_ == nullptr ? nullptr : "an empty tree has a size, a height or a tail"; }
+        if ( root_ == nullptr ) { return size_ == 0 && height_ == 0 && tail_ == nullptr && dir_ == nullptr ? nullptr : "an empty tree has a size, a height, a tail or a directory"; }
+        if ( dir_ != nullptr ) { return validate_indexed(); }
         std::uint32_t counted{ 0 };
         leaf_ptr      previous{ nullptr };
         key_t         floor{ std::numeric_limits<key_t>::min() };
@@ -720,6 +763,366 @@ private:
         for ( unsigned i{ 0 }; i <= inner->n; ++i ) { release_inner( inner->child[ i ], level - 1 ); }
         free_inner( inner );
     }
+
+    // ---- the leaf directory -----------------------------------------------------------------
+    // Once a table is large and its keys are spread evenly enough, the inner levels give way to a flat
+    // table indexed by the high bits of the key. It is then the only index: the inner levels are freed
+    // when it is adopted and rebuilt when it is given up, while the leaves, their chain and the cursors
+    // are the same blocks either way. It is held in memory from the same allocator as the nodes.
+    //
+    // Bucket b covers the keys from `base + (b << shift)` up (bucket 0 reaches down to minus infinity)
+    // and holds the first leaf whose last key is not below that start. A search reads the probe's
+    // bucket and walks the leaf chain from there. The walk is short because no more than the pile limit
+    // of leaves end in one bucket, and a bucket is about half a leaf wide at the average gap between the
+    // keys, so a leaf's span is two or three buckets.
+    //   - A bucket that names no leaf stands for the last leaf (and for "no such key" when that has
+    //     none either): appending to the last leaf, which is what builds a table, never writes the
+    //     table. The last leaf is named once a leaf is linked behind it, as a batch for the whole of its
+    //     span; the last leaf may also be named earlier, and is by adoption.
+    //   - An insert goes to the first leaf whose last key is not below the key, so only a new largest
+    //     key and a leaf split can change which leaf a bucket names, and only a split writes the table.
+    //   - Buckets below the smallest key are not kept (`dir_lo_`), so erasing at the front never
+    //     rewrites a prefix of the table.
+    //   - The directory is adopted from the doubling sizes at which the table reaches a leaf boundary
+    //     (and straight from the chain by a bulk build), and only if the keys span at most about half as
+    //     many buckets as there are entries. It is given up when a leaf split, a new last leaf or an
+    //     erase would pile too many leaves into a bucket, when a leaf ends too far above the others for
+    //     the table to reach, and, after erases, when it has become much larger than the table needs: it
+    //     is then rebuilt at the width that suits the table now, or given up if the table is small or uneven.
+    //   - Everything that can allocate (growing, adopting, giving up) is done before the operation
+    //     that needs it changes anything, so an allocation failure leaves the table as it was.
+    static constexpr std::uint32_t initial_next_eval{ static_cast<std::uint32_t>( std::min<std::uint64_t>( DirectoryMinEntries, std::numeric_limits<std::uint32_t>::max() ) ) };
+    static constexpr unsigned dir_pile_limit  { chunk_directory_pile_limit };
+    // The shape of the table, measured over dense, scattered and random keys of 5 thousand to a million chunks:
+    //   - a bucket is half a leaf's worth of entries wide at the average gap (rounded down to a power of
+    //     two). A quarter of a leaf looks a key up about 15% faster up to a hundred thousand chunks but
+    //     doubles the table, which is slower at a million; a whole leaf looks up 25-45% slower;
+    //   - at most 6 leaves in a bucket (the 3 and 12 limits behave the same on evenly spread keys);
+    //   - a directory is adopted for at most size/2 + 8 buckets, and may grow to size/2 + 64 while keys
+    //     are appended (a quarter of that budget makes a table of a million chunks give the directory up
+    //     for keys the full budget serves), growing by half again each time (a doubling or a quarter
+    //     measure the same);
+    //   - after a failed adoption the next is tried at twice the size (four times delays a table that
+    //     becomes even later by two doublings, for nothing gained).
+    static constexpr unsigned dir_adopt_slack { 8 };
+    static constexpr unsigned dir_growth_slack{ 64 };
+    static constexpr unsigned dir_table_slack { 16 };    // spare buckets of a fresh table; erases shrink a table beyond size + twice this
+
+    [[nodiscard]] static std::uint32_t doubled( std::uint32_t const count ) noexcept {
+        return count > std::numeric_limits<std::uint32_t>::max() / 2 ? std::numeric_limits<std::uint32_t>::max() : count * 2;
+    }
+    [[nodiscard]] static leaf_ptr * allocate_table( std::uint64_t const buckets ) {
+        return reinterpret_cast<leaf_ptr *>( allocate( buckets * sizeof( leaf_ptr ) ) );
+    }
+    static void free_table( leaf_ptr * const table ) noexcept { deallocate( reinterpret_cast<std::byte *>( table ) ); }
+    // Frees whichever index stands over the leaves (the root and the height are the caller's to reset).
+    void free_index() noexcept {
+        if ( dir_ != nullptr ) {
+            free_table( dir_ );
+            dir_ = nullptr;
+            dir_buckets_ = 0;
+        } else if ( height_ != 0 ) {
+            release_inner( root_, height_ );
+        }
+    }
+
+    [[nodiscard]] static key_t last_key( leaf_ptr const leaf ) noexcept { return leaf[ head( leaf ).size - 1 ]; }
+    // The leaf behind this one, unless it is the empty last leaf an abandoned open_back() leaves.
+    [[nodiscard]] static leaf_ptr next_nonempty( leaf_ptr const leaf ) noexcept {
+        auto const following{ links( leaf )[ 0 ] };
+        return ( following == nullptr || head( following ).size == 0 ) ? nullptr : following;
+    }
+    [[nodiscard]] leaf_ptr max_leaf() const noexcept { return head( tail_ ).size == 0 ? prev_leaf( tail_ ) : tail_; }
+    [[nodiscard]] static bool is_max_leaf( leaf_ptr const leaf ) noexcept { return next_nonempty( leaf ) == nullptr; }
+    [[nodiscard]] leaf_ptr first_leaf() const noexcept { return static_cast<leaf_ptr>( root_ ); }
+
+    [[nodiscard]] std::uint64_t bucket_of( key_t const probe ) const noexcept {
+        auto const rel{ probe - dir_base_ };
+        return static_cast<std::uint64_t>( rel < 0 ? 0 : rel ) >> dir_shift_;
+    }
+    // The bucket a search for `probe` reads: inside the kept part of the table.
+    [[nodiscard]] std::uint32_t bucket_clamped( key_t const probe ) const noexcept {
+        return std::max( dir_lo_, static_cast<std::uint32_t>( std::min<std::uint64_t>( bucket_of( probe ), dir_buckets_ - 1 ) ) );
+    }
+    [[nodiscard]] key_t bucket_start( std::uint64_t const bucket ) const noexcept { return dir_base_ + static_cast<key_t>( bucket << dir_shift_ ); }
+
+    // Where a search for `probe` starts walking the leaf chain.
+    [[nodiscard]] leaf_ptr search_start( key_t const probe ) const noexcept {
+        auto const leaf{ dir_[ bucket_clamped( probe ) ] };
+        return leaf != nullptr ? leaf : tail_;
+    }
+    // The first leaf whose last key is not below `probe`; the last leaf if there is none.
+    [[nodiscard]] leaf_ptr locate_indexed( key_t const probe ) const noexcept {
+        auto leaf{ search_start( probe ) };
+        for ( ;; ) {
+            if ( leaf[ count_below<16>( leaf, probe ) ] != pad ) { return leaf; }
+            auto const following{ next_nonempty( leaf ) };
+            if ( following == nullptr ) { return leaf; }
+            leaf = following;
+        }
+    }
+
+    // How many leaves end in `bucket` (counted up to one past the pile limit). The table names the
+    // first of them and the first leaf that ends above them, so they are the run of leaves between the
+    // two, and only their links are read.
+    [[nodiscard]] unsigned pile_at( std::uint64_t const bucket ) const noexcept {
+        if ( bucket >= dir_buckets_ ) { return 0; }
+        auto const above{ bucket + 1 < dir_buckets_ ? dir_[ bucket + 1 ] : nullptr };
+        unsigned count{ 0 };
+        for ( auto at{ dir_[ bucket ] }; at != nullptr && at != above && count <= dir_pile_limit; at = next_nonempty( at ) ) { ++count; }
+        return count;
+    }
+    // Whether splitting `leaf` could put more leaves than the limit into a bucket: the right half ends
+    // where the leaf ends, the left half in some bucket the leaf spans.
+    [[nodiscard]] bool split_overflows( leaf_ptr const leaf ) const noexcept {
+        auto const first{ bucket_clamped( leaf[ 0 ] ) };
+        auto const last { bucket_clamped( last_key( leaf ) ) };
+        return pile_at( last ) >= dir_pile_limit || ( first != last && pile_at( first ) >= dir_pile_limit );
+    }
+
+    // Grows the table to reach at least `at_least` buckets.
+    void grow_table( std::uint64_t const at_least ) {
+        auto const grown{ std::max<std::uint64_t>( at_least, dir_buckets_ + dir_buckets_ / 2 ) };
+        auto * const table{ allocate_table( grown ) };
+        std::memcpy( table, dir_, dir_buckets_ * sizeof( leaf_ptr ) );
+        std::fill( table + dir_buckets_, table + grown, nullptr );
+        free_table( dir_ );
+        dir_         = table;
+        dir_buckets_ = static_cast<std::uint32_t>( grown );
+    }
+    // A leaf that ends in `bucket` is about to be named: the table is made to reach the bucket, or the
+    // directory is given up if the keys have drifted so far apart that it would be mostly empty.
+    // May throw, changing nothing.
+    void reserve_bucket( std::uint64_t const bucket ) {
+        if ( bucket < dir_buckets_ ) [[likely]] { return; }
+        if ( bucket + 1 > size_ / 2 + dir_growth_slack ) {
+            abandon_directory();
+        } else {
+            grow_table( bucket + 1 );
+        }
+    }
+    // The buckets `leaf` answers that the table does not name yet (the last leaf is not named as it grows).
+    void name_leaf( leaf_ptr const leaf ) noexcept {
+        for ( auto b{ static_cast<std::int64_t>( bucket_clamped( last_key( leaf ) ) ) }; b >= dir_lo_ && dir_[ b ] == nullptr; --b ) { dir_[ b ] = leaf; }
+    }
+    // `key` has become the smallest key and is held by `first`, the first leaf.
+    void note_new_minimum( leaf_ptr const first, key_t const key ) noexcept {
+        auto const bucket{ static_cast<std::uint32_t>( std::min<std::uint64_t>( bucket_of( key ), dir_lo_ ) ) };
+        std::fill( dir_ + bucket, dir_ + dir_lo_, first );
+        dir_lo_ = bucket;
+    }
+    // A leaf is about to be linked behind the full last leaf, which the table then has to name: it is
+    // adopted first if it is time, and given up if naming the leaf could overfill a bucket.
+    void prepare_new_last_leaf() {
+        if ( dir_ == nullptr ) { adopt_if_due(); }
+        if ( dir_ != nullptr ) {
+            auto const last{ bucket_of( last_key( tail_ ) ) };
+            if ( last < dir_buckets_ && dir_[ last ] != tail_ && pile_at( last ) >= dir_pile_limit ) {
+                abandon_directory();
+            } else {
+                reserve_bucket( last );
+            }
+        }
+    }
+    // A full leaf is about to split: the left half ends no higher than the entry the split moves up,
+    // and the table has to reach it and be able to take another leaf in the buckets it spans.
+    void prepare_split( leaf_ptr const leaf ) {
+        if ( split_overflows( leaf ) ) {
+            abandon_directory();
+        } else {
+            reserve_bucket( bucket_of( leaf[ head( leaf ).size / 2 ] ) );
+        }
+    }
+    // `right` has just been linked behind `left` and holds the upper part of what `left` held: `left`
+    // is named for the buckets it spans, and `right` for those between the two ends.
+    void split_indexed( leaf_ptr const left, leaf_ptr const right ) noexcept {
+        name_leaf( left );
+        auto const right_bucket{ std::min<std::uint64_t>( bucket_of( last_key( right ) ), dir_buckets_ - 1 ) };
+        for ( auto b{ bucket_clamped( last_key( left ) ) + std::uint64_t{ 1 } }; b <= right_bucket; ++b ) { dir_[ b ] = right; }
+    }
+    // `leaf`, whose last key was `last`, goes away or is absorbed: whatever named it names `to`.
+    void retarget( leaf_ptr const leaf, key_t const last, leaf_ptr const to ) noexcept {
+        for ( auto b{ static_cast<std::int64_t>( bucket_clamped( last ) ) }; b >= dir_lo_ && ( dir_[ b ] == leaf || dir_[ b ] == nullptr ); --b ) { dir_[ b ] = to; }
+    }
+    // The last key of `leaf` fell from `was` to a lower one.
+    void last_decreased( leaf_ptr const leaf, key_t const was ) noexcept {
+        auto const floor{ bucket_clamped( last_key( leaf ) ) };
+        auto const following{ next_nonempty( leaf ) };
+        for ( auto b{ bucket_clamped( was ) }; b > floor && ( dir_[ b ] == leaf || dir_[ b ] == nullptr ); --b ) { dir_[ b ] = following; }
+    }
+    [[nodiscard]] cursor following_cursor( leaf_ptr const leaf ) const noexcept {
+        auto const following{ next_nonempty( leaf ) };
+        return following == nullptr ? cursor{} : cursor{ following, 0 };
+    }
+
+    // Makes the directory fit an erase of the entry at `at`: narrowed or given up if it has become much
+    // larger than the table needs, given up if the erase would pile too many leaves into a bucket (when
+    // the leaf's last key falls into the bucket of leaves before it). False if it was given up.
+    bool prepare_erase( cursor const at ) {
+        if ( dir_buckets_ > size_ + 2 * dir_table_slack ) {
+            if ( size_ <= DirectoryMinEntries / 2 || !adopt_directory( first_leaf() ) ) { abandon_directory(); }
+            if ( dir_ == nullptr ) { return false; }
+        }
+        auto const leaf{ at.leaf_ };
+        auto const n   { head( leaf ).size };
+        if ( at.index_ + 1 == n && n > 1 ) {
+            auto const now{ bucket_clamped( leaf[ n - 2 ] ) };
+            if ( now != bucket_clamped( leaf[ n - 1 ] ) && pile_at( now ) >= dir_pile_limit ) {
+                abandon_directory();
+                return false;
+            }
+        }
+        return true;
+    }
+
+    cursor erase_indexed( cursor const at ) {
+        auto const leaf{ at.leaf_ };
+        auto const was{ last_key( leaf ) };
+        auto const was_last{ at.index_ + 1 == head( leaf ).size };
+        leaf_remove( leaf, at.index_ );
+        --size_;
+        auto const left{ head( leaf ).size };
+        auto const was_first{ at.index_ == 0 && prev_leaf( leaf ) == nullptr };
+        if ( left == 0 ) {
+            auto const following{ next_nonempty( leaf ) };
+            auto const raw_next{ links( leaf )[ 0 ] };
+            unlink( leaf );
+            retarget( leaf, was, following );
+            if ( was_first && following != nullptr ) {
+                dir_lo_ = std::max( dir_lo_, static_cast<std::uint32_t>( bucket_of( following[ 0 ] ) ) );
+                root_   = following;
+            }
+            free_leaf_block( leaf );
+            if ( size_ == 0 ) {
+                if ( raw_next != nullptr ) { destroy_leaf( raw_next ); }   // the empty last leaf of an abandoned open_back()
+                root_ = nullptr;                                            // no leaf is left to walk
+                release();
+                return cursor{};
+            }
+            return following == nullptr ? cursor{} : cursor{ following, 0 };
+        }
+        if ( was_last ) { last_decreased( leaf, was ); }
+        if ( was_first ) { dir_lo_ = std::max( dir_lo_, static_cast<std::uint32_t>( bucket_of( leaf[ 0 ] ) ) ); }
+        if ( left == merge_below - 1 ) {
+            // an underfull leaf joins the leaf behind it, else the one before it, when the two fit one leaf comfortably
+            auto const right{ next_nonempty( leaf ) };
+            auto const before{ prev_leaf( leaf ) };
+            if ( right != nullptr && left + head( right ).size <= merge_limit ) {
+                auto const right_last{ last_key( right ) };
+                absorb( leaf, right );
+                unlink( right );
+                retarget( right, right_last, leaf );
+                free_leaf_block( right );
+            } else if ( before != nullptr && head( before ).size + left <= merge_limit ) {
+                auto const offset{ head( before ).size + at.index_ };
+                auto const leaf_last{ last_key( leaf ) };
+                absorb( before, leaf );
+                unlink( leaf );
+                retarget( leaf, leaf_last, before );
+                free_leaf_block( leaf );
+                return offset < head( before ).size ? cursor{ before, offset } : following_cursor( before );
+            }
+        }
+        return at.index_ < head( leaf ).size ? cursor{ leaf, at.index_ } : following_cursor( leaf );
+    }
+
+    // ---- adopting and giving up the directory -----------------------------------------------
+    // Called where a leaf is about to be added: adopts the directory when the table has reached the
+    // size at which it is next considered. Returns whether a directory now stands. May throw, changing nothing.
+    bool adopt_if_due() {
+        if ( height_ == 0 || size_ < next_eval_ ) { return false; }
+        if ( adopt_directory( leftmost_leaf() ) ) { return true; }
+        next_eval_ = doubled( size_ );
+        return false;
+    }
+    // Gives a chain of leaves (all full, `size_` entries, `tail_` set) the index that suits it: the
+    // directory if it is time and the keys allow, else inner levels.
+    void index_chain( leaf_ptr const first ) {
+        if ( size_ >= next_eval_ ) {
+            if ( adopt_directory( first ) ) { return; }
+            next_eval_ = doubled( size_ );
+        }
+        rebuild_levels( first );
+    }
+    // Replaces the index (inner levels, an earlier directory, or nothing) by a directory whose buckets
+    // are about half a leaf wide; false, with nothing changed, if the keys are spread too unevenly for
+    // that. The new table is built and checked before the old index is touched; allocation may throw.
+    bool adopt_directory( leaf_ptr const first ) {
+        auto const last { last_key( max_leaf() ) };
+        auto const base { first[ 0 ] };
+        auto const span { static_cast<std::uint64_t>( last - base ) + 1 };
+        auto const width{ std::max<std::uint64_t>( span * leaf_capacity / ( 2 * std::uint64_t{ size_ } ), 1 ) };
+        auto const shift{ static_cast<unsigned>( std::bit_width( width ) - 1 ) };
+        auto const used { ( ( span - 1 ) >> shift ) + 1 };
+        if ( used > size_ / 2 + dir_adopt_slack ) { return false; }
+        auto const capacity{ used + used / 8 + dir_table_slack };
+        // (the table is written from the front as the leaves are walked, so an attempt that fails on
+        // the first crowded bucket has touched only that much of it)
+        auto * const table{ allocate_table( capacity ) };
+        // one pass over the leaves: each answers the buckets from the one after the previous leaf's last
+        // key's bucket up to its own, and no more than the pile limit may end in one bucket
+        std::int64_t filled{ -1 };
+        unsigned     run   { 0 };
+        for ( auto leaf{ first }; leaf != nullptr; leaf = next_nonempty( leaf ) ) {
+            auto const bucket{ static_cast<std::int64_t>( static_cast<std::uint64_t>( last_key( leaf ) - base ) >> shift ) };
+            run = bucket == filled ? run + 1 : 1;
+            if ( run > dir_pile_limit ) {
+                free_table( table );
+                return false;
+            }
+            for ( auto b{ filled + 1 }; b <= bucket; ++b ) { table[ b ] = leaf; }
+            filled = bucket;
+        }
+        std::fill( table + filled + 1, table + capacity, nullptr );
+        free_index();
+        dir_         = table;
+        dir_base_    = base;
+        dir_buckets_ = static_cast<std::uint32_t>( capacity );
+        dir_lo_      = 0;
+        dir_shift_   = static_cast<std::uint8_t>( shift );
+        root_        = first;
+        height_      = 1;
+        return true;
+    }
+    // Back to inner levels over the same leaves. May throw, changing nothing.
+    void abandon_directory() {
+        rebuild_levels( first_leaf() );
+        next_eval_ = doubled( static_cast<std::uint32_t>( std::max<std::uint64_t>( size_, DirectoryMinEntries ) ) );
+    }
+
+    [[nodiscard]] char const * validate_indexed() const noexcept {
+        if ( height_ != 1 || root_ == nullptr || prev_leaf( first_leaf() ) != nullptr ) { return "a directory's table does not begin at the first leaf"; }
+        if ( dir_lo_ != bucket_of( first_leaf()[ 0 ] ) ) { return "the first kept bucket is not the bucket of the smallest key"; }
+        std::uint32_t counted{ 0 };
+        leaf_ptr      previous{ nullptr };
+        for ( auto l{ first_leaf() }; l != nullptr; l = links( l )[ 0 ] ) {
+            auto const & hd{ head( l ) };
+            if ( hd.cap != leaf_capacity ) { return "a leaf of a directory tree is not full-sized"; }
+            if ( hd.size > hd.cap || ( hd.size == 0 && l != tail_ ) ) { return "a leaf is empty or over capacity"; }
+            if ( prev_leaf( l ) != previous ) { return "a leaf's back link is wrong"; }
+            for ( unsigned i{ 0 }; i < hd.size; ++i ) {
+                if ( i != 0 && l[ i - 1 ] >= l[ i ] ) { return "leaf keys are not strictly ascending"; }
+            }
+            if ( previous != nullptr && head( previous ).size != 0 && hd.size != 0 && last_key( previous ) >= l[ 0 ] ) { return "leaves are not in key order"; }
+            for ( unsigned i{ hd.size }; i < padded( hd.cap ); ++i ) {
+                if ( l[ i ] != pad ) { return "an unused key slot is not the pad"; }
+            }
+            counted += hd.size;
+            previous = l;
+            if ( hd.size != 0 && pile_at( bucket_of( last_key( l ) ) ) > dir_pile_limit ) { return "too many leaves end in one bucket"; }
+            if ( hd.size != 0 && l != max_leaf() && bucket_of( last_key( l ) ) >= dir_buckets_ ) { return "a leaf ends beyond the table"; }
+        }
+        if ( counted != size_ ) { return "the size differs from the number of entries"; }
+        if ( previous != tail_ ) { return "the tail is not the last leaf"; }
+        // each bucket names the first leaf that reaches it; those the last leaf answers may be left unnamed
+        auto expected{ first_leaf() };
+        for ( std::uint64_t b{ dir_lo_ }; b != dir_buckets_; ++b ) {
+            while ( expected != nullptr && b != dir_lo_ && last_key( expected ) < bucket_start( b ) ) { expected = next_nonempty( expected ); }
+            if ( dir_[ b ] != expected && !( dir_[ b ] == nullptr && expected == max_leaf() ) ) { return "a directory bucket does not hold the first leaf that reaches it"; }
+        }
+        return nullptr;
+    }
+
     static void destroy_chain( leaf_ptr leaf ) noexcept {
         while ( leaf != nullptr ) {
             auto const following{ next_leaf( leaf ) };
@@ -728,17 +1131,29 @@ private:
         }
     }
     void release() noexcept {
-        if ( root_ != nullptr ) { release_subtree( root_, height_ ); }
-        root_ = nullptr;
-        tail_ = nullptr;
-        size_ = 0;
-        height_ = 0;
+        if ( dir_ != nullptr ) {
+            destroy_chain( first_leaf() );
+            free_index();
+        } else if ( root_ != nullptr ) {
+            release_subtree( root_, height_ );
+        }
+        next_eval_ = initial_next_eval;
+        root_      = nullptr;
+        tail_      = nullptr;
+        size_      = 0;
+        height_    = 0;
     }
     void steal( chunk_tree & other ) noexcept {
-        root_   = std::exchange( other.root_, nullptr );
-        tail_   = std::exchange( other.tail_, nullptr );
-        size_   = std::exchange( other.size_, 0 );
-        height_ = std::exchange( other.height_, 0 );
+        root_            = std::exchange( other.root_, nullptr );
+        tail_            = std::exchange( other.tail_, nullptr );
+        size_            = std::exchange( other.size_, 0 );
+        height_          = std::exchange( other.height_, 0 );
+        dir_             = std::exchange( other.dir_, nullptr );
+        dir_base_        = other.dir_base_;
+        dir_buckets_     = std::exchange( other.dir_buckets_, 0 );
+        dir_lo_          = other.dir_lo_;
+        dir_shift_       = other.dir_shift_;
+        next_eval_       = std::exchange( other.next_eval_, initial_next_eval );
     }
     [[nodiscard]] static std::size_t subtree_bytes( void const * const node, unsigned const level ) noexcept {
         if ( level == 0 ) {
@@ -753,6 +1168,7 @@ private:
 
     // ---- navigation -------------------------------------------------------------------------
     [[nodiscard]] leaf_ptr leftmost_leaf() const noexcept {
+        if ( dir_ != nullptr ) { return first_leaf(); }
         auto node{ root_ };
         for ( unsigned level{ height_ }; level != 0; --level ) { node = static_cast<inner_node const *>( node )->child[ 0 ]; }
         return static_cast<leaf_ptr>( node );
@@ -915,12 +1331,14 @@ private:
             }
         }
         path_t path;
-        auto leaf{ descend( key, path ) };
+        auto leaf{ dir_ != nullptr ? locate_indexed( key ) : descend( key, path ) };
         auto const index{ scan( leaf, key, head( leaf ).cap ) };
         auto & hd{ head( leaf ) };
         if ( hd.size < hd.cap ) {
             leaf_put( leaf, index, key, staged );
             ++size_;
+            // (a key above every other one never gets here: it is an append)
+            if ( dir_ != nullptr && index == 0 && prev_leaf( leaf ) == nullptr ) { note_new_minimum( leaf, key ); }
             return cursor{ leaf, index };
         }
         if ( height_ == 0 && hd.cap < leaf_capacity ) {
@@ -930,8 +1348,14 @@ private:
             return cursor{ leaf, index };
         }
         // a full leaf splits
+        if ( dir_ != nullptr ) {
+            prepare_split( leaf );
+            if ( dir_ == nullptr ) { return insert_staged( at, key, staged ); }
+        } else if ( adopt_if_due() ) {
+            return insert_staged( at, key, staged );
+        }
         inner_reserve reserve;
-        reserve.fill( inner_nodes_needed( path ) );
+        if ( dir_ == nullptr ) { reserve.fill( inner_nodes_needed( path ) ); }
         auto const right{ make_leaf( leaf_capacity ) };
         auto const n{ hd.size };
         cursor result;
@@ -959,8 +1383,13 @@ private:
             separator = right[ 0 ];
         }
         link_after( leaf, right );
-        insert_in_parent( path, reserve, 0, separator, right );
         ++size_;
+        if ( dir_ == nullptr ) {
+            insert_in_parent( path, reserve, 0, separator, right );
+        } else {
+            split_indexed( leaf, right );
+        }
+        if ( dir_ != nullptr && result.index_ == 0 && prev_leaf( result.leaf_ ) == nullptr ) { note_new_minimum( result.leaf_, key ); }
         return result;
     }
 
@@ -986,15 +1415,18 @@ private:
             ++size_;
             return true;
         }
+        prepare_new_last_leaf();
         path_t path;
-        descend_rightmost( path );
         inner_reserve reserve;
-        reserve.fill( inner_nodes_needed( path ) );
+        if ( dir_ == nullptr ) {
+            descend_rightmost( path );
+            reserve.fill( inner_nodes_needed( path ) );
+        }
         auto const fresh{ make_leaf( leaf_capacity ) };
         leaf_append( fresh, key, staged );
         link_after( leaf, fresh );
-        insert_in_parent( path, reserve, 0, key, fresh );
         ++size_;
+        if ( dir_ == nullptr ) { insert_in_parent( path, reserve, 0, key, fresh ); } else { name_leaf( leaf ); }
         return false;
     }
 
@@ -1104,13 +1536,15 @@ private:
         }
     }
 
-    // Builds the levels above a chain of full leaves, from `first`, and makes them the tree's. The
-    // nodes are all allocated before anything is changed, so an allocation failure leaves the tree as it was.
+    // Builds the inner levels above a chain of full leaves, from `first`, and makes them the tree's
+    // index in place of whichever one stands. The nodes are all allocated before anything is changed,
+    // so an allocation failure leaves the table as it was.
     void rebuild_levels( leaf_ptr const first ) {
         struct item { void * node; key_t lowest; };
         std::uint32_t count{ 0 };
         for ( auto leaf{ first }; leaf != nullptr; leaf = next_leaf( leaf ) ) { ++count; }
         if ( count <= 1 ) {
+            free_index();
             height_ = 0;
             root_   = first;
             return;
@@ -1131,7 +1565,12 @@ private:
         auto const items{ std::make_unique_for_overwrite<item[]>( count ) };
         {
             std::uint32_t i{ 0 };
-            for ( auto leaf{ first }; leaf != nullptr; leaf = next_leaf( leaf ) ) { items[ i++ ] = item{ leaf, leaf[ 0 ] }; }
+            key_t previous_last{ 0 };
+            for ( auto leaf{ first }; leaf != nullptr; leaf = next_leaf( leaf ) ) {
+                // the empty last leaf of an abandoned open_back() is indexed under a key above everything held
+                items[ i++ ] = item{ leaf, head( leaf ).size == 0 ? previous_last + 1 : leaf[ 0 ] };
+                if ( head( leaf ).size != 0 ) { previous_last = last_key( leaf ); }
+            }
         }
         unsigned height{ 0 };
         for ( std::uint32_t next{ 0 }; count > 1; ) {
@@ -1153,7 +1592,8 @@ private:
             count = groups;
             ++height;
         }
-        height_ = height;
+        free_index();
+        height_ = static_cast<std::uint8_t>( height );
         root_   = items[ 0 ].node;
     }
 
@@ -1184,8 +1624,8 @@ private:
             destroy_leaf( leaf );
             leaf = following;
         }
-        release_inner( root_, height_ );
         if ( last_kept == nullptr ) {
+            free_index();
             root_ = tail_ = nullptr;
             height_ = 0;
             size_ = 0;
@@ -1194,7 +1634,7 @@ private:
         if ( head( last_kept ).cap == leaf_capacity ) { links( last_kept )[ 0 ] = nullptr; }
         size_ = kept;
         tail_ = last_kept;
-        rebuild_levels( first );
+        if ( next_leaf( first ) != nullptr ) { index_chain( first ); } else { rebuild_levels( first ); }
     }
 
     // ---- invariants -------------------------------------------------------------------------
@@ -1237,7 +1677,15 @@ private:
     void *        root_  { nullptr };   // an inner node when height_ != 0, else a leaf
     leaf_ptr      tail_  { nullptr };   // the last leaf, which is empty only between open_back() and commit_back()
     std::uint32_t size_  { 0 };
-    std::uint32_t height_{ 0 };
+    std::uint8_t  height_{ 0 };
+    // The flat directory that stands in for the inner levels (see "the leaf directory"). While it is
+    // held, root_ is the first leaf and height_ is 1.
+    std::uint8_t  dir_shift_      { 0 };
+    leaf_ptr *    dir_            { nullptr };
+    key_t         dir_base_       { 0 };
+    std::uint32_t dir_buckets_    { 0 };        // the capacity of the table
+    std::uint32_t dir_lo_         { 0 };        // the bucket of the smallest key; the buckets below it are not kept
+    std::uint32_t next_eval_      { initial_next_eval };   // the table size at which a directory is next considered
 };
 
 } // namespace frsr::roaring::detail
