@@ -1,7 +1,8 @@
 # frsr::roaring frozen format — v1
 
 The zero-copy serialization format produced by
-`bitmap::serialize_frozen_to_vm_vector` and consumed by
+`bitmap::serialize_frozen_to_vm_vector` (or `bitmap::frozen_serialize` into
+caller storage of `frozen_size_bytes()` bytes, every byte of which it writes) and consumed by
 `bitmap::frozen_view_from_vm_vector` (validating view),
 `frozen_view::materialize()` (eager copy-out), `frozen_view::borrow_into()`
 (zero-copy borrow), and `persistent_bitmap` (file-mapped master). Once written

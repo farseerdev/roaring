@@ -206,7 +206,8 @@ typename Ref::bitmap build_frsr( std::span<std::uint64_t const> values, bool con
 
 template <typename Ref>
 Bytes frsr_bytes( typename Ref::bitmap const & bitmap ) {
-    Bytes bytes( bitmap.portable_size_in_bytes() );
+    // A dirty destination: every output byte has to be written by the serializer.
+    Bytes bytes( bitmap.portable_size_in_bytes(), std::byte{ 0xA5 } );
     EXPECT_EQ( bitmap.portable_serialize( bytes ), bytes.size() );
     return bytes;
 }

@@ -1026,6 +1026,12 @@ public:
 
     void serialize_frozen_to_vm_vector( serialized_byte_vector & out ) const;
 
+    // The frozen image written into caller storage, which needs
+    // `out.size() >= frozen_size_bytes()` and an 8-byte aligned `out.data()` (the image's
+    // offsets are relative to its start; a programming error otherwise) and need not
+    // be zeroed; returns the bytes written (== frozen_size_bytes()).
+    std::size_t frozen_serialize( std::span<std::byte> out ) const;
+
     [[nodiscard]] static bitmap deserialize_from_vm_vector( serialized_byte_vector const & in );
 
     [[nodiscard]] static frozen_view frozen_view_from_vm_vector( serialized_byte_vector const & in );
@@ -2953,7 +2959,7 @@ private:
         std::size_t   payload_bytes{};
     };
     [[nodiscard]] portable_plan portable_plan_for( chunk_cursor first, chunk_cursor last ) const noexcept;
-    std::byte * portable_write_32( chunk_cursor first, chunk_cursor last, portable_plan const & plan, std::byte * out ) const noexcept;
+    std::byte * portable_write_32( chunk_cursor first, chunk_cursor last, std::uint32_t count, std::byte * out ) const noexcept;
     [[nodiscard]] static bool portable_read_32(
         std::byte const * & cursor, std::byte const * end, chunk_type high_bits, bitmap & result, std::size_t & total
     );

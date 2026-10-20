@@ -2,6 +2,7 @@
 #include <frsr/roaring/run_container.hpp>
 
 #include <gtest/gtest.h>
+#include <cstring>
 
 #include <algorithm>
 #include <array>
@@ -1013,6 +1014,75 @@ TEST(FrsrRoaringSmoke, SerializeFrozenViewAndMaterializeRoundTrip) {
     auto const materialized{ TestBitmap::deserialize_frozen_from_vm_vector( buffer ) };
     EXPECT_EQ( materialized.size(), source.size() );
     EXPECT_EQ( materialized.to_vector(), baseline );
+}
+
+// frozen_serialize() writes every byte of the image, padding included, so the
+// destination need not be zero-filled: an image written into a dirty buffer is the
+// one the vector path produces, and it reads back to the same set.
+template <typename Bitmap>
+void check_frozen_into_dirty_buffer( Bitmap const & source, std::set<std::uint64_t> const & oracle ) {
+    typename Bitmap::serialized_byte_vector reference;
+    source.serialize_frozen_to_vm_vector( reference );
+    ASSERT_EQ( source.frozen_size_bytes(), reference.size() );
+
+    std::vector<std::byte> dirty( reference.size() + 16, std::byte{ 0xA5 } );
+    ASSERT_EQ( source.frozen_serialize( std::span{ dirty }.first( reference.size() ) ), reference.size() );
+    EXPECT_TRUE( std::equal( reference.begin(), reference.end(), dirty.begin() ) );
+    // Nothing past the image is touched.
+    EXPECT_TRUE( std::all_of( dirty.begin() + static_cast<std::ptrdiff_t>( reference.size() ), dirty.end(), []( std::byte const b ) { return b == std::byte{ 0xA5 }; } ) );
+
+    typename Bitmap::serialized_byte_vector copy;
+    copy.resize( reference.size() );
+    std::copy( dirty.begin(), dirty.begin() + static_cast<std::ptrdiff_t>( reference.size() ), copy.begin() );
+    auto const materialized{ Bitmap::deserialize_frozen_from_vm_vector( copy ) };
+    auto const values{ materialized.to_vector() };
+    EXPECT_TRUE( std::equal( values.begin(), values.end(), oracle.begin(), oracle.end() ) );
+}
+
+TEST(FrsrRoaringSmoke, FrozenSerializeIntoDirtyBufferMatchesVectorPath) {
+    auto const mixed{ make_mixed_container_bitmap() };
+    auto const mixed_values{ mixed.to_vector() };
+    check_frozen_into_dirty_buffer( mixed, { mixed_values.begin(), mixed_values.end() } );
+
+    // Sparse 64-bit keys: many one-value array containers, odd-sized payloads
+    // before aligned ones (run and bitset) force alignment gaps.
+    using Wide = frsr::roaring::bitmap<std::uint64_t>;
+    Wide wide;
+    std::set<std::uint64_t> oracle;
+    auto const add{ [&]( std::uint64_t const value ) {
+        wide.add( value );
+        oracle.insert( value );
+    } };
+    for ( std::uint64_t i{ 0 }; i < 300; ++i ) {
+        add( ( i << 40 ) | ( i * 977U ) );
+    }
+    for ( std::uint64_t v{ 0 }; v < 9000; ++v ) {
+        add( ( 400ULL << 40 ) + v * 7U );
+    }
+    for ( std::uint64_t v{ 5000 }; v < 5000 + 20000; ++v ) {
+        add( ( 401ULL << 40 ) + v );
+    }
+    for ( std::uint64_t i{ 0 }; i < 3; ++i ) {
+        add( ( 402ULL << 40 ) + i * 100 );
+    }
+    wide.optimize_for_storage();
+    check_frozen_into_dirty_buffer( wide, oracle );
+}
+
+TEST(FrsrRoaringSmoke, FrozenViewRejectsAnEmptyContainerEntry) {
+    TestBitmap single;
+    single.add( 5U );
+    TestBitmap::serialized_byte_vector buffer;
+    single.serialize_frozen_to_vm_vector( buffer );
+    ASSERT_TRUE( static_cast<bool>( TestBitmap::frozen_view_from_vm_vector( buffer ) ) );
+
+    // header: value_count @16; index entry @24: payload_bytes @12, payload_count @16, cardinality @20.
+    auto const poke32{ [&]( std::size_t const offset, std::uint32_t const value ) { std::memcpy( buffer.data() + offset, &value, sizeof( value ) ); } };
+    std::memset( buffer.data() + 16, 0, sizeof( std::uint64_t ) );
+    poke32( 24 + 12, 0 );
+    poke32( 24 + 16, 0 );
+    poke32( 24 + 20, 0 );
+    EXPECT_FALSE( static_cast<bool>( TestBitmap::frozen_view_from_vm_vector( buffer ) ) );
 }
 
 // optimize_run_shaped() is exercised on a run_selection_lazy instantiation:

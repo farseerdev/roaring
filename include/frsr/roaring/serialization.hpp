@@ -39,19 +39,9 @@ std::size_t bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy>::serialized
 template <std::unsigned_integral Key, typename ContainerSet, typename CowPolicy, typename RunSelectionPolicy>
     requires detail::valid_container_set<Key, ContainerSet>
 std::size_t bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy>::frozen_size_bytes() const {
-
-    std::size_t chunk_count{};
-    std::size_t offset{ sizeof( frozen_header ) };
+    // No container is empty (validate()), so the index holds one entry per chunk.
+    auto offset{ sizeof( frozen_header ) + chunks_.size() * sizeof( frozen_chunk_index ) };
     for ( auto const & slot : chunks_.slots() ) {
-        if ( detail::container_size( slot ) != 0 ) {
-            ++chunk_count;
-        }
-    }
-    offset += chunk_count * sizeof( frozen_chunk_index );
-    for ( auto const & slot : chunks_.slots() ) {
-        if ( detail::container_size( slot ) == 0 ) {
-            continue;
-        }
         auto const [alignment, payload_size] = frozen_payload_layout( slot );
         offset = align_up( offset, alignment );
         offset += payload_size;
@@ -93,14 +83,6 @@ void bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy>::serialize_to_vm_v
 template <std::unsigned_integral Key, typename ContainerSet, typename CowPolicy, typename RunSelectionPolicy>
     requires detail::valid_container_set<Key, ContainerSet>
 void bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy>::serialize_frozen_to_vm_vector( serialized_byte_vector & out ) const {
-
-    std::uint32_t chunk_count{};
-    for ( auto const & slot : chunks_.slots() ) {
-        if ( detail::container_size( slot ) != 0 ) {
-            ++chunk_count;
-        }
-    }
-
     auto const byte_count{ static_cast<std::uint32_t>( frozen_size_bytes() ) };
 #if defined(FRSR_ROARING_HAS_PSI_VM) && defined(FRSR_ROARING_ENABLE_VM_VECTOR_SERIALIZATION)
     if ( out.has_attached_storage() ) {
@@ -113,66 +95,83 @@ void bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy>::serialize_frozen_
 #else
     out.resize( byte_count );
 #endif
+    frozen_serialize( std::span{ out.data(), out.size() } );
+}
+
+template <std::unsigned_integral Key, typename ContainerSet, typename CowPolicy, typename RunSelectionPolicy>
+    requires detail::valid_container_set<Key, ContainerSet>
+std::size_t bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy>::frozen_serialize( std::span<std::byte> const out ) const {
+    assert( out.size() >= frozen_size_bytes() );
+    assert( reinterpret_cast<std::uintptr_t>( out.data() ) % alignof( std::uint64_t ) == 0 );
 
     auto * const data{ out.data() };
-    frozen_header const header{
-        .magic = frozen_serialization_magic,
-        .key_bits = static_cast<std::uint16_t>( std::numeric_limits<key_type>::digits ),
-        .version = frozen_format_version,
-        .chunk_count = chunk_count,
-        .value_count = static_cast<std::uint64_t>( size_ )
-    };
-    std::memcpy( data, &header, sizeof( header ) );
+    auto const chunk_count{ static_cast<std::uint32_t>( chunks_.size() ) };
+
+    // Every byte of the output is written, padding included: the destination
+    // need not be zero-filled.
+    std::memset( data, 0, sizeof( frozen_header ) );
+    auto & header{ *reinterpret_cast<frozen_header *>( data ) };
+    header.magic       = frozen_serialization_magic;
+    header.key_bits    = static_cast<std::uint16_t>( std::numeric_limits<key_type>::digits );
+    header.version     = frozen_format_version;
+    header.chunk_count = chunk_count;
+    header.value_count = static_cast<std::uint64_t>( size_ );
 
     auto * const index{
         reinterpret_cast<frozen_chunk_index *>( data + sizeof( frozen_header ) )
     };
-    std::size_t payload_offset{
-        sizeof( frozen_header ) + static_cast<std::size_t>( chunk_count ) * sizeof( frozen_chunk_index )
-    };
+    std::size_t payload_offset{ sizeof( frozen_header ) + std::size_t{ chunk_count } * sizeof( frozen_chunk_index ) };
     std::uint32_t frozen_index{};
     for ( auto chunk_at{ chunks_.begin() }; chunk_at != chunks_.end(); ++chunk_at ) {
         auto const & container{ chunks_.slot( chunk_at ) };
-        if ( detail::container_size( container ) == 0 ) {
-            continue;
-        }
 
+        assert( container.cardinality() != 0 );
         auto const [alignment, payload_size] = frozen_payload_layout( container );
-        payload_offset = align_up( payload_offset, alignment );
-        auto & frozen_chunk{ index[ frozen_index++ ] };
-        frozen_chunk.chunk = static_cast<std::uint64_t>( chunks_.key( chunk_at ) );
-        frozen_chunk.payload_offset = static_cast<std::uint32_t>( payload_offset );
-        frozen_chunk.payload_bytes = static_cast<std::uint32_t>( payload_size );
+        auto const aligned_offset{ align_up( payload_offset, alignment ) };
+        std::memset( data + payload_offset, 0, aligned_offset - payload_offset );
+        payload_offset = aligned_offset;
 
+        frozen_container_kind kind;
+        std::uint32_t payload_count;
+        std::uint32_t cardinality;
         auto * const payload{ data + payload_offset };
         switch ( container.kind() ) {
             case detail::container_kind::array: {
                 auto const array{ container.as_array() };
-                frozen_chunk.payload_count = static_cast<std::uint32_t>( array.values.size() );
-                frozen_chunk.cardinality = static_cast<std::uint32_t>( array.values.size() );
-                frozen_chunk.container_kind = static_cast<std::uint8_t>( frozen_container_kind::array );
+                kind          = frozen_container_kind::array;
+                payload_count = static_cast<std::uint32_t>( array.values.size() );
+                cardinality   = payload_count;
                 std::memcpy( payload, array.values.data(), payload_size );
                 break;
             }
             case detail::container_kind::run: {
                 auto const run{ container.as_run() };
-                frozen_chunk.payload_count = static_cast<std::uint32_t>( run.runs.size() );
-                frozen_chunk.cardinality = static_cast<std::uint32_t>( container.cardinality() );
-                frozen_chunk.container_kind = static_cast<std::uint8_t>( frozen_container_kind::run );
+                kind          = frozen_container_kind::run;
+                payload_count = static_cast<std::uint32_t>( run.runs.size() );
+                cardinality   = static_cast<std::uint32_t>( container.cardinality() );
                 std::memcpy( payload, run.runs.data(), payload_size );
                 break;
             }
             case detail::container_kind::bitset: {
                 auto const bitset{ container.as_bitset() };
-                frozen_chunk.payload_count = static_cast<std::uint32_t>( layout_type::word_count );
-                frozen_chunk.cardinality = static_cast<std::uint32_t>( container.cardinality() );
-                frozen_chunk.container_kind = static_cast<std::uint8_t>( frozen_container_kind::bitset );
+                kind          = frozen_container_kind::bitset;
+                payload_count = static_cast<std::uint32_t>( layout_type::word_count );
+                cardinality   = static_cast<std::uint32_t>( container.cardinality() );
                 std::memcpy( payload, bitset.words.as_array().data(), payload_size );
                 break;
             }
         }
+        index[ frozen_index++ ] = frozen_chunk_index{
+            .chunk          = static_cast<std::uint64_t>( chunks_.key( chunk_at ) ),
+            .payload_offset = static_cast<std::uint32_t>( payload_offset ),
+            .payload_bytes  = static_cast<std::uint32_t>( payload_size ),
+            .payload_count  = payload_count,
+            .cardinality    = cardinality,
+            .container_kind = static_cast<std::uint8_t>( kind )
+        };
         payload_offset += payload_size;
     }
+    return payload_offset;
 }
 
 template <std::unsigned_integral Key, typename ContainerSet, typename CowPolicy, typename RunSelectionPolicy>
@@ -258,6 +257,9 @@ typename bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy>::frozen_view b
         }
         if ( entry.payload_bytes != frozen_expected_payload_bytes( entry ) ) {
             return {};
+        }
+        if ( entry.cardinality == 0 ) {
+            return {};  // a chunk never holds an empty container
         }
         total_cardinality += entry.cardinality;
     }
@@ -603,9 +605,6 @@ typename bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy>::portable_plan
     portable_plan plan;
     for ( auto index{ first }; index != last; ++index ) {
         auto const & slot{ chunks_.slot( index ) };
-        if ( detail::container_size( slot ) == 0 ) {
-            continue;
-        }
         ++plan.containers;
         plan.has_run |= slot.holds_run();
         plan.payload_bytes += detail::portable_wire_of( slot ).bytes;
@@ -623,55 +622,53 @@ typename bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy>::portable_plan
 
 template <std::unsigned_integral Key, typename ContainerSet, typename CowPolicy, typename RunSelectionPolicy>
     requires detail::valid_container_set<Key, ContainerSet>
-std::byte * bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy>::portable_write_32( chunk_cursor const first, chunk_cursor const last, portable_plan const & plan, std::byte * out ) const noexcept {
-    auto const count{ plan.containers };
-    if ( plan.has_run ) {
-        detail::portable_put( out, detail::portable_cookie_with_run | ( ( count - 1U ) << 16 ) );
+std::byte * bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy>::portable_write_32( chunk_cursor const first, chunk_cursor const last, std::uint32_t const count, std::byte * const out ) const noexcept {
+    // The header layout depends on whether any container is a run: one scan of the
+    // handles settles it, then the header and the payloads are written in a single pass.
+    bool has_run{ false };
+    for ( auto index{ first }; index != last; ++index ) {
+        if ( chunks_.slot( index ).holds_run() ) {
+            has_run = true;
+            break;
+        }
+    }
+
+    auto * cursor{ out };
+    std::byte * flags{ nullptr };
+    if ( has_run ) {
+        detail::portable_put( cursor, detail::portable_cookie_with_run | ( ( count - 1U ) << 16 ) );
         auto const flag_bytes{ ( count + 7U ) / 8U };
-        std::memset( out, 0, flag_bytes );
-        std::uint32_t position{ 0 };
-        for ( auto index{ first }; index != last; ++index ) {
-            auto const & slot{ chunks_.slot( index ) };
-            if ( detail::container_size( slot ) == 0 ) {
-                continue;
-            }
-            if ( slot.holds_run() ) {
-                out[ position / 8U ] |= static_cast<std::byte>( 1U << ( position % 8U ) );
-            }
-            ++position;
-        }
-        out += flag_bytes;
+        std::memset( cursor, 0, flag_bytes );
+        flags = cursor;
+        cursor += flag_bytes;
     } else {
-        detail::portable_put( out, detail::portable_cookie_no_run );
-        detail::portable_put( out, count );
+        detail::portable_put( cursor, detail::portable_cookie_no_run );
+        detail::portable_put( cursor, count );
     }
-    for ( auto index{ first }; index != last; ++index ) {
+    auto * descriptive{ cursor };
+    cursor += 4U * std::size_t{ count };
+    std::byte * offsets{ nullptr };
+    if ( !has_run || count >= detail::portable_no_offset_threshold ) {
+        offsets = cursor;
+        cursor += 4U * std::size_t{ count };
+    }
+
+    std::uint32_t position{ 0 };
+    for ( auto index{ first }; index != last; ++index, ++position ) {
         auto const & slot{ chunks_.slot( index ) };
-        if ( detail::container_size( slot ) == 0 ) {
-            continue;
+        assert( slot.cardinality() != 0 );
+        auto const wire{ detail::portable_wire_of( slot ) };
+        detail::portable_put( descriptive, static_cast<std::uint16_t>( chunks_.key( index ) ) );
+        detail::portable_put( descriptive, static_cast<std::uint16_t>( wire.cardinality - 1U ) );
+        if ( offsets != nullptr ) {
+            detail::portable_put( offsets, static_cast<std::uint32_t>( cursor - out ) );
         }
-        detail::portable_put( out, static_cast<std::uint16_t>( chunks_.key( index ) ) );
-        detail::portable_put( out, static_cast<std::uint16_t>( slot.cardinality() - 1U ) );
-    }
-    if ( !plan.has_run || count >= detail::portable_no_offset_threshold ) {
-        auto offset{ plan.header_bytes };
-        for ( auto index{ first }; index != last; ++index ) {
-            auto const & slot{ chunks_.slot( index ) };
-            if ( detail::container_size( slot ) == 0 ) {
-                continue;
-            }
-            detail::portable_put( out, static_cast<std::uint32_t>( offset ) );
-            offset += detail::portable_wire_of( slot ).bytes;
+        if ( slot.holds_run() ) {
+            flags[ position / 8U ] |= static_cast<std::byte>( 1U << ( position % 8U ) );
         }
+        cursor = detail::portable_write_container( slot, wire, cursor );
     }
-    for ( auto index{ first }; index != last; ++index ) {
-        auto const & slot{ chunks_.slot( index ) };
-        if ( detail::container_size( slot ) == 0 ) {
-            continue;
-        }
-        out = detail::portable_write_container( slot, detail::portable_wire_of( slot ), out );
-    }
-    return out;
+    return cursor;
 }
 
 template <std::unsigned_integral Key, typename ContainerSet, typename CowPolicy, typename RunSelectionPolicy>
@@ -709,37 +706,27 @@ std::size_t bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy>::portable_s
 
     auto * cursor{ out.data() };
     if constexpr ( std::numeric_limits<key_type>::digits == 32 ) {
-        cursor = portable_write_32( chunks_.begin(), chunks_.end(), portable_plan_for( chunks_.begin(), chunks_.end() ), cursor );
+        cursor = portable_write_32( chunks_.begin(), chunks_.end(), static_cast<std::uint32_t>( chunks_.size() ), cursor );
     } else {
-        // Bucket count first (a bucket is a run of chunks sharing the high 32 bits and
-        // holding at least one non-empty container), then the buckets in key order.
+        // The buckets (runs of chunks sharing the high 32 bits) in key order, behind
+        // their count, which is only known once they have been walked.
+        auto * const bucket_count_at{ cursor };
+        cursor += sizeof( std::uint64_t );
         std::uint64_t buckets{ 0 };
         for ( auto first{ chunks_.begin() }; first != chunks_.end(); ) {
             auto const high{ chunks_.key( first ) >> 16 };
             auto last{ first };
-            ++last;
-            while ( last != chunks_.end() && ( chunks_.key( last ) >> 16 ) == high ) {
+            std::uint32_t containers{ 0 };
+            do {
                 ++last;
-            }
-            buckets += portable_plan_for( first, last ).containers != 0;
+                ++containers;
+            } while ( last != chunks_.end() && ( chunks_.key( last ) >> 16 ) == high );
+            detail::portable_put( cursor, static_cast<std::uint32_t>( high ) );
+            cursor = portable_write_32( first, last, containers, cursor );
+            ++buckets;
             first = last;
         }
-        std::memcpy( cursor, &buckets, sizeof( buckets ) );
-        cursor += sizeof( buckets );
-        for ( auto first{ chunks_.begin() }; first != chunks_.end(); ) {
-            auto const high{ chunks_.key( first ) >> 16 };
-            auto last{ first };
-            ++last;
-            while ( last != chunks_.end() && ( chunks_.key( last ) >> 16 ) == high ) {
-                ++last;
-            }
-            auto const plan{ portable_plan_for( first, last ) };
-            if ( plan.containers != 0 ) {
-                detail::portable_put( cursor, static_cast<std::uint32_t>( high ) );
-                cursor = portable_write_32( first, last, plan, cursor );
-            }
-            first = last;
-        }
+        std::memcpy( bucket_count_at, &buckets, sizeof( buckets ) );
     }
     return static_cast<std::size_t>( cursor - out.data() );
 }

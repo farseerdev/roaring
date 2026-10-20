@@ -1264,6 +1264,8 @@ struct serStateFrsr {
 #endif
     // Standard portable format buffer (sized once in setup, like the reference arms').
     std::vector<std::byte> portable;
+    // Frozen image buffer, sized once in setup, like the reference arms'.
+    std::vector<std::byte> frozen;
 };
 
 // A rep is a timed region of its own - one run() between one clock pair - so the
@@ -1327,8 +1329,36 @@ struct synthetic_frsr_FrozenSerialize_registrar {
             Entry e;
             e.name = std::string("synthetic/") + Arm::label() + "FrozenSerialize/" + ptag;
             e.description =
-                "frsr frozen serialize into the native indexed frozen "
-                "wire format.";
+                "frsr frozen serialize into the native indexed frozen wire format: one frozen_serialize() call per measured iteration into a buffer preallocated in setup (as in the reference arms, whose caller sizes the buffer).";
+            e.setup = [count, step]() -> void * {
+                auto *s = new serStateFrsr<Arm>;
+                for (size_t i = 0; i < count; ++i) {
+                    auto const v = static_cast<std::uint64_t>(i) * step;
+                    s->r.add(v);
+                }
+                s->r.optimize_for_storage();
+                s->r.shrink_to_fit();
+                s->frozen.resize(s->r.frozen_size_bytes());
+                return s;
+            };
+            e.run = [](void *sv) -> int64_t {
+                auto *s = static_cast<serStateFrsr<Arm> *>(sv);
+                return static_cast<int64_t>(s->r.frozen_serialize(s->frozen));
+            };
+            e.teardown = [](void *sv) {
+                delete static_cast<serStateFrsr<Arm> *>(sv);
+            };
+            e.ops_per_run = 1;
+            e.inner_reps = frozen_reps(count, step);
+            e.reusable_state = true;
+            g_benchmarks.push_back(std::move(e));
+        }
+        // frsrFrozenSerializeVector
+        {
+            Entry e;
+            e.name = std::string("synthetic/") + Arm::label() + "FrozenSerializeVector/" + ptag;
+            e.description =
+                "frsr frozen serialize through serialize_frozen_to_vm_vector: sizes the image, resizes the destination vector and writes it, all inside the timed call.";
             e.setup = [count, step]() -> void * {
                 auto *s = new serStateFrsr<Arm>;
                 for (size_t i = 0; i < count; ++i) {
