@@ -658,6 +658,42 @@ TEST( KernelCoverage, RunCountMatchesNaive ) {
 // ---------------------------------------------------------------------------
 // shrink_to_fit after mass removal, then every kind of mutation.
 // ---------------------------------------------------------------------------
+// Run-list intersection counting: a run of one list that ends before the other's run ends must not
+// hide the next run of its own list
+// ---------------------------------------------------------------------------
+
+TEST( KernelCoverage, RunIntersectionCardinalityMatchesNaive ) {
+    using layout = detail::default_layout<std::uint32_t>;
+    using run_type = run<std::uint16_t>;
+    std::mt19937_64 rng{ 0x2A2A };
+    auto const random_runs{ [ & ]( std::size_t const count ) {
+        std::vector<run_type> runs;
+        std::uint32_t at{ static_cast<std::uint32_t>( rng() % 50 ) };
+        for ( std::size_t i{ 0 }; i < count && at < 65000; ++i ) {
+            auto const length{ static_cast<std::uint32_t>( rng() % ( 1 + ( rng() % 3 == 0 ? 3000 : 40 ) ) ) };
+            runs.push_back( { static_cast<std::uint16_t>( at ), static_cast<std::uint16_t>( at + length ) } );
+            at += length + 2 + static_cast<std::uint32_t>( rng() % 60 );
+        }
+        return runs;
+    } };
+    {
+        std::vector<run_type> const left{ { 0, 9 }, { 20, 29 } };
+        std::vector<run_type> const right{ { 5, 24 } };
+        EXPECT_EQ( ( detail::intersect_runs_cardinality<layout>( left.data(), left.size(), right.data(), right.size() ) ), 10U );
+        EXPECT_EQ( ( detail::intersect_runs_cardinality<layout>( right.data(), right.size(), left.data(), left.size() ) ), 10U );
+    }
+    for ( int trial{ 0 }; trial < 3000; ++trial ) {
+        auto const left { random_runs( rng() % 40 ) };
+        auto const right{ random_runs( rng() % 40 ) };
+        std::vector<bool> in_left( 65536 );
+        for ( auto const & r : left ) { for ( std::uint32_t k{ r.begin }; k <= r.end; ++k ) { in_left[ k ] = true; } }
+        std::size_t expected{ 0 };
+        for ( auto const & r : right ) { for ( std::uint32_t k{ r.begin }; k <= r.end; ++k ) { expected += in_left[ k ]; } }
+        ASSERT_EQ( ( detail::intersect_runs_cardinality<layout>( left.data(), left.size(), right.data(), right.size() ) ), expected ) << "trial " << trial;
+    }
+}
+
+// ---------------------------------------------------------------------------
 
 template <typename Bitmap>
 void shrink_then_mutate_case() {
