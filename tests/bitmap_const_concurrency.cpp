@@ -161,6 +161,8 @@ void concurrent_readers_case() {
     auto const expected_union{ set_union_of( values, other_values ) };
     auto const expected_inter{ set_intersection_of( values, other_values ) };
     auto const expected_diff{ set_difference_of( values, other_values ) };
+    bool probes_hit{ false };
+    for ( auto const v : probes ) { probes_hit = probes_hit || std::ranges::binary_search( values, v ); }
     key_type expected_sum{ 0 };
     for ( auto const v : values ) { expected_sum = static_cast<key_type>( expected_sum + v ); }
 
@@ -179,8 +181,8 @@ void concurrent_readers_case() {
             std::ranges::shuffle( mine, local );
             // The kind of read each thread starts with differs, so every lazy path
             // is entered first by some thread while the others are mid-flight.
-            auto const phases{ std::array{ 0, 1, 2, 3, 4, 5 } };
-            for ( unsigned round{ 0 }; round < 6; ++round ) {
+            auto const phases{ std::array{ 0, 1, 2, 3, 4, 5, 6 } };
+            for ( unsigned round{ 0 }; round < 7; ++round ) {
                 switch ( phases[ ( t + round ) % phases.size() ] ) {
                     case 0:
                         for ( auto const v : mine ) { bad += shared.contains( v ) == std::ranges::binary_search( values, v ) ? 0 : 1; }
@@ -206,6 +208,15 @@ void concurrent_readers_case() {
                         bad += ( shared | other ).size() != expected_union.size() ? 1 : 0;
                         bad += ( shared & other ).size() != expected_inter.size() ? 1 : 0;
                         bad += ( shared - other ).size() != expected_diff.size() ? 1 : 0;
+                        break;
+                    case 6:
+                        // the operations against plain data are reads too
+                        bad += shared.and_cardinality( std::span<key_type const>{ other_values } ) != expected_inter.size() ? 1 : 0;
+                        bad += shared.is_superset_of( std::span<key_type const>{ values } ) ? 0 : 1;
+                        bad += shared.is_subset_of( frsr::roaring::sorted_keys{ values } ) ? 0 : 1;
+                        bad += shared.intersects( mine ) != probes_hit ? 1 : 0;
+                        bad += shared.and_cardinality( frsr::roaring::key_range::all() ) != values.size() ? 1 : 0;
+                        bad += shared.intersects( frsr::roaring::key_range::closed( values.front(), values.back() ) ) ? 0 : 1;
                         break;
                     default: {
                         std::size_t n{ 0 };
