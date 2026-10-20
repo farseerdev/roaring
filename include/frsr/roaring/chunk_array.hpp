@@ -153,6 +153,43 @@ public:
         return at;
     }
 
+    // Inserts a copy of every entry of `other` whose key is not held here and for which `wanted`
+    // holds; `count` is how many that is. The table is grown once and the entries above each
+    // insertion point are moved once, from the back: an entry takes its place among the keys below
+    // the previous insertion point, so a few insertions into a long table move the table once
+    // instead of once per entry.
+    // [croaring-ref] deps/croaring/src/roaring.c:roaring_inplace_union_few (second loop)
+    template <typename Wanted>
+    void insert_absent_from( chunk_array const & other, index_type const count, Wanted const & wanted ) {
+        if ( count == 0 ) { return; }
+        assert( this != &other );
+        if ( size_ + count > capacity_ ) { grow( size_ + count ); }
+        auto const total{ size_ + count };
+        auto end{ size_ };                              // [ 0, end ) is still in place
+        auto dst{ total };                              // [ dst, total ) is final
+        try {
+            for ( auto j{ other.size_ }; j-- != 0 && dst > end; ) {
+                auto const key{ other.keys_[ j ] };
+                auto const index{ static_cast<index_type>( std::lower_bound( keys_, keys_ + end, key ) - keys_ ) };
+                if ( ( index < end && keys_[ index ] == key ) || !wanted( other.slots_[ j ] ) ) { continue; }
+                handle_type copy{ other.slots_[ j ] };  // may throw: nothing has moved yet for this entry
+                auto const tail{ end - index };
+                dst -= tail;
+                std::memmove( static_cast<void *>( slots_ + dst ), static_cast<void const *>( slots_ + index ), std::size_t{ tail } * sizeof( handle_type ) );
+                std::memmove( keys_ + dst, keys_ + index, std::size_t{ tail } * sizeof( chunk_type ) );
+                --dst;
+                new ( slots_ + dst ) handle_type{ std::move( copy ) };
+                keys_[ dst ] = key;
+                end = index;
+            }
+        } catch ( ... ) {
+            close_gap( end, dst, total );
+            throw;
+        }
+        assert( dst == end && "the count was exact" );
+        size_ = total;
+    }
+
     // Removes the entry at `at` and returns the position of the entry that followed it.
     cursor erase( cursor const at ) {
         erase_range( at.index_, at.index_ + 1 );
@@ -323,6 +360,14 @@ private:
         auto const tail{ std::size_t{ size_ } - index };
         std::memmove( static_cast<void *>( slots_ + index + 1 ), static_cast<void const *>( slots_ + index ), tail * sizeof( handle_type ) );
         std::memmove( keys_  + index + 1, keys_  + index, tail * sizeof( chunk_type ) );
+    }
+
+    // Entries [ end, dst ) of the first `total` are a hole between the entries below and the ones above
+    // it: moves the upper ones down and sets the size to what is held.
+    void close_gap( index_type const end, index_type const dst, index_type const total ) noexcept {
+        std::memmove( static_cast<void *>( slots_ + end ), static_cast<void const *>( slots_ + dst ), std::size_t{ total - dst } * sizeof( handle_type ) );
+        std::memmove( keys_ + end, keys_ + dst, std::size_t{ total - dst } * sizeof( chunk_type ) );
+        size_ = end + ( total - dst );
     }
 
     // Destroys [first, last) and closes the gap.
