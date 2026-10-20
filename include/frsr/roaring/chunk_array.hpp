@@ -108,6 +108,16 @@ public:
         return cursor{ static_cast<index_type>( position - first ) };
     }
 
+    // The entry holding `key` (end() if there is none). A probe in the final chunk, the usual
+    // shape for a dense set or a miss just past the end, is answered by one compare of the last
+    // key, as the reference does. A pure read.
+    [[nodiscard]] cursor find( chunk_type const key ) const noexcept {
+        if ( size_ == 0 ) { return end(); }
+        if ( keys_[ size_ - 1 ] == key ) { return last(); }
+        auto const at{ lower_bound( key ) };
+        return ( at == end() || keys_[ at.index_ ] != key ) ? end() : at;
+    }
+
     // lower_bound() for a caller that already stands at `from` and only moves forward (a
     // leapfrogging walk over several tables): the first entry at or after `from` whose key is
     // not below `key`. Gallops from `from`, so the cost follows the distance travelled.

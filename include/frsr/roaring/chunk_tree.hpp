@@ -22,9 +22,6 @@
 #   define FRSR_ROARING_NODE_SCAN_AVX2 0
 #endif
 
-#ifndef FRSR_INNER_KEYS
-#define FRSR_INNER_KEYS 16
-#endif
 namespace frsr::roaring::detail {
 
 // A key slot that holds no key. Every key stored in a node is below it, so the unused tail of a
@@ -99,7 +96,7 @@ public:
     static_assert( alignof( Handle ) <= 8 );
 
     static constexpr unsigned leaf_capacity{ 15 };
-    static constexpr unsigned inner_keys    { FRSR_INNER_KEYS };
+    static constexpr unsigned inner_keys    { 16 };
 
 private:
     using key_t    = std::int64_t;
