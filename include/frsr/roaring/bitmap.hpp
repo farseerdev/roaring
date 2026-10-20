@@ -12,6 +12,7 @@
 #include <frsr/roaring/array_ops.hpp>
 #include <frsr/roaring/run_ops.hpp>
 #include <frsr/roaring/container_ops.hpp>
+#include <frsr/roaring/interop_operands.hpp>
 
 #include <algorithm>
 #include <array>
@@ -691,6 +692,60 @@ public:
         }
         return false;
     }
+
+    // ---- operations against operands that are not bitmaps: keys in a span or any range, std::bitset and
+    // dynamic bit-sets, raw bit words, key intervals. See interop_operands.hpp for the operand kinds and
+    // interop.hpp for how they are applied. Keys of an operand that key_type cannot hold are not members.
+    //
+    // and_with / or_with / andnot_with (and &= |= -=) update this bitmap; they accept a bitmap too, so that
+    // the name works for every operand.
+
+    template <interop_operand Operand>
+    bitmap & and_with( Operand const & operand ) { detail::interop_engine<bitmap>::and_with( *this, operand ); return *this; }
+    template <interop_operand Operand>
+    bitmap & or_with( Operand const & operand ) { detail::interop_engine<bitmap>::or_with( *this, operand ); return *this; }
+    template <interop_operand Operand>
+    bitmap & andnot_with( Operand const & operand ) { detail::interop_engine<bitmap>::andnot_with( *this, operand ); return *this; }
+    bitmap & and_with   ( bitmap const & other ) { return *this &= other; }
+    bitmap & or_with    ( bitmap const & other ) { return *this |= other; }
+    bitmap & andnot_with( bitmap const & other ) { return *this -= other; }
+
+    template <interop_operand Operand>
+    bitmap & operator&=( Operand const & operand ) { return and_with( operand ); }
+    template <interop_operand Operand>
+    bitmap & operator|=( Operand const & operand ) { return or_with( operand ); }
+    template <interop_operand Operand>
+    bitmap & operator-=( Operand const & operand ) { return andnot_with( operand ); }
+
+    // Whether this bitmap and the operand share a key.
+    template <interop_operand Operand>
+    [[nodiscard]] bool intersects( Operand const & operand ) const noexcept( detail::interop_nothrow_v<Operand> ) { return detail::interop_engine<bitmap>::intersects( *this, operand ); }
+    // How many keys this bitmap and the operand share (each key once, whatever the operand repeats).
+    template <interop_operand Operand>
+    [[nodiscard]] size_type and_cardinality( Operand const & operand ) const noexcept( detail::interop_nothrow_v<Operand> ) { return detail::interop_engine<bitmap>::and_cardinality( *this, operand ); }
+    [[nodiscard]] size_type and_cardinality( bitmap const & other ) const { return detail::interop_engine<bitmap>::and_cardinality( *this, other ); }
+    // Whether every key of this bitmap is in the operand.
+    template <interop_operand Operand>
+    [[nodiscard]] bool is_subset_of( Operand const & operand ) const noexcept( detail::interop_nothrow_v<Operand> ) { return detail::interop_engine<bitmap>::is_subset_of( *this, operand ); }
+    [[nodiscard]] bool is_subset_of( bitmap const & other ) const { return detail::interop_engine<bitmap>::is_subset_of( *this, other ); }
+    // Whether every key of the operand is in this bitmap.
+    template <interop_operand Operand>
+    [[nodiscard]] bool is_superset_of( Operand const & operand ) const noexcept( detail::interop_nothrow_v<Operand> ) { return detail::interop_engine<bitmap>::is_superset_of( *this, operand ); }
+    [[nodiscard]] bool is_superset_of( bitmap const & other ) const { return other.is_subset_of( *this ); }
+    // Whether this bitmap and the operand hold the same keys.
+    template <interop_operand Operand>
+    [[nodiscard]] bool equals( Operand const & operand ) const noexcept( detail::interop_nothrow_v<Operand> ) { return detail::interop_engine<bitmap>::equals( *this, operand ); }
+    [[nodiscard]] bool equals( bitmap const & other ) const { return size_ == other.size_ && is_subset_of( other ); }
+
+    // The half-open interval [lo, hi) (empty if hi <= lo); the whole key space and intervals that run to the
+    // largest key are key_range::all() / key_range::from( lo ), through the operations above.
+    [[nodiscard]] bool      intersects_range    ( key_type const lo, key_type const hi ) const noexcept { return intersects( key_range::half_open( lo, hi ) ); }
+    // Whether every key of [lo, hi) is in this bitmap (true for an empty interval).
+    [[nodiscard]] bool      contains_range      ( key_type const lo, key_type const hi ) const noexcept { return is_superset_of( key_range::half_open( lo, hi ) ); }
+    [[nodiscard]] size_type cardinality_in_range( key_type const lo, key_type const hi ) const noexcept { return and_cardinality( key_range::half_open( lo, hi ) ); }
+    // Keeps only the keys of [lo, hi).
+    bitmap &                and_range           ( key_type const lo, key_type const hi )       { return and_with( key_range::half_open( lo, hi ) ); }
+
 
     [[ gnu::hot ]] void add_many_sorted( std::span<key_type const> const sorted_values ) {
         if ( sorted_values.empty() ) {
@@ -3492,6 +3547,8 @@ private:
         }
     }
 
+    friend struct detail::interop_engine<bitmap>;
+
     chunk_store_type chunks_;
     size_type size_{};
 };
@@ -3499,6 +3556,7 @@ private:
 } // namespace frsr::roaring
 
 #include <frsr/roaring/serialization.hpp>
+#include <frsr/roaring/interop.hpp>
 
 namespace frsr::roaring {
 extern template class bitmap<std::uint16_t>;

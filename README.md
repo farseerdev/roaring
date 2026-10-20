@@ -45,6 +45,24 @@ using array_bitset_set = std::variant<
 frsr::roaring::bitmap<std::uint32_t, array_bitset_set> bitmap;
 ```
 
+## Combining with plain data
+
+A bitmap can be and-ed, or-ed, and-not-ed, tested for intersection, subset, superset and equality with key
+spans and ranges, `std::bitset`, dynamic bit-sets, raw bit words and key intervals directly, without building
+a temporary bitmap:
+
+```cpp
+frsr::roaring::bitmap<std::uint32_t> bitmap;
+std::vector<std::uint32_t> keys{ 3, 70000, 70001 };
+
+bitmap.and_with( keys );                                  // keep these keys
+bitmap.or_with( frsr::roaring::bits_at( std::bitset<4096>{ 0xF0F0 }, 65536 ) );
+bool any = bitmap.intersects( frsr::roaring::key_range::half_open( 100, 200 ) );
+auto n = bitmap.cardinality_in_range( 0, 1000 );
+```
+
+See [docs/interop.md](docs/interop.md).
+
 ## Design constraints
 
 - Namespace: `frsr::roaring`

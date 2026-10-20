@@ -137,14 +137,17 @@ template <typename Layout>
             }
         } else {
             cardinality += std::min( end, xend ) - std::max( start, xstart );
-            if ( end <= xend ) {
+            // both decisions are taken on the runs just compared: the left run advancing reloads `end`
+            auto const left_done { end <= xend };
+            auto const right_done{ xend <= end };
+            if ( left_done ) {
                 ++li;
                 if ( li < lhs_size ) {
                     start = static_cast<std::size_t>( lhs_runs[ li ].begin );
                     end = static_cast<std::size_t>( lhs_runs[ li ].end ) + 1U;
                 }
             }
-            if ( xend <= end ) {
+            if ( right_done ) {
                 ++ri;
                 if ( ri < rhs_size ) {
                     xstart = static_cast<std::size_t>( rhs_runs[ ri ].begin );

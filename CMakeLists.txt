@@ -242,6 +242,7 @@ if(FRSR_ROARING_BUILD_TESTS)
         tests/contains_states.cpp
         tests/bitmap_const_concurrency.cpp
         tests/chunk_tree.cpp
+        tests/interop.cpp
     )
     target_link_libraries(frsr_roaring_tests
         PRIVATE
@@ -263,6 +264,7 @@ if(FRSR_ROARING_BUILD_TESTS)
             tests/bitmap_full_crosscheck.cpp
             tests/portable_interop.cpp
             tests/kernel_crosscheck.cpp
+            tests/interop_crosscheck.cpp
         )
         target_link_libraries(frsr_roaring_croaring_crosscheck
             PRIVATE
@@ -306,6 +308,20 @@ if(FRSR_ROARING_BUILD_BENCHMARKS)
     if(TARGET roaring)
         target_link_libraries(frsr_roaring_wide_key_bench PRIVATE roaring)
         target_compile_definitions(frsr_roaring_wide_key_bench PRIVATE FRSR_ROARING_HAS_CROARING=1)
+    endif()
+
+    add_executable(frsr_roaring_interop_bench
+        bench/interop_bench.cpp
+    )
+    target_link_libraries(frsr_roaring_interop_bench PRIVATE frsr_roaring)
+    set_target_properties(frsr_roaring_interop_bench PROPERTIES
+        CXX_STANDARD 26
+        CXX_STANDARD_REQUIRED ON
+        CXX_EXTENSIONS OFF
+    )
+    if(TARGET roaring)
+        target_link_libraries(frsr_roaring_interop_bench PRIVATE roaring)
+        target_compile_definitions(frsr_roaring_interop_bench PRIVATE FRSR_ROARING_HAS_CROARING=1)
     endif()
 
     add_executable(frsr_roaring_chunk_table_bench
