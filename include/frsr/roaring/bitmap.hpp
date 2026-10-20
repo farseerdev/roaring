@@ -1340,6 +1340,14 @@ public:
             }
             return;
         }
+        // An array into an unshared bitset: set its bits in place and count the new ones, as CRoaring's
+        // bitset_container_ior does, rather than materializing a copy of the 8 KB bitset.
+        // [croaring-ref] deps/croaring/src/containers/containers.c:container_ior (BITSET_CONTAINER x ARRAY_CONTAINER)
+        if ( !lazy && mutate_left && left_container.holds_bitset() && right_container.holds_array() ) {
+            auto left_bitset{ left_container.as_bitset() };
+            detail::or_array_into_bitset_inplace<false, layout_type>( left_bitset, right_container.as_array() );
+            return;
+        }
         // Same-key mixed array/bitset in the lazy bulk-union path: accumulate
         // into a bitset in place, mirroring CRoaring's LAZY_OR_BITSET_CONVERSION
         // (roaring.c:roaring_bitmap_lazy_or_inplace). Promote the accumulator
@@ -1366,7 +1374,7 @@ public:
                 if ( right_is_bitset ) {
                     detail::or_bitset_bitset_inplace_lazy<layout_type>( left_bitset, right_container.as_bitset() );
                 } else {
-                    detail::or_array_into_bitset_inplace_lazy<layout_type>( left_bitset, right_container.as_array() );
+                    detail::or_array_into_bitset_inplace<true, layout_type>( left_bitset, right_container.as_array() );
                 }
                 return;
             }
@@ -2221,7 +2229,7 @@ public:
                     if ( right_is_bitset ) {
                         detail::or_bitset_bitset_inplace_bulk<layout_type>( left_bitset, right_container.as_bitset() );
                     } else {
-                        detail::or_array_into_bitset_inplace_lazy<layout_type>( left_bitset, right_container.as_array() );
+                        detail::or_array_into_bitset_inplace<true, layout_type>( left_bitset, right_container.as_array() );
                     }
                     ++pos1;
                     ++pos2;
