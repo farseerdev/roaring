@@ -234,6 +234,7 @@ typename bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy>::frozen_view b
     std::uint64_t total_cardinality{};
     std::uint64_t previous_chunk{};
     bool first_chunk{ true };
+    bool any_empty{ false };
     for ( std::uint32_t i = 0; i < header->chunk_count; ++i ) {
         auto const & entry{ index[ i ] };
         if ( !first_chunk && entry.chunk <= previous_chunk ) {
@@ -258,12 +259,11 @@ typename bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy>::frozen_view b
         if ( entry.payload_bytes != frozen_expected_payload_bytes( entry ) ) {
             return {};
         }
-        if ( entry.cardinality == 0 ) {
-            return {};  // a chunk never holds an empty container
-        }
         total_cardinality += entry.cardinality;
+        any_empty |= ( entry.cardinality == 0 );
     }
-    if ( total_cardinality != header->value_count ) {
+    // a chunk never holds an empty container
+    if ( any_empty || total_cardinality != header->value_count ) {
         return {};
     }
 
