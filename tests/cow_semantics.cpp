@@ -10,6 +10,10 @@
 // its own global replacement operators (duplicate-symbol link error otherwise),
 // and it intercepts allocation itself. The payload-pointer-identity assertions
 // and the threaded race test — the parts TSan is for — remain active.
+//
+// The same operators carry the allocation-failure injection of allocation_fault.hpp.
+
+#include "allocation_fault.hpp"
 
 #include <frsr/roaring/container_handle.hpp>
 
@@ -20,17 +24,6 @@
 #include <new>
 #include <thread>
 #include <vector>
-
-#if defined( __SANITIZE_THREAD__ )
-#   define FRSR_TESTS_COUNT_ALLOCATIONS 0
-#elif defined( __has_feature )
-#   if __has_feature( thread_sanitizer )
-#       define FRSR_TESTS_COUNT_ALLOCATIONS 0
-#   endif
-#endif
-#ifndef FRSR_TESTS_COUNT_ALLOCATIONS
-#   define FRSR_TESTS_COUNT_ALLOCATIONS 1
-#endif
 
 namespace {
 
@@ -46,6 +39,9 @@ std::atomic<std::size_t> g_live_allocations { 0 };
 
 #if FRSR_TESTS_COUNT_ALLOCATIONS
 [[nodiscard]] void * counted_allocate( std::size_t const size ) {
+    if ( frsr::roaring::kernel_test::alloc_fault::should_fail() ) {
+        throw std::bad_alloc{};
+    }
     auto * const p{ std::malloc( size ? size : 1 ) };
     if ( !p ) {
         throw std::bad_alloc{};

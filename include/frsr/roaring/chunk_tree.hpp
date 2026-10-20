@@ -230,7 +230,7 @@ public:
     template <typename H>
     cursor insert( cursor const at, key_type const key, H && handle ) {
         stage staged{ std::forward<H>( handle ) };
-        return insert_staged( at, static_cast<key_t>( key ), staged.bytes );
+        return insert_guarded( at, static_cast<key_t>( key ), staged );
     }
 
     // Inserts a copy of every entry of `other` whose key is not held here and for which `wanted`
@@ -326,7 +326,7 @@ public:
             }
         }
         stage staged{ std::forward<H>( handle ) };
-        return append_staged( static_cast<key_t>( key ), staged.bytes );
+        return append_guarded( static_cast<key_t>( key ), staged );
     }
 
     // Storage for the next appended entry, to be filled with a handle and then committed under its
@@ -350,9 +350,11 @@ public:
                 auto const separator{ leaf[ head( leaf ).size - 1 ] + 1 };
                 path_t path;
                 descend_rightmost( path );
+                inner_reserve reserve;
+                reserve.fill( inner_nodes_needed( path ) );
                 leaf = make_leaf( leaf_capacity );
                 link_after( tail_, leaf );
-                insert_in_parent( path, 0, separator, leaf );
+                insert_in_parent( path, reserve, 0, separator, leaf );
             }
         }
         return &slot_at( leaf, head( leaf ).size );
@@ -447,16 +449,20 @@ public:
                 }
             }
         } catch ( ... ) {
-            for ( auto leaf{ first }; leaf != nullptr; ) {
-                auto const following{ next_leaf( leaf ) };
-                destroy_leaf( leaf );
-                leaf = following;
-            }
+            destroy_chain( first );
+            tail_ = nullptr;
             throw;
         }
         size_ = count;
-        rebuild_levels( first );
         tail_ = last;
+        try {
+            rebuild_levels( first );
+        } catch ( ... ) {
+            destroy_chain( first );
+            size_ = 0;
+            tail_ = nullptr;
+            throw;
+        }
     }
 
     // The in-place rewrite of the table by the walk that is consuming it, in key order: an entry is
@@ -568,7 +574,26 @@ private:
         alignas( Handle ) std::byte bytes[ sizeof( Handle ) ];
         template <typename H>
         explicit stage( H && handle ) { std::construct_at( reinterpret_cast<Handle *>( bytes ), std::forward<H>( handle ) ); }
+        // For an insertion that failed: the staged handle was not relocated into the tree.
+        void destroy() noexcept { std::destroy_at( reinterpret_cast<Handle *>( bytes ) ); }
     };
+    // The staged handle is destroyed if the insertion throws before relocating it into a leaf.
+    [[gnu::noinline]] bool append_guarded( key_t const key, stage & staged ) {
+        try {
+            return append_staged( key, staged.bytes );
+        } catch ( ... ) {
+            staged.destroy();
+            throw;
+        }
+    }
+    cursor insert_guarded( cursor const at, key_t const key, stage & staged ) {
+        try {
+            return insert_staged( at, key, staged.bytes );
+        } catch ( ... ) {
+            staged.destroy();
+            throw;
+        }
+    }
 
     // A leaf that falls below this many entries is merged into a sibling it fits into.
     static constexpr unsigned merge_below{ 3 };
@@ -660,6 +685,25 @@ private:
     }
     static void free_inner( inner_node * const node ) noexcept { deallocate_line( reinterpret_cast<std::byte *>( node ), inner_shift_at ); }
 
+    // The inner nodes an insertion into the tree will need, allocated before it changes anything so
+    // that it cannot fail halfway: one for every full node on the way up, and a new root if they all are.
+    class inner_reserve {
+    public:
+        inner_reserve() noexcept = default;
+        inner_reserve( inner_reserve const & ) = delete;
+        ~inner_reserve() { while ( count_ != 0 ) { free_inner( node_[ --count_ ] ); } }
+        void fill( unsigned const wanted ) {
+            while ( count_ != wanted ) { node_[ count_ ] = make_inner(); ++count_; }
+        }
+        [[nodiscard]] inner_node * take() noexcept {
+            assert( count_ != 0 );
+            return node_[ --count_ ];
+        }
+    private:
+        inner_node * node_[ max_height + 1 ];
+        unsigned     count_{ 0 };
+    };
+
     static void release_subtree( void * const node, unsigned const level ) noexcept {
         if ( level == 0 ) {
             destroy_leaf( static_cast<leaf_ptr>( node ) );
@@ -675,6 +719,13 @@ private:
         auto * const inner{ static_cast<inner_node *>( node ) };
         for ( unsigned i{ 0 }; i <= inner->n; ++i ) { release_inner( inner->child[ i ], level - 1 ); }
         free_inner( inner );
+    }
+    static void destroy_chain( leaf_ptr leaf ) noexcept {
+        while ( leaf != nullptr ) {
+            auto const following{ next_leaf( leaf ) };
+            destroy_leaf( leaf );
+            leaf = following;
+        }
     }
     void release() noexcept {
         if ( root_ != nullptr ) { release_subtree( root_, height_ ); }
@@ -879,6 +930,8 @@ private:
             return cursor{ leaf, index };
         }
         // a full leaf splits
+        inner_reserve reserve;
+        reserve.fill( inner_nodes_needed( path ) );
         auto const right{ make_leaf( leaf_capacity ) };
         auto const n{ hd.size };
         cursor result;
@@ -906,7 +959,7 @@ private:
             separator = right[ 0 ];
         }
         link_after( leaf, right );
-        insert_in_parent( path, 0, separator, right );
+        insert_in_parent( path, reserve, 0, separator, right );
         ++size_;
         return result;
     }
@@ -933,20 +986,28 @@ private:
             ++size_;
             return true;
         }
-        auto const fresh{ make_leaf( leaf_capacity ) };
-        leaf_append( fresh, key, staged );
         path_t path;
         descend_rightmost( path );
+        inner_reserve reserve;
+        reserve.fill( inner_nodes_needed( path ) );
+        auto const fresh{ make_leaf( leaf_capacity ) };
+        leaf_append( fresh, key, staged );
         link_after( leaf, fresh );
-        insert_in_parent( path, 0, key, fresh );
+        insert_in_parent( path, reserve, 0, key, fresh );
         ++size_;
         return false;
     }
 
+    [[nodiscard]] unsigned inner_nodes_needed( path_t const & path ) const noexcept {
+        unsigned level{ 0 };
+        while ( level < height_ && path.node[ level ]->n == inner_keys ) { ++level; }
+        return level + ( level == height_ ? 1U : 0U );
+    }
+
     // Registers `right` as the sibling that follows the node taken at `level` of `path`, separated by `separator`.
-    void insert_in_parent( path_t & path, unsigned const level, key_t const separator, void * const right ) {
+    void insert_in_parent( path_t & path, inner_reserve & reserve, unsigned const level, key_t const separator, void * const right ) noexcept {
         if ( level == height_ ) {                         // the root itself split: a new root above it
-            auto const root{ make_inner() };
+            auto const root{ reserve.take() };
             root->keys[ 0 ] = separator;
             root->child[ 0 ] = root_;
             root->child[ 1 ] = right;
@@ -967,9 +1028,9 @@ private:
         }
         if ( child == inner_keys ) {
             // past the last child of a full node: it stays full and the new child starts the next node
-            auto const fresh{ make_inner() };
+            auto const fresh{ reserve.take() };
             fresh->child[ 0 ] = right;
-            insert_in_parent( path, level + 1, separator, fresh );
+            insert_in_parent( path, reserve, level + 1, separator, fresh );
             return;
         }
         key_t  all_keys    [ inner_keys + 1 ];
@@ -981,7 +1042,7 @@ private:
         all_children[ child + 1 ] = right;
         std::memcpy( all_children + child + 2, parent->child + child + 1, ( inner_keys - child ) * sizeof( void * ) );
         constexpr unsigned kept{ ( inner_keys + 1 ) / 2 };      // all_keys[ 0, kept ) stay, all_keys[ kept ] moves up
-        auto const sibling{ make_inner() };
+        auto const sibling{ reserve.take() };
         std::memcpy( parent->keys, all_keys, kept * sizeof( key_t ) );
         std::fill( parent->keys + kept, parent->keys + inner_keys, pad );
         std::memcpy( parent->child, all_children, ( kept + 1 ) * sizeof( void * ) );
@@ -990,7 +1051,7 @@ private:
         std::memcpy( sibling->keys, all_keys + kept + 1, moved * sizeof( key_t ) );
         std::memcpy( sibling->child, all_children + kept + 1, ( moved + 1 ) * sizeof( void * ) );
         sibling->n = moved;
-        insert_in_parent( path, level + 1, all_keys[ kept ], sibling );
+        insert_in_parent( path, reserve, level + 1, all_keys[ kept ], sibling );
     }
 
     // Removes the child taken at `level` of `path`, whose node has already been unlinked and is about to be freed.
@@ -1043,27 +1104,44 @@ private:
         }
     }
 
-    // Builds the levels above a chain of full leaves, from `first`, and makes them the tree's.
+    // Builds the levels above a chain of full leaves, from `first`, and makes them the tree's. The
+    // nodes are all allocated before anything is changed, so an allocation failure leaves the tree as it was.
     void rebuild_levels( leaf_ptr const first ) {
         struct item { void * node; key_t lowest; };
         std::uint32_t count{ 0 };
         for ( auto leaf{ first }; leaf != nullptr; leaf = next_leaf( leaf ) ) { ++count; }
-        height_ = 0;
-        root_   = first;
-        if ( count <= 1 ) { return; }
+        if ( count <= 1 ) {
+            height_ = 0;
+            root_   = first;
+            return;
+        }
+        std::uint32_t nodes{ 0 };
+        for ( auto level{ count }; level > 1; ) {
+            level  = ( level + inner_keys ) / ( inner_keys + 1 );
+            nodes += level;
+        }
+        auto const pool{ std::make_unique_for_overwrite<inner_node *[]>( nodes ) };
+        std::uint32_t made{ 0 };
+        try {
+            for ( ; made != nodes; ++made ) { pool[ made ] = make_inner(); }
+        } catch ( ... ) {
+            while ( made != 0 ) { free_inner( pool[ --made ] ); }
+            throw;
+        }
         auto const items{ std::make_unique_for_overwrite<item[]>( count ) };
         {
             std::uint32_t i{ 0 };
             for ( auto leaf{ first }; leaf != nullptr; leaf = next_leaf( leaf ) ) { items[ i++ ] = item{ leaf, leaf[ 0 ] }; }
         }
-        while ( count > 1 ) {
+        unsigned height{ 0 };
+        for ( std::uint32_t next{ 0 }; count > 1; ) {
             auto const groups{ ( count + inner_keys ) / ( inner_keys + 1 ) };      // children per node: at most 17
             auto const share { count / groups };
             auto const extra { count % groups };
             std::uint32_t from{ 0 };
             for ( std::uint32_t group{ 0 }; group != groups; ++group ) {
                 auto const children{ share + ( group < extra ? 1U : 0U ) };
-                auto const node{ make_inner() };
+                auto const node{ pool[ next++ ] };
                 for ( std::uint32_t j{ 0 }; j != children; ++j ) {
                     node->child[ j ] = items[ from + j ].node;
                     if ( j != 0 ) { node->keys[ j - 1 ] = items[ from + j ].lowest; }
@@ -1073,9 +1151,10 @@ private:
                 from += children;
             }
             count = groups;
-            ++height_;
+            ++height;
         }
-        root_ = items[ 0 ].node;
+        height_ = height;
+        root_   = items[ 0 ].node;
     }
 
     template <typename Retire>

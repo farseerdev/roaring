@@ -1,6 +1,8 @@
 // The wide-key chunk table against a std::map, through every structural transition: leaf growth,
 // splits at the end and in the middle, merges, emptied leaves, root collapse, the rewriter and the
 // appenders. Entries are identified by the single value their handle holds.
+#include "allocation_fault.hpp"
+
 #include <frsr/roaring/bitmap.hpp>
 #include <frsr/roaring/chunk_tree.hpp>
 #include <frsr/roaring/container_handle.hpp>
@@ -11,6 +13,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <map>
+#include <new>
 #include <random>
 #include <span>
 #include <vector>
@@ -18,6 +21,7 @@
 namespace {
 
 using namespace frsr::roaring;
+namespace alloc_fault = frsr::roaring::kernel_test::alloc_fault;
 using layout = detail::default_layout<std::uint64_t>;
 using handle = detail::container_handle<layout>;
 using tree   = detail::chunk_tree<handle>;
@@ -350,6 +354,94 @@ TEST(ChunkTree, SharedPayloadsSurviveCopiesRewritesAndErases) {
         ASSERT_EQ( slot.cardinality(), values.size() );
         ASSERT_EQ( *detail::container_first( slot ), 0 );
     }
+}
+
+// An allocation that fails leaves the table valid and exactly as it was before the call that failed,
+// through leaf splits, inner node growth, merges and the bulk builds.
+TEST(ChunkTree, AnAllocationFailureLeavesTheTableAsItWas) {
+#if FRSR_ROARING_HAS_MIMALLOC || !FRSR_TESTS_COUNT_ALLOCATIONS
+    GTEST_SKIP() << "allocations of the table cannot be made to fail in this build";
+#else
+    for ( std::uint32_t const period : { 2U, 3U, 5U, 11U, 41U } ) {
+        std::mt19937_64 rng{ period };
+        tree t;
+        model m;
+        std::uint32_t failed{ 0 };
+        auto const attempt = [&] ( auto && operation ) -> bool {
+            alloc_fault::armed const armed{ period };
+            try {
+                operation();
+                return true;
+            } catch ( std::bad_alloc const & ) {
+                ++failed;
+                return false;
+            }
+        };
+        auto const insert_key = [&] ( std::uint64_t const key ) {
+            auto const at{ t.lower_bound( key ) };
+            if ( !( at == t.end() ) && t.key( at ) == key ) { return; }
+            auto h{ make( tag_for( key ) ) };
+            if ( attempt( [&] { (void)t.insert( at, key, std::move( h ) ); } ) ) { m[ key ] = tag_for( key ); }
+        };
+        auto const erase_key = [&] ( std::uint64_t const key ) {
+            auto const at{ t.lower_bound( key ) };
+            if ( at == t.end() || t.key( at ) != key ) { return; }
+            if ( attempt( [&] { (void)t.erase( at ); } ) ) { m.erase( key ); }
+        };
+        auto const append_key = [&] ( std::uint64_t const key, bool const open ) {
+            auto h{ make( tag_for( key ) ) };
+            bool committed{ false };
+            if ( open ) {
+                handle * slot{ nullptr };
+                bool moved{ false };
+                if ( !attempt( [&] { slot = t.open_back( moved ); } ) ) { return; }
+                std::construct_at( slot, std::move( h ) );
+                committed = attempt( [&] { t.commit_back( key ); } );
+                if ( !committed ) { *slot = handle{}; }
+            } else {
+                committed = attempt( [&] { t.push_back( key, std::move( h ) ); } );
+            }
+            if ( committed ) { m[ key ] = tag_for( key ); }
+        };
+        auto const verify = [&] {
+            ASSERT_EQ( t.validate(), nullptr ) << t.validate();
+            expect_same( t, m );
+        };
+        // an evenly spread table, built by appends
+        for ( std::uint64_t k{ 0 }; k < 5000; ++k ) { append_key( 8 * k, k % 3 == 0 ); }
+        verify();
+        if ( HasFatalFailure() ) { return; }
+        // a dense run inside one gap, which splits leaves in the middle of the table
+        for ( std::uint64_t k{ 1 }; k < 1500; ++k ) { insert_key( 8 * 2500 + k % 8 + 8 * 20'000 + 8 * ( k / 8 ) ); }
+        verify();
+        if ( HasFatalFailure() ) { return; }
+        for ( std::uint64_t k{ 0 }; k < 5000; ++k ) { insert_key( 8 * k + 1 + 2 * ( rng() % 3 ) ); }
+        // keys far above the rest
+        for ( std::uint64_t k{ 0 }; k < 400; ++k ) { append_key( ( std::uint64_t{ 1 } << 40 ) + 977 * k, false ); }
+        verify();
+        if ( HasFatalFailure() ) { return; }
+        // erase most of it, scattered
+        std::vector<std::uint64_t> keys;
+        for ( auto const & [key, tag] : m ) { keys.push_back( key ); }
+        std::ranges::shuffle( keys, rng );
+        for ( std::size_t i{ 0 }; i < keys.size() * 9 / 10; ++i ) { erase_key( keys[ i ] ); }
+        verify();
+        if ( HasFatalFailure() ) { return; }
+        // a copy either is one or is nothing
+        {
+            tree copy;
+            bool made{ false };
+            for ( int tries{ 0 }; tries < 50 && !made; ++tries ) { made = attempt( [&] { copy.copy_from( t ); } ); }
+            if ( made ) { expect_same( copy, m ); } else { ASSERT_TRUE( copy.empty() ); }
+            ASSERT_EQ( copy.validate(), nullptr ) << copy.validate();
+        }
+        // an abandoned open is dropped, or not, by shrink_to_fit()
+        { bool moved{ false }; (void)t.open_back( moved ); }
+        while ( !attempt( [&] { t.shrink_to_fit(); } ) ) {}
+        verify();
+        EXPECT_GT( failed, 0U ) << "no allocation failed at period " << period;
+    }
+#endif
 }
 
 TEST(ChunkTree, NodeBytesPerChunk) {
