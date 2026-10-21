@@ -361,6 +361,73 @@ TEST(FrsrRoaringSmoke, ArrayIntoBitsetScatterAgreesAcrossBothDensityRegimes) {
     }
 }
 
+// The bulk-union accumulator holds a bitset whose count is stale until the fold is repaired. An eager
+// in-place operation that meets it first adjusts the count by the bits it changes, so it must count the
+// words first: otherwise the header turns exact with a wrong value, and the repair that follows trusts it.
+// The accumulator is a bitset (two arrays too large to merge as arrays) counted as 3'000 while it holds 6'000.
+std::vector<std::uint32_t> const lazy_accumulator_values = [] {
+    std::vector<std::uint32_t> values;
+    for ( std::uint32_t i{ 0U }; i < 6'000U; ++i ) { values.push_back( i ); }
+    return values;
+}();
+
+TestBitmap lazy_accumulator() {
+    std::vector<std::uint32_t> even_values;
+    std::vector<std::uint32_t> odd_values;
+    for ( std::uint32_t i{ 0U }; i < 3'000U; ++i ) {
+        even_values.push_back( i * 2U );
+        odd_values .push_back( i * 2U + 1U );
+    }
+    TestBitmap const evens{ even_values };
+    TestBitmap const odds { odd_values  };
+    TestBitmap accumulator;
+    accumulator.bulk_or_intermediate( evens );
+    accumulator.bulk_or_intermediate( odds  );
+    return accumulator;
+}
+
+std::vector<std::uint32_t> sparse_values( std::uint32_t const first, std::uint32_t const step ) {
+    std::vector<std::uint32_t> values;
+    for ( std::uint32_t i{ 0U }; i < 100U; ++i ) { values.push_back( first + i * step ); }
+    return values;
+}
+
+TEST(FrsrRoaringSmoke, EagerUnionWithAnArrayOnALazyAccumulatorKeepsTheCardinalityExact) {
+    auto const absent{ sparse_values( 7'000U, 3U ) };
+    auto accumulator{ lazy_accumulator() };
+    accumulator |= TestBitmap{ absent };
+    accumulator.bulk_or_repair_after_lazy();
+    std::vector<std::uint32_t> expected;
+    std::ranges::set_union( lazy_accumulator_values, absent, std::back_inserter( expected ) );
+    EXPECT_EQ( accumulator.to_vector(), expected );
+    EXPECT_EQ( accumulator.size(), expected.size() );
+}
+
+TEST(FrsrRoaringSmoke, EagerDifferenceWithAnArrayOnALazyAccumulatorKeepsTheCardinalityExact) {
+    auto const present{ sparse_values( 20U, 7U ) };
+    auto accumulator{ lazy_accumulator() };
+    accumulator -= TestBitmap{ present };
+    accumulator.bulk_or_repair_after_lazy();
+    std::vector<std::uint32_t> expected;
+    std::ranges::set_difference( lazy_accumulator_values, present, std::back_inserter( expected ) );
+    EXPECT_EQ( accumulator.to_vector(), expected );
+    EXPECT_EQ( accumulator.size(), expected.size() );
+}
+
+TEST(FrsrRoaringSmoke, EagerXorWithAnArrayOnALazyAccumulatorKeepsTheCardinalityExact) {
+    auto mixed{ sparse_values( 20U, 7U ) };
+    auto const absent{ sparse_values( 7'000U, 3U ) };
+    mixed.insert( mixed.end(), absent.begin(), absent.end() );
+    std::ranges::sort( mixed );
+    auto accumulator{ lazy_accumulator() };
+    accumulator ^= TestBitmap{ mixed };
+    accumulator.bulk_or_repair_after_lazy();
+    std::vector<std::uint32_t> expected;
+    std::ranges::set_symmetric_difference( lazy_accumulator_values, mixed, std::back_inserter( expected ) );
+    EXPECT_EQ( accumulator.to_vector(), expected );
+    EXPECT_EQ( accumulator.size(), expected.size() );
+}
+
 TEST(FrsrRoaringSmoke, LazyUnionFinishersExposeExpectedContainerForms) {
     std::vector<std::uint32_t> lhs_values;
     std::vector<std::uint32_t> rhs_values;

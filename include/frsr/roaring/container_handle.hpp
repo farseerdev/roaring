@@ -1748,6 +1748,7 @@ public:
 
     // Marks cardinality unknown after a nocard lazy word OR (repair must popcount).
     void mark_cardinality_stale() noexcept { handle_->mark_cardinality_stale(); }
+    [[nodiscard]] bool cardinality_valid() const noexcept { return handle_->cardinality_valid(); }
 
     // Eagerly recomputes the [min,max] header endpoints from the word block.
     void sync_endpoints() noexcept {

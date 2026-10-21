@@ -106,6 +106,18 @@ FRSR_ROARING_X86_V4_KERNEL
     return cardinality;
 }
 
+// The in-place kernels that move the header cardinality by the number of bits they change are exact only
+// if it is exact on entry. A bitset left by a lazy word kernel (the bulk-union accumulator) has a stale
+// count until the whole fold is repaired, and an eager operation may meet it first: writing an adjusted
+// count would mark the header exact with a wrong value. Counting the words first keeps the update right.
+template <typename Layout, typename CowPolicy>
+inline void settle_stale_cardinality( bitset_ref<Layout, CowPolicy> lhs ) noexcept {
+    if ( !lhs.cardinality_valid() ) [[unlikely]] {
+        auto const & words{ lhs.words.as_array() };
+        lhs.cardinality = static_cast<std::uint32_t>( popcount_words( words.data(), words.size() ) );
+    }
+}
+
 // Set-bit count of the AND of two `n`-word blocks, without storing it.
 // [croaring-ref] deps/croaring/src/containers/bitset.c:bitset_container_and_justcard
 [[nodiscard]] inline std::size_t and_popcount_words( std::uint64_t const * const a, std::uint64_t const * const b, std::size_t const n ) noexcept {
@@ -927,6 +939,7 @@ template <typename Layout, typename CowPolicy = cow_value_semantics>
     bitset_ref<Layout, CowPolicy> lhs,
     array_cref<Layout, CowPolicy> const values
 ) noexcept {
+    settle_stale_cardinality( lhs );
     auto & words{ lhs.words.as_array() };
     std::size_t removed{ 0 };
     for ( auto const value : values.values ) {
@@ -1210,6 +1223,9 @@ template <bool Lazy, typename Layout, typename CowPolicy = cow_value_semantics>
     if ( count == 0 ) [[unlikely]] {
         return;
     }
+    if constexpr ( !Lazy ) {
+        settle_stale_cardinality( lhs );
+    }
     std::size_t gained{ 0 };
     auto const finish{ [ & ] {
         if constexpr ( Lazy ) {
@@ -1275,6 +1291,9 @@ inline void xor_array_into_bitset_inplace(
     bitset_ref<Layout, CowPolicy> lhs,
     array_cref<Layout, CowPolicy> const rhs
 ) noexcept {
+    if constexpr ( !Lazy ) {
+        settle_stale_cardinality( lhs );
+    }
     auto & words{ lhs.words.as_array() };
     std::ptrdiff_t delta{ 0 };
     for ( auto const value : rhs.values ) {
