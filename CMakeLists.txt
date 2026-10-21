@@ -7,6 +7,11 @@ if(PROJECT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR)
     set(FRSR_ROARING_BUILD_TESTS_DEFAULT ON)
 endif()
 
+# Header-only: no library is built or linked; every translation unit that includes a header
+# instantiates the bitmap members it uses (the pre-library behaviour). Off (the default) builds
+# the static library that holds the instantiations bitmap.hpp declares extern, so consumers compile only
+# declarations and the hot inline paths.
+option(FRSR_ROARING_HEADER_ONLY "Use frsr::roaring as a header-only library (no compiled instantiations)" OFF)
 option(FRSR_ROARING_BUILD_TESTS "Build frsr::roaring tests" ${FRSR_ROARING_BUILD_TESTS_DEFAULT})
 option(FRSR_ROARING_BUILD_BENCHMARKS "Build frsr::roaring benchmark executable" ${FRSR_ROARING_BUILD_TESTS_DEFAULT})
 option(FRSR_ROARING_FETCH_GTEST "Fetch GoogleTest when needed" ON)
@@ -34,13 +39,38 @@ if(FRSR_ROARING_ADD_LOCAL_CROARING_TARGET AND NOT TARGET roaring)
     endblock()
 endif()
 
-add_library(frsr_roaring STATIC
-    src/bitmap.cpp
-)
+if(FRSR_ROARING_HEADER_ONLY)
+    add_library(frsr_roaring INTERFACE)
+    set(_frsr_scope INTERFACE)
+    target_compile_definitions(frsr_roaring INTERFACE FRSR_ROARING_HEADER_ONLY=1)
+else()
+    add_library(frsr_roaring STATIC
+        src/library_configuration.cpp
+        src/bitmap_u16_value_eager.cpp
+        src/bitmap_u16_value_lazy.cpp
+        src/bitmap_u16_atomic_eager.cpp
+        src/bitmap_u16_atomic_lazy.cpp
+        src/bitmap_u16_unsync_eager.cpp
+        src/bitmap_u16_unsync_lazy.cpp
+        src/bitmap_u32_value_eager.cpp
+        src/bitmap_u32_value_lazy.cpp
+        src/bitmap_u32_atomic_eager.cpp
+        src/bitmap_u32_atomic_lazy.cpp
+        src/bitmap_u32_unsync_eager.cpp
+        src/bitmap_u32_unsync_lazy.cpp
+        src/bitmap_u64_value_eager.cpp
+        src/bitmap_u64_value_lazy.cpp
+        src/bitmap_u64_atomic_eager.cpp
+        src/bitmap_u64_atomic_lazy.cpp
+        src/bitmap_u64_unsync_eager.cpp
+        src/bitmap_u64_unsync_lazy.cpp
+    )
+    set(_frsr_scope PUBLIC)
+endif()
 add_library(frsr::roaring ALIAS frsr_roaring)
 
 target_include_directories(frsr_roaring
-    PUBLIC
+    ${_frsr_scope}
         ${PROJECT_SOURCE_DIR}/include
 )
 
@@ -108,7 +138,7 @@ if(FRSR_ROARING_USE_PSI_VM)
 
         set(_psiha_root "${PROJECT_SOURCE_DIR}/../psiha")
         target_include_directories(frsr_roaring
-            PUBLIC
+            ${_frsr_scope}
                 ${_psiha_root}/vm/include
                 ${_psiha_root}/build/include
                 ${_psiha_root}/config_ex/include
@@ -118,9 +148,9 @@ if(FRSR_ROARING_USE_PSI_VM)
         # gets it as -isystem; a plain -I on the same directory from here would
         # override that and surface Boost's own warnings under the consumer's
         # -Werror set (seen with Boost 1.92's sort headers).
-        target_include_directories(frsr_roaring SYSTEM PUBLIC ${_boost_include_dir})
-        target_compile_definitions(frsr_roaring PUBLIC FRSR_ROARING_HAS_PSI_VM=1)
-        target_compile_definitions(frsr_roaring PUBLIC
+        target_include_directories(frsr_roaring SYSTEM ${_frsr_scope} ${_boost_include_dir})
+        target_compile_definitions(frsr_roaring ${_frsr_scope} FRSR_ROARING_HAS_PSI_VM=1)
+        target_compile_definitions(frsr_roaring ${_frsr_scope}
             BOOST_EXCEPTION_DISABLE
             BOOST_ENABLE_ASSERT_DEBUG_HANDLER
             BOOST_CONTAINER_NO_LIB
@@ -137,7 +167,7 @@ if(FRSR_ROARING_USE_PSI_VM)
         # so that this library still configures standalone, which also means it
         # cannot inherit a superproject's fix — hence the same force-include here.
         # Remove once upstream orders the include first.
-        target_compile_options(frsr_roaring PUBLIC
+        target_compile_options(frsr_roaring ${_frsr_scope}
             "$<IF:$<STREQUAL:${CMAKE_CXX_COMPILER_FRONTEND_VARIANT},MSVC>,/FIboost/config.hpp,SHELL:-include boost/config.hpp>"
         )
 
@@ -163,11 +193,13 @@ if(FRSR_ROARING_USE_PSI_VM)
     endif()
 endif()
 
-set_target_properties(frsr_roaring PROPERTIES
-    CXX_STANDARD 26
-    CXX_STANDARD_REQUIRED ON
-    CXX_EXTENSIONS OFF
-)
+if(NOT FRSR_ROARING_HEADER_ONLY)
+    set_target_properties(frsr_roaring PROPERTIES
+        CXX_STANDARD 26
+        CXX_STANDARD_REQUIRED ON
+        CXX_EXTENSIONS OFF
+    )
+endif()
 
 # Whether the C++ compiler targets x86-64, decided by compiling a check rather than from
 # CMAKE_SYSTEM_PROCESSOR, which names the host or system and not the compiler's target.
@@ -198,18 +230,31 @@ endif()
 
 if(FRSR_ROARING_X64)
     if(CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
-        target_compile_options(frsr_roaring PUBLIC "$<$<COMPILE_LANGUAGE:C,CXX>:/clang:-mavx2;/clang:-mpopcnt>")
+        target_compile_options(frsr_roaring ${_frsr_scope} "$<$<COMPILE_LANGUAGE:C,CXX>:/clang:-mavx2;/clang:-mpopcnt>")
     elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang" OR CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-        target_compile_options(frsr_roaring PUBLIC "$<$<COMPILE_LANGUAGE:C,CXX>:-mavx2;-mpopcnt>")
+        target_compile_options(frsr_roaring ${_frsr_scope} "$<$<COMPILE_LANGUAGE:C,CXX>:-mavx2;-mpopcnt>")
     endif()
 endif()
 
-# The optimization level only affects the library's own object code.
-if(CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+# The optimization level only affects the library's own object code. Link-time optimization is not
+# chosen here: the library honours CMAKE_INTERPROCEDURAL_OPTIMIZATION / INTERPROCEDURAL_OPTIMIZATION like
+# any other target, so the archiver and the plugin come from the toolchain.
+if(FRSR_ROARING_HEADER_ONLY)
+    # nothing is compiled
+elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
     target_compile_options(frsr_roaring PRIVATE "$<$<NOT:$<CONFIG:Debug>>:/O2>")
 elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang" OR CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     target_compile_options(frsr_roaring PRIVATE "$<$<NOT:$<CONFIG:Debug>>:-O3>")
 endif()
+
+# Tests and benchmarks exercise instantiations the library does not hold (other key types, container sets and
+# policies), so they see the member definitions as well. The instantiations the library holds are still
+# declared extern and called, not compiled again.
+function(frsr_roaring_see_definitions target)
+    if(NOT FRSR_ROARING_HEADER_ONLY)
+        target_compile_definitions(${target} PRIVATE FRSR_ROARING_WITH_DEFINITIONS=1)
+    endif()
+endfunction()
 
 if(FRSR_ROARING_BUILD_TESTS)
     enable_testing()
@@ -251,6 +296,7 @@ if(FRSR_ROARING_BUILD_TESTS)
             frsr_roaring
             GTest::gtest_main
     )
+    frsr_roaring_see_definitions(frsr_roaring_tests)
     set_target_properties(frsr_roaring_tests PROPERTIES
         CXX_STANDARD 26
         CXX_STANDARD_REQUIRED ON
@@ -260,11 +306,29 @@ if(FRSR_ROARING_BUILD_TESTS)
     include(GoogleTest)
     gtest_discover_tests(frsr_roaring_tests)
 
+    # A program that sees only the declarations: it must link against the compiled instantiations (or, header-only,
+    # instantiate them itself) and give the same answers.
+    add_executable(frsr_roaring_consumer_tests
+        tests/compiled_consumer.cpp
+    )
+    target_link_libraries(frsr_roaring_consumer_tests
+        PRIVATE
+            frsr_roaring
+            GTest::gtest_main
+    )
+    set_target_properties(frsr_roaring_consumer_tests PROPERTIES
+        CXX_STANDARD 26
+        CXX_STANDARD_REQUIRED ON
+        CXX_EXTENSIONS OFF
+    )
+    gtest_discover_tests(frsr_roaring_consumer_tests)
+
     # The exception specifications under an allocation policy in which a failed allocation cannot be observed as an
     # exception: compiled (the static_asserts are the test), never linked, since the policy changes the
     # specifications of the templates the test binary instantiates.
     add_library(frsr_roaring_noexcept_policy_nothrow OBJECT tests/noexcept_policy_nothrow.cpp)
     target_link_libraries(frsr_roaring_noexcept_policy_nothrow PRIVATE frsr_roaring)
+    frsr_roaring_see_definitions(frsr_roaring_noexcept_policy_nothrow)
     set_target_properties(frsr_roaring_noexcept_policy_nothrow PROPERTIES
         CXX_STANDARD 26
         CXX_STANDARD_REQUIRED ON
@@ -287,6 +351,7 @@ if(FRSR_ROARING_BUILD_TESTS)
                 GTest::gtest_main
                 roaring
         )
+        frsr_roaring_see_definitions(frsr_roaring_croaring_crosscheck)
         set_target_properties(frsr_roaring_croaring_crosscheck PROPERTIES
             CXX_STANDARD 26
             CXX_STANDARD_REQUIRED ON
@@ -329,6 +394,7 @@ if(FRSR_ROARING_BUILD_BENCHMARKS)
         bench/interop_bench.cpp
     )
     target_link_libraries(frsr_roaring_interop_bench PRIVATE frsr_roaring)
+    frsr_roaring_see_definitions(frsr_roaring_interop_bench)
     set_target_properties(frsr_roaring_interop_bench PROPERTIES
         CXX_STANDARD 26
         CXX_STANDARD_REQUIRED ON
@@ -380,10 +446,10 @@ if(FRSR_ROARING_BUILD_TESTS)
     if(FRSR_ROARING_LLVM_NM)
         set(_frsr_roaring_nm "${FRSR_ROARING_LLVM_NM}")
     endif()
-    set(_frsr_roaring_census_objects
-        "$<TARGET_OBJECTS:frsr_roaring>"
-        "$<TARGET_OBJECTS:frsr_roaring_tests>"
-    )
+    set(_frsr_roaring_census_objects "$<TARGET_OBJECTS:frsr_roaring_tests>")
+    if(NOT FRSR_ROARING_HEADER_ONLY)
+        list(PREPEND _frsr_roaring_census_objects "$<TARGET_OBJECTS:frsr_roaring>")
+    endif()
     if(TARGET frsr_roaring_croaring_crosscheck)
         list(APPEND _frsr_roaring_census_objects "$<TARGET_OBJECTS:frsr_roaring_croaring_crosscheck>")
     endif()
@@ -427,6 +493,6 @@ if(FRSR_ROARING_ENABLE_VM_VECTOR_SERIALIZATION)
     if(WIN32)
         target_compile_definitions(psi_vm PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
     endif()
-    target_link_libraries(frsr_roaring PUBLIC psi_vm)
-    target_compile_definitions(frsr_roaring PUBLIC FRSR_ROARING_ENABLE_VM_VECTOR_SERIALIZATION=1)
+    target_link_libraries(frsr_roaring ${_frsr_scope} psi_vm)
+    target_compile_definitions(frsr_roaring ${_frsr_scope} FRSR_ROARING_ENABLE_VM_VECTOR_SERIALIZATION=1)
 endif()

@@ -37,4 +37,9 @@ inline constexpr bool allocation_failure_terminates{ noexcept( allocation_policy
 template <typename Range, typename Key>
 inline constexpr bool nothrow_key_range{ std::ranges::contiguous_range<Range> && std::convertible_to<std::ranges::range_reference_t<Range>, Key> };
 
+// A sized contiguous range whose elements are exactly Key: it is handed to the compiled code as one span.
+template <typename Range, typename Key>
+concept contiguous_key_values = std::ranges::contiguous_range<Range> && std::ranges::sized_range<Range>
+    && std::same_as<std::remove_cv_t<std::ranges::range_value_t<Range>>, Key>;
+
 } // namespace frsr::roaring::detail
