@@ -2256,6 +2256,60 @@ struct register_frsr_binary_registrar {
         g_benchmarks.push_back(std::move(e));
     }
 
+    // frsr SymmetricDifference  (operator^)
+    {
+        Entry e;
+        e.name        = fmt_so(Arm::label(), "Xor", count, overlap);
+        e.description = "frsr::roaring::bitmap<uint32_t> operator^ (materialised symmetric difference).";
+        e.setup    = make_state;
+        e.run      = [](void *sv) -> int64_t {
+            auto *s = static_cast<FrsrBinaryState<Arm> *>(sv);
+            TestBitmap32 r = s->a ^ s->b;
+            return static_cast<int64_t>(r.size());
+        };
+        e.teardown      = free_state;
+        e.ops_per_run   = 1;
+        e.inner_reps    = kBinaryInnerReps;
+        e.reusable_state = true;
+        g_benchmarks.push_back(std::move(e));
+    }
+
+    // frsr XorInplace  (operator^=)
+    {
+        Entry e;
+        e.name        = fmt_so(Arm::label(), "XorInplace", count, overlap);
+        e.description = "frsr::roaring::bitmap<uint32_t> operator^= (in-place symmetric difference, copies a first).";
+        e.setup    = make_state;
+        e.run      = [](void *sv) -> int64_t {
+            auto *s = static_cast<FrsrBinaryState<Arm> *>(sv);
+            TestBitmap32 tmp = s->a;
+            tmp ^= s->b;
+            return static_cast<int64_t>(tmp.size());
+        };
+        e.teardown      = free_state;
+        e.ops_per_run   = 1;
+        e.inner_reps    = kBinaryInnerReps;
+        e.reusable_state = true;
+        g_benchmarks.push_back(std::move(e));
+    }
+
+    // frsr XorCardinality  (xor_cardinality — nothing materialised)
+    {
+        Entry e;
+        e.name        = fmt_so(Arm::label(), "XorCardinality", count, overlap);
+        e.description = "frsr::roaring::bitmap<uint32_t> xor_cardinality (size of the symmetric difference, no result built).";
+        e.setup    = make_state;
+        e.run      = [](void *sv) -> int64_t {
+            auto *s = static_cast<FrsrBinaryState<Arm> *>(sv);
+            return static_cast<int64_t>(s->a.xor_cardinality(s->b));
+        };
+        e.teardown      = free_state;
+        e.ops_per_run   = 1;
+        e.inner_reps    = kBinaryInnerReps;
+        e.reusable_state = true;
+        g_benchmarks.push_back(std::move(e));
+    }
+
     // frsr UnionScratch  (union_into — allocation-free path)
     {
         Entry e;
@@ -2430,6 +2484,63 @@ struct register_cpp_binary_registrar {
         e.reusable_state = true;
         g_benchmarks.push_back(std::move(e));
     }
+    // cpp Xor
+    {
+        Entry e;
+        e.name        = fmt_so(Arm::label(), "Xor", count, overlap);
+        e.description = "CRoaring roaring_bitmap_xor() (materialised symmetric difference). Checksum = cardinality.";
+        e.setup    = make_state;
+        e.run      = [](void *sv) -> int64_t {
+            auto *s   = static_cast<CppBinaryState<Arm> *>(sv);
+            auto *r   = roaring_bitmap_xor(s->a, s->b);
+            int64_t c = static_cast<int64_t>(roaring_bitmap_get_cardinality(r));
+            roaring_bitmap_free(r);
+            return c;
+        };
+        e.teardown      = free_state;
+        e.ops_per_run   = 1;
+        e.inner_reps    = kBinaryInnerReps;
+        e.reusable_state = true;
+        g_benchmarks.push_back(std::move(e));
+    }
+
+    // cpp XorInplace
+    {
+        Entry e;
+        e.name        = fmt_so(Arm::label(), "XorInplace", count, overlap);
+        e.description = "CRoaring roaring_bitmap_xor_inplace() (copies a first, then ^= b).";
+        e.setup    = make_state;
+        e.run      = [](void *sv) -> int64_t {
+            auto *s = static_cast<CppBinaryState<Arm> *>(sv);
+            auto *tmp = Arm::copy(s->a);
+            roaring_bitmap_xor_inplace(tmp, s->b);
+            int64_t c = static_cast<int64_t>(roaring_bitmap_get_cardinality(tmp));
+            roaring_bitmap_free(tmp);
+            return c;
+        };
+        e.teardown      = free_state;
+        e.ops_per_run   = 1;
+        e.inner_reps    = kBinaryInnerReps;
+        e.reusable_state = true;
+        g_benchmarks.push_back(std::move(e));
+    }
+
+    // cpp XorCardinality
+    {
+        Entry e;
+        e.name        = fmt_so(Arm::label(), "XorCardinality", count, overlap);
+        e.description = "CRoaring roaring_bitmap_xor_cardinality() (size of the symmetric difference, no result built).";
+        e.setup    = make_state;
+        e.run      = [](void *sv) -> int64_t {
+            auto *s = static_cast<CppBinaryState<Arm> *>(sv);
+            return static_cast<int64_t>(roaring_bitmap_xor_cardinality(s->a, s->b));
+        };
+        e.teardown      = free_state;
+        e.ops_per_run   = 1;
+        e.inner_reps    = kBinaryInnerReps;
+        e.reusable_state = true;
+        g_benchmarks.push_back(std::move(e));
+    }
 }};
 template <class Arm> static void register_cpp_binary(std::size_t count, std::size_t offset,
                                   const char *overlap) { register_cpp_binary_registrar<Arm>::run(count, offset, overlap); }
@@ -2575,6 +2686,64 @@ static void register_r64_binary(std::size_t count, std::size_t offset,
             int64_t c = static_cast<int64_t>(roaring64_bitmap_get_cardinality(tmp));
             roaring64_bitmap_free(tmp);
             return c;
+        };
+        e.teardown      = free_state;
+        e.ops_per_run   = 1;
+        e.inner_reps    = kBinaryInnerReps;
+        e.reusable_state = true;
+        g_benchmarks.push_back(std::move(e));
+    }
+
+    // r64 Xor
+    {
+        Entry e;
+        e.name        = fmt_so("r64", "Xor", count, overlap);
+        e.description = "CRoaring roaring64_bitmap_xor() (materialised symmetric difference, 64-bit).";
+        e.setup    = make_state;
+        e.run      = [](void *sv) -> int64_t {
+            auto *s   = static_cast<R64BinaryState *>(sv);
+            auto *r   = roaring64_bitmap_xor(s->a, s->b);
+            int64_t c = static_cast<int64_t>(roaring64_bitmap_get_cardinality(r));
+            roaring64_bitmap_free(r);
+            return c;
+        };
+        e.teardown      = free_state;
+        e.ops_per_run   = 1;
+        e.inner_reps    = kBinaryInnerReps;
+        e.reusable_state = true;
+        g_benchmarks.push_back(std::move(e));
+    }
+
+    // r64 XorInplace
+    {
+        Entry e;
+        e.name        = fmt_so("r64", "XorInplace", count, overlap);
+        e.description = "CRoaring roaring64_bitmap_xor_inplace() (copies a first, 64-bit).";
+        e.setup    = make_state;
+        e.run      = [](void *sv) -> int64_t {
+            auto *s   = static_cast<R64BinaryState *>(sv);
+            auto *tmp = roaring64_bitmap_copy(s->a);
+            roaring64_bitmap_xor_inplace(tmp, s->b);
+            int64_t c = static_cast<int64_t>(roaring64_bitmap_get_cardinality(tmp));
+            roaring64_bitmap_free(tmp);
+            return c;
+        };
+        e.teardown      = free_state;
+        e.ops_per_run   = 1;
+        e.inner_reps    = kBinaryInnerReps;
+        e.reusable_state = true;
+        g_benchmarks.push_back(std::move(e));
+    }
+
+    // r64 XorCardinality
+    {
+        Entry e;
+        e.name        = fmt_so("r64", "XorCardinality", count, overlap);
+        e.description = "CRoaring roaring64_bitmap_xor_cardinality() (64-bit, no result built).";
+        e.setup    = make_state;
+        e.run      = [](void *sv) -> int64_t {
+            auto *s = static_cast<R64BinaryState *>(sv);
+            return static_cast<int64_t>(roaring64_bitmap_xor_cardinality(s->a, s->b));
         };
         e.teardown      = free_state;
         e.ops_per_run   = 1;

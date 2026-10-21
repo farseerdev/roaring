@@ -326,6 +326,18 @@ if(FRSR_ROARING_BUILD_BENCHMARKS)
         target_compile_definitions(frsr_roaring_interop_bench PRIVATE FRSR_ROARING_HAS_CROARING=1)
     endif()
 
+    if(TARGET roaring)
+        add_executable(frsr_roaring_symmetric_difference_bench
+            bench/symmetric_difference_bench.cpp
+        )
+        target_link_libraries(frsr_roaring_symmetric_difference_bench PRIVATE frsr_roaring roaring)
+        set_target_properties(frsr_roaring_symmetric_difference_bench PROPERTIES
+            CXX_STANDARD 26
+            CXX_STANDARD_REQUIRED ON
+            CXX_EXTENSIONS OFF
+        )
+    endif()
+
     add_executable(frsr_roaring_chunk_table_bench
         bench/chunk_table_bench.cpp
     )
