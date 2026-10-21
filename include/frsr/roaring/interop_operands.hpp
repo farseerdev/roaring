@@ -200,6 +200,70 @@ concept interop_operand =
 
 namespace detail {
 
+// ---- operands the library holds compiled ------------------------------------------------------------------
+//
+// The interop operations are templates over the operand; instantiating the engine for every operand a caller
+// names would put all of it into the caller. The operands that account for nearly every use are therefore
+// reduced to one type-erased view, which the library's bitmap members take: an interval of keys, a bit string
+// (of any word width: the bits are read as bytes), and a contiguous run of keys of the bitmap's key type,
+// declared sorted or not. Any other operand (a std::bitset, a dynamic bit-set, a key range that is not
+// contiguous or holds another integer type, a bit string reached through based_bits) still goes through the
+// engine itself, which needs bitmap_definitions.hpp when the bitmap is compiled in the library.
+
+enum class interop_op : std::uint8_t {
+    and_with, or_with, andnot_with, xor_with,
+    xor_cardinality, and_cardinality,
+    intersects, is_subset_of, is_superset_of, equals
+};
+
+struct operand_view {
+    enum class shape_type : std::uint8_t { interval, bits, sorted_keys, unsorted_keys };
+
+    shape_type    shape{};
+    key_range     interval{};   // interval
+    void const *  data{};       // bits: the first byte; keys: the first key
+    std::size_t   count{};      // keys
+    std::uint64_t bit_count{};  // bits
+    std::uint64_t base{};       // bits: the key bit 0 stands for
+};
+
+template <typename T, typename Key>
+concept contiguous_keys_of = std::ranges::contiguous_range<T const> && std::ranges::sized_range<T const>
+    && std::same_as<std::remove_cv_t<std::ranges::range_value_t<T const>>, Key>;
+
+template <typename Operand, typename Key>
+inline constexpr bool sorted_keys_erasable{ false };
+template <typename Range, typename Key>
+inline constexpr bool sorted_keys_erasable<sorted_keys<Range>, Key>{ contiguous_keys_of<Range, Key> };
+
+template <typename Operand, typename Key>
+inline constexpr bool interop_erasable{
+    std::same_as<Operand, key_range> || is_bit_words_v<Operand> || contiguous_keys_of<Operand, Key> || sorted_keys_erasable<Operand, Key>
+};
+
+template <typename Operand>
+[[nodiscard]] operand_view make_operand_view( Operand const & operand ) noexcept {
+    operand_view view;
+    if constexpr ( std::same_as<Operand, key_range> ) {
+        view.shape    = operand_view::shape_type::interval;
+        view.interval = operand;
+    } else if constexpr ( is_bit_words_v<Operand> ) {
+        view.shape     = operand_view::shape_type::bits;
+        view.data      = operand.words.data();
+        view.bit_count = operand.bit_count;
+        view.base      = operand.base;
+    } else if constexpr ( is_sorted_keys_v<Operand> ) {
+        view.shape = operand_view::shape_type::sorted_keys;
+        view.data  = std::ranges::data( operand.keys );
+        view.count = static_cast<std::size_t>( std::ranges::size( operand.keys ) );
+    } else {
+        view.shape = operand_view::shape_type::unsorted_keys;
+        view.data  = std::ranges::data( operand );
+        view.count = static_cast<std::size_t>( std::ranges::size( operand ) );
+    }
+    return view;
+}
+
 // ---- chunk sources ---------------------------------------------------------------------------------------
 //
 // A chunk source yields the non-overlapping pieces of an operand in ascending chunk order:

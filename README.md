@@ -82,6 +82,40 @@ When an allocation does throw, a bitmap stays valid. The chunk table is left as 
 operation never touches its operands; an in-place `^=` or `xor_many_in_place` leaves its left side valid with
 unspecified contents.
 
+## Compiled library and header-only mode
+
+`bitmap` is split in two. The headers a program includes (`<frsr/roaring/bitmap.hpp>`) declare the class and
+define only what has to inline into a caller: `contains`, `add`, `remove` of one key, the iterators, the size
+queries and the thin templates that adapt a caller's range or operand. The set operations, conversions,
+merges, range updates, optimization, serialization and the interop engine are defined in
+`<frsr/roaring/bitmap_definitions.hpp>`, which a program does not parse or instantiate: the library
+(`frsr_roaring`, a static library) holds them compiled for every key width (`uint16_t`, `uint32_t`,
+`uint64_t`), every copy-on-write policy (value, atomic refcount, unsynchronized refcount) and both run
+selection policies, over the default container set. `bitmap.hpp` declares those instantiations `extern`.
+
+| mode | CMake | what a program compiles | notes |
+| --- | --- | --- | --- |
+| compiled (default) | `FRSR_ROARING_HEADER_ONLY=OFF` | declarations and the inline fast paths | link `frsr::roaring` |
+| header-only | `-DFRSR_ROARING_HEADER_ONLY=ON` (`frsr::roaring` becomes an `INTERFACE` target defining `FRSR_ROARING_HEADER_ONLY`) | everything, in every translation unit that uses it | nothing to link |
+
+Which operands reach the compiled interop code: a `key_range`, a `bit_words` of any word width, and a
+contiguous range of `key_type` (also as `sorted_keys`). Every other operand (a `std::bitset`, a dynamic
+bit-set, a range of another integer type or one that is not contiguous, `based_bits`) is applied by the
+engine in the calling translation unit.
+
+A bitmap that the library does not hold (another key type, container set or policy), and an operand of the
+last kind above, needs the definitions in the program. Include `<frsr/roaring/bitmap_definitions.hpp>`, or define
+`FRSR_ROARING_WITH_DEFINITIONS` before `bitmap.hpp`: the program then instantiates what it uses, exactly
+as in header-only mode, and still calls the library for the instantiations it holds.
+
+The library honours the toolchain's link-time optimization: set `CMAKE_INTERPROCEDURAL_OPTIMIZATION`
+(or `-flto` / `-flto=thin` in the flags, with the matching archiver) for the library and for the programs that
+link it, and calls into it inline across the boundary.
+
+The options that change the compiled code (`FRSR_ROARING_NO_SBO`, `FRSR_ROARING_COMBINE_STATS`, the
+allocation policy, psi::vm containers and file-mapped serialization) must be the same in the library and in
+the program. A program built with other settings fails to link instead of running mismatched code.
+
 ## Design constraints
 
 - Namespace: `frsr::roaring`

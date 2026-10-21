@@ -24,7 +24,7 @@ env:
 
 jobs:
   linux:
-    name: ${{ matrix.compiler }} / ${{ matrix.sbo == 'on' && 'inline buffers' || 'no inline buffers' }}
+    name: ${{ matrix.compiler }} / ${{ matrix.sbo == 'on' && 'inline buffers' || 'no inline buffers' }} / ${{ matrix.mode }}
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     strategy:
@@ -32,6 +32,12 @@ jobs:
       matrix:
         compiler: [ clang-22, gcc-15 ]
         sbo: [ off, on ]
+        # compiled: the library holds the bitmap instantiations; header-only: every program instantiates its own;
+        # lto: compiled, with link-time optimization across the library boundary.
+        mode: [ compiled, header-only ]
+        include:
+          - { compiler: clang-22, sbo: off, mode: lto }
+          - { compiler: gcc-15,   sbo: off, mode: lto }
     steps:
       - uses: actions/checkout@v4
         with:
@@ -99,7 +105,13 @@ jobs:
         run: |
           set -eux
           flags=""; [ "${{ matrix.sbo }}" = off ] && flags="-DFRSR_ROARING_NO_SBO=1"
-          cmake -S roaring -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+          mode_args=""
+          case "${{ matrix.mode }}" in
+            header-only) mode_args="-DFRSR_ROARING_HEADER_ONLY=ON" ;;
+            lto)         mode_args="-DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON"
+                         case "${{ matrix.compiler }}" in clang-*) mode_args="$mode_args -DCMAKE_EXE_LINKER_FLAGS=-fuse-ld=lld" ;; esac ;;
+          esac
+          cmake -S roaring -B build -G Ninja -DCMAKE_BUILD_TYPE=Release $mode_args \
             -DCMAKE_C_COMPILER="$CC" -DCMAKE_CXX_COMPILER="$CXX" \
             -DBoost_ROOT="$PWD/boost" "-DCMAKE_CXX_FLAGS=$flags" \
             "-DCMAKE_CXX_STANDARD_LIBRARIES=$PWD/psivm_shim.o" \
@@ -107,10 +119,11 @@ jobs:
             -DFRSR_ROARING_BUILD_CROARING_CROSSCHECK=ON -DFRSR_ROARING_BUILD_BENCHMARKS=OFF
 
       - name: Build
-        run: cmake --build build --target frsr_roaring_tests frsr_roaring_croaring_crosscheck
+        run: cmake --build build --target frsr_roaring_tests frsr_roaring_consumer_tests frsr_roaring_croaring_crosscheck
 
       - name: Test
         working-directory: build
         run: |
           ./frsr_roaring_tests --gtest_brief=1
+          ./frsr_roaring_consumer_tests --gtest_brief=1
           ./frsr_roaring_croaring_crosscheck --gtest_brief=1

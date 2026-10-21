@@ -517,7 +517,7 @@ struct interop_engine {
     // Calls `visit( cursor, piece )` for each pair of a chunk of `self` and a non-empty piece of the same key,
     // in ascending order, until it returns false. Either side jumps over the other's absent keys.
     template <typename Self, typename Source, typename Visit>
-    static void leapfrog( Self & self, Source & source, Visit && visit ) {
+    [[ gnu::always_inline ]] static void leapfrog( Self & self, Source & source, Visit && visit ) {
         auto at{ self.chunks_.begin() };
         while ( at != self.chunks_.end() && !source.at_end() ) {
             auto const self_key  { self.chunks_.key( at ) };
@@ -685,7 +685,7 @@ struct interop_engine {
     }
 
     template <typename Source>
-    [[nodiscard]] static size_type and_cardinality_stream( Bitmap const & self, Source & source ) {
+    [[nodiscard]] [[ gnu::always_inline ]] static size_type and_cardinality_stream( Bitmap const & self, Source & source ) {
         size_type count{ 0 };
         leapfrog( self, source, [ & ]( cursor const at, handle_type const & piece ) {
             auto const & slot{ self.chunks_.slot( at ) };
@@ -941,6 +941,20 @@ struct interop_engine {
         }
     }
 
+    template <interop_op Op, typename Self, typename Operand>
+    static decltype( auto ) run( Self & self, Operand const & operand ) {
+        if constexpr      ( Op == interop_op::and_with        ) { return and_with       ( self, operand ); }
+        else if constexpr ( Op == interop_op::or_with         ) { return or_with        ( self, operand ); }
+        else if constexpr ( Op == interop_op::andnot_with     ) { return andnot_with    ( self, operand ); }
+        else if constexpr ( Op == interop_op::xor_with        ) { return xor_with       ( self, operand ); }
+        else if constexpr ( Op == interop_op::xor_cardinality ) { return xor_cardinality( self, operand ); }
+        else if constexpr ( Op == interop_op::and_cardinality ) { return and_cardinality( self, operand ); }
+        else if constexpr ( Op == interop_op::intersects      ) { return intersects     ( self, operand ); }
+        else if constexpr ( Op == interop_op::is_subset_of    ) { return is_subset_of   ( self, operand ); }
+        else if constexpr ( Op == interop_op::is_superset_of  ) { return is_superset_of ( self, operand ); }
+        else                                                    { return equals         ( self, operand ); }
+    }
+
     // against another bitmap
 
     [[nodiscard]] static bool intersects( Bitmap const & self, Bitmap const & other ) {
@@ -959,3 +973,34 @@ struct interop_engine {
 };
 
 } // namespace frsr::roaring::detail
+
+namespace frsr::roaring {
+
+namespace detail {
+
+// Calls f with the operand a view stands for, as one of the operand types the engine understands.
+template <typename Key, typename F>
+decltype( auto ) with_operand( operand_view const & view, F && f ) {
+    switch ( view.shape ) {
+        case operand_view::shape_type::interval:
+            return f( view.interval );
+        case operand_view::shape_type::bits: {
+            std::span<std::uint8_t const> const bytes{ static_cast<std::uint8_t const *>( view.data ), static_cast<std::size_t>( ( view.bit_count + 7 ) / 8 ) };
+            return f( bit_words<std::uint8_t>{ bytes, view.base, view.bit_count } );
+        }
+        case operand_view::shape_type::sorted_keys: {
+            std::span<Key const> const keys{ static_cast<Key const *>( view.data ), view.count };
+            return f( sorted_keys{ keys } );
+        }
+        case operand_view::shape_type::unsorted_keys:
+            break;
+    }
+    std::span<Key const> const keys{ static_cast<Key const *>( view.data ), view.count };
+    return f( keys );
+}
+
+} // namespace detail
+
+
+
+} // namespace frsr::roaring
