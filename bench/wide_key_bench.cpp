@@ -3,7 +3,7 @@
 // inserting a chunk. Each band is timed as a tight loop in one process (no
 // per-op harness), best of several repeats, ns per operation.
 //
-// usage: frsr_roaring_wide_key_bench [--count N]... [--pattern dense|sparse|random]...
+// usage: frsr_roaring_wide_key_bench [--count N]... [--pattern dense|sparse|random|clustered]...
 //                                    [--band substring] [--reps R] [--arm frsr|r64]
 //                                    [--scatter-cap N] [--lookups-only|--mutations-only]
 //                                    [--narrow]   (32-bit lookup bands only: bitmap<uint32_t> vs roaring_bitmap_t)
@@ -49,9 +49,16 @@ double best_ns_per_op( int const reps, std::size_t const ops, F && f ) {
     return best;
 }
 
-enum class pattern { dense, sparse, random };
+enum class pattern { dense, sparse, random, clustered };
 
-char const * name( pattern const p ) { return p == pattern::dense ? "dense" : p == pattern::sparse ? "sparse" : "random"; }
+char const * name( pattern const p ) { switch ( p ) {
+        case pattern::dense: return "dense";
+        case pattern::sparse: return "sparse";
+        case pattern::random: return "random";
+        case pattern::clustered: return "cluster";
+    }
+    return "?";
+}
 
 // Sorted, distinct, EVEN chunk keys; the value stored in a chunk is chunk<<16 | 7.
 std::vector<u64> make_chunks( pattern const p, std::size_t const n ) {
@@ -61,6 +68,10 @@ std::vector<u64> make_chunks( pattern const p, std::size_t const n ) {
     switch ( p ) {
         case pattern::dense : for ( std::size_t i{ 0 }; i < n; ++i ) { chunks.push_back( 2 * i ); } break;
         case pattern::sparse: for ( std::size_t i{ 0 }; i < n; ++i ) { chunks.push_back( ( 2 * i ) << 16 ); } break;
+        case pattern::clustered:   // eight dense runs, far apart: not one spread a flat directory could cover
+            for ( std::size_t i{ 0 }; i < n; ++i ) { chunks.push_back( ( ( i % 8 ) << 38 ) + 2 * ( i / 8 ) ); }
+            std::sort( chunks.begin(), chunks.end() );
+            break;
         case pattern::random: {
             for ( std::size_t i{ 0 }; i < n; ++i ) { chunks.push_back( ( rng() >> 17 ) << 1 ); }
             std::sort( chunks.begin(), chunks.end() );
@@ -303,7 +314,7 @@ int main( int argc, char ** argv ) {
         std::string const a{ argv[ i ] };
         auto const next{ [&] { return i + 1 < argc ? std::string{ argv[ ++i ] } : std::string{}; } };
         if      ( a == "--count"   ) { counts.push_back( std::strtoull( next().c_str(), nullptr, 10 ) ); }
-        else if ( a == "--pattern" ) { auto const s{ next() }; patterns.push_back( s == "dense" ? pattern::dense : s == "sparse" ? pattern::sparse : pattern::random ); }
+        else if ( a == "--pattern" ) { auto const s{ next() }; patterns.push_back( s == "dense" ? pattern::dense : s == "sparse" ? pattern::sparse : s == "clustered" ? pattern::clustered : pattern::random ); }
         else if ( a == "--band"    ) { cfg.band_filter = next(); }
         else if ( a == "--arm"     ) { cfg.arm_filter = next(); }
         else if ( a == "--scatter-cap" ) { cfg.scatter_cap = std::strtoull( next().c_str(), nullptr, 10 ); }
@@ -313,7 +324,7 @@ int main( int argc, char ** argv ) {
         else if ( a == "--mutations-only" ) { lookups = false; }
     }
     if ( counts.empty() ) { counts = { 1000, 100000, 1000000 }; }
-    if ( patterns.empty() ) { patterns = { pattern::dense, pattern::sparse, pattern::random }; }
+    if ( patterns.empty() ) { patterns = { pattern::dense, pattern::sparse, pattern::random, pattern::clustered }; }
     if ( narrow ) { for ( auto const n : counts ) { run_narrow_lookup_bands( cfg, n ); } return 0; }
     for ( auto const p : patterns ) {
         for ( auto const n : counts ) {

@@ -3,7 +3,7 @@
 // container work is in the number. The same code runs for every key width; which structure sits
 // behind the store (a sorted array or a tree) is the store's choice.
 //
-// usage: frsr_roaring_chunk_table_bench [--width 32|64] [--count N] [--pattern dense|random] [--band substring] [--reps R]
+// usage: frsr_roaring_chunk_table_bench [--width 32|64] [--count N] [--pattern dense|sparse|random|clustered] [--band substring] [--reps R]
 //                                       [--scatter-cap N]   (skip the scattered-insert bands above N chunks: they are quadratic for a flat array)
 //
 // Keys are even, so that key + 1 is absent inside the stored range. A lookup is a lower_bound,
@@ -84,6 +84,11 @@ void run_bands() {
     auto const domain{ std::numeric_limits<key_t>::digits >= 48 ? 46 : std::numeric_limits<key_t>::digits - 2 };
     if ( C.pattern == "dense" ) {
         for ( std::size_t i{ 0 }; i < C.count; ++i ) { keys.push_back( static_cast<key_t>( 2 * i ) ); }
+    } else if ( C.pattern == "clustered" ) {   // eight dense runs, far apart: not one spread a flat directory could cover
+        for ( std::size_t i{ 0 }; i < C.count; ++i ) { keys.push_back( static_cast<key_t>( ( ( i % 8 ) << 38 ) + 2 * ( i / 8 ) ) ); }
+        std::sort( keys.begin(), keys.end() );
+    } else if ( C.pattern == "sparse" ) {
+        for ( std::size_t i{ 0 }; i < C.count; ++i ) { keys.push_back( static_cast<key_t>( ( 2 * i ) << 16 ) ); }
     } else {
         for ( std::size_t i{ 0 }; i < C.count; ++i ) { keys.push_back( static_cast<key_t>( ( rng() >> ( 64 - domain ) ) << 1 ) ); }
         std::sort( keys.begin(), keys.end() );
@@ -151,7 +156,7 @@ void run_bands() {
         {
             store s;
             build( s );
-            report( "memAsc", static_cast<double>( heap_in_use() - h0 ) / static_cast<double>( n ), "B/chunk" );
+            report( s.indexed() ? "memAscIdx" : "memAsc", static_cast<double>( heap_in_use() - h0 ) / static_cast<double>( n ), "B/chunk" );
         }
         auto shuffled{ keys };
         std::shuffle( shuffled.begin(), shuffled.end(), std::mt19937_64{ 3 } );
@@ -192,6 +197,52 @@ void run_bands() {
         }
         if ( want( ni ) ) { report( ni, bi ); }
         if ( want( nr ) ) { report( nr, br ); }
+    }
+    if ( want( "insClus" ) && scattered_ok && n >= 1000 ) {
+        // a dense cluster of absent keys inside one gap of an evenly spread table, then lookups of it
+        auto const lo{ keys[ n / 2 ] + 1 };
+        std::vector<key_t> cluster;
+        for ( std::size_t j{ 0 }; j < K; ++j ) { cluster.push_back( static_cast<key_t>( lo + 2 * j ) ); }
+        std::shuffle( cluster.begin(), cluster.end(), rng );
+        double bi{ 1e30 }, bl{ 1e30 };
+        bool indexed{ false };
+        for ( int r{ 0 }; r < C.reps; ++r ) {
+            store s;
+            build( s );
+            auto const t0{ Clock::now() };
+            for ( auto const k : cluster ) { add( s, k ); }
+            auto const t1{ Clock::now() };
+            std::uint64_t h{};
+            for ( int q{ 0 }; q < 5; ++q ) { for ( auto const k : cluster ) { h += has( s, k ); } }
+            auto const t2{ Clock::now() };
+            g_sink += h;
+            indexed = s.indexed();
+            bi = std::min( bi, std::chrono::duration<double, std::nano>( t1 - t0 ).count() / static_cast<double>( K ) );
+            bl = std::min( bl, std::chrono::duration<double, std::nano>( t2 - t1 ).count() / static_cast<double>( 5 * K ) );
+        }
+        report( "insClus", bi );
+        report( "hitClus", bl );
+        report( indexed ? "clusIdx" : "clusTree", 0, "" );
+    }
+    if ( want( "insDesc" ) && scattered_ok ) {
+        double b{ 1e30 }, bl{ 1e30 };
+        bool indexed{ false };
+        for ( int r{ 0 }; r < C.reps; ++r ) {
+            store s;
+            auto const t0{ Clock::now() };
+            for ( std::size_t i{ n }; i-- > 0; ) { add( s, keys[ i ] ); }
+            auto const t1{ Clock::now() };
+            std::uint64_t h{};
+            for ( std::size_t i{ 0 }; i < n; i += 7 ) { h += has( s, keys[ i ] ); }
+            auto const t2{ Clock::now() };
+            g_sink += h;
+            indexed = s.indexed();
+            b  = std::min( b , std::chrono::duration<double, std::nano>( t1 - t0 ).count() / static_cast<double>( n ) );
+            bl = std::min( bl, std::chrono::duration<double, std::nano>( t2 - t1 ).count() / static_cast<double>( ( n + 6 ) / 7 ) );
+        }
+        report( "insDesc", b );
+        report( "hitDesc", bl );
+        report( indexed ? "descIdx" : "descTree", 0, "" );
     }
     if ( want( "tbl" ) ) {
         // two interleaved tables walked together, as the set operations walk the chunk tables of

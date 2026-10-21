@@ -18,7 +18,8 @@ namespace frsr::roaring::detail {
 // up to 32 bits) bounds the table at 65536 entries, which a sorted array serves best: contiguous,
 // searched by a binary search, and just what the reference uses. A wider chunk key has no such
 // bound, and an array's insertions and removals, which shift its tail, become the cost of the
-// bitmap; those keys live in a B+ tree instead.
+// bitmap; those keys live in linked leaves instead, indexed by a B+ tree or, for a large table
+// of evenly spread keys, by a flat directory (chunk_tree.hpp).
 //
 // Whichever it is, the table is walked through cursors, searched without writing anything (so
 // concurrent readers of one table are safe), and rewritten by appenders and a rewriter, never by
@@ -77,6 +78,9 @@ public:
     // The handles in key order.
     [[nodiscard]] auto slots()       noexcept { return live_.slots(); }
     [[nodiscard]] auto slots() const noexcept { return std::as_const( live_ ).slots(); }
+
+    // Whether the table is held by a directory instead of a tree (a wide chunk key only).
+    [[nodiscard]] bool indexed() const noexcept { if constexpr ( wide ) { return live_.indexed(); } else { return false; } }
 
     // Storage footprint of the table itself (not the spilled payloads).
     [[nodiscard]] std::size_t entry_bytes() const noexcept { return live_.node_bytes(); }
