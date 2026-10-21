@@ -25,6 +25,7 @@
 
 #include <frsr/roaring/tuning.hpp>
 #include <frsr/roaring/container_layout.hpp>
+#include <frsr/roaring/allocation_policy.hpp>
 #include <frsr/roaring/cow_policy.hpp>
 #include <frsr/roaring/run.hpp>
 #include <frsr/roaring/run_container.hpp>
@@ -245,11 +246,11 @@ public:
     // failure under the non-refcounted ones (kept noexcept so the Model-1 hot
     // path does not grow exception edges).
 
-    [[nodiscard]] array_ref <Layout, CowPolicy> as_array ()       noexcept( !CowPolicy::refcounted );
+    [[nodiscard]] array_ref <Layout, CowPolicy> as_array ()       noexcept( !CowPolicy::refcounted || detail::allocation_failure_terminates );
     [[nodiscard]] array_cref<Layout, CowPolicy> as_array () const noexcept;
-    [[nodiscard]] run_ref   <Layout, CowPolicy> as_run   ()       noexcept( !CowPolicy::refcounted );
+    [[nodiscard]] run_ref   <Layout, CowPolicy> as_run   ()       noexcept( !CowPolicy::refcounted || detail::allocation_failure_terminates );
     [[nodiscard]] run_cref  <Layout, CowPolicy> as_run   () const noexcept;
-    [[nodiscard]] bitset_ref <Layout, CowPolicy> as_bitset()       noexcept( !CowPolicy::refcounted );
+    [[nodiscard]] bitset_ref <Layout, CowPolicy> as_bitset()       noexcept( !CowPolicy::refcounted || detail::allocation_failure_terminates );
     [[nodiscard]] bitset_cref<Layout, CowPolicy> as_bitset() const noexcept;
 
     template <typename F> decltype( auto ) visit( F && f );
@@ -665,7 +666,7 @@ private:
     // reason — inline, their allocate + copy + release code exceeds the inliner's budget
     // and the barrier is emitted as an out-of-line call per mutation, which is how it
     // came to hold its own line in a downstream profile.
-    void make_payload_unique() noexcept( !CowPolicy::refcounted ) {
+    void make_payload_unique() noexcept( !CowPolicy::refcounted || detail::allocation_failure_terminates ) {
         if ( owner_ == storage_ownership::borrowed ) [[unlikely]] {
             clone_borrowed_payload();
             return;
@@ -684,7 +685,7 @@ private:
     // The co-owned arm of the write barrier: clone to a fresh born-shared payload and
     // drop this handle's reference to the old one. Cold by construction — a handle is
     // only co-owned between a copy and the first write through either side.
-    [[gnu::noinline, gnu::cold]] void clone_shared_payload() noexcept( !CowPolicy::refcounted )
+    [[gnu::noinline, gnu::cold]] void clone_shared_payload() noexcept( !CowPolicy::refcounted || detail::allocation_failure_terminates )
         requires( CowPolicy::refcounted )
     {
         auto * const old_payload{ spill().data };
@@ -705,7 +706,7 @@ private:
     // The mapped source bytes are only read. noexcept-shaped like the barrier:
     // under a non-refcounted policy an allocation failure here terminates
     // rather than widening every Model-1 mutable accessor into a throwing one.
-    [[gnu::cold]] void clone_borrowed_payload() noexcept( !CowPolicy::refcounted ) {
+    [[gnu::cold]] void clone_borrowed_payload() noexcept( !CowPolicy::refcounted || detail::allocation_failure_terminates ) {
         auto const bytes{ std::size_t{ count_ } * element_size() };
         void const * const source{ spill().data };
         if ( bytes <= body_size ) {   // bitsets (8 KB block) never fit ⇒ always take the spilled arm
@@ -1796,21 +1797,21 @@ template <typename Layout, typename CowPolicy>
 }
 
 template <typename Layout, typename CowPolicy>
-array_ref<Layout, CowPolicy> container_handle<Layout, CowPolicy>::as_array() noexcept( !CowPolicy::refcounted ) {
+array_ref<Layout, CowPolicy> container_handle<Layout, CowPolicy>::as_array() noexcept( !CowPolicy::refcounted || detail::allocation_failure_terminates ) {
     make_payload_unique();
     return array_ref<Layout, CowPolicy>{ *this };
 }
 template <typename Layout, typename CowPolicy>
 array_cref<Layout, CowPolicy> container_handle<Layout, CowPolicy>::as_array() const noexcept { return array_cref<Layout, CowPolicy>{ *this }; }
 template <typename Layout, typename CowPolicy>
-run_ref<Layout, CowPolicy> container_handle<Layout, CowPolicy>::as_run() noexcept( !CowPolicy::refcounted ) {
+run_ref<Layout, CowPolicy> container_handle<Layout, CowPolicy>::as_run() noexcept( !CowPolicy::refcounted || detail::allocation_failure_terminates ) {
     make_payload_unique();
     return run_ref<Layout, CowPolicy>{ *this };
 }
 template <typename Layout, typename CowPolicy>
 run_cref<Layout, CowPolicy> container_handle<Layout, CowPolicy>::as_run() const noexcept { return run_cref<Layout, CowPolicy>{ *this }; }
 template <typename Layout, typename CowPolicy>
-bitset_ref<Layout, CowPolicy> container_handle<Layout, CowPolicy>::as_bitset() noexcept( !CowPolicy::refcounted ) {
+bitset_ref<Layout, CowPolicy> container_handle<Layout, CowPolicy>::as_bitset() noexcept( !CowPolicy::refcounted || detail::allocation_failure_terminates ) {
     make_payload_unique();
     return bitset_ref<Layout, CowPolicy>{ *this };
 }

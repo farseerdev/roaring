@@ -244,6 +244,7 @@ if(FRSR_ROARING_BUILD_TESTS)
         tests/chunk_tree.cpp
         tests/interop.cpp
         tests/symmetric_difference.cpp
+        tests/noexcept_policy.cpp
     )
     target_link_libraries(frsr_roaring_tests
         PRIVATE
@@ -258,6 +259,18 @@ if(FRSR_ROARING_BUILD_TESTS)
 
     include(GoogleTest)
     gtest_discover_tests(frsr_roaring_tests)
+
+    # The exception specifications under an allocation policy in which a failed allocation cannot be observed as an
+    # exception: compiled (the static_asserts are the test), never linked, since the policy changes the
+    # specifications of the templates the test binary instantiates.
+    add_library(frsr_roaring_noexcept_policy_nothrow OBJECT tests/noexcept_policy_nothrow.cpp)
+    target_link_libraries(frsr_roaring_noexcept_policy_nothrow PRIVATE frsr_roaring)
+    set_target_properties(frsr_roaring_noexcept_policy_nothrow PROPERTIES
+        CXX_STANDARD 26
+        CXX_STANDARD_REQUIRED ON
+        CXX_EXTENSIONS OFF
+    )
+    add_dependencies(frsr_roaring_tests frsr_roaring_noexcept_policy_nothrow)
 
     if(FRSR_ROARING_BUILD_CROARING_CROSSCHECK AND TARGET roaring)
         add_executable(frsr_roaring_croaring_crosscheck

@@ -66,3 +66,7 @@ All const operations are pure reads and are safe to run concurrently on one bitm
 against a `key_range`, a `bit_words` and a `std::bitset` of up to 131072 bits, which they read without
 allocating; against a range of keys or a larger bit-set they may allocate (to sort a copy, or to copy the bits
 out) and are not.
+
+The operations that change the bitmap (`and_with`, `or_with`, `andnot_with`, `xor_with` and the compound operators)
+allocate, so they are `noexcept` exactly when a failed allocation cannot be observed as an exception (see
+[README](../README.md), Exceptions) and the operand is a `key_range`, a `bit_words` or a bit-set of up to 131072 bits.
