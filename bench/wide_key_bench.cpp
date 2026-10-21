@@ -49,6 +49,20 @@ double best_ns_per_op( int const reps, std::size_t const ops, F && f ) {
     return best;
 }
 
+// Times only `destroy( make() )`'s second half: the object is built outside the clock.
+template <class Make, class Destroy>
+double best_destroy_ns_per_op( int const reps, std::size_t const ops, Make && make, Destroy && destroy ) {
+    double best{ 1e30 };
+    for ( int r{ 0 }; r < reps; ++r ) {
+        auto * const object{ make() };
+        auto const t0{ Clock::now() };
+        destroy( object );
+        auto const t1{ Clock::now() };
+        best = std::min( best, std::chrono::duration<double, std::nano>( t1 - t0 ).count() / static_cast<double>( ops ) );
+    }
+    return best;
+}
+
 enum class pattern { dense, sparse, random, clustered };
 
 char const * name( pattern const p ) { switch ( p ) {
@@ -214,6 +228,17 @@ void run_mutation_bands( config const & cfg, pattern const p, std::size_t const 
         frsr_bitmap base; base.add_many( values );
         report( "copy", "frsr", p, n, best_ns_per_op( cfg.reps, n, [&] { frsr_bitmap c{ base }; return c.size(); } ) );
     }
+    if ( selected( cfg, "destroy", "frsr" ) ) {
+        frsr_bitmap base; base.add_many( values );
+        report( "destroy", "frsr", p, n, best_destroy_ns_per_op( cfg.reps, n, [&] { return new frsr_bitmap{ base }; }, []( frsr_bitmap * b ) { delete b; } ) );
+    }
+#if FRSR_ROARING_HAS_CROARING
+    if ( selected( cfg, "destroy", "r64" ) ) {
+        auto * base{ roaring64_bitmap_create() }; roaring64_bitmap_add_many( base, values.size(), values.data() );
+        report( "destroy", "r64", p, n, best_destroy_ns_per_op( cfg.reps, n, [&] { return roaring64_bitmap_copy( base ); }, []( roaring64_bitmap_t * b ) { roaring64_bitmap_free( b ); } ) );
+        roaring64_bitmap_free( base );
+    }
+#endif
     {
         // two interleaved halves: union / intersection / difference walk the chunk tables together
         std::vector<u64> a, b;
@@ -223,12 +248,14 @@ void run_mutation_bands( config const & cfg, pattern const p, std::size_t const 
         frsr_bitmap fa, fb; fa.add_many( a ); fb.add_many( b );
         if ( selected( cfg, "or", "frsr" ) ) { report( "or", "frsr", p, n, best_ns_per_op( cfg.reps, n, [&] { return ( fa | fb ).size(); } ) ); }
         if ( selected( cfg, "and", "frsr" ) ) { report( "and", "frsr", p, n, best_ns_per_op( cfg.reps, n, [&] { return ( fa & fb ).size(); } ) ); }
+        if ( selected( cfg, "andnot", "frsr" ) ) { report( "andnot", "frsr", p, n, best_ns_per_op( cfg.reps, n, [&] { return ( fa - fb ).size(); } ) ); }
         if ( selected( cfg, "orInplace", "frsr" ) ) { report( "orInplace", "frsr", p, n, best_ns_per_op( cfg.reps, n, [&] { auto c{ fa }; c |= fb; return c.size(); } ) ); }
 #if FRSR_ROARING_HAS_CROARING
         auto * ra{ roaring64_bitmap_create() }; auto * rb{ roaring64_bitmap_create() };
         roaring64_bitmap_add_many( ra, a.size(), a.data() ); roaring64_bitmap_add_many( rb, b.size(), b.data() );
         if ( selected( cfg, "or", "r64" ) ) { report( "or", "r64", p, n, best_ns_per_op( cfg.reps, n, [&] { auto * r{ roaring64_bitmap_or( ra, rb ) }; auto c{ roaring64_bitmap_get_cardinality( r ) }; roaring64_bitmap_free( r ); return c; } ) ); }
         if ( selected( cfg, "and", "r64" ) ) { report( "and", "r64", p, n, best_ns_per_op( cfg.reps, n, [&] { auto * r{ roaring64_bitmap_and( ra, rb ) }; auto c{ roaring64_bitmap_get_cardinality( r ) }; roaring64_bitmap_free( r ); return c; } ) ); }
+        if ( selected( cfg, "andnot", "r64" ) ) { report( "andnot", "r64", p, n, best_ns_per_op( cfg.reps, n, [&] { auto * r{ roaring64_bitmap_andnot( ra, rb ) }; auto c{ roaring64_bitmap_get_cardinality( r ) }; roaring64_bitmap_free( r ); return c; } ) ); }
         if ( selected( cfg, "orInplace", "r64" ) ) { report( "orInplace", "r64", p, n, best_ns_per_op( cfg.reps, n, [&] { auto * c{ roaring64_bitmap_copy( ra ) }; roaring64_bitmap_or_inplace( c, rb ); auto k{ roaring64_bitmap_get_cardinality( c ) }; roaring64_bitmap_free( c ); return k; } ) ); }
         roaring64_bitmap_free( ra ); roaring64_bitmap_free( rb );
 #endif
