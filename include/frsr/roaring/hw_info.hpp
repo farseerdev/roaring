@@ -110,7 +110,8 @@ template <set_operation Op, typename V>
 [[ gnu::always_inline ]] inline V apply_bitwise_op( V const a, V const b ) noexcept {
     if      constexpr ( Op == set_operation::bit_or  ) { return a | b;  }
     else if constexpr ( Op == set_operation::bit_and ) { return a & b;  }
-    else                                               { return a & ~b; }  // bit_andnot
+    else if constexpr ( Op == set_operation::bit_xor ) { return a ^ b;  }
+    else                                               { static_assert( Op == set_operation::bit_andnot ); return a & ~b; }
 }
 
 // ---- x86 runtime dispatch (function multi-versioning) ----------------------

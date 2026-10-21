@@ -40,6 +40,12 @@ inline constexpr std::uint32_t array_sbo_size{ 8 };
 #endif
 inline constexpr std::size_t lazy_union_array_bound{ FRSR_ROARING_LAZY_UNION_ARRAY_BOUND };
 
+// Lazy in-place K-way exclusive-or (bulk_xor_intermediate): an array against an array whose summed cardinality is
+// at or below this bound is merged as arrays; above it the accumulator becomes a bitset, which every later
+// operand flips bits in.
+// [croaring-ref] deps/croaring/src/containers/perfparameters.h:ARRAY_LAZY_LOWERBOUND
+inline constexpr std::size_t lazy_xor_array_bound{ 1024 };
+
 // Route the in-place bitset combine through the Harley-Seal carry-save kernel
 // (fused_combine_inplace_popcount) instead of the naive per-word loop in
 // combine_bitset_bitset_inplace (bitset_ops.hpp).

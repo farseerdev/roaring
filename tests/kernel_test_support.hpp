@@ -136,6 +136,13 @@ template <typename T>
     return r;
 }
 
+template <typename T>
+[[nodiscard]] std::vector<T> set_symmetric_difference_of( std::vector<T> const & a, std::vector<T> const & b ) {
+    std::vector<T> r;
+    std::ranges::set_symmetric_difference( a, b, std::back_inserter( r ) );
+    return r;
+}
+
 template <typename Key>
 [[nodiscard]] std::vector<Key> sorted_unique( std::vector<Key> values ) {
     std::ranges::sort( values );

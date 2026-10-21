@@ -374,6 +374,54 @@ template <typename Layout, typename CowPolicy = cow_value_semantics>
     return result;
 }
 
+// The symmetric difference of two run lists, merged by begin with every run exclusive-or-appended to what is
+// built so far. `out` must hold lhs_size + rhs_size runs (the most it can come to). Returns the run count.
+// [croaring-ref] deps/croaring/src/containers/run.c:run_container_xor
+template <typename Layout>
+[[ gnu::hot ]] inline std::size_t xor_runs(
+    run<typename Layout::low_type> const * const lhs, std::size_t const lhs_size,
+    run<typename Layout::low_type> const * const rhs, std::size_t const rhs_size,
+    run<typename Layout::low_type> * const out
+) noexcept {
+    std::size_t li{ 0 }, ri{ 0 }, n{ 0 };
+    while ( li < lhs_size && ri < rhs_size ) {
+        if ( lhs[ li ].begin <= rhs[ ri ].begin ) {
+            n = append_run_exclusive( out, n, lhs[ li ].begin, lhs[ li ].end );
+            ++li;
+        } else {
+            n = append_run_exclusive( out, n, rhs[ ri ].begin, rhs[ ri ].end );
+            ++ri;
+        }
+    }
+    for ( ; li < lhs_size; ++li ) { n = append_run_exclusive( out, n, lhs[ li ].begin, lhs[ li ].end ); }
+    for ( ; ri < rhs_size; ++ri ) { n = append_run_exclusive( out, n, rhs[ ri ].begin, rhs[ ri ].end ); }
+    return n;
+}
+
+// The same for a sorted array of values (each a run of one) against a run list. `out` must hold
+// values_size + runs_size runs.
+// [croaring-ref] deps/croaring/src/containers/mixed_xor.c:array_run_container_lazy_xor
+template <typename Layout>
+[[ gnu::hot ]] inline std::size_t xor_values_runs(
+    typename Layout::low_type const * const values, std::size_t const values_size,
+    run<typename Layout::low_type> const * const runs, std::size_t const runs_size,
+    run<typename Layout::low_type> * const out
+) noexcept {
+    std::size_t vi{ 0 }, ri{ 0 }, n{ 0 };
+    while ( vi < values_size && ri < runs_size ) {
+        if ( runs[ ri ].begin <= values[ vi ] ) {
+            n = append_run_exclusive( out, n, runs[ ri ].begin, runs[ ri ].end );
+            ++ri;
+        } else {
+            n = append_run_exclusive( out, n, values[ vi ], values[ vi ] );
+            ++vi;
+        }
+    }
+    for ( ; vi < values_size; ++vi ) { n = append_run_exclusive( out, n, values[ vi ], values[ vi ] ); }
+    for ( ; ri < runs_size  ; ++ri ) { n = append_run_exclusive( out, n, runs[ ri ].begin, runs[ ri ].end ); }
+    return n;
+}
+
 template <typename Layout, typename CowPolicy = cow_value_semantics>
 [[nodiscard]] inline container_handle<Layout, CowPolicy> make_container_from_runs(
     run_container<Layout> run,

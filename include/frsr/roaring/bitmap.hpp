@@ -1,5 +1,6 @@
 #pragma once
 
+#include <frsr/roaring/allocation_policy.hpp>
 #include <frsr/roaring/container_layout.hpp>
 #include <frsr/roaring/run_container.hpp>
 #include <frsr/roaring/run_selection_policy.hpp>
@@ -32,6 +33,7 @@
 #include <iterator>
 #include <limits>
 #include <memory>
+#include <new>
 #include <optional>
 #include <ranges>
 #include <span>
@@ -403,11 +405,11 @@ public:
 
     bitmap() = default;
 
-    bitmap( bitmap const & ) = default;
+    bitmap( bitmap const & ) noexcept( detail::allocation_failure_terminates ) = default;
 
     bitmap( bitmap && ) noexcept = default;
 
-    bitmap & operator=( bitmap const & other ) {
+    bitmap & operator=( bitmap const & other ) noexcept( detail::allocation_failure_terminates ) {
         if ( this != &other ) [[likely]] {
             bitmap copy{ other };
             swap( copy );
@@ -428,7 +430,7 @@ public:
     template <std::ranges::input_range Range>
         requires std::convertible_to<std::ranges::range_reference_t<Range>, key_type>
               && ( !std::same_as<std::remove_cvref_t<Range>, bitmap> )
-    explicit bitmap( Range && values ) {
+    explicit bitmap( Range && values ) noexcept( detail::allocation_failure_terminates && detail::nothrow_key_range<Range, key_type> ) {
         add_many( std::forward<Range>( values ) );
     }
 
@@ -635,7 +637,7 @@ public:
         return detail::container_contains( *ctx.slot, low );
     }
 
-    [[nodiscard]] bool add( key_type const value ) {
+    [[nodiscard]] bool add( key_type const value ) noexcept( detail::allocation_failure_terminates ) {
         return add_impl( value, nullptr );
     }
 
@@ -644,7 +646,7 @@ public:
     // and the value goes straight into its container. Everything else (a new
     // chunk) is the shared add_impl.
     // [croaring-ref] deps/croaring/src/roaring.c:add_bulk_impl
-    [[nodiscard]] bool add_bulk( bulk_context & ctx, key_type const value ) {
+    [[nodiscard]] bool add_bulk( bulk_context & ctx, key_type const value ) noexcept( detail::allocation_failure_terminates ) {
         auto const chunk{ layout_type::chunk_key( value ) };
         if ( ctx.slot != nullptr && ctx.generation == chunks_.generation() && ctx.chunk == chunk ) [[likely]] {
             // The context was filled from this (non-const) bitmap, whose slots are not const.
@@ -673,7 +675,7 @@ public:
         return add_impl( value, &ctx );
     }
 
-    [[nodiscard]] bool remove( key_type const value ) {
+    [[nodiscard]] bool remove( key_type const value ) noexcept( detail::allocation_failure_terminates ) {
         auto const chunk{ layout_type::chunk_key( value ) };
         auto const low{ layout_type::low_key( value ) };
         auto const at{ chunks_.lower_bound( chunk ) };
@@ -688,8 +690,8 @@ public:
         return true;
     }
 
-    [[nodiscard]] bool try_add( key_type const value ) { return add( value ); }
-    [[nodiscard]] bool try_remove( key_type const value ) { return remove( value ); }
+    [[nodiscard]] bool try_add( key_type const value ) noexcept( detail::allocation_failure_terminates ) { return add( value ); }
+    [[nodiscard]] bool try_remove( key_type const value ) noexcept( detail::allocation_failure_terminates ) { return remove( value ); }
 
     [[nodiscard]] bool intersects( bitmap const & other ) const noexcept {
 
@@ -721,21 +723,28 @@ public:
     // the name works for every operand.
 
     template <interop_operand Operand>
-    bitmap & and_with( Operand const & operand ) { detail::interop_engine<bitmap>::and_with( *this, operand ); return *this; }
+    bitmap & and_with( Operand const & operand ) noexcept( detail::allocation_failure_terminates && detail::interop_nothrow_v<Operand> ) { detail::interop_engine<bitmap>::and_with( *this, operand ); return *this; }
     template <interop_operand Operand>
-    bitmap & or_with( Operand const & operand ) { detail::interop_engine<bitmap>::or_with( *this, operand ); return *this; }
+    bitmap & or_with( Operand const & operand ) noexcept( detail::allocation_failure_terminates && detail::interop_nothrow_v<Operand> ) { detail::interop_engine<bitmap>::or_with( *this, operand ); return *this; }
     template <interop_operand Operand>
-    bitmap & andnot_with( Operand const & operand ) { detail::interop_engine<bitmap>::andnot_with( *this, operand ); return *this; }
-    bitmap & and_with   ( bitmap const & other ) { return *this &= other; }
-    bitmap & or_with    ( bitmap const & other ) { return *this |= other; }
-    bitmap & andnot_with( bitmap const & other ) { return *this -= other; }
+    bitmap & andnot_with( Operand const & operand ) noexcept( detail::allocation_failure_terminates && detail::interop_nothrow_v<Operand> ) { detail::interop_engine<bitmap>::andnot_with( *this, operand ); return *this; }
+    // Keeps the keys that are in exactly one of this bitmap and the operand. With a key_range this is the flip of
+    // the interval.
+    template <interop_operand Operand>
+    bitmap & xor_with( Operand const & operand ) noexcept( detail::allocation_failure_terminates && detail::interop_nothrow_v<Operand> ) { detail::interop_engine<bitmap>::xor_with( *this, operand ); return *this; }
+    bitmap & and_with   ( bitmap const & other ) noexcept( detail::allocation_failure_terminates ) { return *this &= other; }
+    bitmap & or_with    ( bitmap const & other ) noexcept( detail::allocation_failure_terminates ) { return *this |= other; }
+    bitmap & andnot_with( bitmap const & other ) noexcept( detail::allocation_failure_terminates ) { return *this -= other; }
+    bitmap & xor_with   ( bitmap const & other ) noexcept( detail::allocation_failure_terminates ) { return *this ^= other; }
 
     template <interop_operand Operand>
-    bitmap & operator&=( Operand const & operand ) { return and_with( operand ); }
+    bitmap & operator&=( Operand const & operand ) noexcept( detail::allocation_failure_terminates && detail::interop_nothrow_v<Operand> ) { return and_with( operand ); }
     template <interop_operand Operand>
-    bitmap & operator|=( Operand const & operand ) { return or_with( operand ); }
+    bitmap & operator|=( Operand const & operand ) noexcept( detail::allocation_failure_terminates && detail::interop_nothrow_v<Operand> ) { return or_with( operand ); }
     template <interop_operand Operand>
-    bitmap & operator-=( Operand const & operand ) { return andnot_with( operand ); }
+    bitmap & operator-=( Operand const & operand ) noexcept( detail::allocation_failure_terminates && detail::interop_nothrow_v<Operand> ) { return andnot_with( operand ); }
+    template <interop_operand Operand>
+    bitmap & operator^=( Operand const & operand ) noexcept( detail::allocation_failure_terminates && detail::interop_nothrow_v<Operand> ) { return xor_with( operand ); }
 
     // Whether this bitmap and the operand share a key.
     template <interop_operand Operand>
@@ -744,6 +753,9 @@ public:
     template <interop_operand Operand>
     [[nodiscard]] size_type and_cardinality( Operand const & operand ) const noexcept( detail::interop_nothrow_v<Operand> ) { return detail::interop_engine<bitmap>::and_cardinality( *this, operand ); }
     [[nodiscard]] size_type and_cardinality( bitmap const & other ) const { return detail::interop_engine<bitmap>::and_cardinality( *this, other ); }
+    // How many keys are in exactly one of this bitmap and the operand.
+    template <interop_operand Operand>
+    [[nodiscard]] size_type xor_cardinality( Operand const & operand ) const noexcept( detail::interop_nothrow_v<Operand> ) { return detail::interop_engine<bitmap>::xor_cardinality( *this, operand ); }
     // Whether every key of this bitmap is in the operand.
     template <interop_operand Operand>
     [[nodiscard]] bool is_subset_of( Operand const & operand ) const noexcept( detail::interop_nothrow_v<Operand> ) { return detail::interop_engine<bitmap>::is_subset_of( *this, operand ); }
@@ -764,10 +776,10 @@ public:
     [[nodiscard]] bool      contains_range      ( key_type const lo, key_type const hi ) const noexcept { return is_superset_of( key_range::half_open( lo, hi ) ); }
     [[nodiscard]] size_type cardinality_in_range( key_type const lo, key_type const hi ) const noexcept { return and_cardinality( key_range::half_open( lo, hi ) ); }
     // Keeps only the keys of [lo, hi).
-    bitmap &                and_range           ( key_type const lo, key_type const hi )       { return and_with( key_range::half_open( lo, hi ) ); }
+    bitmap &                and_range           ( key_type const lo, key_type const hi )       noexcept( detail::allocation_failure_terminates ) { return and_with( key_range::half_open( lo, hi ) ); }
 
 
-    [[ gnu::hot ]] void add_many_sorted( std::span<key_type const> const sorted_values ) {
+    [[ gnu::hot ]] void add_many_sorted( std::span<key_type const> const sorted_values ) noexcept( detail::allocation_failure_terminates ) {
         if ( sorted_values.empty() ) {
             return;
         }
@@ -814,7 +826,7 @@ public:
         flush_group();
     }
 
-    [[ gnu::hot ]] void remove_many_sorted( std::span<key_type const> const sorted_values ) {
+    [[ gnu::hot ]] void remove_many_sorted( std::span<key_type const> const sorted_values ) noexcept( detail::allocation_failure_terminates ) {
         if ( sorted_values.empty() ) {
             return;
         }
@@ -870,7 +882,7 @@ public:
 
     template <std::ranges::input_range Range>
         requires std::convertible_to<std::ranges::range_reference_t<Range>, key_type>
-    [[ gnu::hot ]] void add_many( Range && values ) {
+    [[ gnu::hot ]] void add_many( Range && values ) noexcept( detail::allocation_failure_terminates && detail::nothrow_key_range<Range, key_type> ) {
         if ( try_add_many_single_chunk_dense( values ) ) {
             return;
         }
@@ -892,7 +904,7 @@ public:
 
     template <std::ranges::input_range Range>
         requires std::convertible_to<std::ranges::range_reference_t<Range>, key_type>
-    [[ gnu::hot ]] void remove_many( Range && values ) {
+    [[ gnu::hot ]] void remove_many( Range && values ) noexcept( detail::allocation_failure_terminates && detail::nothrow_key_range<Range, key_type> ) {
         detail::heap_vector<key_type> sorted_values;
         if constexpr ( requires { std::ranges::size( values ); } ) {
             sorted_values.reserve( static_cast<std::uint32_t>( std::ranges::size( values ) ) );
@@ -949,15 +961,15 @@ public:
         flush_group();
     }
 
-    void add_closed_range( key_type const begin_value, key_type const end_value ) {
+    void add_closed_range( key_type const begin_value, key_type const end_value ) noexcept( detail::allocation_failure_terminates ) {
         apply_closed_range_operation( begin_value, end_value, detail::range_operation::add );
     }
 
-    void remove_closed_range( key_type const begin_value, key_type const end_value ) {
+    void remove_closed_range( key_type const begin_value, key_type const end_value ) noexcept( detail::allocation_failure_terminates ) {
         apply_closed_range_operation( begin_value, end_value, detail::range_operation::remove );
     }
 
-    void flip_closed_range( key_type const begin_value, key_type const end_value ) {
+    void flip_closed_range( key_type const begin_value, key_type const end_value ) noexcept( detail::allocation_failure_terminates ) {
         apply_closed_range_operation( begin_value, end_value, detail::range_operation::flip );
     }
 
@@ -1163,7 +1175,7 @@ public:
         std::swap( size_, other.size_ );
     }
 
-    [[ gnu::hot ]] void intersect_into( bitmap const & other, bitmap & scratch ) const {
+    [[ gnu::hot ]] void intersect_into( bitmap const & other, bitmap & scratch ) const noexcept( detail::allocation_failure_terminates ) {
         if ( this == &other ) {
             scratch = *this;
             return;
@@ -1177,7 +1189,7 @@ public:
         const_cast<bitmap*>(this)->combine( other, detail::set_operation::bit_and, &scratch );
     }
 
-    [[ gnu::hot ]] void union_into( bitmap const & other, bitmap & scratch ) const {
+    [[ gnu::hot ]] void union_into( bitmap const & other, bitmap & scratch ) const noexcept( detail::allocation_failure_terminates ) {
         if ( this == &other ) {
             scratch = *this;
             return;
@@ -1272,7 +1284,7 @@ public:
         }
     }
 
-    [[ gnu::hot ]] void difference_into( bitmap const & other, bitmap & scratch ) const {
+    [[ gnu::hot ]] void difference_into( bitmap const & other, bitmap & scratch ) const noexcept( detail::allocation_failure_terminates ) {
         if ( this == &other ) {
             scratch.clear_keep_capacity();
             return;
@@ -1607,7 +1619,7 @@ public:
         return *this;
     }
 
-    [[ gnu::hot ]] bitmap & operator|=( bitmap const & other ) { return union_merge( other, false ); }
+    [[ gnu::hot ]] bitmap & operator|=( bitmap const & other ) noexcept( detail::allocation_failure_terminates ) { return union_merge( other, false ); }
 
     // Recomputes every chunk's cardinality when a nocard lazy word kernel left it
     // stale, and rebuilds size_. Card-updating bulk OR clears the stale flag, so a
@@ -2213,13 +2225,15 @@ public:
         return *this;
     }
 
-    [[ gnu::hot ]] bitmap & operator&=( bitmap const & other ) { return combine( other, detail::set_operation::bit_and ); }
+    [[ gnu::hot ]] bitmap & operator&=( bitmap const & other ) noexcept( detail::allocation_failure_terminates ) { return combine( other, detail::set_operation::bit_and ); }
 
-    [[ gnu::hot ]] bitmap & operator-=( bitmap const & other ) { return combine( other, detail::set_operation::bit_andnot ); }
+    [[ gnu::hot ]] bitmap & operator-=( bitmap const & other ) noexcept( detail::allocation_failure_terminates ) { return combine( other, detail::set_operation::bit_andnot ); }
 
-    bitmap & operator+=( bitmap const & other ) { return ( *this |= other ); }
+    bitmap & operator+=( bitmap const & other ) noexcept( detail::allocation_failure_terminates ) { return ( *this |= other ); }
 
-    bitmap & operator&=( inverse_proxy const inverse ) {
+    bitmap & operator^=( bitmap const & other ) noexcept( detail::allocation_failure_terminates ) { return xor_merge( other ); }
+
+    bitmap & operator&=( inverse_proxy const inverse ) noexcept( detail::allocation_failure_terminates ) {
         return ( *this -= inverse.bm );
     }
 
@@ -2231,7 +2245,7 @@ public:
     // chunk-move that union_merge(…, /*lazy*/true) incurs on every one of the K folds — the
     // profiler-confirmed core-bound / per-call-alloc cost that dominated the N-way union.
     // [croaring-ref] deps/croaring/src/roaring.c:roaring_bitmap_lazy_or_inplace
-    [[ gnu::hot ]] void bulk_or_inplace( bitmap const & other ) {
+    [[ gnu::hot ]] void bulk_or_inplace( bitmap const & other ) noexcept( detail::allocation_failure_terminates ) {
         auto const & rhs{ other.chunks_ };
         auto pos1{ chunks_.begin() };
         auto pos2{ rhs.begin() };
@@ -2330,14 +2344,14 @@ public:
 
     // Lazy accumulation step: OR `other` in, deferring the per-bitset popcount.
     // size_ is invalid until a finisher (or or_many_in_place) calls repair_cardinality().
-    [[ gnu::hot ]] void bulk_or_intermediate( bitmap const & other ) { bulk_or_inplace( other ); }
+    [[ gnu::hot ]] void bulk_or_intermediate( bitmap const & other ) noexcept( detail::allocation_failure_terminates ) { bulk_or_inplace( other ); }
     // Reshapes with the bitmap's AMBIENT RunSelectionPolicy, not a forced eager
     // one: this finishes an ordinary (lazy-accumulated) merge result, so it must
     // NOT reintroduce eager run-selection under run_selection_lazy — that's
     // exactly the "merge results" case this policy targets. Deliberately does not
     // call the public optimize() (which forces run_selection_eager, mirroring
     // CRoaring's explicit run_optimize() and must stay caller-requested-only).
-    void bulk_or_finish() noexcept {
+    void bulk_or_finish() noexcept( detail::allocation_failure_terminates ) {
         repair_cardinality();
         for ( auto & slot : chunks_.slots() ) {
             slot = optimize_container_for_policy( std::move( slot ) );
@@ -2348,7 +2362,7 @@ public:
     // in verbatim from its operands, and under the ambient lazy policy a run can
     // never be re-chosen, so every such container would be materialized out and
     // re-encoded on the caller's next optimize().
-    void bulk_or_finish_keep_bitsets() noexcept {
+    void bulk_or_finish_keep_bitsets() noexcept( detail::allocation_failure_terminates ) {
         repair_cardinality();  // bulk_or_intermediate left bitset cardinalities stale
         for ( auto & slot : chunks_.slots() ) {
             slot = optimize_container_keep_bitsets_for_policy<detail::run_selection_eager>( std::move( slot ) );
@@ -2360,7 +2374,7 @@ public:
     // pre-existing run containers, and leave arrays untouched. This is narrower
     // than bulk_or_finish(), which applies the ambient storage policy to every
     // slot and needlessly scans dense bitsets for run encoding.
-    void bulk_or_repair_after_lazy() noexcept {
+    void bulk_or_repair_after_lazy() noexcept( detail::allocation_failure_terminates ) {
         repair_cardinality();
         for ( auto & slot : chunks_.slots() ) {
             if ( slot.holds_bitset() && slot.cardinality() <= array_to_bitset_threshold ) {
@@ -2376,7 +2390,7 @@ public:
         }
     }
 
-    [[ gnu::hot ]] void or_many_in_place( std::span<bitmap const * const> const others ) {
+    [[ gnu::hot ]] void or_many_in_place( std::span<bitmap const * const> const others ) noexcept( detail::allocation_failure_terminates ) {
         for ( auto const other : others ) {
             if ( other != nullptr ) {
                 bulk_or_intermediate( *other );
@@ -2385,18 +2399,352 @@ public:
         bulk_or_repair_after_lazy();
     }
 
-    [[ gnu::hot ]] void or_many_sorted_in_place( std::span<bitmap const *> others ) {
+    [[ gnu::hot ]] void or_many_sorted_in_place( std::span<bitmap const *> others ) noexcept( detail::allocation_failure_terminates ) {
         std::ranges::sort( others, []( bitmap const * const lhs, bitmap const * const rhs ) {
             return lhs->data_byte_size() > rhs->data_byte_size();
         } );
         or_many_in_place( { others.data(), others.size() } );
     }
 
-    void or_many_heap_in_place( std::span<bitmap const *> others ) {
+    void or_many_heap_in_place( std::span<bitmap const *> others ) noexcept( detail::allocation_failure_terminates ) {
         or_many_sorted_in_place( others );
     }
 
-    [[ gnu::hot ]] void and_many_sorted_in_place( std::span<bitmap const *> others ) {
+    // ---- exclusive-or (symmetric difference) --------------------------------------------------------------
+    //
+    // Unlike the other set operations the result can lose a chunk the operands hold (two equal containers cancel)
+    // and gains the chunks only the other operand holds, so the walks are the union's with empty results dropped.
+    // A result is an array up to array_to_bitset_threshold values and a bitset above, as the reference has it.
+    // [croaring-ref] deps/croaring/src/roaring.c:roaring_bitmap_xor, roaring_bitmap_xor_inplace
+
+    [[nodiscard]] static handle_type xor_result_for_policy( handle_type container ) {
+        if constexpr ( uses_default_container_set ) {
+            return container;
+        } else {
+            return optimize_container_for_policy( std::move( container ) );
+        }
+    }
+
+    [[nodiscard]] static handle_type xor_containers_for_policy( handle_type const & lhs, handle_type const & rhs ) {
+        return xor_result_for_policy( detail::xor_containers<layout_type, CowPolicy>( lhs, rhs, array_to_bitset_threshold ) );
+    }
+
+    // A bitset result in its final form (see detail::settle_xor_bitset); the vacated payload of a demotion is
+    // parked in `store` for the next result to take. Parking is only a reuse of the memory: a table that cannot
+    // grow to hold it frees it instead, so the demotion that has been made is not undone by the failure.
+    [[nodiscard]] static handle_type settle_xor_bitset( handle_type && container, detail::chunk_store<layout_type, CowPolicy> & store ) {
+        return detail::settle_xor_bitset<layout_type, CowPolicy>(
+            std::move( container ), array_to_bitset_threshold, [ &store ]( handle_type && vacated ) noexcept {
+                try { store.retire( std::move( vacated ) ); } catch ( std::bad_alloc const & ) {}
+            } );
+    }
+
+    // `lhs ^ rhs` of the containers of one key, as a new container; neither operand is touched.
+    [[nodiscard]] static handle_type xor_pair( detail::chunk_store<layout_type, CowPolicy> & store, handle_type const & lhs, handle_type const & rhs ) {
+        if ( lhs.holds_array() && rhs.holds_array() ) {
+            return xor_result_for_policy( detail::xor_array_array<layout_type, CowPolicy>( lhs.as_array(), rhs.as_array(), array_to_bitset_threshold ) );
+        }
+        if ( lhs.holds_bitset() && rhs.holds_bitset() ) {
+            return settle_xor_bitset( combine_bitset_bitset_for_policy(
+                lhs.as_bitset(), rhs.as_bitset(), detail::set_operation::bit_xor, store.take_retired( detail::container_kind::bitset ) ), store );
+        }
+        return xor_containers_for_policy( lhs, rhs );
+    }
+
+    // `left ^= right` of the containers of one key. A payload nobody else holds is changed where it stands when
+    // that is the cheaper form: a bitset takes a bitset, the values of an array or the runs of a run container
+    // by flipping the bits in its own words, with the cardinality kept exact. Everything else is computed into
+    // a new container.
+    // [croaring-ref] deps/croaring/src/containers/containers.c:container_ixor
+    [[ gnu::always_inline ]] void xor_same_key(
+        detail::chunk_store<layout_type, CowPolicy> & store,
+        handle_type & left_container,
+        handle_type const & right_container
+    ) {
+        if ( left_container.holds_bitset() && left_container.payload_is_unshared() ) {
+            if ( right_container.holds_bitset() ) {
+                detail::combine_bitset_bitset_inplace<layout_type>( left_container.as_bitset(), right_container.as_bitset(), detail::set_operation::bit_xor );
+            } else if ( right_container.holds_array() ) {
+                detail::xor_array_into_bitset_inplace<false, layout_type>( left_container.as_bitset(), right_container.as_array() );
+            } else {
+                detail::xor_runs_into_bitset_inplace<false, layout_type>( left_container.as_bitset(), right_container.as_run() );
+            }
+            left_container = settle_xor_bitset( std::move( left_container ), store );
+            return;
+        }
+        left_container = xor_pair( store, left_container, right_container );
+    }
+
+    // `this ^ other` into `scratch` (whose previous contents are discarded; its payloads are reused).
+    [[ gnu::hot ]] void xor_into( bitmap const & other, bitmap & scratch ) const noexcept( detail::allocation_failure_terminates ) {
+        scratch.clear_keep_capacity();
+        if ( this == &other ) {
+            return;
+        }
+        scratch.chunks_.reserve( chunks_.size() + other.chunks_.size() );
+        auto const push_alone{ [ & ]( chunk_type const key, handle_type const & container ) {
+            if ( auto const count{ detail::container_size( container ) }; count != 0 ) {
+                scratch.size_ += count;
+                scratch.chunks_.push_back( key, container );
+            }
+        } };
+        auto left{ chunks_.begin() };
+        auto right{ other.chunks_.begin() };
+        while ( left != chunks_.end() && right != other.chunks_.end() ) {
+            auto const left_key { chunks_.key( left ) };
+            auto const right_key{ other.chunks_.key( right ) };
+            if ( left_key < right_key ) {
+                push_alone( left_key, chunks_.slot( left ) );
+                ++left;
+            } else if ( right_key < left_key ) {
+                push_alone( right_key, other.chunks_.slot( right ) );
+                ++right;
+            } else {
+                auto container{ xor_pair( scratch.chunks_, chunks_.slot( left ), other.chunks_.slot( right ) ) };
+                if ( auto const count{ detail::container_size( container ) }; count != 0 ) {
+                    scratch.size_ += count;
+                    scratch.chunks_.push_back( left_key, std::move( container ) );
+                }
+                ++left;
+                ++right;
+            }
+        }
+        for ( ; left != chunks_.end(); ++left ) {
+            push_alone( chunks_.key( left ), chunks_.slot( left ) );
+        }
+        for ( ; right != other.chunks_.end(); ++right ) {
+            push_alone( other.chunks_.key( right ), other.chunks_.slot( right ) );
+        }
+    }
+
+    // Keeps `size_` equal to the sum of the containers' sizes across an exclusive-or of one container, whether it
+    // returns or throws (a container is replaced only by a finished result, so one that is left is whole).
+    struct size_reconciliation {
+        size_type &          total;
+        handle_type const &  container;
+        size_type            before;
+        size_reconciliation( size_type & total_, handle_type const & container_ ) noexcept
+            : total{ total_ }, container{ container_ }, before{ detail::container_size( container_ ) } {}
+        size_reconciliation( size_reconciliation const & ) = delete;
+        ~size_reconciliation() { total = total - before + detail::container_size( container ); }
+    };
+
+    // The containers of shared keys are exclusive-ored in place while the walk finds no key the other bitmap
+    // holds and this one lacks, and no container that cancels out; from the first of either the rest of the
+    // table is rebuilt. If an allocation fails the bitmap is left valid but with unspecified contents (the
+    // containers the walk had already combined are changed, and once the table is being rebuilt it is emptied).
+    // [croaring-ref] deps/croaring/src/roaring.c:roaring_bitmap_xor_inplace
+    [[ gnu::hot ]] bitmap & xor_merge( bitmap const & other ) {
+        if ( this == &other ) {
+            clear();
+            return *this;
+        }
+        if ( other.chunks_.empty() ) {
+            return *this;
+        }
+        if ( chunks_.empty() ) {
+            return *this = other;
+        }
+        auto left{ chunks_.begin() };
+        auto right{ other.chunks_.begin() };
+        bool cancelled{ false };
+        while ( left != chunks_.end() && right != other.chunks_.end() ) {
+            auto const left_key { chunks_.key( left ) };
+            auto const right_key{ other.chunks_.key( right ) };
+            if ( left_key < right_key ) {
+                ++left;
+            } else if ( right_key < left_key ) {
+                break;
+            } else {
+                auto       & left_container { chunks_.slot( left ) };
+                auto const & right_container{ other.chunks_.slot( right ) };
+                {
+                    size_reconciliation const reconcile{ size_, left_container };
+                    xor_same_key( chunks_, left_container, right_container );
+                }
+                ++right;
+                if ( detail::container_size( left_container ) == 0 ) {
+                    cancelled = true;
+                    break;   // `left` stays on the emptied slot, which the rebuild below drops
+                }
+                ++left;
+            }
+        }
+        if ( right == other.chunks_.end() && !cancelled ) {
+            return *this;
+        }
+
+        try {
+        detail::chunk_store<layout_type, CowPolicy> merged;
+        merged.reserve( chunks_.size() + other.chunks_.size() );
+        for ( auto kept{ chunks_.begin() }; kept != left; ++kept ) {
+            merged.push_back( chunks_.key( kept ), std::move( chunks_.slot( kept ) ) );
+        }
+        auto const keep_left{ [ & ]( auto const at ) {
+            if ( detail::container_size( chunks_.slot( at ) ) != 0 ) {
+                merged.push_back( chunks_.key( at ), std::move( chunks_.slot( at ) ) );
+            }
+        } };
+        auto const take_right{ [ & ]( auto const at ) {
+            auto const & container{ other.chunks_.slot( at ) };
+            if ( auto const count{ detail::container_size( container ) }; count != 0 ) {
+                size_ += count;
+                merged.push_back( other.chunks_.key( at ), container );
+            }
+        } };
+        while ( left != chunks_.end() && right != other.chunks_.end() ) {
+            auto const left_key { chunks_.key( left ) };
+            auto const right_key{ other.chunks_.key( right ) };
+            if ( left_key < right_key ) {
+                keep_left( left );
+                ++left;
+            } else if ( right_key < left_key ) {
+                take_right( right );
+                ++right;
+            } else {
+                auto       & left_container { chunks_.slot( left ) };
+                auto const & right_container{ other.chunks_.slot( right ) };
+                {
+                    size_reconciliation const reconcile{ size_, left_container };
+                    xor_same_key( merged, left_container, right_container );
+                }
+                keep_left( left );
+                ++left;
+                ++right;
+            }
+        }
+        for ( ; left != chunks_.end(); ++left ) { keep_left( left ); }
+        for ( ; right != other.chunks_.end(); ++right ) { take_right( right ); }
+        chunks_ = std::move( merged );
+        } catch ( ... ) {
+            clear();   // slots have been moved into `merged`: what is left of the table is not the bitmap
+            throw;
+        }
+        return *this;
+    }
+
+    // How many keys are in exactly one of the two bitmaps.
+    // [croaring-ref] deps/croaring/src/roaring.c:roaring_bitmap_xor_cardinality
+    [[nodiscard]] size_type xor_cardinality( bitmap const & other ) const {
+        return size_ + other.size_ - 2 * and_cardinality( other );
+    }
+
+    // One fold of xor_many_in_place: `other` is exclusive-ored into the chunk table without rebuilding
+    // it (shared keys in place, keys only this holds untouched, keys only `other` holds spliced in), and
+    // the cardinalities of the bitsets it dirties are left stale for bulk_xor_repair_after_lazy().
+    // [croaring-ref] deps/croaring/src/roaring.c:roaring_bitmap_lazy_xor_inplace
+    [[ gnu::hot ]] void bulk_xor_intermediate( bitmap const & other ) noexcept( detail::allocation_failure_terminates ) {
+        if ( this == &other ) {
+            clear();
+            return;
+        }
+        auto const & rhs{ other.chunks_ };
+        auto pos1{ chunks_.begin() };
+        auto pos2{ rhs.begin() };
+        while ( pos1 != chunks_.end() && pos2 != rhs.end() ) {
+            auto const left_key { chunks_.key( pos1 ) };
+            auto const right_key{ rhs.key( pos2 ) };
+            if ( left_key < right_key ) {
+                ++pos1;
+                continue;
+            }
+            if ( right_key < left_key ) {
+                if ( detail::container_size( rhs.slot( pos2 ) ) != 0 ) {
+                    pos1 = chunks_.insert( pos1, right_key, rhs.slot( pos2 ) );
+                    ++pos1;
+                }
+                ++pos2;
+                continue;
+            }
+            lazy_xor_same_key( chunks_, chunks_.slot( pos1 ), rhs.slot( pos2 ) );
+            ++pos1;
+            ++pos2;
+        }
+        for ( ; pos2 != rhs.end(); ++pos2 ) {
+            if ( detail::container_size( rhs.slot( pos2 ) ) != 0 ) {
+                chunks_.push_back( rhs.key( pos2 ), rhs.slot( pos2 ) );
+            }
+        }
+    }
+
+    // `left ^= right` of the containers of one key, leaving a bitset's cardinality stale where that saves its
+    // count: a bitset against a bitset, an array or runs; two arrays that grow past what an array merge is worth
+    // become a bitset, as does an array against a bitset. Anything else is computed whole.
+    // [croaring-ref] deps/croaring/src/containers/containers.c:container_lazy_ixor
+    void lazy_xor_same_key(
+        detail::chunk_store<layout_type, CowPolicy> & store,
+        handle_type & left_container,
+        handle_type const & right_container
+    ) {
+        if ( left_container.holds_array() && right_container.holds_array() &&
+             left_container.count() + right_container.count() > detail::lazy_xor_array_bound ) {
+            left_container = detail::bitset_handle_from_sorted_values<layout_type, CowPolicy>(
+                { std::as_const( left_container ).as_array().values.data(), left_container.count() } );
+        } else if ( left_container.holds_array() && right_container.holds_bitset() ) {
+            auto result{ detail::clone_bitset_words<layout_type, CowPolicy>( right_container.as_bitset() ) };
+            detail::xor_array_into_bitset_inplace<true, layout_type>( result.as_bitset(), std::as_const( left_container ).as_array() );
+            left_container = std::move( result );
+            return;
+        }
+        if ( left_container.holds_bitset() ) {
+            if ( right_container.holds_bitset() ) {
+                detail::xor_bitset_bitset_inplace_lazy<layout_type>( left_container.as_bitset(), right_container.as_bitset() );
+                return;
+            }
+            if ( right_container.holds_array() ) {
+                detail::xor_array_into_bitset_inplace<true, layout_type>( left_container.as_bitset(), right_container.as_array() );
+                return;
+            }
+            detail::xor_runs_into_bitset_inplace<true, layout_type>( left_container.as_bitset(), right_container.as_run() );
+            return;
+        }
+        left_container = xor_pair( store, left_container, right_container );
+    }
+
+    // Puts the bitmap right after a fold of bulk_xor_intermediate() steps: the deferred bitset cardinalities are
+    // counted, bitsets that fell to the array limit become arrays, run containers get their form decided again,
+    // and the containers that cancelled out are dropped.
+    // [croaring-ref] deps/croaring/src/roaring.c:roaring_bitmap_repair_after_lazy
+    void bulk_xor_repair_after_lazy() noexcept( detail::allocation_failure_terminates ) {
+        repair_cardinality();
+        bool any_empty{ false };
+        for ( auto & slot : chunks_.slots() ) {
+            if ( slot.holds_bitset() && slot.cardinality() <= array_to_bitset_threshold ) {
+                slot = settle_xor_bitset( std::move( slot ), chunks_ );
+            } else if ( slot.holds_run() ) {
+                slot = optimize_container_for_policy<detail::run_selection_eager>( std::move( slot ) );
+            }
+            any_empty |= slot.cardinality() == 0;
+        }
+        if ( any_empty ) {
+            detail::interop_engine<bitmap>::drop_empty_chunks( *this );
+        }
+    }
+
+    // `this ^= *others[ 0 ] ^= ...`: the fold of the exclusive-or over many bitmaps, which defers the
+    // bitsets' cardinality counts to the end. Null entries are skipped.
+    // [croaring-ref] deps/croaring/src/roaring.c:roaring_bitmap_xor_many
+    [[ gnu::hot ]] void xor_many_in_place( std::span<bitmap const * const> const others ) noexcept( detail::allocation_failure_terminates ) {
+        try {
+            for ( auto const other : others ) {
+                if ( other != nullptr ) {
+                    bulk_xor_intermediate( *other );
+                }
+            }
+        } catch ( ... ) {
+            clear();   // the folded containers are not counted and some may have cancelled: valid, contents unspecified
+            throw;
+        }
+        bulk_xor_repair_after_lazy();
+    }
+
+    [[nodiscard]] static bitmap xor_many( std::span<bitmap const * const> const operands ) noexcept( detail::allocation_failure_terminates ) {
+        bitmap result;
+        result.xor_many_in_place( operands );
+        return result;
+    }
+
+    [[ gnu::hot ]] void and_many_sorted_in_place( std::span<bitmap const *> others ) noexcept( detail::allocation_failure_terminates ) {
         std::ranges::sort( others, []( bitmap const * const lhs, bitmap const * const rhs ) {
             return lhs->data_byte_size() < rhs->data_byte_size();
         } );
@@ -2835,7 +3183,7 @@ public:
     // next to a caller-requested compaction (optimize()) or before a long idle
     // period, never inside a set operation.
     // [croaring-ref] deps/croaring/src/roaring.c:roaring_bitmap_shrink_to_fit
-    [[ gnu::cold ]] std::size_t shrink_to_fit() {
+    [[ gnu::cold ]] std::size_t shrink_to_fit() noexcept( detail::allocation_failure_terminates ) {
         std::size_t freed{ 0 };
         for ( auto & slot : chunks_.slots() ) {
             freed += detail::container_shrink_to_fit( slot );
@@ -2844,7 +3192,7 @@ public:
         return freed;
     }
 
-    void promote_large_arrays( std::uint16_t const threshold = static_cast<std::uint16_t>( array_to_bitset_threshold ) ) {
+    void promote_large_arrays( std::uint16_t const threshold = static_cast<std::uint16_t>( array_to_bitset_threshold ) ) noexcept( detail::allocation_failure_terminates ) {
         for ( auto & slot : chunks_.slots() ) {
             if ( slot.holds_array() && slot.count() >= threshold ) {
                 if constexpr ( supports_bitset_container ) {
@@ -2865,7 +3213,7 @@ public:
     // insert/merge never auto-picks run encoding, but this call still can, on
     // request, exactly like CRoaring never auto-run-encodes except via an
     // explicit run_optimize() call.
-    void optimize() {
+    void optimize() noexcept( detail::allocation_failure_terminates ) {
         for ( auto & slot : chunks_.slots() ) {
             slot = optimize_container_for_policy<detail::run_selection_eager>( std::move( slot ) );
         }
@@ -2891,7 +3239,7 @@ public:
     // the two are behaviourally identical there; the divergence from run_optimize() is
     // real in principle but was not observed to matter. Do not cite this as a
     // speed optimization without measuring it.
-    void optimize_keep_bitsets() {
+    void optimize_keep_bitsets() noexcept( detail::allocation_failure_terminates ) {
         for ( auto & slot : chunks_.slots() ) {
             if constexpr ( supports_bitset_container && uses_default_container_set ) {
                 if ( slot.holds_bitset() ) {
@@ -2932,7 +3280,7 @@ public:
     // every container by serialized size, only strongly run-shaped containers move
     // — a marginal run container costs more in consumers' run×array/run×bitset
     // kernels than it saves in bytes, so the caller sets the bar.
-    void optimize_run_shaped( std::size_t const min_mean_run_length ) {
+    void optimize_run_shaped( std::size_t const min_mean_run_length ) noexcept( detail::allocation_failure_terminates ) {
         for ( auto & slot : chunks_.slots() ) {
             if ( slot.holds_run() ) {
                 continue;
@@ -2959,23 +3307,23 @@ public:
         }
     }
 
-    void optimize_for_storage() { optimize(); }
-    void optimize_for_speed( std::uint16_t const threshold = static_cast<std::uint16_t>( array_to_bitset_threshold ) ) {
+    void optimize_for_storage() noexcept( detail::allocation_failure_terminates ) { optimize(); }
+    void optimize_for_speed( std::uint16_t const threshold = static_cast<std::uint16_t>( array_to_bitset_threshold ) ) noexcept( detail::allocation_failure_terminates ) {
         promote_large_arrays( threshold );
     }
     [[nodiscard]] inverse_proxy operator!() const noexcept { return inverse_proxy{ *this }; }
 
-    [[nodiscard]] friend bitmap operator|( bitmap const & lhs, bitmap const & rhs ) {
+    [[nodiscard]] friend bitmap operator|( bitmap const & lhs, bitmap const & rhs ) noexcept( detail::allocation_failure_terminates ) {
         bitmap result;
         lhs.union_into( rhs, result );
         return result;
     }
 
-    [[nodiscard]] friend bitmap operator+( bitmap const & lhs, bitmap const & rhs ) {
+    [[nodiscard]] friend bitmap operator+( bitmap const & lhs, bitmap const & rhs ) noexcept( detail::allocation_failure_terminates ) {
         return lhs | rhs;
     }
 
-    [[nodiscard]] friend bitmap operator&( bitmap const & lhs, bitmap const & rhs ) {
+    [[nodiscard]] friend bitmap operator&( bitmap const & lhs, bitmap const & rhs ) noexcept( detail::allocation_failure_terminates ) {
         bitmap result;
         lhs.intersect_into( rhs, result );
         return result;
@@ -2985,15 +3333,21 @@ public:
     // — taking lhs by value would copy the whole bitmap and then mutate the copy,
     // which under a refcounting CowPolicy also clones every payload the in-place
     // difference touches, because the copy left them shared.
-    [[nodiscard]] friend bitmap operator&( bitmap const & lhs, inverse_proxy const rhs ) {
+    [[nodiscard]] friend bitmap operator&( bitmap const & lhs, inverse_proxy const rhs ) noexcept( detail::allocation_failure_terminates ) {
         bitmap result;
         lhs.difference_into( rhs.bm, result );
         return result;
     }
 
-    [[nodiscard]] friend bitmap operator-( bitmap const & lhs, bitmap const & rhs ) {
+    [[nodiscard]] friend bitmap operator-( bitmap const & lhs, bitmap const & rhs ) noexcept( detail::allocation_failure_terminates ) {
         bitmap result;
         lhs.difference_into( rhs, result );
+        return result;
+    }
+
+    [[nodiscard]] friend bitmap operator^( bitmap const & lhs, bitmap const & rhs ) noexcept( detail::allocation_failure_terminates ) {
+        bitmap result;
+        lhs.xor_into( rhs, result );
         return result;
     }
 

@@ -215,7 +215,18 @@ template <typename Layout, typename CowPolicy = cow_value_semantics>
     auto array{ result.as_array() };
     resize_uninitialized( array.values, container_size<Layout>( container ) );
     auto * out{ array.values.data() };
-    container_for_each<Layout>( container, [&]( typename Layout::low_type const value ) { *out++ = value; } );
+    if ( container.holds_run() ) {
+        // a counted, index-addressed fill per run, which the compiler turns into vector stores
+        // [croaring-ref] deps/croaring/src/containers/convert.c:array_container_from_run
+        for ( auto const & run : container.as_run().runs ) {
+            auto const first{ run.begin };
+            auto const count{ static_cast<std::size_t>( run.end - run.begin ) + 1U };
+            for ( std::size_t i{ 0 }; i < count; ++i ) { out[ i ] = static_cast<typename Layout::low_type>( first + i ); }
+            out += count;
+        }
+    } else {
+        container_for_each<Layout>( container, [&]( typename Layout::low_type const value ) { *out++ = value; } );
+    }
     array.sync_header();
     return result;
 }
@@ -763,6 +774,9 @@ template <typename Layout>
             case set_operation::bit_andnot:
                 lhs[ index ] &= ~rhs[ index ];
                 break;
+            case set_operation::bit_xor:
+                lhs[ index ] ^= rhs[ index ];
+                break;
         }
     }
     return lhs;
@@ -913,6 +927,31 @@ template <typename Layout, typename CowPolicy>
     return result;
 }
 
+// A freshly built run container (at least one run, header synced) in the smallest of its three forms: the
+// runs as they are, an array of the values, or a bitset.
+template <typename Layout, typename CowPolicy>
+[[nodiscard]] inline container_handle<Layout, CowPolicy> settle_run_result(
+    container_handle<Layout, CowPolicy> result,
+    std::size_t const bitset_threshold
+) {
+    using low_type = typename Layout::low_type;
+    using run_type = ::frsr::roaring::run<low_type>;
+    constexpr auto bitset_bytes{ Layout::word_count * sizeof( std::uint64_t ) };
+    auto const runs       { std::as_const( result ).as_run().runs };
+    auto const cardinality{ static_cast<std::size_t>( result.cardinality() ) };
+    auto const run_bytes  { runs.size() * sizeof( run_type ) + sizeof( low_type ) };
+    auto const array_bytes{ cardinality * sizeof( low_type ) };
+    if ( run_bytes <= std::min( bitset_bytes, array_bytes ) ) { return result; }
+    if ( !is_bitset_cardinality<Layout>( cardinality, bitset_threshold ) ) {
+        return array_handle_from_container<Layout, CowPolicy>( result );
+    }
+    word_array<Layout> words{};
+    for ( auto const & current : runs ) {
+        apply_range_to_words<Layout>( words, current.begin, current.end, range_operation::add );
+    }
+    return make_bitset_container_from_words<Layout, CowPolicy>( words );
+}
+
 // Flip of [begin, end] in a run container: the range joins the runs as one more
 // exclusive-or append (run_container_negation_range), then the result takes the
 // smallest of the three forms.
@@ -942,20 +981,7 @@ template <typename Layout, typename CowPolicy>
     if ( n == 0 ) { return handle_type{}; }
     ref.runs.resize_uninitialized( static_cast<std::uint32_t>( n ) );
     ref.sync_header();
-
-    constexpr auto bitset_bytes{ Layout::word_count * sizeof( std::uint64_t ) };
-    auto const cardinality{ static_cast<std::size_t>( result.cardinality() ) };
-    auto const run_bytes  { n * sizeof( run_type ) + sizeof( low_type ) };
-    auto const array_bytes{ cardinality * sizeof( low_type ) };
-    if ( run_bytes <= std::min( bitset_bytes, array_bytes ) ) { return result; }
-    if ( !is_bitset_cardinality<Layout>( cardinality, bitset_threshold ) ) {
-        return array_handle_from_container<Layout, CowPolicy>( result );
-    }
-    word_array<Layout> words{};
-    for ( auto const & current : std::span<run_type const>{ ref.runs.data(), n } ) {
-        apply_range_to_words<Layout>( words, current.begin, current.end, range_operation::add );
-    }
-    return make_bitset_container_from_words<Layout, CowPolicy>( words );
+    return settle_run_result<Layout, CowPolicy>( std::move( result ), bitset_threshold );
 }
 
 // Flip of [begin, end] in a bitset: the words flip in place, and the result is an

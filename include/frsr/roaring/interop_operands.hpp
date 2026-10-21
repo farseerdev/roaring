@@ -283,6 +283,11 @@ private:
     handle_type        full_piece_ {};
 };
 
+template <typename Source>
+inline constexpr bool is_interval_source_v{ false };
+template <typename Layout, typename CowPolicy>
+inline constexpr bool is_interval_source_v<interval_source<Layout, CowPolicy>>{ true };
+
 // The pieces of a sorted range of keys (equal neighbours allowed): the keys of a chunk are gathered into an
 // array piece, or a bitset piece when there are more of them than an array holds.
 template <typename Layout, typename CowPolicy, typename It, typename Sent>
