@@ -413,13 +413,14 @@ template <typename Layout, typename CowPolicy = cow_value_semantics>
 }
 
 // Exact CRoaring container_is_full: true only when the header still knows the
-// container is saturated. Lazy bitsets with a stale/unknown card return false
+// container is saturated. A bitset whose count is stale answers from the count it holds, which is never
+// above the true one (see mark_cardinality_stale), so it says full only when it is, and says no
 // even if every bit happens to be set.
 template <typename Layout, typename CowPolicy = cow_value_semantics>
 [[nodiscard]] inline bool container_is_known_full(
     container_handle<Layout, CowPolicy> const & handle
 ) noexcept {
-    if ( handle.cardinality() != Layout::low_domain_size ) {
+    if ( handle.stored_cardinality() != Layout::low_domain_size ) {
         return false;
     }
     if ( handle.holds_run() ) {

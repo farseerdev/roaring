@@ -285,6 +285,7 @@ if(FRSR_ROARING_BUILD_TESTS)
         tests/bitmap_concurrent_reads.cpp
         tests/kernel_coverage.cpp
         tests/contains_states.cpp
+        tests/lazy_fold_state.cpp
         tests/bitmap_const_concurrency.cpp
         tests/chunk_tree.cpp
         tests/interop.cpp

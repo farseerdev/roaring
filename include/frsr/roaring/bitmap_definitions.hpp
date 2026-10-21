@@ -180,6 +180,7 @@ FRSR_ROARING_DEFINITION_INLINE bool FRSR_ROARING_BITMAP::intersects( bitmap cons
 
 FRSR_ROARING_BITMAP_TEMPLATE
 FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::add_many_sorted( std::span<key_type const> const sorted_values ) noexcept( detail::allocation_failure_terminates ) {
+    settle_counts();
     if ( sorted_values.empty() ) {
         return;
     }
@@ -228,6 +229,7 @@ FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::add_many_sorted( std::s
 
 FRSR_ROARING_BITMAP_TEMPLATE
 FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::remove_many_sorted( std::span<key_type const> const sorted_values ) noexcept( detail::allocation_failure_terminates ) {
+    settle_counts();
     if ( sorted_values.empty() ) {
         return;
     }
@@ -1359,6 +1361,8 @@ FRSR_ROARING_DEFINITION_INLINE auto FRSR_ROARING_BITMAP::combine( bitmap const &
 
 FRSR_ROARING_BITMAP_TEMPLATE
 FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::bulk_or_inplace( bitmap const & other ) noexcept( detail::allocation_failure_terminates ) {
+    // Counts are not maintained by the fold.
+    size_ = size_deferred;
     auto const & rhs{ other.chunks_ };
     auto pos1{ chunks_.begin() };
     auto pos2{ rhs.begin() };
@@ -1441,7 +1445,9 @@ FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::bulk_or_inplace( bitmap
                 continue;
             }
         }
-        // Run-typed operand (no SIMD in-place form): materialized combine into the slot.
+        // Run-typed operand (no SIMD in-place form): materialized combine into the slot, which reads the
+        // exact count of a bitset it meets.
+        left_container.settle_cardinality();
         left_container = combine_containers_for_policy( left_container, right_container, detail::set_operation::bit_or );
         ++pos1;
         ++pos2;
@@ -1605,6 +1611,7 @@ FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::xor_into( bitmap const 
 
 FRSR_ROARING_BITMAP_TEMPLATE
 FRSR_ROARING_DEFINITION_INLINE auto FRSR_ROARING_BITMAP::xor_merge( bitmap const & other ) -> bitmap & {
+    settle_counts();
     if ( this == &other ) {
         clear();
         return *this;
@@ -1695,6 +1702,8 @@ FRSR_ROARING_DEFINITION_INLINE auto FRSR_ROARING_BITMAP::xor_merge( bitmap const
 
 FRSR_ROARING_BITMAP_TEMPLATE
 FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::bulk_xor_intermediate( bitmap const & other ) noexcept( detail::allocation_failure_terminates ) {
+    // Counts are not maintained by the fold.
+    size_ = size_deferred;
     if ( this == &other ) {
         clear();
         return;
@@ -2024,6 +2033,7 @@ FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::promote_large_arrays( s
 
 FRSR_ROARING_BITMAP_TEMPLATE
 FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::optimize() noexcept( detail::allocation_failure_terminates ) {
+    settle_counts();
     for ( auto & slot : chunks_.slots() ) {
         slot = optimize_container_for_policy<detail::run_selection_eager>( std::move( slot ) );
     }
@@ -2031,6 +2041,7 @@ FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::optimize() noexcept( de
 
 FRSR_ROARING_BITMAP_TEMPLATE
 FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::optimize_keep_bitsets() noexcept( detail::allocation_failure_terminates ) {
+    settle_counts();
     for ( auto & slot : chunks_.slots() ) {
         if constexpr ( supports_bitset_container && uses_default_container_set ) {
             if ( slot.holds_bitset() ) {
@@ -2059,6 +2070,7 @@ FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::optimize_keep_bitsets()
 
 FRSR_ROARING_BITMAP_TEMPLATE
 FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::optimize_run_shaped( std::size_t const min_mean_run_length ) noexcept( detail::allocation_failure_terminates ) {
+    settle_counts();
     for ( auto & slot : chunks_.slots() ) {
         if ( slot.holds_run() ) {
             continue;
@@ -2184,6 +2196,7 @@ FRSR_ROARING_DEFINITION_INLINE auto FRSR_ROARING_BITMAP::intersect_run_bitset_fo
 
 FRSR_ROARING_BITMAP_TEMPLATE
 FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::apply_closed_range_operation( key_type const begin_value, key_type const end_value, detail::range_operation const operation ) {
+    settle_counts();
     if ( begin_value > end_value ) {
         return;
     }
@@ -2263,16 +2276,19 @@ FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::remove_many_unsorted( s
 
 FRSR_ROARING_BITMAP_TEMPLATE
 FRSR_ROARING_DEFINITION_INLINE auto FRSR_ROARING_BITMAP::operator|=( bitmap const & other ) noexcept( detail::allocation_failure_terminates ) -> bitmap & {
+    settle_counts();
     return union_merge<false>( other );
 }
 
 FRSR_ROARING_BITMAP_TEMPLATE
 FRSR_ROARING_DEFINITION_INLINE auto FRSR_ROARING_BITMAP::operator&=( bitmap const & other ) noexcept( detail::allocation_failure_terminates ) -> bitmap & {
+    settle_counts();
     return combine<detail::set_operation::bit_and, true>( other, nullptr );
 }
 
 FRSR_ROARING_BITMAP_TEMPLATE
 FRSR_ROARING_DEFINITION_INLINE auto FRSR_ROARING_BITMAP::operator-=( bitmap const & other ) noexcept( detail::allocation_failure_terminates ) -> bitmap & {
+    settle_counts();
     return combine<detail::set_operation::bit_andnot, true>( other, nullptr );
 }
 

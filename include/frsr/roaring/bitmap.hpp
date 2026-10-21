@@ -440,7 +440,8 @@ public:
 
     [[nodiscard]] bool empty() const noexcept { return size_ == 0; }
     [[nodiscard]] bool test( key_type const value ) const noexcept { return contains( value ); }
-    [[nodiscard]] size_type size() const noexcept { return size_; }
+    // Not meaningful while the bitmap is in the middle of a lazy fold (see bulk_or_intermediate).
+    [[nodiscard]] size_type size() const noexcept { assert( !counts_deferred() ); return size_; }
     [[nodiscard]] size_type byte_size() const noexcept;
 
     // Administrative charge per chunk in data_byte_size(), fixed at the reference
@@ -968,6 +969,14 @@ public:
     // popcount when the header is already live).
     void repair_cardinality() noexcept;
 
+    // The state a lazy fold leaves: size_ and the counts of the bitsets it dirtied are not known. size_ then
+    // holds a value no size can reach (the top bit; the half below it absorbs what operations subtract), so that an operation which adds to it or subtracts from it keeps it
+    // recognizable, and empty() is false whatever the fold held. repair_cardinality() ends it.
+    static constexpr size_type size_deferred{ size_type{ 1 } << ( std::numeric_limits<size_type>::digits - 1 ) };
+    [[nodiscard]] bool counts_deferred() const noexcept { return size_ >= size_deferred / 2; }
+    // The entry of an in-place operation that reads container counts: ends a deferred state first.
+    void settle_counts() noexcept { if ( counts_deferred() ) [[unlikely]] { repair_cardinality(); } }
+
     // The shared in-place merge-walk spine behind operator&= (op == bit_and) and
     // operator-= (op == bit_andnot) — ONE copy of the forward-compacting chunk walk
     // and its bookkeeping instead of two monomorphized spines (a differential
@@ -1016,7 +1025,10 @@ public:
     [[ gnu::hot ]] void bulk_or_inplace( bitmap const & other ) noexcept( detail::allocation_failure_terminates );
 
     // Lazy accumulation step: OR `other` in, deferring the per-bitset popcount.
-    // size_ is invalid until a finisher (or or_many_in_place) calls repair_cardinality().
+    // The bitmap is then deferred until a finisher counts it. Meanwhile further folds, every in-place update
+    // (add, remove, ranges, add_many/remove_many, the set-operation assignments and *_with, optimize*) and contains
+    // are allowed and leave a correct bitmap; anything that needs a size or a count (size, iteration,
+    // cardinalities, equals, serialization, using it as an operand) needs the finished bitmap. docs/lazy-folds.md.
     [[ gnu::hot ]] void bulk_or_intermediate( bitmap const & other ) noexcept( detail::allocation_failure_terminates ) { bulk_or_inplace( other ); }
     // Reshapes with the bitmap's AMBIENT RunSelectionPolicy, not a forced eager
     // one: this finishes an ordinary (lazy-accumulated) merge result, so it must
@@ -1945,6 +1957,10 @@ private:
 
     template <detail::interop_op Op, typename Self, typename Operand>
     static decltype( auto ) interop_dispatch( Self & self, Operand const & operand ) {
+        if constexpr ( Op == detail::interop_op::and_with || Op == detail::interop_op::or_with
+                    || Op == detail::interop_op::andnot_with || Op == detail::interop_op::xor_with ) {
+            self.settle_counts();
+        }
         if constexpr ( detail::interop_erasable<Operand, key_type> ) {
             auto const view{ detail::make_operand_view( operand ) };
             if constexpr ( Op == detail::interop_op::and_with || Op == detail::interop_op::or_with

@@ -982,7 +982,7 @@ void combine_bitset_bitset_inplace(
     // so this is an O(1) test that elides the 8 KB read+write+popcount entirely. A
     // fully populated chunk dominates the cost on dense operands; this shortcut is
     // also why CRoaring's in-place OR beats its in-place AND (which has no analog).
-    if ( op == set_operation::bit_or && lhs.cardinality == Layout::word_count * 64U ) {
+    if ( op == set_operation::bit_or && lhs.stored_cardinality() == Layout::word_count * 64U ) {
         return;
     }
     if constexpr ( kFusedHarleySealPopcount ) {
@@ -1173,7 +1173,7 @@ template <typename Layout, typename CowPolicy = cow_value_semantics>
     // dispatched kernel costs no extra call here. Same saturated-LHS shortcut as
     // combine_bitset_bitset_inplace.
     if ( have_x86_v4() ) [[likely]] {
-        if ( lhs.cardinality == Layout::word_count * 64U ) {
+        if ( lhs.stored_cardinality() == Layout::word_count * 64U ) {
             return;
         }
         auto       * const a{ lhs.words.as_array().data() };
@@ -1303,7 +1303,7 @@ inline void xor_array_into_bitset_inplace(
         word ^= std::uint64_t{ 1 } << shift;
     }
     if constexpr ( Lazy ) {
-        lhs.mark_cardinality_stale();
+        lhs.mark_cardinality_unknown();
     } else {
         lhs.cardinality = static_cast<std::uint32_t>( static_cast<std::ptrdiff_t>( lhs.size() ) + delta );
     }
@@ -1335,7 +1335,7 @@ inline void xor_runs_into_bitset_inplace(
         flip( last_word, last_mask );
     }
     if constexpr ( Lazy ) {
-        lhs.mark_cardinality_stale();
+        lhs.mark_cardinality_unknown();
     } else {
         lhs.cardinality = static_cast<std::uint32_t>( popcount_words( words.data(), words.size() ) );
     }
@@ -1352,7 +1352,7 @@ inline void xor_bitset_bitset_inplace_lazy(
     auto       * const a{ lhs.words.as_array().data() };
     auto const * const b{ rhs.words.as_array().data() };
     for ( std::size_t i{ 0 }; i < Layout::word_count; ++i ) { a[ i ] ^= b[ i ]; }
-    lhs.mark_cardinality_stale();
+    lhs.mark_cardinality_unknown();
     lhs.mark_endpoints_stale();
 }
 

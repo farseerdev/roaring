@@ -211,8 +211,14 @@ public:
 
     // Element count in the payload's own unit: array #values, run #runs, bitset word_count.
     [[nodiscard]] std::uint32_t count      () const noexcept { return count_      ; }
-    [[nodiscard]] std::uint32_t cardinality() const noexcept { return cardinality_; }
-    [[nodiscard]] bool          empty      () const noexcept { return cardinality_ == 0; }
+    // The exact element count. A bitset left by a lazy word kernel carries a stale count until a repair
+    // counts its words (see cardinality_valid): reading it then is a programming error, so a debug build
+    // asserts. A consumer that can meet such a bitset settles it first, or reads stored_cardinality().
+    [[nodiscard]] std::uint32_t cardinality() const noexcept { assert( cardinality_valid() ); return cardinality_; }
+    [[nodiscard]] bool          empty      () const noexcept { assert( cardinality_valid() ); return cardinality_ == 0; }
+    // The header count as stored, exact or not. Only for a count that is adjusted by the bits changed
+    // (adjust_cardinality) or recounted, never for a decision.
+    [[nodiscard]] std::uint32_t stored_cardinality() const noexcept { return cardinality_; }
 
     // Valid iff !empty(): smallest / largest value present. Enables the
     // header-only reject (v < min || v > max) without touching the payload.
@@ -230,7 +236,11 @@ public:
     // bulk OR (and ordinary add/remove) leave it clear so a dense K-way union
     // does not re-scan every saturated 8 KB block at finish.
     [[nodiscard]] bool cardinality_valid() const noexcept { return ( flags_ & cardinality_stale_flag ) == 0; }
-    void mark_cardinality_stale() noexcept { flags_ |= cardinality_stale_flag; }
+    // A stale count is never above the true one, which is what lets the count stand in for "at least this
+    // many" (the full-container shortcut) while a fold runs. A kernel that only adds bits keeps the count it
+    // had and marks it stale; one that may clear bits makes it unknown, which is zero.
+    void mark_cardinality_stale  () noexcept { flags_ |= cardinality_stale_flag; }
+    void mark_cardinality_unknown() noexcept { cardinality_ = 0; flags_ |= cardinality_stale_flag; }
 
     [[nodiscard]] bool spilled() const noexcept { return ( flags_ & spilled_flag ) != 0; }
 
@@ -338,9 +348,26 @@ public:
     // ---- header maintenance (used by refs and by direct-write call sites) ---
 
     void set_count      ( std::uint32_t const n ) noexcept { count_       = n; }
+    // Stores an exact count, which makes a stale one exact.
     void set_cardinality( std::uint32_t const n ) noexcept {
         cardinality_ = n;
         flags_ &= static_cast<std::uint8_t>( ~cardinality_stale_flag );
+    }
+    // Makes a stale bitset count exact by counting the payload's words; a no-op on an exact one.
+    void settle_cardinality() noexcept {
+        if ( !cardinality_valid() ) [[unlikely]] {
+            auto const * const words{ payload_data<std::uint64_t>() };
+            std::uint32_t count{ 0 };
+            for ( std::size_t i{ 0 }; i < Layout::word_count; ++i ) {
+                count += static_cast<std::uint32_t>( std::popcount( words[ i ] ) );
+            }
+            set_cardinality( count );
+        }
+    }
+    // Moves the count by the number of bits a mutation changed. A stale count stays stale, and so is still
+    // recounted by the repair, where storing the adjusted value would have declared it exact.
+    void adjust_cardinality( std::int32_t const delta ) noexcept {
+        cardinality_ += static_cast<std::uint32_t>( delta );
     }
     void set_endpoints  ( low_type const min, low_type const max ) noexcept {
         min_ = min;
@@ -917,8 +944,8 @@ public:
     [[nodiscard]] operator std::uint32_t() const noexcept { return handle_->cardinality(); }
 
     header_cardinality_proxy & operator= ( std::uint32_t const n ) noexcept { handle_->set_cardinality( n ); return *this; }
-    header_cardinality_proxy & operator+=( std::uint32_t const n ) noexcept { handle_->set_cardinality( handle_->cardinality() + n ); return *this; }
-    header_cardinality_proxy & operator-=( std::uint32_t const n ) noexcept { handle_->set_cardinality( handle_->cardinality() - n ); return *this; }
+    header_cardinality_proxy & operator+=( std::uint32_t const n ) noexcept { handle_->adjust_cardinality( static_cast<std::int32_t>( n ) ); return *this; }
+    header_cardinality_proxy & operator-=( std::uint32_t const n ) noexcept { handle_->adjust_cardinality( -static_cast<std::int32_t>( n ) ); return *this; }
     header_cardinality_proxy & operator++() noexcept { return *this += 1U; }
     header_cardinality_proxy & operator--() noexcept { return *this -= 1U; }
 
@@ -1680,7 +1707,7 @@ public:
         // Count stays exact (the reference keeps only that); the endpoints are
         // marked stale like the bulk word kernels do, and the first read
         // recomputes them — cheaper than two compares and two stores per bit.
-        handle_->set_cardinality( handle_->cardinality() + 1U );
+        handle_->adjust_cardinality( 1 );
         handle_->mark_endpoints_stale();
         return true;
     }
@@ -1699,9 +1726,9 @@ public:
         if ( additions == 0 ) {
             return 0;
         }
-        auto const previous_cardinality{ handle_->cardinality() };
-        handle_->set_cardinality( static_cast<std::uint32_t>( previous_cardinality + additions ) );
-        if ( previous_cardinality == 0 ) {
+        auto const was_empty{ handle_->cardinality_valid() && handle_->stored_cardinality() == 0 };
+        handle_->adjust_cardinality( static_cast<std::int32_t>( additions ) );
+        if ( was_empty ) {
             handle_->set_endpoints( sorted_values.front(), sorted_values.back() );
         } else if ( handle_->endpoints_valid() ) {
             handle_->set_endpoints(
@@ -1720,10 +1747,12 @@ public:
         if ( ( word & mask ) == 0 ) {
             return false;
         }
+        // The caller drops a container that this empties, which the count must be able to tell.
+        handle_->settle_cardinality();
         word &= ~mask;
-        handle_->set_cardinality( handle_->cardinality() - 1U );
+        handle_->adjust_cardinality( -1 );
         if (
-            !handle_->empty() && handle_->endpoints_valid() &&
+            handle_->endpoints_valid() &&
             ( value == handle_->min_value() || value == handle_->max_value() )
         ) {
             handle_->mark_endpoints_stale();
@@ -1747,8 +1776,10 @@ public:
     void mark_endpoints_stale() noexcept { handle_->mark_endpoints_stale(); }
 
     // Marks cardinality unknown after a nocard lazy word OR (repair must popcount).
-    void mark_cardinality_stale() noexcept { handle_->mark_cardinality_stale(); }
+    void mark_cardinality_stale  () noexcept { handle_->mark_cardinality_stale  (); }
+    void mark_cardinality_unknown() noexcept { handle_->mark_cardinality_unknown(); }
     [[nodiscard]] bool cardinality_valid() const noexcept { return handle_->cardinality_valid(); }
+    [[nodiscard]] std::uint32_t stored_cardinality() const noexcept { return handle_->stored_cardinality(); }
 
     // Eagerly recomputes the [min,max] header endpoints from the word block.
     void sync_endpoints() noexcept {
@@ -1865,15 +1896,21 @@ container_handle<Layout, CowPolicy> container_handle<Layout, CowPolicy>::make_bi
 
 template <typename Layout, typename CowPolicy>
 void container_handle<Layout, CowPolicy>::ensure_endpoints() const noexcept {
-    if ( endpoints_valid() || cardinality_ == 0 ) {
+    if ( endpoints_valid() || ( cardinality_valid() && cardinality_ == 0 ) ) {
         return;
     }
     // Only bitsets go stale (bulk word kernels defer the scan); array/run
-    // mutation keeps the endpoints exact.
+    // mutation keeps the endpoints exact. A bitset whose count is stale as well, one in the middle of a lazy
+    // fold, may have lost every bit: the count cannot say, so the words are scanned bounded.
     auto const * const words{ payload_data<std::uint64_t>() };
     std::size_t front{ 0 };
-    while ( words[ front ] == 0 ) {
+    while ( front < Layout::word_count && words[ front ] == 0 ) {
         ++front;
+    }
+    if ( front == Layout::word_count ) {
+        min_ = max_ = 0;
+        flags_ &= static_cast<std::uint8_t>( ~endpoints_stale_flag );
+        return;
     }
     std::size_t back{ Layout::word_count - 1 };
     while ( words[ back ] == 0 ) {
