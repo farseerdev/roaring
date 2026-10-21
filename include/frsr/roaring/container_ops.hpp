@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <cassert>
 #include <cstddef>
 #include <limits>
 #include <type_traits>
@@ -31,6 +32,7 @@ template <typename Layout, typename CowPolicy = cow_value_semantics, typename Ru
     std::size_t const bitset_threshold,
     set_operation const op
 ) {
+    assert( op != set_operation::bit_xor && "an exclusive-or goes through xor_containers" );
     auto combine_run_bitset_words = []( run_cref<Layout, CowPolicy> const run, bitset_cref<Layout, CowPolicy> const bitset, set_operation const run_op ) {
         if ( run_op == set_operation::bit_or ) {
             auto words{ bitset.words.as_array() };
@@ -161,6 +163,196 @@ template <typename Layout, typename CowPolicy = cow_value_semantics, typename Ru
 
         auto words{ combine_words<Layout>( words_from_container<Layout>( lhs ), words_from_container<Layout>( rhs ), op ) };
         return make_container_from_words<Layout, CowPolicy>( words, bitset_threshold );
+    }, lhs, rhs );
+}
+
+// ---- symmetric difference ---------------------------------------------------------------------------------
+//
+// The result of an exclusive-or lands in the form the reference gives it: an array when it holds no more values
+// than `array_limit`, a bitset above, and runs only where an operand was run-encoded and they are the smallest of
+// the three. The rules the union and difference kernels use for minting a run encoding do not apply: an
+// exclusive-or of two arrays never produces one.
+
+// A bitset result in its final form: empty, an array when it fell to the limit or below, else itself.
+template <typename Layout, typename CowPolicy, typename Retire>
+[[nodiscard]] inline container_handle<Layout, CowPolicy> settle_xor_bitset(
+    container_handle<Layout, CowPolicy> && result,
+    std::size_t const array_limit,
+    Retire && retire
+) {
+    auto const cardinality{ result.cardinality() };
+    if ( cardinality == 0 ) {
+        return container_handle<Layout, CowPolicy>{};
+    }
+    if ( cardinality <= array_limit ) {
+        auto array{ array_from_bitset<Layout, CowPolicy>( std::as_const( result ).as_bitset(), cardinality ) };
+        retire( std::move( result ) );
+        return array;
+    }
+    return std::move( result );
+}
+
+template <typename Layout, typename CowPolicy>
+[[nodiscard]] inline container_handle<Layout, CowPolicy> settle_xor_bitset(
+    container_handle<Layout, CowPolicy> && result,
+    std::size_t const array_limit
+) {
+    return settle_xor_bitset<Layout, CowPolicy>( std::move( result ), array_limit, []( auto && ) noexcept {} );
+}
+
+// [croaring-ref] deps/croaring/src/containers/mixed_xor.c:array_array_container_xor
+template <typename Layout, typename CowPolicy>
+[[nodiscard]] inline container_handle<Layout, CowPolicy> xor_array_array(
+    array_cref<Layout, CowPolicy> const lhs,
+    array_cref<Layout, CowPolicy> const rhs,
+    std::size_t const array_limit
+) {
+    using handle_type = container_handle<Layout, CowPolicy>;
+    if ( lhs.values.size() + rhs.values.size() <= array_limit ) {
+        handle_type result;
+        auto result_array{ result.as_array() };
+        xor_array_array_to_vector<Layout>( lhs, rhs, result_array.values );
+        if ( result_array.values.empty() ) {
+            return handle_type{};
+        }
+        result_array.sync_header();
+        return result;
+    }
+    // The result may be larger than an array can be: one side scattered into a bitset, the other flipped in.
+    auto result{ bitset_handle_from_sorted_values<Layout, CowPolicy>( { lhs.values.data(), lhs.values.size() } ) };
+    xor_array_into_bitset_inplace<false, Layout, CowPolicy>( result.as_bitset(), rhs );
+    return settle_xor_bitset<Layout, CowPolicy>( std::move( result ), array_limit );
+}
+
+// [croaring-ref] deps/croaring/src/containers/mixed_xor.c:array_bitset_container_xor
+template <typename Layout, typename CowPolicy>
+[[nodiscard]] inline container_handle<Layout, CowPolicy> xor_array_bitset(
+    array_cref<Layout, CowPolicy> const array,
+    bitset_cref<Layout, CowPolicy> const bitset,
+    std::size_t const array_limit
+) {
+    auto result{ clone_bitset_words<Layout, CowPolicy>( bitset ) };
+    xor_array_into_bitset_inplace<false, Layout, CowPolicy>( result.as_bitset(), array );
+    return settle_xor_bitset<Layout, CowPolicy>( std::move( result ), array_limit );
+}
+
+// [croaring-ref] deps/croaring/src/containers/mixed_xor.c:run_bitset_container_xor
+template <typename Layout, typename CowPolicy>
+[[nodiscard]] inline container_handle<Layout, CowPolicy> xor_run_bitset(
+    run_cref<Layout, CowPolicy> const runs,
+    bitset_cref<Layout, CowPolicy> const bitset,
+    std::size_t const array_limit
+) {
+    auto result{ clone_bitset_words<Layout, CowPolicy>( bitset ) };
+    xor_runs_into_bitset_inplace<false, Layout, CowPolicy>( result.as_bitset(), runs );
+    return settle_xor_bitset<Layout, CowPolicy>( std::move( result ), array_limit );
+}
+
+// A run container of `capacity` runs filled by `fill` (which returns how many it wrote), in its smallest form.
+template <typename Layout, typename CowPolicy, typename Fill>
+[[nodiscard]] inline container_handle<Layout, CowPolicy> xor_into_run_result(
+    std::size_t const capacity,
+    std::size_t const array_limit,
+    Fill && fill
+) {
+    using handle_type = container_handle<Layout, CowPolicy>;
+    auto result{ handle_type::make_run() };
+    auto ref{ result.as_run() };
+    ref.runs.resize_uninitialized( static_cast<std::uint32_t>( capacity ) );
+    auto const n{ fill( ref.runs.data() ) };
+    if ( n == 0 ) {
+        return handle_type{};
+    }
+    ref.runs.resize_uninitialized( static_cast<std::uint32_t>( n ) );
+    ref.sync_header();
+    return settle_run_result<Layout, CowPolicy>( std::move( result ), array_limit + 1U );
+}
+
+// [croaring-ref] deps/croaring/src/containers/mixed_xor.c:run_run_container_xor
+template <typename Layout, typename CowPolicy>
+[[nodiscard]] inline container_handle<Layout, CowPolicy> xor_run_run(
+    run_cref<Layout, CowPolicy> const lhs,
+    run_cref<Layout, CowPolicy> const rhs,
+    std::size_t const array_limit
+) {
+    return xor_into_run_result<Layout, CowPolicy>( lhs.runs.size() + rhs.runs.size(), array_limit, [ & ]( auto * const out ) noexcept {
+        return xor_runs<Layout>( lhs.runs.data(), lhs.runs.size(), rhs.runs.data(), rhs.runs.size(), out );
+    } );
+}
+
+// A few values against runs stay runs; many against a run container that fits an array go through the array
+// merge; many against a larger one are flipped into the run container's bitset.
+// [croaring-ref] deps/croaring/src/containers/mixed_xor.c:array_run_container_xor
+template <typename Layout, typename CowPolicy>
+[[nodiscard]] inline container_handle<Layout, CowPolicy> xor_array_run(
+    array_cref<Layout, CowPolicy> const array,
+    container_handle<Layout, CowPolicy> const & run_handle,
+    std::size_t const array_limit
+) {
+    constexpr std::size_t few_values{ 32 };
+    auto const runs{ run_handle.as_run() };
+    if ( array.values.size() < few_values ) {
+        return xor_into_run_result<Layout, CowPolicy>( array.values.size() + runs.runs.size(), array_limit, [ & ]( auto * const out ) noexcept {
+            return xor_values_runs<Layout>( array.values.data(), array.values.size(), runs.runs.data(), runs.runs.size(), out );
+        } );
+    }
+    if ( run_handle.cardinality() <= array_limit ) {
+        auto const expanded{ array_handle_from_container<Layout, CowPolicy>( run_handle ) };
+        return xor_array_array<Layout, CowPolicy>( expanded.as_array(), array, array_limit );
+    }
+    auto result{ container_handle<Layout, CowPolicy>::make_bitset_zeroed() };
+    {
+        auto bitset{ result.as_bitset() };
+        auto & words{ bitset.words.as_array() };
+        for ( auto const & current : runs.runs ) {
+            apply_range_to_words<Layout>( words, current.begin, current.end, range_operation::add );
+        }
+    }
+    result.set_cardinality( run_handle.cardinality() );
+    xor_array_into_bitset_inplace<false, Layout, CowPolicy>( result.as_bitset(), array );
+    return settle_xor_bitset<Layout, CowPolicy>( std::move( result ), array_limit );
+}
+
+// lhs ^ rhs as a legal container. `array_limit` is the largest cardinality an array may have.
+template <typename Layout, typename CowPolicy = cow_value_semantics>
+[[nodiscard]] inline container_handle<Layout, CowPolicy> xor_containers(
+    container_handle<Layout, CowPolicy> const & lhs,
+    container_handle<Layout, CowPolicy> const & rhs,
+    std::size_t const array_limit
+) {
+    using handle_type = container_handle<Layout, CowPolicy>;
+    if ( lhs.cardinality() == 0 ) { return handle_type{ rhs }; }
+    if ( rhs.cardinality() == 0 ) { return handle_type{ lhs }; }
+    return visit_container_pair<Layout, CowPolicy>( [ & ]( auto const & left, auto const & right ) -> handle_type {
+        using left_type  = std::remove_cvref_t<decltype( left )>;
+        using right_type = std::remove_cvref_t<decltype( right )>;
+        constexpr bool left_array  { std::same_as<left_type , array_cref <Layout, CowPolicy>> };
+        constexpr bool right_array { std::same_as<right_type, array_cref <Layout, CowPolicy>> };
+        constexpr bool left_run    { std::same_as<left_type , run_cref   <Layout, CowPolicy>> };
+        constexpr bool right_run   { std::same_as<right_type, run_cref   <Layout, CowPolicy>> };
+        constexpr bool left_bitset { std::same_as<left_type , bitset_cref<Layout, CowPolicy>> };
+        constexpr bool right_bitset{ std::same_as<right_type, bitset_cref<Layout, CowPolicy>> };
+        if constexpr ( left_array && right_array ) {
+            return xor_array_array<Layout, CowPolicy>( left, right, array_limit );
+        } else if constexpr ( left_array && right_bitset ) {
+            return xor_array_bitset<Layout, CowPolicy>( left, right, array_limit );
+        } else if constexpr ( left_bitset && right_array ) {
+            return xor_array_bitset<Layout, CowPolicy>( right, left, array_limit );
+        } else if constexpr ( left_run && right_bitset ) {
+            return xor_run_bitset<Layout, CowPolicy>( left, right, array_limit );
+        } else if constexpr ( left_bitset && right_run ) {
+            return xor_run_bitset<Layout, CowPolicy>( right, left, array_limit );
+        } else if constexpr ( left_array && right_run ) {
+            return xor_array_run<Layout, CowPolicy>( left, rhs, array_limit );
+        } else if constexpr ( left_run && right_array ) {
+            return xor_array_run<Layout, CowPolicy>( right, lhs, array_limit );
+        } else if constexpr ( left_run && right_run ) {
+            return xor_run_run<Layout, CowPolicy>( left, right, array_limit );
+        } else {
+            static_assert( left_bitset && right_bitset );
+            return settle_xor_bitset<Layout, CowPolicy>(
+                combine_bitset_bitset<Layout, CowPolicy>( left, right, set_operation::bit_xor ), array_limit );
+        }
     }, lhs, rhs );
 }
 

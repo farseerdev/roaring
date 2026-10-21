@@ -880,6 +880,7 @@ template <typename Layout, typename OutVector, typename CowPolicy = cow_value_se
         return;
     }
 
+    assert( op == set_operation::bit_andnot && "an exclusive-or goes through xor_array_array_to_vector" );
     resize_uninitialized( result, lhs.values.size() );
     result.resize( static_cast<std::uint32_t>( difference_sorted_scalar( li, lhs.values.size(), ri, rhs.values.size(), result.data() ) ) );
 }
@@ -1262,6 +1263,252 @@ template <typename Layout, typename OutVector, typename CowPolicy = cow_value_se
     ) ) );
 }
 
+// The values in exactly one of two sorted arrays. Same hybrid merge as the others: while four values remain on
+// each side it looks for a block of four to handle at once (all below the other side's current value, or equal
+// to the other side's next four, which cancel), otherwise four branchless steps. `out` has sa + sb slots and
+// may not alias either input.
+// [croaring-ref] deps/croaring/src/array_util.c:xor_uint16
+template <typename T>
+[[ gnu::hot ]] inline std::size_t xor_sorted_scalar(
+    T const * const a, std::size_t const sa,
+    T const * const b, std::size_t const sb,
+    T * const out
+) noexcept {
+    std::size_t i{ 0 }, j{ 0 }, k{ 0 };
+    while ( i + 4 <= sa && j + 4 <= sb ) {
+        if ( a[ i + 3 ] < b[ j ] ) {
+            std::memcpy( out + k, a + i, 4 * sizeof( T ) );
+            k += 4;
+            i += 4;
+        } else if ( b[ j + 3 ] < a[ i ] ) {
+            std::memcpy( out + k, b + j, 4 * sizeof( T ) );
+            k += 4;
+            j += 4;
+        } else if ( equal_blocks4( a + i, b + j ) ) {
+            i += 4;
+            j += 4;
+        } else {
+            for ( int step{ 0 }; step < 4; ++step ) {
+                T const x{ a[ i ] }, y{ b[ j ] };
+                out[ k ] = x < y ? x : y;
+                k += ( x != y );
+                i += ( x <= y );
+                j += ( x >= y );
+            }
+        }
+    }
+    while ( i < sa && j < sb ) {
+        T const x{ a[ i ] }, y{ b[ j ] };
+        out[ k ] = x < y ? x : y;
+        k += ( x != y );
+        i += ( x <= y );
+        j += ( x >= y );
+    }
+    move_tail( out + k, a + i, sa - i );
+    k += sa - i;
+    move_tail( out + k, b + j, sb - j );
+    return k + ( sb - j );
+}
+
+#if defined( __SSE4_2__ )
+// SSE4.2 sorted-array symmetric difference — a port of CRoaring's xor_vector16. Two sorted 8-lane blocks are
+// merged by a min/max network (the smaller block stays in `vec_max` as the running tail, the other is the next
+// block of the array whose head is smaller); each merged low half is stored with the values that occur twice (a
+// value in both arrays) dropped, comparing each lane with its neighbours across the vector boundary. What is left
+// when one array's blocks run out — the running tail and the sub-vector remainders — is finished by a scalar
+// exclusive-or. Each store writes a full 8-lane vector, so `out` must have sa + sb + 8 slots.
+// [croaring-ref] deps/croaring/src/array_util.c:xor_vector16
+inline constexpr std::size_t sse42_xor_min_side{ 8 };
+
+// The lanes of `a` and `b` (both ascending, strictly) sorted ascending: low half in `lo`, high half in `hi`.
+// [croaring-ref] deps/croaring/src/array_util.c:sse_merge
+[[ gnu::always_inline ]] inline void merge_sorted_blocks_sse( __m128i const a, __m128i const b, __m128i & lo, __m128i & hi ) noexcept {
+    __m128i const reverse{ _mm_setr_epi8( 14, 15, 12, 13, 10, 11, 8, 9, 6, 7, 4, 5, 2, 3, 0, 1 ) };
+    __m128i x{ a };
+    __m128i y{ _mm_shuffle_epi8( b, reverse ) };
+    for ( int stage{ 0 }; stage < 4; ++stage ) {
+        __m128i const mn{ _mm_min_epu16( x, y ) };
+        __m128i const mx{ _mm_max_epu16( x, y ) };
+        x = _mm_unpacklo_epi16( mn, mx );
+        y = _mm_unpackhi_epi16( mn, mx );
+    }
+    lo = x;
+    hi = y;
+}
+
+// Stores, from the merged stream `old` ++ `fresh`, the last lane of `old` and the first seven of `fresh` with
+// every value that occurs twice in a row removed (the last lane of `fresh` is decided by the next block), and
+// returns how many values were stored. `old` is all ones on the first call: that lane never survives, since
+// its neighbour on the left is itself.
+[[ gnu::always_inline ]] inline int store_unique_xor_sse( __m128i const old, __m128i const fresh, std::uint16_t * const out ) noexcept {
+    __m128i const two_back{ _mm_alignr_epi8( fresh, old, 16 - 4 ) };
+    __m128i const one_back{ _mm_alignr_epi8( fresh, old, 16 - 2 ) };
+    __m128i const equal{ _mm_or_si128( _mm_cmpeq_epi16( one_back, two_back ), _mm_cmpeq_epi16( one_back, fresh ) ) };
+    unsigned const doubled{ static_cast<unsigned>( _mm_movemask_epi8( _mm_packs_epi16( equal, _mm_setzero_si128() ) ) ) };
+    unsigned const keep{ ~doubled & 0xFFU };
+    __m128i const ctrl{ _mm_lddqu_si128( reinterpret_cast<__m128i const *>( array_intersect_compact_table[ keep ].data() ) ) };
+    _mm_storeu_si128( reinterpret_cast<__m128i *>( out ), _mm_shuffle_epi8( one_back, ctrl ) );
+    return std::popcount( keep );
+}
+
+[[ gnu::hot ]] inline std::size_t xor_sorted_uint16_sse(
+    std::uint16_t const * const a, std::size_t const sa,
+    std::uint16_t const * const b, std::size_t const sb,
+    std::uint16_t       * const out
+) noexcept {
+    constexpr std::size_t vl{ 8 };
+    assert( sa >= vl && sb >= vl );
+    std::size_t const blocks_a{ sa / vl };
+    std::size_t const blocks_b{ sb / vl };
+    std::size_t pos_a{ 1 }, pos_b{ 1 };   // blocks taken
+    std::uint16_t * cursor{ out };
+
+    __m128i low, high;
+    merge_sorted_blocks_sse( _mm_lddqu_si128( reinterpret_cast<__m128i const *>( a ) ), _mm_lddqu_si128( reinterpret_cast<__m128i const *>( b ) ), low, high );
+    cursor += store_unique_xor_sse( _mm_set1_epi16( -1 ), low, cursor );
+    __m128i last{ low };
+
+    if ( pos_a < blocks_a && pos_b < blocks_b ) {
+        std::uint16_t head_a{ a[ vl * pos_a ] };
+        std::uint16_t head_b{ b[ vl * pos_b ] };
+        __m128i next;
+        while ( true ) {
+            if ( head_a <= head_b ) {
+                next = _mm_lddqu_si128( reinterpret_cast<__m128i const *>( a + vl * pos_a ) );
+                if ( ++pos_a == blocks_a ) { break; }
+                head_a = a[ vl * pos_a ];
+            } else {
+                next = _mm_lddqu_si128( reinterpret_cast<__m128i const *>( b + vl * pos_b ) );
+                if ( ++pos_b == blocks_b ) { break; }
+                head_b = b[ vl * pos_b ];
+            }
+            merge_sorted_blocks_sse( high, next, low, high );
+            cursor += store_unique_xor_sse( last, low, cursor );
+            last = low;
+        }
+        merge_sorted_blocks_sse( high, next, low, high );
+        cursor += store_unique_xor_sse( last, low, cursor );
+        last = low;
+    }
+    std::size_t count{ static_cast<std::size_t>( cursor - out ) };
+
+    // The running tail, deduplicated, plus the remainder of the array whose blocks ran out, sorted: a handful of
+    // values, which the scalar exclusive-or then merges with the blocks of the other array that were not taken.
+    std::uint16_t pending[ 2 * vl + 1 ];
+    std::size_t pending_count{ static_cast<std::size_t>( store_unique_xor_sse( last, high, pending ) ) };
+    std::uint16_t const tail_top{ static_cast<std::uint16_t>( _mm_extract_epi16( high, 7 ) ) };
+    if ( tail_top != static_cast<std::uint16_t>( _mm_extract_epi16( high, 6 ) ) ) { pending[ pending_count++ ] = tail_top; }
+    bool const a_ran_out{ pos_a == blocks_a };
+    std::uint16_t const * const rest      { a_ran_out ? b + vl * pos_b : a + vl * pos_a };
+    std::size_t           const rest_count{ a_ran_out ? sb - vl * pos_b : sa - vl * pos_a };
+    std::uint16_t const * const sub_vector{ a_ran_out ? a + vl * blocks_a : b + vl * blocks_b };
+    std::size_t           const sub_count { a_ran_out ? sa - vl * blocks_a : sb - vl * blocks_b };
+    std::memcpy( pending + pending_count, sub_vector, sub_count * sizeof( std::uint16_t ) );
+    pending_count += sub_count;
+    if ( pending_count == 0 ) {
+        std::memcpy( out + count, rest, rest_count * sizeof( std::uint16_t ) );
+        return count + rest_count;
+    }
+    // insertion sort of at most 16 values, then the pairs in it (equal neighbours) cancel
+    for ( std::size_t i{ 1 }; i < pending_count; ++i ) {
+        std::uint16_t const v{ pending[ i ] };
+        std::size_t j{ i };
+        for ( ; j > 0 && pending[ j - 1 ] > v; --j ) { pending[ j ] = pending[ j - 1 ]; }
+        pending[ j ] = v;
+    }
+    std::size_t kept{ 0 };
+    for ( std::size_t i{ 0 }; i < pending_count; ++i ) {
+        if ( kept != 0 && pending[ kept - 1 ] == pending[ i ] ) { --kept; } else { pending[ kept++ ] = pending[ i ]; }
+    }
+    return count + xor_sorted_scalar( static_cast<std::uint16_t const *>( pending ), kept, rest, rest_count, out + count );
+}
+
+// How many values two sorted arrays share: the intersection kernel above with the stores replaced by a count of the
+// matches. Both sides must fill at least one block.
+// [croaring-ref] deps/croaring/src/array_util.c:intersect_vector16_cardinality
+[[ gnu::hot ]] inline std::size_t intersect_cardinality_array_array_sse42(
+    std::uint16_t const * const a, std::size_t const sa,
+    std::uint16_t const * const b, std::size_t const sb
+) noexcept {
+    constexpr std::size_t vl{ 8 };
+    std::size_t const sta{ ( sa / vl ) * vl };
+    std::size_t const stb{ ( sb / vl ) * vl };
+    std::size_t ia{ 0 }, ib{ 0 }, count{ 0 };
+    if ( ia < sta && ib < stb ) {
+        __m128i va{ _mm_lddqu_si128( reinterpret_cast<__m128i const *>( a + ia ) ) };
+        __m128i vb{ _mm_lddqu_si128( reinterpret_cast<__m128i const *>( b + ib ) ) };
+        // PCMPISTRM treats a zero element as a terminator: while either block holds one, the explicit-length form.
+        while ( a[ ia ] == 0 || b[ ib ] == 0 ) {
+            __m128i const res{ _mm_cmpestrm( vb, vl, va, vl, _SIDD_UWORD_OPS | _SIDD_CMP_EQUAL_ANY | _SIDD_BIT_MASK ) };
+            count += static_cast<std::size_t>( std::popcount( static_cast<unsigned>( _mm_extract_epi32( res, 0 ) ) ) );
+            std::uint16_t const amax{ a[ ia + vl - 1 ] };
+            std::uint16_t const bmax{ b[ ib + vl - 1 ] };
+            if ( amax <= bmax ) {
+                ia += vl;
+                if ( ia == sta ) { break; }
+                va = _mm_lddqu_si128( reinterpret_cast<__m128i const *>( a + ia ) );
+            }
+            if ( bmax <= amax ) {
+                ib += vl;
+                if ( ib == stb ) { break; }
+                vb = _mm_lddqu_si128( reinterpret_cast<__m128i const *>( b + ib ) );
+            }
+        }
+        if ( ia < sta && ib < stb ) {
+            while ( true ) {
+                __m128i const res{ _mm_cmpistrm( vb, va, _SIDD_UWORD_OPS | _SIDD_CMP_EQUAL_ANY | _SIDD_BIT_MASK ) };
+                count += static_cast<std::size_t>( std::popcount( static_cast<unsigned>( _mm_extract_epi32( res, 0 ) ) ) );
+                std::uint16_t const amax{ a[ ia + vl - 1 ] };
+                std::uint16_t const bmax{ b[ ib + vl - 1 ] };
+                if ( amax <= bmax ) {
+                    ia += vl;
+                    if ( ia == sta ) { break; }
+                    va = _mm_lddqu_si128( reinterpret_cast<__m128i const *>( a + ia ) );
+                }
+                if ( bmax <= amax ) {
+                    ib += vl;
+                    if ( ib == stb ) { break; }
+                    vb = _mm_lddqu_si128( reinterpret_cast<__m128i const *>( b + ib ) );
+                }
+            }
+        }
+    }
+    while ( ia < sa && ib < sb ) {
+        std::uint16_t const av{ a[ ia ] };
+        std::uint16_t const bv{ b[ ib ] };
+        count += av == bv;
+        ia += av <= bv;
+        ib += bv <= av;
+    }
+    return count;
+}
+#endif  // __SSE4_2__
+
+template <typename Layout, typename OutVector, typename CowPolicy = cow_value_semantics>
+[[ gnu::hot ]] inline void xor_array_array_to_vector(
+    array_cref<Layout, CowPolicy> const lhs,
+    array_cref<Layout, CowPolicy> const rhs,
+    OutVector & out
+) {
+#if defined( __SSE4_2__ )
+    // The vector merge stores whole blocks, so the result buffer has a block of slack; below one block on either
+    // side it is all setup, and the scalar merge sizes the result exactly.
+    if constexpr ( std::is_same_v<typename Layout::low_type, std::uint16_t> ) {
+        auto const sa{ lhs.values.size() };
+        auto const sb{ rhs.values.size() };
+        if ( sa >= sse42_xor_min_side && sb >= sse42_xor_min_side ) {
+            resize_uninitialized( out, sa + sb + 8U );
+            out.resize( static_cast<std::uint32_t>( xor_sorted_uint16_sse( lhs.values.data(), sa, rhs.values.data(), sb, out.data() ) ) );
+            return;
+        }
+    }
+#endif
+    resize_uninitialized( out, lhs.values.size() + rhs.values.size() );
+    out.resize( static_cast<std::uint32_t>( xor_sorted_scalar(
+        lhs.values.data(), lhs.values.size(), rhs.values.data(), rhs.values.size(), out.data()
+    ) ) );
+}
+
 // array∩run written directly into caller-supplied output (same OutVector
 // contract as filter_array_bitset_into: reusable scratch or, on the hot combine
 // path, the result container's own payload). Per-RUN slice copies over a
@@ -1628,6 +1875,9 @@ template <typename Layout, typename CowPolicy = cow_value_semantics>
                 break;
             case set_operation::bit_andnot:
                 words[ word_index ] &= ~mask;
+                break;
+            case set_operation::bit_xor:
+                words[ word_index ] ^= mask;
                 break;
         }
     }

@@ -168,6 +168,12 @@ inline oracle_set difference( oracle_set const & a, oracle_set const & b ) {
     return result;
 }
 
+inline oracle_set symmetric_difference( oracle_set const & a, oracle_set const & b ) {
+    oracle_set result;
+    std::set_symmetric_difference( a.begin(), a.end(), b.begin(), b.end(), std::back_inserter( result ) );
+    return result;
+}
+
 // random bit string over [base, base + bits) as words and as the set of its keys
 struct bit_string {
     std::vector<std::uint64_t> words;

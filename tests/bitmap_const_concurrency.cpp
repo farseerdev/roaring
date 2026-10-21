@@ -161,6 +161,7 @@ void concurrent_readers_case() {
     auto const expected_union{ set_union_of( values, other_values ) };
     auto const expected_inter{ set_intersection_of( values, other_values ) };
     auto const expected_diff{ set_difference_of( values, other_values ) };
+    auto const expected_xor { set_symmetric_difference_of( values, other_values ) };
     bool probes_hit{ false };
     for ( auto const v : probes ) { probes_hit = probes_hit || std::ranges::binary_search( values, v ); }
     key_type expected_sum{ 0 };
@@ -208,6 +209,8 @@ void concurrent_readers_case() {
                         bad += ( shared | other ).size() != expected_union.size() ? 1 : 0;
                         bad += ( shared & other ).size() != expected_inter.size() ? 1 : 0;
                         bad += ( shared - other ).size() != expected_diff.size() ? 1 : 0;
+                        bad += ( shared ^ other ).size() != expected_xor.size() ? 1 : 0;
+                        bad += shared.xor_cardinality( other ) != expected_xor.size() ? 1 : 0;
                         break;
                     case 6:
                         // the operations against plain data are reads too

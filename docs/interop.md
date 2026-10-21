@@ -8,8 +8,10 @@ into one. The operations, all members of `bitmap`:
 | `and_with( x )`, `&=` | keep the keys that are also in `x` |
 | `or_with( x )`, `\|=` | add the keys of `x` |
 | `andnot_with( x )`, `-=` | remove the keys of `x` |
+| `xor_with( x )`, `^=` | keep the keys that are in exactly one of the bitmap and `x`; with a `key_range`, flip the interval |
 | `intersects( x )` | whether a key is in both |
 | `and_cardinality( x )` | how many keys are in both (each key once) |
+| `xor_cardinality( x )` | how many keys are in exactly one |
 | `is_subset_of( x )` | every key of the bitmap is in `x` |
 | `is_superset_of( x )` | every key of `x` is in the bitmap |
 | `equals( x )` | the same keys |
@@ -48,14 +50,15 @@ ever stored in a bitmap: what an operation keeps is built in fresh storage.
 
 * An **interval** is a run piece per chunk made on demand. A chunk it covers entirely is kept (`and_with`),
   dropped (`andnot_with`) or counted from its header (`and_cardinality`) without being opened; a long interval
-  over a few chunks costs the few chunks.
+  over a few chunks costs the few chunks. `xor_with( key_range )` flips the interval in one pass over the chunks
+  it covers (a chunk it covers entirely is complemented without being read twice), as `flip_closed_range` does.
 * A **sorted range of keys** is grouped by chunk in a scratch array (or a bitset past the array limit);
   random-access ranges are searched by galloping, so a few keys against a large bitmap cost the keys.
 * An **unsorted range of keys** has three treatments. `intersects` and `is_superset_of` probe key by key (a
   binary search of the chunk table and one container lookup) at any size, since they stop at the first answer.
   `and_with` and `and_cardinality` probe below 2048 keys, where the cost follows the keys and not the bitmap;
   from there on they sort a copy of the keys (a radix sort) and merge it like a sorted range, which costs less
-  than a probe per key. `or_with`, `andnot_with`, `is_subset_of` and `equals` need the operand as a set: they
+  than a probe per key. `or_with`, `andnot_with`, `xor_with`, `is_subset_of` and `equals` need the operand as a set: they
   sort a copy and merge it like a sorted range.
 * A **bit string** is merged a chunk at a time; a chunk-aligned string of aligned words is used where it is.
 

@@ -47,7 +47,7 @@ frsr::roaring::bitmap<std::uint32_t, array_bitset_set> bitmap;
 
 ## Combining with plain data
 
-A bitmap can be and-ed, or-ed, and-not-ed, tested for intersection, subset, superset and equality with key
+A bitmap can be and-ed, or-ed, and-not-ed, xor-ed, tested for intersection, subset, superset and equality with key
 spans and ranges, `std::bitset`, dynamic bit-sets, raw bit words and key intervals directly, without building
 a temporary bitmap:
 

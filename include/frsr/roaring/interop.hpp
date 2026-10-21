@@ -1,8 +1,8 @@
 #pragma once
 
 // The set operations of bitmap against operands that are not bitmaps (see interop_operands.hpp for the
-// operand kinds): and_with / or_with / andnot_with, intersects, and_cardinality, is_subset_of,
-// is_superset_of, equals.
+// operand kinds): and_with / or_with / andnot_with / xor_with, intersects, and_cardinality, xor_cardinality,
+// is_subset_of, is_superset_of, equals.
 //
 // The operand is walked as a stream of chunk-sized pieces and merged with the chunk table the way two bitmaps
 // are: both sides are searched for each other's next key (a gallop on the bitmap's table, a seek on the
@@ -396,16 +396,23 @@ struct interop_engine {
             size_type count{ 0 };
             if ( small->size() * 16 < large->size() ) {
                 for ( auto const value : *small ) { count += std::binary_search( large->begin(), large->end(), value ); }
-            } else {
-                auto li{ left.begin() };
-                auto ri{ right.begin() };
-                while ( li != left.end() && ri != right.end() ) {
-                    count += *li == *ri;
-                    auto const advance_left { *li <= *ri };
-                    auto const advance_right{ *ri <= *li };
-                    li += advance_left;
-                    ri += advance_right;
+                return count;
+            }
+#if defined( __SSE4_2__ )
+            if constexpr ( std::is_same_v<low_type, std::uint16_t> ) {
+                if ( small->size() >= sse42_intersect_min_side ) {
+                    return intersect_cardinality_array_array_sse42( left.data(), left.size(), right.data(), right.size() );
                 }
+            }
+#endif
+            auto li{ left.begin() };
+            auto ri{ right.begin() };
+            while ( li != left.end() && ri != right.end() ) {
+                count += *li == *ri;
+                auto const advance_left { *li <= *ri };
+                auto const advance_right{ *ri <= *li };
+                li += advance_left;
+                ri += advance_right;
             }
             return count;
         }
@@ -594,6 +601,71 @@ struct interop_engine {
         insert_added( self, added );
     }
 
+    // `container ^ piece` for a piece that is an interval cut to its chunk (one run): the flip of that range of the
+    // container, which every container form has a kernel for. An absent chunk is an empty container. So an interval
+    // is flipped in one pass over the chunks it covers, whatever the chunks hold.
+    [[nodiscard]] static handle_type flip_piece( handle_type && container, handle_type const & piece ) {
+        auto const run{ piece.as_run().runs.front() };
+        // an array may hold as many values as the bitmap's own limit: the flip kernels take the first cardinality
+        // that is a bitset
+        auto result{ apply_range_to_container<layout_type, cow_policy, typename Bitmap::run_selection_policy>(
+            std::move( container ), run.begin, run.end, range_operation::flip, Bitmap::array_to_bitset_threshold + 1U ) };
+        if constexpr ( !Bitmap::uses_default_container_set ) { result = Bitmap::optimize_container_for_policy( std::move( result ) ); }
+        return result;
+    }
+
+    template <typename Source>
+    static void xor_stream( Bitmap & self, Source & source ) {
+        std::vector<std::pair<chunk_type, handle_type>> added;
+        size_type added_size{ 0 };
+        bool any_empty{ false };
+        auto at{ self.chunks_.begin() };
+        while ( !source.at_end() ) {
+            auto const key{ source.key() };
+            if ( at != self.chunks_.end() && self.chunks_.key( at ) < key ) { at = self.chunks_.lower_bound( key, at ); }
+            auto const & piece{ source.piece() };
+            if ( auto const cardinality{ piece.cardinality() }; cardinality != 0 ) {
+                if ( at != self.chunks_.end() && self.chunks_.key( at ) == key ) {
+                    auto & slot{ self.chunks_.slot( at ) };
+                    assert( slot.cardinality() != 0 );
+                    self.size_ -= slot.cardinality();
+                    if constexpr ( is_interval_source_v<Source> ) { slot = flip_piece( std::move( slot ), piece ); } else { self.xor_same_key( self.chunks_, slot, piece ); }
+                    self.size_ += slot.cardinality();
+                    any_empty |= slot.cardinality() == 0;
+                    ++at;
+                } else {
+                    if constexpr ( is_interval_source_v<Source> ) { added.emplace_back( key, flip_piece( handle_type{}, piece ) ); } else { added.emplace_back( key, own( piece ) ); }
+                    added_size += cardinality;
+                }
+            }
+            source.advance();
+        }
+        self.size_ += added_size;
+        if ( any_empty ) { drop_empty_chunks( self ); }
+        insert_added( self, added );
+    }
+
+    template <typename Source>
+    [[nodiscard]] static size_type xor_cardinality_stream( Bitmap const & self, Source & source ) {
+        size_type common{ 0 };
+        size_type total { 0 };
+        auto at{ self.chunks_.begin() };
+        while ( !source.at_end() ) {
+            auto const key{ source.key() };
+            auto const & piece{ source.piece() };
+            if ( auto const cardinality{ piece.cardinality() }; cardinality != 0 ) {
+                total += cardinality;
+                if ( at != self.chunks_.end() && self.chunks_.key( at ) < key ) { at = self.chunks_.lower_bound( key, at ); }
+                if ( at != self.chunks_.end() && self.chunks_.key( at ) == key ) {
+                    auto const & slot{ self.chunks_.slot( at ) };
+                    common += is_full( piece ) ? size_type{ slot.cardinality() } : and_card( slot, piece );
+                }
+            }
+            source.advance();
+        }
+        return self.size_ + total - 2 * common;
+    }
+
     template <typename Source>
     [[nodiscard]] static bool intersects_stream( Bitmap const & self, Source & source ) {
         bool found{ false };
@@ -778,6 +850,28 @@ struct interop_engine {
             [ & ]( unsorted_keys_tag, auto const & keys ) {
                 auto merge{ overloaded{ [ & ]( auto & source ) { andnot_stream( self, source ); } } };
                 sorted_copy_visit( keys, merge );
+            }
+        } );
+    }
+
+    template <typename Operand>
+    static void xor_with( Bitmap & self, Operand const & operand ) {
+        visit( operand, overloaded{
+            [ & ]( auto & source ) { xor_stream( self, source ); },
+            [ & ]( unsorted_keys_tag, auto const & keys ) {
+                auto merge{ overloaded{ [ & ]( auto & source ) { xor_stream( self, source ); } } };
+                sorted_copy_visit( keys, merge );
+            }
+        } );
+    }
+
+    template <typename Operand>
+    [[nodiscard]] static size_type xor_cardinality( Bitmap const & self, Operand const & operand ) {
+        return visit( operand, overloaded{
+            [ & ]( auto & source ) { return xor_cardinality_stream( self, source ); },
+            [ & ]( unsorted_keys_tag, auto const & keys ) {
+                auto merge{ overloaded{ [ & ]( auto & source ) { return xor_cardinality_stream( self, source ); } } };
+                return sorted_copy_visit( keys, merge );
             }
         } );
     }

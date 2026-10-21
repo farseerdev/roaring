@@ -41,6 +41,8 @@ struct reference<std::uint32_t> {
     static void and_inplace   ( handle * a, handle const * b ) { roaring_bitmap_and_inplace( a, b ); }
     static void or_inplace    ( handle * a, handle const * b ) { roaring_bitmap_or_inplace( a, b ); }
     static void andnot_inplace( handle * a, handle const * b ) { roaring_bitmap_andnot_inplace( a, b ); }
+    static void xor_inplace   ( handle * a, handle const * b ) { roaring_bitmap_xor_inplace( a, b ); }
+    static std::uint64_t xor_card( handle const * a, handle const * b ) { return roaring_bitmap_xor_cardinality( a, b ); }
     static bool intersect     ( handle const * a, handle const * b ) { return roaring_bitmap_intersect( a, b ); }
     static std::uint64_t and_card( handle const * a, handle const * b ) { return roaring_bitmap_and_cardinality( a, b ); }
     static bool subset ( handle const * a, handle const * b ) { return roaring_bitmap_is_subset( a, b ); }
@@ -62,6 +64,7 @@ struct reference<std::uint32_t> {
     }
     static void remove_range( handle * a, std::uint64_t first, std::uint64_t last ) { roaring_bitmap_remove_range_closed( a, static_cast<std::uint32_t>( first ), static_cast<std::uint32_t>( last ) ); }
     static void add_range   ( handle * a, std::uint64_t first, std::uint64_t last ) { roaring_bitmap_add_range_closed( a, static_cast<std::uint32_t>( first ), static_cast<std::uint32_t>( last ) ); }
+    static void flip_range  ( handle * a, std::uint64_t first, std::uint64_t last ) { roaring_bitmap_flip_inplace( a, first, last + 1 ); }
 };
 
 template <>
@@ -81,6 +84,8 @@ struct reference<std::uint64_t> {
     static void and_inplace   ( handle * a, handle const * b ) { roaring64_bitmap_and_inplace( a, b ); }
     static void or_inplace    ( handle * a, handle const * b ) { roaring64_bitmap_or_inplace( a, b ); }
     static void andnot_inplace( handle * a, handle const * b ) { roaring64_bitmap_andnot_inplace( a, b ); }
+    static void xor_inplace   ( handle * a, handle const * b ) { roaring64_bitmap_xor_inplace( a, b ); }
+    static std::uint64_t xor_card( handle const * a, handle const * b ) { return roaring64_bitmap_xor_cardinality( a, b ); }
     static bool intersect     ( handle const * a, handle const * b ) { return roaring64_bitmap_intersect( a, b ); }
     static std::uint64_t and_card( handle const * a, handle const * b ) { return roaring64_bitmap_and_cardinality( a, b ); }
     static bool subset ( handle const * a, handle const * b ) { return roaring64_bitmap_is_subset( a, b ); }
@@ -109,6 +114,7 @@ struct reference<std::uint64_t> {
     }
     static void remove_range( handle * a, std::uint64_t first, std::uint64_t last ) { roaring64_bitmap_remove_range_closed( a, first, last ); }
     static void add_range   ( handle * a, std::uint64_t first, std::uint64_t last ) { roaring64_bitmap_add_range_closed( a, first, last ); }
+    static void flip_range  ( handle * a, std::uint64_t first, std::uint64_t last ) { roaring64_bitmap_flip_closed_inplace( a, first, last ); }
 };
 
 template <typename Key>
@@ -147,6 +153,12 @@ void compare( frsr::roaring::bitmap<Key> const & bitmap, oracle_set const & cont
         b.andnot_with( operand );
         expect_same( b, ref::andnot_inplace, "andnot" );
     }
+    {
+        bitmap_type b{ bitmap };
+        b.xor_with( operand );
+        expect_same( b, ref::xor_inplace, "xor" );
+    }
+    EXPECT_EQ( bitmap.xor_cardinality( operand ), ref::xor_card( reference_content.h, reference_operand.h ) ) << what;
     EXPECT_EQ( bitmap.intersects( operand ), ref::intersect( reference_content.h, reference_operand.h ) ) << what;
     EXPECT_EQ( bitmap.and_cardinality( operand ), ref::and_card( reference_content.h, reference_operand.h ) ) << what;
     EXPECT_EQ( bitmap.is_subset_of( operand ), ref::subset( reference_content.h, reference_operand.h ) ) << what;
@@ -234,13 +246,14 @@ TYPED_TEST( InteropCrosscheck, Ranges ) {
                 EXPECT_EQ( bitmap.cardinality_in_range( static_cast<Key>( first ), static_cast<Key>( last + 1 ) ), ref::range_cardinality( reference_content.h, first, last ) ) << what;
             }
             // the in-place forms against CRoaring's own range operations
-            for ( int which{ 0 }; which < 3; ++which ) {
-                if ( which == 1 && last - first >= ( std::uint64_t{ 1 } << 32 ) ) { continue; }   // a union that wide is 2^16 chunks per 2^32 keys
+            for ( int which{ 0 }; which < 4; ++which ) {
+                if ( ( which == 1 || which == 3 ) && last - first >= ( std::uint64_t{ 1 } << 32 ) ) { continue; }   // a union or flip that wide is 2^16 chunks per 2^32 keys
                 Bitmap b{ bitmap };
                 auto const owner{ ref::make( content ) };
                 if ( which == 0 ) { b.and_with( key_range::closed( first, last ) ); ref::keep_range( owner.h, first, last ); }
                 if ( which == 1 ) { b.or_with( key_range::closed( first, last ) ); ref::add_range( owner.h, first, last ); }
                 if ( which == 2 ) { b.andnot_with( key_range::closed( first, last ) ); ref::remove_range( owner.h, first, last ); }
+                if ( which == 3 ) { b.xor_with( key_range::closed( first, last ) ); ref::flip_range( owner.h, first, last ); }
                 ASSERT_EQ( b.validate(), nullptr ) << what << " op " << which;
                 ASSERT_EQ( b.size(), ref::cardinality( owner.h ) ) << what << " op " << which;
                 if ( ref::cardinality( owner.h ) > 20'000'000 ) { continue; }   // too wide to list; the size and validate() stand

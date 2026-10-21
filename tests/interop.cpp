@@ -66,6 +66,8 @@ static_assert( noexcept( std::declval<frsr::roaring::bitmap<std::uint32_t> const
 static_assert( noexcept( std::declval<frsr::roaring::bitmap<std::uint32_t> const &>().is_superset_of( std::declval<bit_words<std::uint64_t>>() ) ) );
 static_assert( noexcept( std::declval<frsr::roaring::bitmap<std::uint64_t> const &>().and_cardinality( std::declval<std::bitset<65536>>() ) ) );
 static_assert( noexcept( std::declval<frsr::roaring::bitmap<std::uint32_t> const &>().contains_range( 1, 2 ) ) );
+static_assert( noexcept( std::declval<frsr::roaring::bitmap<std::uint32_t> const &>().xor_cardinality( std::declval<key_range>() ) ) );
+static_assert( !noexcept( std::declval<frsr::roaring::bitmap<std::uint32_t> const &>().xor_cardinality( std::declval<std::vector<std::uint32_t>>() ) ) );
 static_assert( !noexcept( std::declval<frsr::roaring::bitmap<std::uint32_t> const &>().intersects( std::declval<std::vector<std::uint32_t>>() ) ) );
 static_assert( !noexcept( std::declval<frsr::roaring::bitmap<std::uint32_t> const &>().equals( std::declval<std::bitset<1000000>>() ) ) );
 
@@ -106,6 +108,12 @@ void check_operand( Bitmap const & bitmap, oracle_set const & content, Operand c
     }
     {
         Bitmap b{ bitmap };
+        b.xor_with( operand );
+        expect_holds( b, symmetric_difference( content, representable ), what + " xor_with" );
+        if ( ::testing::Test::HasFatalFailure() ) { return; }
+    }
+    {
+        Bitmap b{ bitmap };
         b &= operand;
         expect_holds( b, intersection( content, members ), what + " &=" );
         b = bitmap;
@@ -114,11 +122,15 @@ void check_operand( Bitmap const & bitmap, oracle_set const & content, Operand c
         b = bitmap;
         b -= operand;
         expect_holds( b, difference( content, members ), what + " -=" );
+        b = bitmap;
+        b ^= operand;
+        expect_holds( b, symmetric_difference( content, representable ), what + " ^=" );
         if ( ::testing::Test::HasFatalFailure() ) { return; }
     }
     auto const common{ intersection( content, members ) };
     EXPECT_EQ( bitmap.intersects( operand ), !common.empty() ) << what << " intersects";
     EXPECT_EQ( bitmap.and_cardinality( operand ), common.size() ) << what << " and_cardinality";
+    EXPECT_EQ( bitmap.xor_cardinality( operand ), content.size() + representable.size() - 2 * common.size() ) << what << " xor_cardinality";
     EXPECT_EQ( bitmap.is_subset_of( operand ), common.size() == content.size() ) << what << " is_subset_of";
     EXPECT_EQ( bitmap.is_superset_of( operand ), common.size() == members.size() ) << what << " is_superset_of";
     EXPECT_EQ( bitmap.equals( operand ), content == members ) << what << " equals";
@@ -438,6 +450,16 @@ TYPED_TEST( InteropTest, WideKeyRanges ) {
             Bitmap andnot_result{ bitmap };
             andnot_result.andnot_with( range );
             expect_holds( andnot_result, difference( content, inside ), what + " andnot_with" );
+            if ( last - first < ( std::uint64_t{ 1 } << 22 ) ) {   // the oracle lists the interval key by key; wider ones are compared with CRoaring
+                Bitmap xor_result{ bitmap };
+                xor_result.xor_with( range );
+                oracle_set flipped;
+                for ( auto key{ first }; ; ++key ) {
+                    if ( !std::binary_search( inside.begin(), inside.end(), key ) ) { flipped.push_back( key ); }
+                    if ( key == last ) { break; }
+                }
+                expect_holds( xor_result, unite( difference( content, inside ), flipped ), what + " xor_with" );
+            }
             EXPECT_EQ( bitmap.intersects( range ), !inside.empty() ) << what;
             EXPECT_EQ( bitmap.and_cardinality( range ), inside.size() ) << what;
             EXPECT_EQ( bitmap.is_subset_of( range ), inside.size() == content.size() ) << what;
@@ -580,10 +602,10 @@ TEST( InteropShared, OperationsDoNotDisturbCopies ) {
     auto const original{ make_bitmap<Bitmap>( content, true ) };
     auto const related{ random_related<Bitmap>( rng, content, false ) };
     std::vector<std::uint32_t> keys( related.begin(), related.end() );
-    for ( int which{ 0 }; which < 3; ++which ) {
+    for ( int which{ 0 }; which < 4; ++which ) {
         auto copy{ original };
         auto another{ original };
-        if ( which == 0 ) { copy.and_with( keys ); } else if ( which == 1 ) { copy.or_with( keys ); } else { copy.andnot_with( keys ); }
+        if ( which == 0 ) { copy.and_with( keys ); } else if ( which == 1 ) { copy.or_with( keys ); } else if ( which == 2 ) { copy.andnot_with( keys ); } else { copy.xor_with( keys ); }
         expect_holds( another, content, "the copy" );
         expect_holds( original, content, "the original" );
     }

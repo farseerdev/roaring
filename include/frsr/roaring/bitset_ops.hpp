@@ -40,6 +40,9 @@ FRSR_ROARING_X86_V4_KERNEL
         case set_operation::bit_andnot:
             for ( std::size_t i{ 0 }; i < n; ++i ) { out[ i ] = a[ i ] & ~b[ i ]; cardinality += static_cast<std::size_t>( std::popcount( out[ i ] ) ); }
             break;
+        case set_operation::bit_xor:
+            for ( std::size_t i{ 0 }; i < n; ++i ) { out[ i ] = a[ i ] ^  b[ i ]; cardinality += static_cast<std::size_t>( std::popcount( out[ i ] ) ); }
+            break;
     }
     return cardinality;
 }
@@ -61,6 +64,9 @@ FRSR_ROARING_X86_V4_KERNEL
             break;
         case set_operation::bit_andnot:
             for ( std::size_t i{ 0 }; i < n; ++i ) { a[ i ] &= ~b[ i ]; cardinality += static_cast<std::size_t>( std::popcount( a[ i ] ) ); }
+            break;
+        case set_operation::bit_xor:
+            for ( std::size_t i{ 0 }; i < n; ++i ) { a[ i ] ^=  b[ i ]; cardinality += static_cast<std::size_t>( std::popcount( a[ i ] ) ); }
             break;
     }
     return cardinality;
@@ -579,6 +585,12 @@ template <typename Layout, typename CowPolicy = cow_value_semantics>
                 cardinality += static_cast<std::size_t>( std::popcount( out[ i ] ) );
             }
             break;
+        case set_operation::bit_xor:
+            for ( auto i{ 0U }; i < n; ++i ) {
+                out[ i ] = a[ i ] ^ b[ i ];
+                cardinality += static_cast<std::size_t>( std::popcount( out[ i ] ) );
+            }
+            break;
     }
     if ( cardinality == 0 ) {
         return container_handle<Layout, CowPolicy>{};
@@ -973,6 +985,9 @@ void combine_bitset_bitset_inplace(
             case set_operation::bit_andnot:
                 lhs.cardinality = static_cast<std::uint32_t>( fused_combine_inplace_popcount<Layout, set_operation::bit_andnot >( a, b ) );
                 break;
+            case set_operation::bit_xor:
+                lhs.cardinality = static_cast<std::uint32_t>( fused_combine_inplace_popcount<Layout, set_operation::bit_xor    >( a, b ) );
+                break;
         }
         lhs.mark_endpoints_stale();
         return;
@@ -1009,6 +1024,12 @@ void combine_bitset_bitset_inplace(
         case set_operation::bit_andnot:
             for ( auto i{ 0U }; i < n; ++i ) {
                 a[ i ] &= ~b[ i ];
+                cardinality += static_cast<std::size_t>( std::popcount( a[ i ] ) );
+            }
+            break;
+        case set_operation::bit_xor:
+            for ( auto i{ 0U }; i < n; ++i ) {
+                a[ i ] ^= b[ i ];
                 cardinality += static_cast<std::size_t>( std::popcount( a[ i ] ) );
             }
             break;
@@ -1244,6 +1265,91 @@ template <bool Lazy, typename Layout, typename CowPolicy = cow_value_semantics>
         set_bit( values[ scatter ] );
     }
     finish();
+}
+
+// Flips the bit of every value of a sorted array in a bitset's own words. The cardinality is kept exact by the
+// sign of each flip, or, when `Lazy`, left stale for the caller to repair.
+// [croaring-ref] deps/croaring/src/bitset_util.c:bitset_flip_list_withcard
+template <bool Lazy, typename Layout, typename CowPolicy = cow_value_semantics>
+inline void xor_array_into_bitset_inplace(
+    bitset_ref<Layout, CowPolicy> lhs,
+    array_cref<Layout, CowPolicy> const rhs
+) noexcept {
+    auto & words{ lhs.words.as_array() };
+    std::ptrdiff_t delta{ 0 };
+    for ( auto const value : rhs.values ) {
+        auto       & word{ words[ static_cast<std::size_t>( value ) >> 6U ] };
+        auto const   shift{ static_cast<unsigned>( value ) & 63U };
+        delta += 1 - 2 * static_cast<std::ptrdiff_t>( ( word >> shift ) & 1U );
+        word ^= std::uint64_t{ 1 } << shift;
+    }
+    if constexpr ( Lazy ) {
+        lhs.mark_cardinality_stale();
+    } else {
+        lhs.cardinality = static_cast<std::uint32_t>( static_cast<std::ptrdiff_t>( lhs.size() ) + delta );
+    }
+    lhs.mark_endpoints_stale();
+}
+
+// Flips every bit of every run in a bitset's own words, then, unless `Lazy`, counts the words once.
+// [croaring-ref] deps/croaring/src/containers/mixed_xor.c:run_bitset_container_xor
+template <bool Lazy, typename Layout, typename CowPolicy = cow_value_semantics>
+inline void xor_runs_into_bitset_inplace(
+    bitset_ref<Layout, CowPolicy> lhs,
+    run_cref<Layout, CowPolicy> const rhs
+) noexcept {
+    auto & words{ lhs.words.as_array() };
+    auto const flip{ [ & ]( std::size_t const index, std::uint64_t const mask ) noexcept { words[ index ] ^= mask; } };
+    for ( auto const & current : rhs.runs ) {
+        auto const first_word{ static_cast<std::size_t>( current.begin ) >> 6U };
+        auto const last_word { static_cast<std::size_t>( current.end   ) >> 6U };
+        auto const first_mask{ std::uint64_t{ 0 } - ( std::uint64_t{ 1 } << ( current.begin & 63U ) ) };
+        auto const last_mask { ( std::uint64_t{ 2 } << ( current.end & 63U ) ) - 1U };
+        if ( first_word == last_word ) {
+            flip( first_word, first_mask & last_mask );
+            continue;
+        }
+        flip( first_word, first_mask );
+        for ( auto index{ first_word + 1U }; index < last_word; ++index ) {
+            flip( index, ~std::uint64_t{ 0 } );
+        }
+        flip( last_word, last_mask );
+    }
+    if constexpr ( Lazy ) {
+        lhs.mark_cardinality_stale();
+    } else {
+        lhs.cardinality = static_cast<std::uint32_t>( popcount_words( words.data(), words.size() ) );
+    }
+    lhs.mark_endpoints_stale();
+}
+
+// lhs.words ^= rhs.words with the cardinality left stale, for a fold whose caller repairs it once at the end.
+// [croaring-ref] deps/croaring/src/containers/bitset.c:bitset_container_xor_nocard
+template <typename Layout, typename CowPolicy = cow_value_semantics>
+inline void xor_bitset_bitset_inplace_lazy(
+    bitset_ref<Layout, CowPolicy> lhs,
+    bitset_cref<Layout, CowPolicy> const rhs
+) noexcept {
+    auto       * const a{ lhs.words.as_array().data() };
+    auto const * const b{ rhs.words.as_array().data() };
+    for ( std::size_t i{ 0 }; i < Layout::word_count; ++i ) { a[ i ] ^= b[ i ]; }
+    lhs.mark_cardinality_stale();
+    lhs.mark_endpoints_stale();
+}
+
+// A bitset handle holding the words of `source` (and its cardinality), in a retired payload when one is offered.
+template <typename Layout, typename CowPolicy = cow_value_semantics>
+[[nodiscard]] inline container_handle<Layout, CowPolicy> clone_bitset_words(
+    bitset_cref<Layout, CowPolicy> const source,
+    container_handle<Layout, CowPolicy> && reuse = {}
+) {
+    auto result{ reuse.holds_bitset()
+        ? std::move( reuse )
+        : container_handle<Layout, CowPolicy>::make_bitset_uninitialized() };
+    std::memcpy( result.payload_data_raw(), source.words.begin(), sizeof( word_array<Layout> ) );
+    result.set_cardinality( static_cast<std::uint32_t>( source.size() ) );
+    result.mark_endpoints_stale();
+    return result;
 }
 
 } // namespace frsr::roaring::detail
