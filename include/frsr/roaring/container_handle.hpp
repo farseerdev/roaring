@@ -520,7 +520,9 @@ public:
 #if FRSR_ROARING_PAYLOAD_ALLOC_STATS
         ( spilled() ? payload_alloc_stats().grow_chain : payload_alloc_stats().grow_first ).fetch_add( 1, std::memory_order_relaxed );
 #endif
-        auto const grown{ std::max( required, payload_capacity<E>() * 2U ) };
+        // never below what is copied: a payload that holds more than its capacity says (a small borrowed payload cloned into
+        // the body in a build whose inline capacity is zero) that is then shrunk is "grown" to fewer elements than it holds
+        auto const grown{ std::max( std::max( required, count_ ), payload_capacity<E>() * 2U ) };
         auto * const fresh{ allocate_payload( std::size_t{ grown } * sizeof( E ) ) };
         std::memcpy( fresh, payload_data_raw(), std::size_t{ count_ } * sizeof( E ) );
         if ( spilled() ) {
