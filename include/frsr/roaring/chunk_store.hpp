@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <new>
 #include <utility>
 
 namespace frsr::roaring::detail {
@@ -233,10 +234,24 @@ public:
     // non-spilled handle has no payload to offer, and a shared one cannot be
     // rebuilt in place — parking it would allocate a retired table for nothing
     // and hold the co-owners' payload alive until the next clear.
+    //
+    // The table of parked payloads only ever grows while payloads are parked: when both cursors have taken or passed
+    // everything in it, nothing in it can be handed out any more and it starts over, so a table that is refilled and
+    // consumed pair by pair (a long-lived receiver of repeated `&=`) does not grow with the number of operations.
     void retire( handle_type && handle ) {
         if ( handle.offers_reusable_payload( handle.kind() ) ) {
+            if ( retired_.size() != 0 && retired_array_next_ == retired_.size() && retired_bitset_next_ == retired_.size() ) {
+                retired_.destroy_all();
+                retired_array_next_ = retired_bitset_next_ = 0;
+            }
             retired_.push_back( chunk_type{}, std::move( handle ) );
         }
+    }
+
+    // retire() for a caller that has no use for an allocation failure of the table of parked payloads: the handle then keeps
+    // its payload, which its owner frees as it would have without the parking.
+    void try_retire( handle_type && handle ) noexcept {
+        try { retire( std::move( handle ) ); } catch ( std::bad_alloc const & ) {}
     }
 
     // The in-place rewrite of the table by the walk that is consuming it (the shrinking set

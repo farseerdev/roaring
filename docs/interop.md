@@ -70,7 +70,8 @@ ever stored in a bitmap: what an operation keeps is built in fresh storage.
   where those share an operand's container as the result (against a saturated bitset or a full-domain run) a view
   computes the result instead, which is the price of writing nothing to the viewed bitmap. A difference that leaves a
   bitset below the array limit makes it an array; an intersection leaves it a bitset, as the operation between two
-  bitmaps does.
+  bitmaps does (`a &= view` is `a &= bitmap`). Against every other operand an intersection makes it an array too, as the
+  reference does.
 
 All const operations are pure reads and are safe to run concurrently on one bitmap. The queries are `noexcept`
 against a `key_range`, a `bit_words` and a `std::bitset` of up to 131072 bits, which they read without
@@ -131,7 +132,14 @@ n-way AND that starts from the operand with the fewest chunks and leapfrogs from
 operand lacks is a gallop; where every operand has the chunk, the containers meet in ascending order of their
 cardinality and the walk ends the chunk at the first empty accumulator. It writes nothing the operands own and
 the result keeps none of their containers (the single operand is copied too). `bitmap::and_many_into( views, out )`
-writes the result into a bitmap of the caller's, whose chunk table keeps its capacity.
+writes the result into a bitmap of the caller's, whose chunk table keeps its capacity and whose payloads the next call
+builds in.
+
+The walk of `and_many` over views is the walk over pointers (which already copies nothing and writes no count), so views do
+not make it faster; they make it applicable to bitmaps that have to be named by view. What the n-way AND with
+views and a reused result saves over the pointer form is the allocation of the result, and what `a.intersect_into( view,
+scratch )` followed by `scratch &= view` of the rest saves over a counted copy is the reference count it does not write:
+see `bench/view_contention_bench.cpp`, arms `and-many-ptr`, `views`, `many-into` and `views-into`.
 
 ### Complements
 
@@ -171,9 +179,21 @@ whose size is known); `jaccard_index` of two empty sets is NaN, as in the refere
 aliases of those of `b` (the way a bitmap served from a mapped file borrows its payloads): making it writes nothing to
 `b`, where copying a bitmap under a counting policy writes one count per container, and it copies no payload. The first
 update of a container of the copy clones that container into private storage, so the copy is as mutable as any bitmap
-and `b` is never changed through it. Because it does refer to `b`, the copy (and every copy of it) must be dropped, or
-have each of its containers written once, before `b` is changed or destroyed. When the copy has to outlive `b`, copy
-the bitmap.
+and `b` is never changed through it.
+
+Because it does refer to `b`, so does everything that takes a container of the copy by copying its handle, which a
+borrowed container keeps borrowed under every policy: `bitmap{ copy }`, an assignment from the copy, the receiver of
+`x |= copy` or `x ^= copy` (the containers `x` lacks) and of `x &= copy` (a full chunk). All of them must be dropped, or have
+each of their containers written once, before `b` is changed or destroyed; this is the aliasing of a bitmap served from a
+mapped file. To get a bitmap that outlives `b`, take the copy through a view, which adopts nothing:
+
+```cpp
+bitmap detached;
+detached |= view_of( copy );   // or view_of( b ): a copy of the contents, shared with nothing
+```
+
+Taking the copy by `bitmap{ copy }` does not do that, and a copy of a `bitmap` under a counting policy
+(`bitmap{ b }`) is the one to use when the reference counts of `b` may be written.
 
 A bitmap served from a mapped file has `persistent_bitmap::view()`: an operation through it never aliases the
 mapping, where `x |= *persistent` adopts the borrowed payloads and `x` is then valid only as long as the mapping is.

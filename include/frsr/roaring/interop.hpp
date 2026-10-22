@@ -53,6 +53,9 @@ private:
     typename Store::cursor       cur_;
 };
 
+template <typename Source> inline constexpr bool is_store_source_v{ false };
+template <typename Store> inline constexpr bool is_store_source_v<store_source<Store>>{ true };
+
 template <typename... Fs>
 struct overloaded : Fs... { using Fs::operator()...; };
 template <typename... Fs>
@@ -251,11 +254,17 @@ struct interop_engine {
 
     [[nodiscard]] static bool is_full( handle_type const & piece ) noexcept { return piece.cardinality() == chunk_capacity; }
 
-    // Whether a bitset that an operation leaves below the array limit becomes an array: a difference does, an
-    // intersection does not unless tuning.hpp says so (the rule of the walk of bitmap against bitmap: an intersection is
-    // the accumulator of a fold, and an array accumulator loses the dense kernels of every later pair).
-    [[nodiscard]] static constexpr bool demotes_sparse_result( set_operation const op ) noexcept {
-        return op == set_operation::bit_andnot || ( op == set_operation::bit_and && kAndDemotesSparseBitsets );
+    // Whether a bitset that an operation leaves below the array limit becomes an array: a difference does; an
+    // intersection does against every operand but a bitmap's chunks, where it does not unless tuning.hpp says so (the rule
+    // of the walk of bitmap against bitmap: an intersection is the accumulator of a fold, and an array accumulator loses
+    // the dense kernels of every later pair).
+    // against the chunks of a bitmap, as the walk of bitmap against bitmap leaves them; the other operands (bit words, keys,
+    // a key range) leave an array, as the reference does.
+    template <typename Source>
+    static constexpr bool and_demotes_sparse_bitsets{ kAndDemotesSparseBitsets || !is_store_source_v<Source> };
+
+    [[nodiscard]] static constexpr bool demotes_sparse_result( set_operation const op, bool const and_demotes ) noexcept {
+        return op == set_operation::bit_andnot || ( op == set_operation::bit_and && and_demotes );
     }
 
     // `lhs op rhs` for the shrinking operations, by the kernel of the pair that writes straight into a payload the table
@@ -324,12 +333,12 @@ struct interop_engine {
     }
 
     // `lhs op rhs` as a legal container of the bitmap's container set.
-    [[nodiscard]] static handle_type combine( Bitmap & self, handle_type const & lhs, handle_type const & rhs, set_operation const op ) {
+    [[nodiscard]] static handle_type combine( Bitmap & self, handle_type const & lhs, handle_type const & rhs, set_operation const op, bool const and_demotes ) {
         handle_type result;
         if ( op == set_operation::bit_or || !combine_with_kernel( self, lhs, rhs, op, result ) ) {
             result = Bitmap::combine_containers_for_policy( lhs, rhs, op );
         }
-        if ( demotes_sparse_result( op ) ) { result = Bitmap::demote_sparse_bitset( std::move( result ), self.chunks_ ); }
+        if ( demotes_sparse_result( op, and_demotes ) ) { result = Bitmap::demote_sparse_bitset( std::move( result ), self.chunks_ ); }
         assert( result.payload_is_unshared() && !result.shares_payload_with( lhs ) && !result.shares_payload_with( rhs ) && "a combine result aliases its operand" );
         return result;
     }
@@ -338,14 +347,14 @@ struct interop_engine {
     // holds is changed in place where the result is a subset of it and the kernels of bitmap against bitmap
     // do so (bitset against bitset, an array filtered by a bitset or a run, small array against array, a bitset
     // lessened by an array); everything else is computed into fresh storage.
-    static void combine_into( Bitmap & self, handle_type & slot, handle_type const & piece, set_operation const op ) {
+    static void combine_into( Bitmap & self, handle_type & slot, handle_type const & piece, set_operation const op, bool const and_demotes ) {
         assert( op != set_operation::bit_or );
         if constexpr ( Bitmap::uses_default_container_set ) {
             if ( slot.payload_is_unshared() ) {
                 if ( slot.holds_bitset() ) {
                     if ( piece.holds_bitset() ) {
                         combine_bitset_bitset_inplace<layout_type, cow_policy>( slot.as_bitset(), piece.as_bitset(), op );
-                        if ( demotes_sparse_result( op ) ) { slot = Bitmap::demote_sparse_bitset( std::move( slot ), self.chunks_ ); }
+                        if ( demotes_sparse_result( op, and_demotes ) ) { slot = Bitmap::demote_sparse_bitset( std::move( slot ), self.chunks_ ); }
                         return;
                     }
                     if ( op == set_operation::bit_andnot && piece.holds_array() ) {
@@ -373,8 +382,8 @@ struct interop_engine {
                 }
             }
         }
-        auto result{ combine( self, slot, piece, op ) };
-        self.chunks_.retire( std::move( slot ) );   // the payload it leaves is the next pair's result buffer
+        auto result{ combine( self, slot, piece, op, and_demotes ) };
+        self.chunks_.try_retire( std::move( slot ) );   // the payload it leaves is the next pair's result buffer
         slot = std::move( result );
     }
 
@@ -629,7 +638,7 @@ struct interop_engine {
                 new_size += slot.cardinality();
                 rewrite.keep( at );
             } else {
-                combine_into( self, slot, piece, set_operation::bit_and );
+                combine_into( self, slot, piece, set_operation::bit_and, and_demotes_sparse_bitsets<Source> );
                 assert( slot.payload_is_unshared() && !slot.shares_payload_with( piece ) && "an intersection keeps its operand's container" );
                 if ( slot.cardinality() != 0 ) {
                     new_size += slot.cardinality();
@@ -651,7 +660,7 @@ struct interop_engine {
         out.clear_keep_capacity();
         leapfrog( self, source, [ & ]( cursor const at, handle_type const & piece ) {
             auto const & slot{ self.chunks_.slot( at ) };
-            auto result{ is_full( piece ) ? own( slot ) : combine( out, slot, piece, set_operation::bit_and ) };
+            auto result{ is_full( piece ) ? own( slot ) : combine( out, slot, piece, set_operation::bit_and, and_demotes_sparse_bitsets<Source> ) };
             if ( auto const count{ result.cardinality() }; count != 0 ) {
                 out.size_ += count;
                 out.chunks_.push_back( self.chunks_.key( at ), std::move( result ) );
@@ -660,13 +669,39 @@ struct interop_engine {
         } );
     }
 
+    // `self - source` as a new bitmap in `out` (cleared first, its table and the payloads it parked kept for reuse): the chunks
+    // `self` holds and the source lacks are copied, the others are combined with their piece, and only what is kept is built.
+    // Every container of the result is built in `out`'s own storage; none is shared with `self` or with the source.
+    template <typename Source>
+    static void andnot_stream_into( Bitmap const & self, Source & source, Bitmap & out ) {
+        assert( &out != &self );
+        out.clear_keep_capacity();
+        for ( auto at{ self.chunks_.begin() }; at != self.chunks_.end(); ++at ) {
+            auto const key{ self.chunks_.key( at ) };
+            auto const & slot{ self.chunks_.slot( at ) };
+            source.seek( key );
+            handle_type result;
+            if ( !source.at_end() && source.key() == key && source.piece().cardinality() != 0 ) {
+                auto const & piece{ source.piece() };
+                if ( is_full( piece ) ) { continue; }
+                result = combine( out, slot, piece, set_operation::bit_andnot, true );
+            } else {
+                result = own( slot );
+            }
+            if ( auto const count{ result.cardinality() }; count != 0 ) {
+                out.size_ += count;
+                out.chunks_.push_back( key, std::move( result ) );
+            }
+        }
+    }
+
     template <typename Source>
     static void andnot_stream( Bitmap & self, Source & source ) {
         bool any_empty{ false };
         leapfrog( self, source, [ & ]( cursor const at, handle_type const & piece ) {
             auto & slot{ self.chunks_.slot( at ) };
             auto const before{ slot.cardinality() };
-            if ( is_full( piece ) ) { slot = handle_type{}; } else { combine_into( self, slot, piece, set_operation::bit_andnot ); }
+            if ( is_full( piece ) ) { slot = handle_type{}; } else { combine_into( self, slot, piece, set_operation::bit_andnot, true ); }
             assert( slot.payload_is_unshared() && !slot.shares_payload_with( piece ) && "a difference keeps its operand's container" );
             self.size_ -= before - slot.cardinality();
             any_empty |= slot.cardinality() == 0;
@@ -1005,7 +1040,7 @@ struct interop_engine {
     [[nodiscard]] static bool is_subset_of( Bitmap const & self, Operand const & operand ) {
         if ( self.empty() ) { return true; }
         // a bitmap with more keys than the one it is asked to lie in does not: known from the sizes, as for two bitmaps
-        if constexpr ( is_typed_view_v<Operand> ) { if ( self.size_ > operand.get().size_ ) { return false; } }
+        if constexpr ( is_typed_view_v<Operand> ) { if ( self.size() > operand.get().size() ) { return false; } }
         auto visitor{ overloaded{ [ & ]( auto & source ) { return subset_stream( self, source ); } } };
         if constexpr ( key_sequence<Operand> ) {
             // the operand has to be seen as a set: an unsorted range is sorted (a copy) first
@@ -1023,7 +1058,7 @@ struct interop_engine {
 
     template <typename Operand>
     [[nodiscard]] static bool is_superset_of( Bitmap const & self, Operand const & operand ) {
-        if constexpr ( is_typed_view_v<Operand> ) { if ( operand.get().size_ > self.size_ ) { return false; } }
+        if constexpr ( is_typed_view_v<Operand> ) { if ( operand.get().size() > self.size() ) { return false; } }
         return visit( operand, overloaded{
             [ & ]( auto & source ) { size_type total{ 0 }; return superset_stream( self, source, total ); },
             [ & ]( unsorted_keys_tag, auto const & keys ) { return superset_probe( self, keys ); }
@@ -1032,7 +1067,7 @@ struct interop_engine {
 
     template <typename Operand>
     [[nodiscard]] static bool equals( Bitmap const & self, Operand const & operand ) {
-        if constexpr ( is_typed_view_v<Operand> ) { if ( operand.get().size_ != self.size_ ) { return false; } }
+        if constexpr ( is_typed_view_v<Operand> ) { if ( operand.get().size() != self.size() ) { return false; } }
         auto const test{ [ & ]( auto & source ) {
             size_type total{ 0 };
             return superset_stream( self, source, total ) && total == self.size_;

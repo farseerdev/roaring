@@ -1884,6 +1884,13 @@ FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::intersect_into( typed_v
 }
 
 FRSR_ROARING_BITMAP_TEMPLATE
+FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::difference_into( typed_view<bitmap> const view, bitmap & out ) const noexcept( detail::allocation_failure_terminates ) {
+    assert( &out != this && &out != &view.get() );
+    detail::store_source source{ view.get().chunks_ };
+    detail::interop_engine<bitmap>::andnot_stream_into( *this, source, out );
+}
+
+FRSR_ROARING_BITMAP_TEMPLATE
 FRSR_ROARING_DEFINITION_INLINE auto FRSR_ROARING_BITMAP::and_many( std::span<bitmap const * const> const operands ) -> bitmap {
     bitmap result;
     and_many_into( operands, result );

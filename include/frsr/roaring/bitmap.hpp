@@ -727,13 +727,13 @@ public:
         requires ( std::same_as<Operand, bitmap> || std::same_as<Operand, typed_view<bitmap>> || std::same_as<Operand, key_range> )
     [[nodiscard]] double jaccard_index( Operand const & operand ) const noexcept( detail::complement_query_nothrow_v<Operand> ) {
         auto const common{ and_cardinality( operand ) };
-        return static_cast<double>( common ) / static_cast<double>( size() + operand_size( operand ) - common );
+        return static_cast<double>( common ) / ( static_cast<double>( size() ) + operand_size_as_double( operand ) - static_cast<double>( common ) );
     }
     // Whether every key of this bitmap is in the operand and the operand has more. [croaring-ref] deps/croaring/src/roaring.c:roaring_bitmap_is_strict_subset
     template <typename Operand>
         requires ( std::same_as<Operand, bitmap> || std::same_as<Operand, typed_view<bitmap>> || std::same_as<Operand, key_range> )
     [[nodiscard]] bool is_strict_subset_of( Operand const & operand ) const noexcept( detail::complement_query_nothrow_v<Operand> ) {
-        return size() < operand_size( operand ) && is_subset_of( operand );
+        return operand_has_more_than( operand, size() ) && is_subset_of( operand );
     }
     template <interop_operand Operand>
         requires ( !std::same_as<Operand, typed_view<bitmap>> && !std::same_as<Operand, key_range> )
@@ -1306,11 +1306,14 @@ public:
     // viewed bitmap, where a copy of a bitmap under a counting policy writes one reference count per container. The first
     // update of a container of the copy clones it into private storage, so the copy is as mutable as any bitmap and the
     // viewed bitmap is never changed by it.
-    // Unlike everything else that reads through a view, the result DOES refer to the viewed bitmap: it, and every copy
-    // of it, must be dropped (or have every container written once) before the viewed bitmap is changed or destroyed.
-    // The cost is one pass over the chunk table, a 32-byte handle per container and no payload copy; bitmap's own
-    // copy, which shares by count or copies the payload, is the one to use when the copy outlives the viewed bitmap.
-    // (The same aliasing a bitmap served from a mapped file has: see persistent_bitmap.)
+    // Unlike everything else that reads through a view, the result DOES refer to the viewed bitmap, and so does every bitmap
+    // that takes a container of it by copying its handle: a copy of it (`bitmap{ copy }`, which stays borrowed under every
+    // policy), an assignment from it, and the receiver of `x |= copy` or `x ^= copy` (the containers x lacks) and of
+    // `x &= copy` (a full chunk), as a bitmap served from a mapped file does (see persistent_bitmap). All of them must be
+    // dropped, or have every container written once, before the viewed bitmap is changed or destroyed. Through a VIEW of the
+    // copy nothing is adopted: `x |= view_of( copy )` is a copy of the viewed contents that outlives the master, as is any
+    // other operation that takes a view.
+    // The cost is one pass over the chunk table, a 32-byte handle per container and no payload copy.
     [[nodiscard]] static bitmap borrowed_copy( typed_view<bitmap> const view ) noexcept( detail::allocation_failure_terminates );
 
     // The AND written into `out`, which is cleared first (its chunk table keeps its capacity). `out` is none of the operands.
@@ -1347,6 +1350,8 @@ public:
     // `*this & view` into `out` (cleared first, its parked payloads reused), as intersect_into does for a bitmap, without sharing a
     // container of the view or of this bitmap: only the chunks both hold are visited, and what is kept is built in `out`.
     void intersect_into( typed_view<bitmap> const view, bitmap & out ) const noexcept( detail::allocation_failure_terminates );
+    // `*this - view` into `out`, built the same way: only the chunks that are kept are built.
+    void difference_into( typed_view<bitmap> const view, bitmap & out ) const noexcept( detail::allocation_failure_terminates );
 
 private:
     static constexpr std::size_t and_many_inline_operands{ 16 };
@@ -1621,13 +1626,17 @@ public:
         return result;
     }
 
-    // Materializes straight into the result, exactly as the operator- below does
-    // — taking lhs by value would copy the whole bitmap and then mutate the copy,
-    // which under a refcounting CowPolicy also clones every payload the in-place
-    // difference touches, because the copy left them shared.
+    // Against a bitmap or a view, materializes straight into the result, exactly as the operator- below
+    // does: only the chunks that are kept are built. Against any other operand it copies lhs and subtracts
+    // from the copy, which under a refcounting CowPolicy writes one count per container of lhs and then
+    // clones every payload the in-place difference touches, because the copy left them shared.
     template <complementable Operand>
     [[nodiscard]] friend bitmap operator&( bitmap const & lhs, complement<Operand> const & rhs ) noexcept( detail::allocation_failure_terminates && detail::complement_mutation_nothrow_v<Operand> ) {
         if constexpr ( std::same_as<Operand, bitmap> ) {
+            bitmap result;
+            lhs.difference_into( rhs.operand, result );
+            return result;
+        } else if constexpr ( std::same_as<Operand, typed_view<bitmap>> ) {
             bitmap result;
             lhs.difference_into( rhs.operand, result );
             return result;
@@ -1642,8 +1651,12 @@ public:
     template <complementable Operand>
     [[nodiscard]] friend bitmap operator&( typed_view<bitmap> const lhs, complement<Operand> const & rhs ) noexcept( detail::allocation_failure_terminates && detail::complement_mutation_nothrow_v<Operand> ) {
         bitmap result;
-        result |= lhs;
-        result.andnot_with( rhs.operand );
+        if constexpr ( std::same_as<Operand, bitmap> || std::same_as<Operand, typed_view<bitmap>> ) {
+            lhs.get().difference_into( typed_view<bitmap>{ rhs.operand }, result );
+        } else {
+            result |= lhs;
+            result.andnot_with( rhs.operand );
+        }
         return result;
     }
     template <complementable Operand>
@@ -1700,19 +1713,17 @@ public:
     [[nodiscard]] friend bitmap operator^( typed_view<bitmap> const lhs, bitmap const & rhs ) noexcept( detail::allocation_failure_terminates ) { return rhs ^ lhs; }
     [[nodiscard]] friend bitmap operator-( typed_view<bitmap> const lhs, typed_view<bitmap> const rhs ) noexcept( detail::allocation_failure_terminates ) {
         bitmap result;
-        result |= lhs;
-        result -= rhs;
+        lhs.get().difference_into( rhs, result );
         return result;
     }
     [[nodiscard]] friend bitmap operator-( bitmap const & lhs, typed_view<bitmap> const rhs ) noexcept( detail::allocation_failure_terminates ) {
-        bitmap result{ lhs };
-        result -= rhs;
+        bitmap result;
+        lhs.difference_into( rhs, result );
         return result;
     }
     [[nodiscard]] friend bitmap operator-( typed_view<bitmap> const lhs, bitmap const & rhs ) noexcept( detail::allocation_failure_terminates ) {
         bitmap result;
-        result |= lhs;
-        result -= rhs;
+        lhs.get().difference_into( view_of( rhs ), result );
         return result;
     }
 
@@ -2178,11 +2189,30 @@ private:
     [[nodiscard]] static size_type operand_size( bitmap const & operand ) noexcept { return operand.size(); }
     [[nodiscard]] static size_type operand_size( typed_view<bitmap> const operand ) noexcept { return operand.size(); }
     [[nodiscard]] static size_type operand_size( key_range const operand ) noexcept {
-        constexpr auto max{ static_cast<std::uint64_t>( std::numeric_limits<key_type>::max() ) };
-        if ( operand.empty() || operand.first > max ) { return 0; }
-        auto const count{ std::min( operand.last, max ) - operand.first + 1 };
+        if ( !operand_interval_holds_keys( operand ) ) { return 0; }
+        auto const count{ interval_keys_after_first( operand ) + 1 };
         assert( count != 0 && "an interval of every 64-bit key has no size" );
         return static_cast<size_type>( count );
+    }
+
+    // The sizes where an interval of every 64-bit key (which has none a size_type holds) is a legal operand: the comparison
+    // with a count and the size as a double.
+    [[nodiscard]] static bool operand_has_more_than( bitmap const & operand, size_type const count ) noexcept { return operand.size() > count; }
+    [[nodiscard]] static bool operand_has_more_than( typed_view<bitmap> const operand, size_type const count ) noexcept { return operand.size() > count; }
+    [[nodiscard]] static bool operand_has_more_than( key_range const operand, size_type const count ) noexcept {
+        return operand_interval_holds_keys( operand ) && count <= interval_keys_after_first( operand );
+    }
+    [[nodiscard]] static double operand_size_as_double( bitmap const & operand ) noexcept { return static_cast<double>( operand.size() ); }
+    [[nodiscard]] static double operand_size_as_double( typed_view<bitmap> const operand ) noexcept { return static_cast<double>( operand.size() ); }
+    [[nodiscard]] static double operand_size_as_double( key_range const operand ) noexcept {
+        return operand_interval_holds_keys( operand ) ? static_cast<double>( interval_keys_after_first( operand ) ) + 1.0 : 0.0;
+    }
+    [[nodiscard]] static bool operand_interval_holds_keys( key_range const operand ) noexcept {
+        return !operand.empty() && operand.first <= static_cast<std::uint64_t>( std::numeric_limits<key_type>::max() );
+    }
+    // the keys of a non-empty interval, clipped to the key type, but the first (one less than its size, which cannot wrap)
+    [[nodiscard]] static std::uint64_t interval_keys_after_first( key_range const operand ) noexcept {
+        return std::min( operand.last, static_cast<std::uint64_t>( std::numeric_limits<key_type>::max() ) ) - operand.first;
     }
 
     template <detail::interop_op Op, typename Self, typename Operand>
