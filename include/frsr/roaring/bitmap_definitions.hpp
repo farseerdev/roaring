@@ -1909,7 +1909,11 @@ FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::and_many_into( std::spa
         } else if ( auto & mine{ const_cast<handle_type &>( *acc ) }; mine.holds_bitset() && count <= array_to_bitset_threshold ) {
             result.chunks_.push_back( key, detail::array_handle_from_container<layout_type, CowPolicy>( mine ) );
         } else {
+            // the accumulator moves into the result; it carries on with a payload the result's table retired when it was
+            // cleared (the previous result of a reused bitmap), if there is one, instead of allocating the next one
+            auto const kind{ mine.kind() };
             result.chunks_.push_back( key, std::move( mine ) );
+            result.chunks_.take_retired_into( &mine, kind );
         }
         result.size_ += count;
         return true;

@@ -14,11 +14,13 @@
 #include "interop_support.hpp"
 #include "view_support.hpp"
 
+#include <algorithm>
 #include <array>
 #include <memory>
 #include <random>
 #include <span>
 #include <string>
+#include <variant>
 #include <vector>
 
 namespace {
@@ -43,6 +45,17 @@ using counted_bitmaps = ::testing::Types<
 template <typename Bitmap>
 class ViewWitness : public ::testing::Test {};
 TYPED_TEST_SUITE( ViewWitness, counted_bitmaps );
+
+// the same properties under the value-semantics policy, where a copy of a bitmap copies every payload
+using value_bitmaps = ::testing::Types<
+    bitmap_of<std::uint16_t, detail::cow_value_semantics>,
+    bitmap_of<std::uint32_t, detail::cow_value_semantics>,
+    bitmap_of<std::uint32_t, detail::cow_value_semantics, detail::run_selection_lazy>,
+    bitmap_of<std::uint64_t, detail::cow_value_semantics>
+>;
+template <typename Bitmap>
+class ViewValueSemantics : public ::testing::Test {};
+TYPED_TEST_SUITE( ViewValueSemantics, value_bitmaps );
 
 template <typename Bitmap>
 oracle_set contents_of( Bitmap const & bitmap ) {
@@ -207,5 +220,33 @@ TYPED_TEST( ViewWitness, StaleEndpointsOfAPublishedBitmapStayStale ) {
         EXPECT_NE( stale, 0U ) << "the publishing sequence no longer leaves a stale endpoint: this test no longer tests what it says";
     }
 }
+
+// ---- intersect_into / and_many_into ------------------------------------------------------------------------------
+
+// The scratch of intersect_into( view, scratch ) is reused: its table keeps its capacity and the payloads of the previous
+// result are the ones the next result is built in. Whatever the previous result left in them must not show: each round
+// intersects a different pair, alternating between large and small results, and the scratch is checked against the oracle
+// every time. (How many allocations the reuse saves is measured by the contention benchmark.)
+template <typename Bitmap>
+void check_scratch_reuse() {
+    std::mt19937_64 rng{ 31 };
+    Bitmap scratch;
+    for ( int round{ 0 }; round < 24; ++round ) {
+        auto const content_a{ round % 3 == 2 ? oracle_set{} : random_content<Bitmap>( rng ) };
+        auto const content_b{ round % 4 == 3 ? content_a : random_related<Bitmap>( rng, content_a, false ) };
+        auto const a{ make_bitmap<Bitmap>( content_a, round % 2 == 1 ) };
+        auto const b{ make_bitmap<Bitmap>( content_b, round % 5 == 4 ) };
+        a.intersect_into( view_of( b ), scratch );
+        expect_equals( scratch, intersection( content_a, content_b ), "intersect_into, round " + std::to_string( round ) );
+        if ( ::testing::Test::HasFatalFailure() ) { return; }
+        scratch.clear_keep_capacity();   // as a caller does between uses
+        a.intersect_into( view_of( b ), scratch );
+        expect_equals( scratch, intersection( content_a, content_b ), "intersect_into after clear_keep_capacity, round " + std::to_string( round ) );
+        if ( ::testing::Test::HasFatalFailure() ) { return; }
+    }
+}
+
+TYPED_TEST( ViewWitness, IntersectIntoAReusedScratch ) { check_scratch_reuse<TypeParam>(); }
+TYPED_TEST( ViewValueSemantics, IntersectIntoAReusedScratch ) { check_scratch_reuse<TypeParam>(); }
 
 } // namespace
