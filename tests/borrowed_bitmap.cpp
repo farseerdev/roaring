@@ -9,8 +9,10 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <tuple>
 #include <vector>
@@ -167,6 +169,47 @@ TEST(FrsrRoaringBorrow, ChunkKeyWiderThanTheChunkKeyTypeIsRejected) {
     EXPECT_FALSE( static_cast<bool>( TestBitmap::frozen_view_from_vm_vector( buffer ) ) );
 }
 
+// A view of a bitmap over a read-only master: what an operation takes from it is a copy, so the result is valid after the
+// master is gone (`x |= borrowed` adopts the borrowed payloads instead, which are valid only as long as the master is),
+// and the master bytes are never written.
+TEST(FrsrRoaringBorrow, ViewOfABorrowedBitmapNeverAliasesTheMaster) {
+    auto const source{ make_mixed_container_bitmap() };
+    auto const baseline{ source.to_vector() };
+    TestBitmap other;
+    other.add_closed_range( 60'000U, 66'000U );
+    other.add_closed_range( 196'000U, 200'000U );
+    std::ignore = other.add( 131'072U );
+
+    TestBitmap united, intersected, differed, exclusive, anded, from_nothing;
+    {
+        auto master{ std::make_unique<TestBitmap::serialized_byte_vector>() };
+        source.serialize_frozen_to_vm_vector( *master );
+        auto const master_snapshot{ snapshot( *master ) };
+        auto const frozen{ TestBitmap::frozen_view_from_vm_vector( *master ) };
+        ASSERT_TRUE( static_cast<bool>( frozen ) );
+        TestBitmap borrowed;
+        frozen.borrow_into( borrowed );
+        auto const view{ frsr::roaring::view_of( borrowed ) };
+
+        from_nothing |= view;
+        united = other;      united |= view;
+        intersected = other; intersected &= view;
+        differed = other;    differed -= view;
+        exclusive = other;   exclusive ^= view;
+        anded = borrowed & other;
+        EXPECT_EQ( borrowed.and_cardinality( view ), baseline.size() );
+        EXPECT_TRUE( bytes_equal( *master, master_snapshot ) );
+        EXPECT_EQ( TestBitmap::and_many( std::array<frsr::roaring::typed_view<TestBitmap>, 2>{ view, frsr::roaring::view_of( other ) } ).to_vector(), ( source & other ).to_vector() );
+        EXPECT_EQ( TestBitmap::and_many( std::array<frsr::roaring::typed_view<TestBitmap>, 1>{ view } ).to_vector(), baseline );
+    }   // the master is released here
+    EXPECT_EQ( from_nothing.to_vector(), baseline );
+    EXPECT_EQ( united.to_vector(), ( source | other ).to_vector() );
+    EXPECT_EQ( intersected.to_vector(), ( source & other ).to_vector() );
+    EXPECT_EQ( differed.to_vector(), ( other - source ).to_vector() );
+    EXPECT_EQ( exclusive.to_vector(), ( other ^ source ).to_vector() );
+    EXPECT_EQ( anded.to_vector(), ( source & other ).to_vector() );
+}
+
 #if defined(FRSR_ROARING_HAS_PSI_VM) && defined(FRSR_ROARING_ENABLE_VM_VECTOR_SERIALIZATION)
 
 TEST(FrsrRoaringBorrow, PersistentBitmapFileRoundTrip) {
@@ -192,6 +235,29 @@ TEST(FrsrRoaringBorrow, PersistentBitmapFileRoundTrip) {
         EXPECT_EQ( ( *reopened )->to_vector(), baseline );
     }
 
+    std::remove( file_name.c_str() );
+}
+
+// persistent_bitmap::view(): what a set operation takes through it is a copy, valid after the mapping is released
+TEST(FrsrRoaringBorrow, PersistentBitmapViewDoesNotAliasTheMapping) {
+    auto const source{ make_mixed_container_bitmap() };
+    auto const baseline{ source.to_vector() };
+    auto const file_name{ std::string{ ::testing::TempDir() } + "frsr_persistent_bitmap.view" };
+    ASSERT_TRUE( ( frsr::roaring::persistent_bitmap<std::uint32_t>::store( file_name.c_str(), source ) ) );
+    TestBitmap copy, other;
+    other.add_closed_range( 60'000U, 66'000U );
+    TestBitmap united{ other };
+    {
+        auto opened{ frsr::roaring::persistent_bitmap<std::uint32_t>::open( file_name.c_str() ) };
+        ASSERT_TRUE( opened.has_value() );
+        auto const view{ opened->view() };
+        EXPECT_EQ( view.size(), source.size() );
+        copy |= view;
+        united |= view;
+        EXPECT_EQ( other.and_cardinality( view ), ( other & source ).size() );
+    }
+    EXPECT_EQ( copy.to_vector(), baseline );
+    EXPECT_EQ( united.to_vector(), ( source | other ).to_vector() );
     std::remove( file_name.c_str() );
 }
 

@@ -180,6 +180,10 @@ TYPED_TEST( InteropCrosscheck, KeysBitsAndWords ) {
         compare( bitmap, content, std::span<Key const>{ keys }, related, "unsorted keys" );
         compare( bitmap, content, sorted_keys{ related }, related, "declared sorted keys" );
         compare( bitmap, content, Bitmap{ keys }, related, "bitmap" );
+        {
+            Bitmap const viewed{ keys };
+            compare( bitmap, content, frsr::roaring::view_of( viewed ), related, "view" );
+        }
 
         for ( std::uint64_t const base : { std::uint64_t{ 0 }, std::uint64_t{ 65536 }, std::uint64_t{ 131072 + 37 }, std::uint64_t{ 5 } << 32 } ) {
             if ( base > domain<Bitmap>::max ) { continue; }

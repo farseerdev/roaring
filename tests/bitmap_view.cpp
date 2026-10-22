@@ -130,6 +130,18 @@ TEST( BitmapView, TryAsRecoversConcreteType ) {
     EXPECT_EQ( view.try_as<bitmap<std::uint64_t>>(), nullptr );
 }
 
+// the operand of the set operations converts to the erased view, which recovers the same bitmap
+TEST( BitmapView, ATypedViewConvertsToTheErasedView ) {
+    bitmap<std::uint32_t> source;
+    for ( std::uint32_t value : { 1U, 70'000U, 4'000'000U } ) { std::ignore = source.add( value ); }
+    bitmap_view const erased{ frsr::roaring::view_of( source ) };
+    EXPECT_EQ( erased.size(), 3U );
+    EXPECT_TRUE( erased.contains( 70'000U ) );
+    EXPECT_FALSE( erased.contains( 70'001U ) );
+    EXPECT_EQ( erased.try_as<bitmap<std::uint32_t>>(), &source );
+    EXPECT_TRUE( erased == bitmap_view{ source } );
+}
+
 TEST( BitmapRef, MutationThroughErasedBoundary ) {
     bitmap<std::uint32_t> bm;
     bitmap_ref const ref{ bm };

@@ -410,6 +410,19 @@ TEST( lazy_fold_state, operations_between_folds_and_the_finisher ) {
     run_sessions<eager_bitmap>( 1, FRSR_ROARING_LAZY_FOLD_SESSIONS );
 }
 
+// A view is taken of a finished bitmap: of one in the middle of a fold a debug build asserts; after the finisher it is fine.
+TEST( lazy_fold_state, a_view_is_taken_of_a_finished_bitmap ) {
+    bitmap<std::uint32_t> a, b;
+    for ( std::uint32_t key{ 0 }; key < 40'000; key += 2 ) { a.add( key ); }
+    for ( std::uint32_t key{ 1 }; key < 40'000; key += 3 ) { b.add( key ); }
+    a.bulk_or_intermediate( b );
+    EXPECT_DEBUG_DEATH( { auto const deferred_view{ view_of( a ) }; (void)deferred_view; }, "finished" );
+    a.bulk_or_finish();
+    auto const view{ view_of( a ) };
+    EXPECT_EQ( view.size(), a.size() );
+    EXPECT_EQ( a.and_cardinality( view ), a.size() );
+}
+
 TEST( lazy_fold_state, operations_between_folds_under_the_lazy_run_policy ) {
     run_sessions<lazy_runs_bitmap>( 100'000, FRSR_ROARING_LAZY_FOLD_SESSIONS / 2 );
 }
