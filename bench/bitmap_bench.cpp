@@ -6723,6 +6723,112 @@ struct register_cpp_bulk_add_grouped_registrar {
 };
 #endif
 
+// ------------------------------------------------------------------------
+// Sorted batch into a run container: one chunk held as `runs` evenly spaced
+// runs (half of each period covered), a batch of ascending values drawn
+// uniformly over the chunk - some land inside runs, some in gaps - handed over
+// in one add_many_sorted() / roaring_bitmap_add_many() call. Every run starts
+// from a copy of the same base, so the copy is part of both arms alike.
+// Checksum = values added.
+// ------------------------------------------------------------------------
+struct RunBatchShape {
+    std::uint32_t batch;
+    std::uint32_t runs;
+};
+static constexpr RunBatchShape kRunBatchShapes[] = {
+    { 8, 16 }, { 64, 16 }, { 512, 16 },
+    { 8, 128 }, { 64, 128 }, { 512, 128 },
+    { 8, 1024 }, { 64, 1024 }, { 512, 1024 },
+};
+
+static std::vector<std::uint32_t> make_run_batch_values(RunBatchShape const &shape) {
+    std::mt19937 rng{ 0xBA7C4U + shape.batch + shape.runs };
+    std::set<std::uint32_t> unique;
+    while (unique.size() < shape.batch) { unique.insert(rng() & 0xFFFFU); }
+    return { unique.begin(), unique.end() };
+}
+
+template <class Arm>
+struct register_frsr_run_batch_registrar {
+    using TestBitmap32 = typename Arm::bitmap;
+    struct S {
+        TestBitmap32 base;
+        std::vector<std::uint32_t> batch;
+    };
+    static void run(RunBatchShape const &shape) {
+        Entry e;
+        char buf[160];
+        snprintf(buf, sizeof(buf), "set_ops/%sSortedBatchIntoRuns/batch=%u/runs=%u", Arm::label(), shape.batch, shape.runs);
+        e.name        = buf;
+        e.description = "frsr::roaring::bitmap<uint32_t> add_many_sorted() of an ascending batch into a copy of a "
+                        "single-chunk run container. Checksum = values added.";
+        e.setup = [shape]() -> void * {
+            auto *s = new S;
+            std::uint32_t const period = 65'536U / shape.runs;
+            for (std::uint32_t r = 0; r < shape.runs; ++r) {
+                s->base.add_closed_range(r * period, r * period + period / 2 - 1);
+            }
+            s->base.optimize();
+            s->batch = make_run_batch_values(shape);
+            return s;
+        };
+        e.run = [](void *sv) -> int64_t {
+            auto *s = static_cast<S *>(sv);
+            TestBitmap32 work{ s->base };
+            work.add_many_sorted({ s->batch.data(), s->batch.size() });
+            return static_cast<std::int64_t>(work.size() - s->base.size());
+        };
+        e.teardown       = [](void *sv) { delete static_cast<S *>(sv); };
+        e.ops_per_run    = 1;
+        e.inner_reps     = kBinaryInnerReps;
+        e.reusable_state = true;
+        g_benchmarks.push_back(std::move(e));
+    }
+};
+
+#if FRSR_ROARING_HAS_CROARING
+template <class Arm>
+struct register_cpp_run_batch_registrar {
+    struct S {
+        roaring_bitmap_t *base{};
+        std::vector<std::uint32_t> batch;
+        ~S() { if (base) roaring_bitmap_free(base); }
+    };
+    static void run(RunBatchShape const &shape) {
+        Entry e;
+        char buf[160];
+        snprintf(buf, sizeof(buf), "set_ops/%sSortedBatchIntoRuns/batch=%u/runs=%u", Arm::label(), shape.batch, shape.runs);
+        e.name        = buf;
+        e.description = "CRoaring roaring_bitmap_add_many() of the same ascending batch into a copy of the same "
+                        "single-chunk run container. [croaring-ref] deps/croaring/src/roaring.c:roaring_bitmap_add_many";
+        e.setup = [shape]() -> void * {
+            auto *s = new S;
+            s->base = Arm::create();
+            std::uint32_t const period = 65'536U / shape.runs;
+            for (std::uint32_t r = 0; r < shape.runs; ++r) {
+                roaring_bitmap_add_range_closed(s->base, r * period, r * period + period / 2 - 1);
+            }
+            roaring_bitmap_run_optimize(s->base);
+            s->batch = make_run_batch_values(shape);
+            return s;
+        };
+        e.run = [](void *sv) -> int64_t {
+            auto *s = static_cast<S *>(sv);
+            auto *work = Arm::copy(s->base);
+            roaring_bitmap_add_many(work, s->batch.size(), s->batch.data());
+            auto const added = static_cast<std::int64_t>(roaring_bitmap_get_cardinality(work) - roaring_bitmap_get_cardinality(s->base));
+            roaring_bitmap_free(work);
+            return added;
+        };
+        e.teardown       = [](void *sv) { delete static_cast<S *>(sv); };
+        e.ops_per_run    = 1;
+        e.inner_reps     = kBinaryInnerReps;
+        e.reusable_state = true;
+        g_benchmarks.push_back(std::move(e));
+    }
+};
+#endif
+
 #if FRSR_ROARING_HAS_CROARING
 template <class Arm>
 struct register_cpp_bulk_add_registrar {
@@ -6793,6 +6899,12 @@ void register_benchmarks() {
                 arms::for_each_frsr<register_frsr_copy_registrar>(shape);
 #if FRSR_ROARING_HAS_CROARING
                 arms::for_each_croaring<register_cpp_copy_registrar>(shape);
+#endif
+            }
+            for (auto const &shape : kRunBatchShapes) {
+                arms::for_each_frsr<register_frsr_run_batch_registrar>(shape);
+#if FRSR_ROARING_HAS_CROARING
+                arms::for_each_croaring<register_cpp_run_batch_registrar>(shape);
 #endif
             }
             for (auto const &shape : kBulkAddShapes) {
