@@ -1441,16 +1441,105 @@ public:
         return handle_->cardinality() != previous_size;
     }
 
-    // The group form of add(). A run container has no cheaper bulk shape than a
-    // value-at-a-time insert (each value either extends a run, fills a gap or
-    // splits one), so this exists for the payload resolution alone: the group's
-    // write barrier and kind dispatch are paid once by the caller.
+    // The group form of add(): one forward merge of the sorted, duplicate-free batch into the run list.
+    // Runs before the batch's first value stay where they are; the rest of the list is moved up by the
+    // number of runs the batch can open, and the merge then writes from the front of that gap while it
+    // reads behind the write position, so the payload grows at most once per batch (and not at all when
+    // its capacity already holds the result). Adjacent and overlapping runs coalesce as they are written.
+    // The caller owns the write barrier and any kind change the result calls for. Returns how many
+    // values were new.
     std::size_t add_sorted( std::span<low_type const> const sorted_values ) {
-        auto const previous_size{ handle_->cardinality() };
-        for ( auto const value : sorted_values ) {
-            add_closed_range( value, value );
+        if ( sorted_values.empty() ) {
+            return 0;
         }
-        return handle_->cardinality() - previous_size;
+
+        auto const batch_front{ sorted_values.front() };
+        auto const batch_back { sorted_values.back () };
+        auto const run_count  { runs.size() };
+
+        // The first run that is not strictly separated from the batch's first value.
+        auto const first_touched{ static_cast<std::uint32_t>( std::partition_point(
+            runs.begin(), runs.end(),
+            [ batch_front ]( run_type const & current ) noexcept {
+                return static_cast<std::size_t>( current.end ) + 1U < static_cast<std::size_t>( batch_front );
+            }
+        ) - runs.begin() ) };
+
+        // Values between two members of one run are in that run.
+        if ( first_touched != run_count && runs[ first_touched ].begin <= batch_front && batch_back <= runs[ first_touched ].end ) {
+            return 0;
+        }
+
+        // At most one new run per maximal consecutive group of the batch.
+        auto groups{ std::uint32_t{ 1 } };
+        for ( auto index{ std::size_t{ 1 } }; index < sorted_values.size(); ++index ) {
+            groups += static_cast<std::uint32_t>(
+                static_cast<std::size_t>( sorted_values[ index ] ) != static_cast<std::size_t>( sorted_values[ index - 1 ] ) + 1U
+            );
+        }
+
+        runs.reserve( run_count + groups );
+        auto * const data{ runs.data() };
+        auto const suffix_count{ run_count - first_touched };
+        std::memmove( data + first_touched + groups, data + first_touched, std::size_t{ suffix_count } * sizeof( run_type ) );
+
+        auto read { std::size_t{ first_touched } + groups };
+        auto const read_end{ std::size_t{ run_count } + groups };
+        auto write{ std::size_t{ first_touched } };
+        auto added{ std::size_t{ 0 } };
+
+        auto const overlap{ []( std::size_t const begin, std::size_t const end, run_type const & current ) noexcept {
+            auto const low { std::max( begin, std::size_t{ current.begin } ) };
+            auto const high{ std::min( end  , std::size_t{ current.end   } ) };
+            return high >= low ? high - low + 1U : std::size_t{ 0 };
+        } };
+
+        // One maximal consecutive group of the batch at a time: the runs strictly before it move as one block,
+        // and the group joins every run it touches (the previous output run included, which an earlier group
+        // may have stretched over it).
+        auto batch{ sorted_values.begin() };
+        auto const batch_end{ sorted_values.end() };
+        while ( batch != batch_end ) {
+            auto const group_begin{ std::size_t{ *batch } };
+            auto group_end{ group_begin };
+            for ( ++batch; batch != batch_end && std::size_t{ *batch } == group_end + 1U; ++batch ) {
+                group_end = *batch;
+            }
+
+            auto const block_end{ static_cast<std::size_t>( std::partition_point(
+                data + read, data + read_end,
+                [ group_begin ]( run_type const & current ) noexcept { return std::size_t{ current.end } + 1U < group_begin; }
+            ) - data ) };
+            std::memmove( data + write, data + read, ( block_end - read ) * sizeof( run_type ) );
+            write += block_end - read;
+            read   = block_end;
+
+            auto merged_begin{ group_begin };
+            auto merged_end  { group_end   };
+            auto already_present{ std::size_t{ 0 } };
+            auto const absorb{ [ & ]( run_type const & current ) noexcept {
+                already_present += overlap( group_begin, group_end, current );
+                merged_begin = std::min( merged_begin, std::size_t{ current.begin } );
+                merged_end   = std::max( merged_end  , std::size_t{ current.end   } );
+            } };
+            if ( write != 0 && std::size_t{ data[ write - 1 ].end } + 1U >= group_begin ) {
+                absorb( data[ --write ] );
+            }
+            while ( read != read_end && std::size_t{ data[ read ].begin } <= merged_end + 1U ) {
+                absorb( data[ read++ ] );
+            }
+            added += group_end - group_begin + 1U - already_present;
+            data[ write++ ] = run_type{ static_cast<low_type>( merged_begin ), static_cast<low_type>( merged_end ) };
+        }
+
+        // The runs after the last group are untouched.
+        std::memmove( data + write, data + read, ( read_end - read ) * sizeof( run_type ) );
+        write += read_end - read;
+
+        runs.resize_uninitialized( static_cast<std::uint32_t>( write ) );
+        handle_->adjust_cardinality( static_cast<std::int32_t>( added ) );
+        handle_->set_endpoints( data[ 0 ].begin, data[ write - 1 ].end );
+        return added;
     }
 
     [[nodiscard]] bool remove( low_type const value ) {
