@@ -427,6 +427,22 @@ public:
         return true;
     }
 
+    // A handle on the same contents as `master`, which it aliases without touching it: a spilled payload is borrowed
+    // (as a mapped one is: copies alias it too, nothing is counted or freed, and the first mutable access clones it
+    // into private storage), an inline payload is copied by value. The header, cardinality and endpoints included,
+    // is the master's, so nothing has to be derived again; the capacity is the count (a payload that is never
+    // written in place is never grown in place). Reads the master's header and payload pointer, writes nothing of it.
+    // The master's payload must outlive every handle made from it, and be left unchanged.
+    [[nodiscard]] static container_handle make_borrowed_alias( container_handle const & master ) noexcept {
+        container_handle handle;
+        handle.copy_fields_from( master );
+        if ( master.spilled() ) {
+            handle.owner_ = storage_ownership::borrowed;
+            handle.spill().capacity = master.count_;
+        }
+        return handle;
+    }
+
     // Whether both handles are spilled onto the very same payload (a copy of a handle under a refcounted
     // policy, or a borrowed alias of it). Inline payloads are values and never shared.
     [[nodiscard]] bool shares_payload_with( container_handle const & other ) const noexcept {

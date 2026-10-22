@@ -113,6 +113,9 @@ struct checks {
     static_assert( noexcept( std::declval<Bitmap const &>().jaccard_index( std::declval<key_range>() ) ) );
     static_assert( noexcept( std::declval<Bitmap const &>().is_strict_subset_of( std::declval<view>() ) ) );
 
+    // a copy that shares the payloads of a view
+    static_assert( noexcept( Bitmap::borrowed_copy( std::declval<view>() ) ) == terminates );
+
     static_assert( noexcept( std::declval<Bitmap &>().optimize() ) == terminates );
     static_assert( noexcept( std::declval<Bitmap &>().optimize_for_storage() ) == terminates );
     static_assert( noexcept( std::declval<Bitmap &>().optimize_for_speed() ) == terminates );

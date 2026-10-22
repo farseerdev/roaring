@@ -1301,6 +1301,18 @@ public:
     // The AND as a bitmap. A result bitset that fell to array size is stored as an array.
     [[nodiscard]] static bitmap and_many( std::span<bitmap const * const> const operands );
 
+    // A copy of the viewed bitmap that shares its payloads without counting them: each spilled container of the copy
+    // is a borrowed alias of the viewed one (a small one is copied by value), so making the copy writes nothing to the
+    // viewed bitmap, where a copy of a bitmap under a counting policy writes one reference count per container. The first
+    // update of a container of the copy clones it into private storage, so the copy is as mutable as any bitmap and the
+    // viewed bitmap is never changed by it.
+    // Unlike everything else that reads through a view, the result DOES refer to the viewed bitmap: it, and every copy
+    // of it, must be dropped (or have every container written once) before the viewed bitmap is changed or destroyed.
+    // The cost is one pass over the chunk table, a 32-byte handle per container and no payload copy; bitmap's own
+    // copy, which shares by count or copies the payload, is the one to use when the copy outlives the viewed bitmap.
+    // (The same aliasing a bitmap served from a mapped file has: see persistent_bitmap.)
+    [[nodiscard]] static bitmap borrowed_copy( typed_view<bitmap> const view ) noexcept( detail::allocation_failure_terminates );
+
     // The AND written into `out`, which is cleared first (its chunk table keeps its capacity). `out` is none of the operands.
     static void and_many_into( std::span<bitmap const * const> const operands, bitmap & out ) noexcept( detail::allocation_failure_terminates );
 

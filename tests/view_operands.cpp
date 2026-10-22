@@ -249,4 +249,124 @@ void check_scratch_reuse() {
 TYPED_TEST( ViewWitness, IntersectIntoAReusedScratch ) { check_scratch_reuse<TypeParam>(); }
 TYPED_TEST( ViewValueSemantics, IntersectIntoAReusedScratch ) { check_scratch_reuse<TypeParam>(); }
 
+// ---- borrowed_copy ----------------------------------------------------------------------------------------------
+
+// A borrowed copy shares the payloads of the viewed bitmap without writing anything of it, is as mutable as any bitmap,
+// and never changes the viewed one.
+template <typename Bitmap>
+void check_borrowed_copy( std::unique_ptr<Bitmap> master, std::mt19937_64 & rng, std::string const & what ) {
+    using access = bitmap_test_access<Bitmap>;
+    using key_type = typename Bitmap::key_type;
+    auto const members{ contents_of( *master ) };
+    auto const before{ access::snapshot( *master ) };
+    {
+        auto copy{ Bitmap::borrowed_copy( view_of( *master ) ) };
+        ASSERT_EQ( copy.validate(), nullptr ) << what;
+        ASSERT_EQ( copy.size(), members.size() ) << what;
+        ASSERT_EQ( contents_of( copy ), members ) << what;
+        EXPECT_EQ( copy.statistics().container_count(), master->statistics().container_count() ) << what;
+        EXPECT_TRUE( copy == *master ) << what;
+
+        // every spilled container is the master's own payload, borrowed: nothing was copied
+        auto const copied{ access::snapshot( copy ) };
+        ASSERT_EQ( copied.size(), before.size() ) << what;
+        for ( std::size_t i{ 0 }; i < copied.size(); ++i ) {
+            EXPECT_EQ( copied[ i ].key, before[ i ].key ) << what;
+            EXPECT_EQ( copied[ i ].payload, before[ i ].payload ) << what << ": a payload was copied";
+            EXPECT_EQ( copied[ i ].content, before[ i ].content ) << what;
+        }
+        // a copy of the borrowed copy aliases the same payloads, and counts nothing
+        Bitmap second{ copy };
+        EXPECT_TRUE( before == access::snapshot( *master ) ) << what << ": copying the borrowed copy wrote to the master";
+        EXPECT_EQ( contents_of( second ), members ) << what;
+
+        // the copy is mutable: every kind of update, with the master and the second copy as the witnesses
+        auto expected{ members };
+        auto const forget{ [ & ]( std::uint64_t const key ) { expected.erase( std::remove( expected.begin(), expected.end(), key ), expected.end() ); } };
+        for ( int i{ 0 }; i < 300 && !expected.empty(); ++i ) {
+            auto const key{ expected[ rng() % expected.size() ] };
+            ASSERT_TRUE( copy.remove( static_cast<key_type>( key ) ) ) << what;
+            forget( key );
+        }
+        for ( int i{ 0 }; i < 300; ++i ) {
+            std::uint64_t const key{ domain<Bitmap>::max == std::numeric_limits<std::uint64_t>::max() ? rng() : rng() % ( domain<Bitmap>::max + 1 ) };
+            copy.add( static_cast<key_type>( key ) );
+            expected.push_back( key );
+        }
+        finalize( expected );
+        expect_equals( copy, expected, what + " after single updates" );
+        auto const other{ make_bitmap<Bitmap>( random_content<Bitmap>( rng ), false ) };
+        copy |= other;
+        expected = unite( expected, contents_of( other ) );
+        expect_equals( copy, expected, what + " after |=" );
+        copy &= view_of( other );
+        expected = intersection( expected, contents_of( other ) );
+        expect_equals( copy, expected, what + " after &= view" );
+        copy.optimize();
+        expect_equals( copy, expected, what + " after optimize" );
+
+        EXPECT_TRUE( before == access::snapshot( *master ) ) << what << ": updating the borrowed copy changed the master";
+        EXPECT_EQ( contents_of( second ), members ) << what << ": updating the borrowed copy changed another copy of it";
+    }
+    EXPECT_TRUE( before == access::snapshot( *master ) ) << what << ": dropping the borrowed copies changed the master";
+    ASSERT_EQ( master->validate(), nullptr ) << what;
+    ASSERT_EQ( contents_of( *master ), members ) << what;
+}
+
+template <typename Bitmap>
+void check_borrowed_copies() {
+    std::mt19937_64 rng{ 5005 };
+    for ( int round{ 0 }; round < 3; ++round ) {
+        check_borrowed_copy<Bitmap>( std::make_unique<Bitmap>( publish<Bitmap>( rng ) ), rng, "published " + std::to_string( round ) );
+        if ( ::testing::Test::HasFatalFailure() ) { return; }
+    }
+    check_borrowed_copy<Bitmap>( std::make_unique<Bitmap>(), rng, "empty" );
+    for ( auto const kind : { shape::sparse, shape::array, shape::dense_bitset, shape::runs, shape::full, shape::ends, shape::single, shape::mixed } ) {
+        oracle_set content;
+        for ( auto const chunk : domain<Bitmap>::chunks() ) { fill_chunk( content, chunk, kind, rng, domain<Bitmap>::max ); }
+        finalize( content );
+        for ( bool const optimize : { false, true } ) {
+            check_borrowed_copy<Bitmap>( std::make_unique<Bitmap>( make_bitmap<Bitmap>( content, optimize ) ), rng, "shape " + std::to_string( static_cast<int>( kind ) ) );
+            if ( ::testing::Test::HasFatalFailure() ) { return; }
+        }
+    }
+}
+
+TYPED_TEST( ViewWitness, BorrowedCopyWritesNothingAndIsolatesTheMaster ) { check_borrowed_copies<TypeParam>(); }
+
+// ... and the same under the value-semantics policy, where a copy is a deep copy and the borrowed one is not
+TYPED_TEST( ViewValueSemantics, BorrowedCopyAliasesAndIsolatesTheMaster ) { check_borrowed_copies<TypeParam>(); }
+TYPED_TEST( ViewValueSemantics, ReadingThroughAViewKeepsNothing ) {
+    using Bitmap = TypeParam;
+    std::mt19937_64 rng{ 20261023 };
+    for ( int round{ 0 }; round < 3; ++round ) { exercise_views_of<Bitmap>( std::make_unique<Bitmap>( publish<Bitmap>( rng ) ), rng, "published " + std::to_string( round ) ); }
+}
+
+// a view of a bitmap of a container set the library does not hold, and of 8-bit keys, which only the header serves
+TEST( ViewOperandsHeaderOnly, UncompiledInstantiations ) {
+    using narrow = bitmap<std::uint8_t>;
+    using other_set = bitmap<std::uint32_t, std::variant<array_container<std::uint32_t>, bitset_container<std::uint32_t>>>;
+    std::mt19937_64 rng{ 77 };
+    {
+        auto const content{ random_content<narrow>( rng ) };
+        auto const viewed{ make_bitmap<narrow>( content, false ) };
+        narrow b{ viewed };
+        b |= view_of( viewed );
+        expect_equals( b, content, "u8" );
+        b ^= view_of( viewed );
+        expect_equals( b, {}, "u8 xor" );
+        EXPECT_EQ( narrow::borrowed_copy( view_of( viewed ) ).size(), content.size() );
+    }
+    {
+        auto const content{ random_content<other_set>( rng ) };
+        auto const viewed{ make_bitmap<other_set>( content, false ) };
+        other_set b;
+        b |= view_of( viewed );
+        expect_equals( b, content, "variant set" );
+        EXPECT_EQ( b.and_cardinality( view_of( viewed ) ), content.size() );
+        EXPECT_EQ( other_set::and_many( std::array<typed_view<other_set>, 2>{ view_of( b ), view_of( viewed ) } ).size(), content.size() );
+        EXPECT_EQ( contents_of( other_set::borrowed_copy( view_of( viewed ) ) ), content );
+    }
+}
+
 } // namespace

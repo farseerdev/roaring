@@ -1921,6 +1921,20 @@ FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::and_many_into( std::spa
 }
 
 FRSR_ROARING_BITMAP_TEMPLATE
+FRSR_ROARING_DEFINITION_INLINE auto FRSR_ROARING_BITMAP::borrowed_copy( typed_view<bitmap> const view ) noexcept( detail::allocation_failure_terminates ) -> bitmap {
+    bitmap result;
+    auto const & source{ view.get().chunks_ };
+    result.chunks_.reserve( source.size() );
+    for ( auto at{ source.begin() }; at != source.end(); ++at ) {
+        // built in the table's own storage, as a combine builds its result
+        ::new ( static_cast<void *>( result.chunks_.open_back() ) ) handle_type( handle_type::make_borrowed_alias( source.slot( at ) ) );
+        result.chunks_.commit_back( source.key( at ) );
+    }
+    result.size_ = view.get().size_;
+    return result;
+}
+
+FRSR_ROARING_BITMAP_TEMPLATE
 FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::and_many_seed_bitset( and_many_scratch & scratch, handle_type const & source ) {
     auto & acc{ scratch.bitset_acc };
     if ( !acc.holds_bitset() ) {

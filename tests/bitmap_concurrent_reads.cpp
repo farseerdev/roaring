@@ -214,6 +214,20 @@ void view_reads_from_many_threads() {
         Bitmap scratch;
         a.intersect_into( vb, scratch );
         if ( to_vector( scratch ) != expected_and ) { return false; }
+        // a borrowed copy of a shared bitmap, updated in this thread: the shared one is neither written nor changed
+        {
+            auto copy{ Bitmap::borrowed_copy( va ) };
+            if ( copy.size() != a.size() ) { return false; }
+            copy &= vb;
+            if ( to_vector( copy ) != expected_and ) { return false; }
+            auto again{ Bitmap::borrowed_copy( vb ) };
+            again.add( static_cast<key_type>( t ) );
+            again |= va;
+            again -= vc;
+            again ^= va;
+            again.optimize();
+            if ( again.validate() != nullptr ) { return false; }
+        }
         std::size_t visited{ 0 };
         Bitmap::and_many_for_each( views, [&]( key_type ) { ++visited; } );
         return visited == expected_and3.size();
