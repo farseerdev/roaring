@@ -420,6 +420,232 @@ TYPED_TEST( InteropTest, ViewOperands ) {
     }
 }
 
+// The complement of an operand: the operations it is rewritten to, on every operand form, against the oracle
+// (a bitmap holds only keys, so a complement is read through what the bitmap holds)
+template <typename Bitmap, typename Complement>
+void check_complement( Bitmap const & bitmap, oracle_set const & content, Complement const & complement, oracle_set const & members, std::string const & what ) {
+    auto const without{ difference( content, members ) };
+    auto const common{ intersection( content, members ) };
+    {
+        Bitmap b{ bitmap };
+        b &= complement;
+        expect_holds( b, without, what + " &= !x" );
+        b = bitmap;
+        b.and_with( complement );
+        expect_holds( b, without, what + " and_with( !x )" );
+        b = bitmap;
+        b -= complement;
+        expect_holds( b, common, what + " -= !x" );
+        b = bitmap;
+        b.andnot_with( complement );
+        expect_holds( b, common, what + " andnot_with( !x )" );
+        expect_holds( bitmap & complement, without, what + " bitmap & !x" );
+        expect_holds( complement & bitmap, without, what + " !x & bitmap" );
+        if ( ::testing::Test::HasFatalFailure() ) { return; }
+    }
+    EXPECT_EQ( bitmap.intersects( complement ), !without.empty() ) << what << " intersects";
+    EXPECT_EQ( bitmap.and_cardinality( complement ), without.size() ) << what << " and_cardinality";
+    EXPECT_EQ( bitmap.is_subset_of( complement ), common.empty() ) << what << " is_subset_of";
+}
+
+TYPED_TEST( InteropTest, ComplementOperands ) {
+    using Bitmap = TypeParam;
+    using frsr::roaring::complement_of;
+    using frsr::roaring::view_of;
+    std::mt19937_64 rng{ 1111 };
+    for ( int round{ 0 }; round < 2 * scale; ++round ) {
+        auto const content{ random_content<Bitmap>( rng ) };
+        for ( bool const optimize : { false, true } ) {
+            auto const bitmap{ make_bitmap<Bitmap>( content, optimize ) };
+            for ( int variant{ 0 }; variant < 3; ++variant ) {
+                auto const members{ random_related<Bitmap>( rng, content, false ) };
+                auto const viewed{ make_bitmap<Bitmap>( members, variant == 1 ) };
+                auto const tag{ std::string{ optimize ? " (optimized) " : " " } + std::to_string( variant ) };
+                check_complement( bitmap, content, !view_of( viewed ), members, "!view" + tag );
+                check_complement( bitmap, content, complement_of( view_of( viewed ) ), members, "complement_of( view )" + tag );
+                check_complement( bitmap, content, !viewed, members, "!bitmap" + tag );
+                if ( ::testing::Test::HasFatalFailure() ) { return; }
+                with_key_operands<Bitmap>( members, rng, [ & ]( auto const & operand, std::string const & what ) {
+                    check_complement( bitmap, content, complement_of( operand ), members, "complement_of( " + what + " )" + tag );
+                } );
+                // !!x is x
+                auto const twice{ !!view_of( viewed ) };
+                static_assert( std::same_as<std::remove_cvref_t<decltype( twice )>, frsr::roaring::typed_view<Bitmap>> );
+                EXPECT_TRUE( twice == view_of( viewed ) );
+                if ( ::testing::Test::HasFatalFailure() ) { return; }
+            }
+            with_word_operands<Bitmap>( rng, [ & ]( auto const & operand, oracle_set const & members, std::string const & what ) {
+                check_complement( bitmap, content, complement_of( operand ), members, "complement_of( " + what + " )" );
+            } );
+            with_range_operands<Bitmap>( rng, [ & ]( auto const & operand, oracle_set const & members, std::string const & what ) {
+                check_complement( bitmap, content, !operand, members, "!" + what );
+            } );
+            if ( ::testing::Test::HasFatalFailure() ) { return; }
+        }
+    }
+}
+
+// a complement does not copy a container operand, and the complement of a complement is the operand
+TEST( ComplementOperand, StorageAndInvolution ) {
+    using frsr::roaring::complement;
+    using frsr::roaring::complement_of;
+    std::vector<std::uint32_t> keys{ 1, 2, 3 };
+    auto const by_reference{ complement_of( keys ) };
+    EXPECT_EQ( &by_reference.operand, &keys );   // held, not copied: a std::vector would allocate
+    std::bitset<100> bits;
+    auto const bits_complement{ complement_of( bits ) };
+    EXPECT_EQ( &bits_complement.operand, &bits );
+    static_assert( sizeof( complement<frsr::roaring::key_range> ) == sizeof( frsr::roaring::key_range ) );
+    static_assert( std::is_trivially_copyable_v<complement<frsr::roaring::key_range>> );
+    static_assert( std::is_trivially_copyable_v<complement<frsr::roaring::typed_view<frsr::roaring::bitmap<std::uint32_t>>>> );
+    static_assert( std::is_trivially_copyable_v<complement<std::span<std::uint32_t const>>> );
+    static_assert( noexcept( complement_of( keys ) ) );
+    auto const range{ frsr::roaring::key_range::closed( 5, 9 ) };
+    auto const back{ !!range };
+    static_assert( std::same_as<std::remove_cvref_t<decltype( back )>, frsr::roaring::key_range> );
+    EXPECT_EQ( back.first, 5U );
+    EXPECT_EQ( back.last, 9U );
+    EXPECT_EQ( &complement_of( complement_of( keys ) ), &keys );
+}
+
+// the combinations a complement does not offer do not compile: a union with the rest of the key space is wanted for no operand but an interval
+template <typename Bitmap>
+constexpr bool complement_forms_hold() {
+    using frsr::roaring::complement;
+    using frsr::roaring::key_range;
+    using frsr::roaring::typed_view;
+    using view = typed_view<Bitmap>;
+    using bits = std::bitset<64>;
+    return
+        requires ( Bitmap & b, complement<key_range> c ) { b |= c; b ^= c; b &= c; b -= c; b.or_with( c ); b.xor_with( c ); } &&
+        requires ( Bitmap & b, complement<view> c ) { b &= c; b -= c; b.and_with( c ); b.andnot_with( c ); } &&
+        requires ( Bitmap & b, complement<Bitmap> c ) { b &= c; b -= c; } &&
+        requires ( Bitmap const & b, complement<view> c ) { b.intersects( c ); b.and_cardinality( c ); b.is_subset_of( c ); } &&
+        requires ( Bitmap const & b, complement<Bitmap> c ) { b.intersects( c ); b.and_cardinality( c ); b.is_subset_of( c ); } &&
+        !requires ( Bitmap & b, complement<view> c ) { b |= c; } &&
+        !requires ( Bitmap & b, complement<view> c ) { b ^= c; } &&
+        !requires ( Bitmap & b, complement<view> c ) { b.or_with( c ); } &&
+        !requires ( Bitmap & b, complement<bits> c ) { b |= c; } &&
+        !requires ( Bitmap & b, complement<Bitmap> c ) { b |= c; } &&
+        !requires ( Bitmap & b, complement<Bitmap> c ) { b ^= c; } &&
+        !requires ( Bitmap & b, complement<std::span<std::uint32_t const>> c ) { b.xor_with( c ); } &&
+        !requires ( Bitmap const & b, complement<view> c ) { b.xor_cardinality( c ); } &&
+        !requires ( Bitmap const & b, complement<key_range> c ) { b.xor_cardinality( c ); } &&
+        !requires ( Bitmap const & b, complement<view> c ) { b.is_superset_of( c ); } &&
+        !requires ( Bitmap const & b, complement<view> c ) { b.equals( c ); } &&
+        !requires ( Bitmap const & b, complement<key_range> c ) { b.equals( c ); };
+}
+static_assert( complement_forms_hold<frsr::roaring::bitmap<std::uint32_t>>() );
+static_assert( complement_forms_hold<frsr::roaring::bitmap<std::uint64_t, frsr::roaring::default_container_set<std::uint64_t>, frsr::roaring::detail::cow_atomic_refcount>>() );
+static_assert( complement_forms_hold<frsr::roaring::bitmap<std::uint16_t>>() );
+
+// the union and exclusive-or with the complement of an interval, the one complement that has them: the two intervals
+// outside it, including the ends of the key space and the intervals with nothing outside or everything
+TYPED_TEST( InteropTest, ComplementOfAnInterval ) {
+    using Bitmap = TypeParam;
+    using key_type = typename Bitmap::key_type;
+    using frsr::roaring::key_range;
+    constexpr std::uint64_t max{ domain<Bitmap>::max };
+    if constexpr ( std::numeric_limits<key_type>::digits > 32 || ( max > 0xFFFF && std::variant_size_v<typename Bitmap::container_set_type> < 3 ) ) {
+        return;   // the rest of a 64-bit key space cannot be materialized, nor that of 32-bit keys where a full chunk takes 8 KB (no run containers)
+    } else {
+        // a domain that can be listed whole is compared whole; a wider one by its size and by probing keys around the interval
+        constexpr bool listable{ max <= 0xFFFF };
+        std::mt19937_64 rng{ 1212 };
+        std::vector<key_range> ranges{
+            key_range{}, key_range::all(), key_range::closed( 0, 0 ), key_range::closed( max, max ),
+            key_range::closed( 0, max ), key_range::closed( 0, max / 2 ), key_range::closed( max / 2, max ),
+            key_range::closed( 1, max - 1 ), key_range::closed( max / 4, max / 4 + 70000 ), key_range::from( max ), key_range::from( 1 ), key_range::closed( max / 3, max / 3 ),
+            key_range::closed( max / 2, max + 5 ),      // reaches past the key type
+            key_range::closed( max + 1, max + 9 )       // entirely past it: nothing of it is a key
+        };
+        for ( int round{ 0 }; round < scale; ++round ) {
+            auto const content{ random_content<Bitmap>( rng ) };
+            for ( bool const optimize : { false, true } ) {
+                auto const bitmap{ make_bitmap<Bitmap>( content, optimize ) };
+                for ( auto const & range : ranges ) {
+                    for ( bool const exclusive : { false, true } ) {
+                        Bitmap b{ bitmap };
+                        if ( exclusive ) { b ^= !range; } else { b |= !range; }
+                        ASSERT_EQ( b.validate(), nullptr );
+                        auto const inside{ [ & ]( std::uint64_t const key ) { return !range.empty() && range.first <= key && key <= range.last; } };
+                        auto const was{ [ & ]( std::uint64_t const key ) { return std::binary_search( content.begin(), content.end(), key ); } };
+                        auto const expected{ [ & ]( std::uint64_t const key ) { return inside( key ) ? was( key ) : ( exclusive ? !was( key ) : true ); } };
+                        auto const what{ std::string{ exclusive ? "^=" : "|=" } + " !range [" + std::to_string( range.first ) + ", " + std::to_string( range.last ) + "]" };
+                        if constexpr ( listable ) {
+                            oracle_set want;
+                            for ( std::uint64_t key{ 0 }; key <= max; ++key ) { if ( expected( key ) ) { want.push_back( key ); } }
+                            expect_holds( b, want, what );
+                        } else {
+                            std::uint64_t inside_count{ 0 };
+                            if ( !range.empty() && range.first <= max ) { inside_count = std::min( range.last, max ) - range.first + 1; }
+                            std::uint64_t members_inside{ 0 };
+                            for ( auto const key : content ) { members_inside += inside( key ); }
+                            auto const members_outside{ content.size() - members_inside };
+                            auto const outside_count{ max - inside_count + 1 };
+                            auto const want_size{ exclusive ? members_inside + ( outside_count - members_outside ) : members_inside + outside_count };
+                            ASSERT_EQ( b.size(), want_size ) << what;
+                            std::vector<std::uint64_t> probes{ 0, 1, max, max - 1, max / 2 };
+                            if ( !range.empty() ) { for ( auto const edge : { range.first, range.last } ) { for ( std::int64_t d{ -2 }; d <= 2; ++d ) { probes.push_back( edge + static_cast<std::uint64_t>( d ) ); } } }
+                            for ( int i{ 0 }; i < 20 && !content.empty(); ++i ) { probes.push_back( content[ rng() % content.size() ] ); }
+                            for ( int i{ 0 }; i < 20; ++i ) { probes.push_back( rng() % ( max + 1 ) ); }
+                            for ( auto const key : probes ) {
+                                if ( key > max ) { continue; }
+                                ASSERT_EQ( b.contains( static_cast<key_type>( key ) ), expected( key ) ) << "key " << key << " " << what;
+                            }
+                        }
+                    }
+                }
+                if ( ::testing::Test::HasFatalFailure() ) { return; }
+            }
+        }
+    }
+}
+
+// the complement of an interval that leaves only the ends of the key space (the overflow cases of the two-interval split), for
+// every key width: the union and the exclusive-or add or flip exactly those keys
+TYPED_TEST( InteropTest, ComplementOfAnIntervalAtTheEnds ) {
+    using Bitmap = TypeParam;
+    using frsr::roaring::key_range;
+    constexpr std::uint64_t max{ domain<Bitmap>::max };
+    struct ends { key_range range; oracle_set outside; };
+    std::vector<ends> cases{
+        { key_range::closed( 1, max - 1 ), { 0, max } },
+        { key_range::from( 1 ), { 0 } },
+        { key_range::closed( 0, max - 1 ), { max } },
+        { key_range::closed( 0, max ), {} }
+    };
+    if constexpr ( max < std::numeric_limits<std::uint64_t>::max() ) {
+        cases.push_back( { key_range::closed( 0, max + 7 ), {} } );   // reaches past the key type: still all of it
+    }
+    std::mt19937_64 rng{ 1313 };
+    for ( int round{ 0 }; round < scale; ++round ) {
+        auto content{ random_content<Bitmap>( rng ) };
+        content.push_back( 0 );
+        content.push_back( max );
+        finalize( content );
+        for ( bool const optimize : { false, true } ) {
+            auto const bitmap{ make_bitmap<Bitmap>( content, optimize ) };
+            for ( auto const & [ range, outside ] : cases ) {
+                Bitmap united{ bitmap };
+                united |= !range;
+                expect_holds( united, unite( content, outside ), "|= !range at the ends" );
+                Bitmap flipped{ bitmap };
+                flipped ^= !range;
+                expect_holds( flipped, symmetric_difference( content, outside ), "^= !range at the ends" );
+                Bitmap intersected{ bitmap };
+                intersected &= !range;
+                expect_holds( intersected, intersection( content, outside ), "&= !range at the ends" );
+                Bitmap removed{ bitmap };
+                removed -= !range;
+                expect_holds( removed, difference( content, outside ), "-= !range at the ends" );
+                EXPECT_EQ( bitmap.and_cardinality( !range ), intersection( content, outside ).size() );
+                if ( ::testing::Test::HasFatalFailure() ) { return; }
+            }
+        }
+    }
+}
+
 // a bitmap updated by a view of itself
 TYPED_TEST( InteropTest, ViewOfTheBitmapItself ) {
     using Bitmap = TypeParam;

@@ -256,7 +256,97 @@ concept interop_operand =
     detail::sorted_key_sequence<T> ||
     detail::is_typed_view_v<T>;
 
+// ---- complements -------------------------------------------------------------------------------------------
+//
+// The complement of an operand, within the key space, as a lazy operand: `!x` (for the operand types of the library)
+// or `complement_of( x )` (for every operand, which is how to write it for a std::span, a std::vector or a
+// std::bitset, whose namespace is not ours to put an operator in). Nothing is built: a bitmap applying it rewrites the
+// operation it is asked for into the one it stands for,
+//
+//     a &= !x   is  a -= x        a -= !x  is  a &= x
+//     a.intersects( !x )          is  !a.is_subset_of( x )         a.is_subset_of( !x ) is !a.intersects( x )
+//     a.and_cardinality( !x )     is  a.size() - a.and_cardinality( x )
+//     a & !x                      is  a - x                        (a new bitmap)
+//
+// and `a |= !r` / `a ^= !r` for an interval r are the two intervals outside it. A complement is the rest of the key
+// space, so a union or an exclusive-or with the complement of anything else, and the queries that would need the
+// whole complement (xor_cardinality, is_superset_of, equals), are not defined (deleted overloads).
+//
+// A small descriptor (an interval, a view, a span, a bit string, a sorted_keys or based_bits) is held by value; any other
+// operand (a vector, a std::set, a std::bitset, a bitmap) by reference, so it must outlive the complement: create the
+// complement in the expression that uses it.
+
 namespace detail {
+template <typename Operand>
+inline constexpr bool is_span_v{ false };
+template <typename Element, std::size_t Extent>
+inline constexpr bool is_span_v<std::span<Element, Extent>>{ true };
+
+// The small descriptors the library defines (and the span): copied into the complement. Everything else is referred to.
+template <typename Operand>
+inline constexpr bool complement_holds_by_value_v{
+    std::same_as<Operand, key_range> || is_bit_words_v<Operand> || is_based_bits_v<Operand> || is_sorted_keys_v<Operand> || is_typed_view_v<Operand> || is_span_v<Operand>
+};
+}
+
+template <typename Operand>
+struct complement {
+    using operand_type = Operand;
+    using stored_type  = std::conditional_t<detail::complement_holds_by_value_v<Operand>, Operand, Operand const &>;
+
+    constexpr explicit complement( Operand const & x ) noexcept : operand{ x } {}
+
+    // the complement of the complement
+    [[nodiscard]] constexpr stored_type operator!() const noexcept { return operand; }
+
+    stored_type operand;
+};
+
+template <typename T>
+inline constexpr bool is_complement_v{ false };
+template <typename Operand>
+inline constexpr bool is_complement_v<complement<Operand>>{ true };
+
+// What has a complement: every operand, and a bitmap (of the instantiation that applies it).
+template <typename T>
+concept complementable = interop_operand<T> || detail::bitmap_like<T>;
+
+template <complementable Operand>
+[[nodiscard]] constexpr complement<Operand> complement_of( Operand const & x ) noexcept { return complement<Operand>{ x }; }
+template <typename Operand>
+[[nodiscard]] constexpr typename complement<Operand>::stored_type complement_of( complement<Operand> const & c ) noexcept { return c.operand; }
+
+[[nodiscard]] constexpr complement<key_range> operator!( key_range const range ) noexcept { return complement<key_range>{ range }; }
+template <typename Word>
+[[nodiscard]] constexpr complement<bit_words<Word>> operator!( bit_words<Word> const & bits ) noexcept { return complement<bit_words<Word>>{ bits }; }
+template <typename Bits>
+[[nodiscard]] constexpr complement<based_bits<Bits>> operator!( based_bits<Bits> const & bits ) noexcept { return complement<based_bits<Bits>>{ bits }; }
+template <typename Range>
+[[nodiscard]] constexpr complement<sorted_keys<Range>> operator!( sorted_keys<Range> const & keys ) noexcept { return complement<sorted_keys<Range>>{ keys }; }
+template <typename Bitmap>
+[[nodiscard]] constexpr complement<typed_view<Bitmap>> operator!( typed_view<Bitmap> const view ) noexcept { return complement<typed_view<Bitmap>>{ view }; }
+
+namespace detail {
+
+// The exception specifications of the operations a complement rewrites to.
+template <typename Operand>
+inline constexpr bool complement_query_nothrow_v{ interop_nothrow_v<Operand> };
+template <typename Operand>
+inline constexpr bool complement_mutation_nothrow_v{ bitmap_like<Operand> || interop_nothrow_v<Operand> };
+
+// The intervals outside [first, last], at most two and disjoint, in ascending order; an empty key_range is absent.
+struct complement_intervals {
+    key_range below{};
+    key_range above{};
+};
+[[nodiscard]] constexpr complement_intervals outside( key_range const range ) noexcept {
+    constexpr auto max{ std::numeric_limits<std::uint64_t>::max() };
+    if ( range.empty() ) { return { key_range::all(), key_range{} }; }
+    return {
+        range.first == 0   ? key_range{} : key_range::closed( 0, range.first - 1 ),
+        range.last  == max ? key_range{} : key_range::from( range.last + 1 )
+    };
+}
 
 // ---- operands the library holds compiled ------------------------------------------------------------------
 //

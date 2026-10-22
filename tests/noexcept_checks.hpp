@@ -97,6 +97,16 @@ struct checks {
     static_assert( noexcept( Bitmap::and_many( std::declval<std::span<view const>>() ) ) == terminates );
     static_assert( noexcept( Bitmap::and_many_into( std::declval<std::span<view const>>(), std::declval<Bitmap &>() ) ) == terminates );
 
+    // against the complement of an operand: as the operation each is rewritten to
+    static_assert( noexcept( std::declval<Bitmap &>() &= !std::declval<view>() ) == terminates );
+    static_assert( noexcept( std::declval<Bitmap &>() -= !std::declval<view>() ) == terminates );
+    static_assert( noexcept( std::declval<Bitmap &>() |= !std::declval<key_range>() ) == terminates );
+    static_assert( noexcept( std::declval<Bitmap &>() ^= !std::declval<key_range>() ) == terminates );
+    static_assert( noexcept( std::declval<Bitmap &>() &= !std::declval<Bitmap const &>() ) == terminates );
+    static_assert( noexcept( std::declval<Bitmap const &>().intersects( !std::declval<view>() ) ) );
+    static_assert( noexcept( std::declval<Bitmap const &>().and_cardinality( !std::declval<key_range>() ) ) );
+    static_assert( noexcept( std::declval<Bitmap const &>().is_subset_of( !std::declval<view>() ) ) );
+
     static_assert( noexcept( std::declval<Bitmap &>().optimize() ) == terminates );
     static_assert( noexcept( std::declval<Bitmap &>().optimize_for_storage() ) == terminates );
     static_assert( noexcept( std::declval<Bitmap &>().optimize_for_speed() ) == terminates );

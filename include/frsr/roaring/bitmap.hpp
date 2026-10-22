@@ -292,9 +292,8 @@ public:
         }
     };
 
-    struct inverse_proxy {
-        bitmap const & bm;
-    };
+    // What `!bitmap` is: the complement of a bitmap as an operand (see complement in interop_operands.hpp).
+    using inverse_proxy = complement<bitmap>;
 
     // Caches the chunk a sequence of add_bulk()/contains_bulk() calls is working
     // on. `payload_private` records that this chunk's payload has already been
@@ -651,6 +650,63 @@ public:
     template <interop_operand Operand>
     [[nodiscard]] bool equals( Operand const & operand ) const noexcept( detail::interop_nothrow_v<Operand> ) { return interop_dispatch<detail::interop_op::equals>( *this, operand ); }
     [[nodiscard]] bool equals( bitmap const & other ) const { return size_ == other.size_ && is_subset_of( other ); }
+
+    // ---- against the complement of an operand (`!x`, `complement_of( x )`; see interop_operands.hpp). Each of these
+    // is the operation it is rewritten to; none builds the complement.
+    // The result of a union or an exclusive-or with a complement is the rest of the key space and is wanted for
+    // no operand but an interval, and the queries that would walk the whole complement are not offered.
+#if defined( __cpp_deleted_function ) && __cpp_deleted_function >= 202403L
+#   define FRSR_ROARING_DELETED_COMPLEMENT( WHY ) delete( WHY )
+#else
+#   define FRSR_ROARING_DELETED_COMPLEMENT( WHY ) delete
+#endif
+    template <complementable Operand>
+    bitmap & and_with( complement<Operand> const & c ) noexcept( detail::allocation_failure_terminates && detail::complement_mutation_nothrow_v<Operand> ) { return andnot_with( c.operand ); }
+    template <complementable Operand>
+    bitmap & andnot_with( complement<Operand> const & c ) noexcept( detail::allocation_failure_terminates && detail::complement_mutation_nothrow_v<Operand> ) { return and_with( c.operand ); }
+    // The two intervals outside the interval.
+    bitmap & or_with( complement<key_range> const & c ) noexcept( detail::allocation_failure_terminates ) {
+        auto const [ below, above ]{ detail::outside( c.operand ) };
+        or_with( below );
+        return or_with( above );
+    }
+    bitmap & xor_with( complement<key_range> const & c ) noexcept( detail::allocation_failure_terminates ) {
+        auto const [ below, above ]{ detail::outside( c.operand ) };
+        xor_with( below );
+        return xor_with( above );
+    }
+    template <typename Operand>
+    bitmap & or_with( complement<Operand> const & ) = FRSR_ROARING_DELETED_COMPLEMENT( "the union with the complement of an operand is the rest of the key space: only the complement of a key_range is offered" );
+    template <typename Operand>
+    bitmap & xor_with( complement<Operand> const & ) = FRSR_ROARING_DELETED_COMPLEMENT( "the exclusive-or with the complement of an operand is the rest of the key space: only the complement of a key_range is offered" );
+
+    template <complementable Operand>
+    bitmap & operator&=( complement<Operand> const & c ) noexcept( detail::allocation_failure_terminates && detail::complement_mutation_nothrow_v<Operand> ) { return and_with( c ); }
+    template <complementable Operand>
+    bitmap & operator-=( complement<Operand> const & c ) noexcept( detail::allocation_failure_terminates && detail::complement_mutation_nothrow_v<Operand> ) { return andnot_with( c ); }
+    bitmap & operator|=( complement<key_range> const & c ) noexcept( detail::allocation_failure_terminates ) { return or_with( c ); }
+    bitmap & operator^=( complement<key_range> const & c ) noexcept( detail::allocation_failure_terminates ) { return xor_with( c ); }
+    template <typename Operand>
+    bitmap & operator|=( complement<Operand> const & ) = FRSR_ROARING_DELETED_COMPLEMENT( "the union with the complement of an operand is the rest of the key space: only the complement of a key_range is offered" );
+    template <typename Operand>
+    bitmap & operator^=( complement<Operand> const & ) = FRSR_ROARING_DELETED_COMPLEMENT( "the exclusive-or with the complement of an operand is the rest of the key space: only the complement of a key_range is offered" );
+
+    // Whether this bitmap has a key outside the operand; how many.
+    template <complementable Operand>
+    [[nodiscard]] bool intersects( complement<Operand> const & c ) const noexcept( detail::complement_query_nothrow_v<Operand> ) { return !is_subset_of( c.operand ); }
+    template <complementable Operand>
+    [[nodiscard]] size_type and_cardinality( complement<Operand> const & c ) const noexcept( detail::complement_query_nothrow_v<Operand> ) { return size() - and_cardinality( c.operand ); }
+    // Whether no key of this bitmap is in the operand.
+    template <complementable Operand>
+    [[nodiscard]] bool is_subset_of( complement<Operand> const & c ) const noexcept( detail::complement_query_nothrow_v<Operand> ) { return !intersects( c.operand ); }
+    template <typename Operand>
+    [[nodiscard]] size_type xor_cardinality( complement<Operand> const & ) const = FRSR_ROARING_DELETED_COMPLEMENT( "the complement of an operand is the rest of the key space: its exclusive-or cardinality is not offered" );
+    template <typename Operand>
+    [[nodiscard]] bool is_superset_of( complement<Operand> const & ) const = FRSR_ROARING_DELETED_COMPLEMENT( "the complement of an operand is the rest of the key space: no bitmap is expected to hold it" );
+    template <typename Operand>
+    [[nodiscard]] bool equals( complement<Operand> const & ) const = FRSR_ROARING_DELETED_COMPLEMENT( "the complement of an operand is the rest of the key space: no bitmap is expected to equal it" );
+#undef FRSR_ROARING_DELETED_COMPLEMENT
+
 
     // The half-open interval [lo, hi) (empty if hi <= lo); the whole key space and intervals that run to the
     // largest key are key_range::all() / key_range::from( lo ), through the operations above.
@@ -1015,10 +1071,6 @@ public:
     bitmap & operator+=( bitmap const & other ) noexcept( detail::allocation_failure_terminates ) { return ( *this |= other ); }
 
     bitmap & operator^=( bitmap const & other ) noexcept( detail::allocation_failure_terminates ) { return xor_merge( other ); }
-
-    bitmap & operator&=( inverse_proxy const inverse ) noexcept( detail::allocation_failure_terminates ) {
-        return ( *this -= inverse.bm );
-    }
 
     // In-place N-way bulk-union step (mirrors CRoaring roaring_bitmap_lazy_or_inplace):
     // OR `other` into our existing chunk vector WITHOUT rebuilding it — same-key
@@ -1528,11 +1580,29 @@ public:
     // — taking lhs by value would copy the whole bitmap and then mutate the copy,
     // which under a refcounting CowPolicy also clones every payload the in-place
     // difference touches, because the copy left them shared.
-    [[nodiscard]] friend bitmap operator&( bitmap const & lhs, inverse_proxy const rhs ) noexcept( detail::allocation_failure_terminates ) {
+    template <complementable Operand>
+    [[nodiscard]] friend bitmap operator&( bitmap const & lhs, complement<Operand> const & rhs ) noexcept( detail::allocation_failure_terminates && detail::complement_mutation_nothrow_v<Operand> ) {
+        if constexpr ( std::same_as<Operand, bitmap> ) {
+            bitmap result;
+            lhs.difference_into( rhs.operand, result );
+            return result;
+        } else {
+            bitmap result{ lhs };
+            result.andnot_with( rhs.operand );
+            return result;
+        }
+    }
+    template <complementable Operand>
+    [[nodiscard]] friend bitmap operator&( complement<Operand> const & lhs, bitmap const & rhs ) noexcept( noexcept( rhs & lhs ) ) { return rhs & lhs; }
+    template <complementable Operand>
+    [[nodiscard]] friend bitmap operator&( typed_view<bitmap> const lhs, complement<Operand> const & rhs ) noexcept( detail::allocation_failure_terminates && detail::complement_mutation_nothrow_v<Operand> ) {
         bitmap result;
-        lhs.difference_into( rhs.bm, result );
+        result |= lhs;
+        result.andnot_with( rhs.operand );
         return result;
     }
+    template <complementable Operand>
+    [[nodiscard]] friend bitmap operator&( complement<Operand> const & lhs, typed_view<bitmap> const rhs ) noexcept( noexcept( rhs & lhs ) ) { return rhs & lhs; }
 
     [[nodiscard]] friend bitmap operator-( bitmap const & lhs, bitmap const & rhs ) noexcept( detail::allocation_failure_terminates ) {
         bitmap result;
