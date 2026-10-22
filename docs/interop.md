@@ -32,6 +32,9 @@ into one. The operations, all members of `bitmap`:
 * **`bit_words<Word>( words, base, bit_count )`**: a string of bits in memory, bit `i` standing for the key
   `base + i`. `Word` is any unsigned type; the bits are read in memory order as little-endian words.
 * **`std::bitset<N>`**: bit `i` is the key `i`; `bits_at( bitset, base )` makes it `base + i`.
+* **`view_of( bitmap )`**: a read-only, non-owning view of a finished bitmap of the bitmap's own instantiation (see
+  [Views and complements](#views-and-complements)).
+* **`!x`, `complement_of( x )`**: the complement of any of these (and of a bitmap), as a lazy operand.
 * **A dynamic bit-set** such as `boost::dynamic_bitset`, recognized by shape, with no dependency on Boost: a
   `block_type`, `size()` and an ADL `to_block_range( bits, out )` (the blocks are copied out), or else
   `size()`, `find_first()`, `find_next( pos )` and `npos` (walked by its set bits). `bits_at` adds a base.
@@ -61,6 +64,13 @@ ever stored in a bitmap: what an operation keeps is built in fresh storage.
   than a probe per key. `or_with`, `andnot_with`, `xor_with`, `is_subset_of` and `equals` need the operand as a set: they
   sort a copy and merge it like a sorted range.
 * A **bit string** is merged a chunk at a time; a chunk-aligned string of aligned words is used where it is.
+* A **view** is merged chunk against chunk with the other bitmap's table, each of its containers meeting ours as a
+  piece does. The intersection and the difference build a result container with the kernel of the pair of kinds
+  (array, bitset, run), in a payload the table retired where there is one, as the operations between two bitmaps do;
+  where those share an operand's container as the result (against a saturated bitset or a full-domain run) a view
+  computes the result instead, which is the price of writing nothing to the viewed bitmap. A difference that leaves a
+  bitset below the array limit makes it an array; an intersection leaves it a bitset, as the operation between two
+  bitmaps does.
 
 All const operations are pure reads and are safe to run concurrently on one bitmap. The queries are `noexcept`
 against a `key_range`, a `bit_words` and a `std::bitset` of up to 131072 bits, which they read without
@@ -70,3 +80,101 @@ out) and are not.
 The operations that change the bitmap (`and_with`, `or_with`, `andnot_with`, `xor_with` and the compound operators)
 allocate, so they are `noexcept` exactly when a failed allocation cannot be observed as an exception (see
 [README](../README.md), Exceptions) and the operand is a `key_range`, a `bit_words` or a bit-set of up to 131072 bits.
+
+## Views and complements
+
+### A view as an operand
+
+`view_of( b )` is a `typed_view`, one pointer wide, that stands for the finished bitmap `b` as an operand of the
+operations above: `a &= view_of( b )`, `a |= view_of( b )`, `a -= view_of( b )`, `a ^= view_of( b )`, and the queries
+(`intersects`, `and_cardinality`, `xor_cardinality`, `is_subset_of`, `is_superset_of`, `equals`). It is the operand
+for a reader of a bitmap that other threads read too: an operation reading through a view **writes nothing the viewed
+bitmap owns**, not a reference count, not a container header, not the chunk table, and **keeps nothing of it**: what a
+result takes from the view is a fresh copy, so a result is valid after the viewed bitmap is gone.
+
+Passing the bitmap itself (`a &= b`) is the operation between two bitmaps, which is the cheapest for one thread because
+it shares the containers of `b` by reference count where it can; under a counting copy-on-write policy that sharing is
+a write to the counts of `b`, to cache lines the other readers use. A view is the operand to use there. The two give
+the same answers.
+
+A view belongs to the bitmap type it was made from: `bitmap<K, S, P, R>` takes `typed_view<bitmap<K, S, P, R>>`
+only. It is not a range (it has no `begin` or `end`, so it is never taken for a sequence of keys) and it is not the
+type-erased `bitmap_view` of `bitmap_view.hpp`, which has no set operations; it converts to that.
+
+The contract, which the caller keeps (as with `std::string_view`; a release build does not check it):
+
+1. **Finished.** The viewed bitmap is not in the middle of a lazy fold (a debug build asserts; see
+   [lazy-folds.md](lazy-folds.md)).
+2. **Unchanged while viewed.** It is not modified, moved, swapped or destroyed while a view of it, or an operation
+   reading through one, is alive. Any number of threads may read through views of it, and read it directly, at the
+   same time.
+3. **Nothing reachable from a view is written.** The bitmap may carry bitset containers whose endpoints are not
+   settled (a lazy fold leaves them so); operations through a view do not settle them.
+4. **Results do not refer to the view.** The one exception is `borrowed_copy` below, which says so by its name.
+5. **A bitmap updated through a view of itself is defined.** `a &= view_of( a )` and `a |= view_of( a )` leave `a`
+   as it is, `a -= view_of( a )` and `a ^= view_of( a )` empty it.
+6. **A copy-on-write copy of the viewed bitmap may be updated through its view.** Releasing a payload the copy shares
+   with the viewed bitmap drops the copy's own reference to it; that is the copy's, not a write through the view.
+
+The binary operators take views on either side and build a bitmap, as `bitmap & bitmap` does: `view & view`,
+`bitmap & view`, `view | bitmap`, `view - view`, `view ^ bitmap`, and so on. `a.intersect_into( view, scratch )` is
+`a & view` into a scratch bitmap the caller reuses.
+
+A view travels through the same compiled code as the other erased operands: a program that uses one instantiates
+nothing of the engine.
+
+### Many bitmaps: the n-way AND
+
+`bitmap::and_many`, `and_many_cardinality`, `and_many_intersects`, `and_many_for_each` and
+`and_many_for_each_block` take a `std::span<typed_view<bitmap> const>` as well as a span of pointers. The walk is the
+n-way AND that starts from the operand with the fewest chunks and leapfrogs from chunk to chunk, so a chunk any
+operand lacks is a gallop; where every operand has the chunk, the containers meet in ascending order of their
+cardinality and the walk ends the chunk at the first empty accumulator. It writes nothing the operands own and
+the result keeps none of their containers (the single operand is copied too). `bitmap::and_many_into( views, out )`
+writes the result into a bitmap of the caller's, whose chunk table keeps its capacity.
+
+### Complements
+
+`!x` is the complement of `x` within the key space, for a `typed_view`, a `key_range`, a `bit_words`, a `sorted_keys`,
+a `based_bits` and a bitmap; `complement_of( x )` is the same for any operand, which is how to write it for a
+`std::span`, a `std::vector` or a `std::bitset`, whose namespace is not ours to put an operator in:
+`a &= complement_of( std::span<std::uint32_t const>{ keys } )` keeps the keys of `a` that are not in `keys`. `!!x` is `x`. Nothing is built: the operation is rewritten to the one it stands for.
+
+| expression | is |
+| --- | --- |
+| `a &= !x`, `a & !x` | `a -= x`, `a - x` |
+| `a -= !x` | `a &= x` |
+| `a.intersects( !x )` | `!a.is_subset_of( x )` |
+| `a.is_subset_of( !x )` | `!a.intersects( x )` |
+| `a.and_cardinality( !x )`, `a.andnot_cardinality( x )` | `a.size() - a.and_cardinality( x )` |
+| `a.andnot_cardinality( !x )` | `a.and_cardinality( x )` |
+| `a \|= !r`, `a ^= !r` for a `key_range` `r` | the two intervals outside `r`, one after the other |
+
+A complement is the rest of the key space, so the other combinations are not defined, and do not compile: `a |= !x`
+and `a ^= !x` for any `x` but a `key_range`, and `xor_cardinality( !x )`, `is_superset_of( !x )` and `equals( !x )` for
+any `x`. The union with the complement of an interval is as large as the intervals it adds.
+
+A complement holds a small descriptor (an interval, a view, a span, a bit string) by value and any
+other operand by reference, so it has to be created in the expression that uses it, as `sorted_keys` and `based_bits`
+have to be.
+
+### Sizes, and the strict subset
+
+`andnot_cardinality( x )`, `or_cardinality( x )`, `jaccard_index( x )` and `is_strict_subset_of( x )` answer without
+building the combination, as the reference's `roaring_bitmap_andnot_cardinality`, `_or_cardinality`, `_jaccard_index`
+and `_is_strict_subset` do. The operand of the second and third is a bitmap, a view or a `key_range` (an operand
+whose size is known); `jaccard_index` of two empty sets is NaN, as in the reference.
+
+### A cheap copy of a published bitmap
+
+`bitmap::borrowed_copy( view_of( b ) )` is a copy of the finished bitmap `b` whose spilled containers are borrowed
+aliases of those of `b` (the way a bitmap served from a mapped file borrows its payloads): making it writes nothing to
+`b`, where copying a bitmap under a counting policy writes one count per container, and it copies no payload. The first
+update of a container of the copy clones that container into private storage, so the copy is as mutable as any bitmap
+and `b` is never changed through it. Because it does refer to `b`, the copy (and every copy of it) must be dropped, or
+have each of its containers written once, before `b` is changed or destroyed. When the copy has to outlive `b`, copy
+the bitmap.
+
+A bitmap served from a mapped file has `persistent_bitmap::view()`: an operation through it never aliases the
+mapping, where `x |= *persistent` adopts the borrowed payloads and `x` is then valid only as long as the mapping is.
+

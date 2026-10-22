@@ -24,7 +24,7 @@ While a bitmap is deferred:
 
 What is **not** allowed until a finisher has run: anything that needs a size or a count, namely `size`,
 `equals`, `is_subset_of`, `and_cardinality` and the other cardinalities, iteration, `to_vector`, `front` / `back`,
-serialization, `validate`, and using the deferred bitmap as the operand of another operation. A build without
+serialization, `validate`, taking a view of it (`view_of`), and using the deferred bitmap as the operand of another operation. A build without
 `NDEBUG` asserts on the first such read (`container_handle::cardinality()` asserts that the count is exact,
 `bitmap::size()` that the bitmap is not deferred).
 
@@ -61,6 +61,7 @@ an XOR fold or a mix.
 | range updates, `add_many*`, `remove_many*`, `|=`, `&=`, `-=`, `^=`, `*_with`, `optimize*` | read container counts | deferred bitmap | `settle_counts()` at entry |
 | single-key `add`, `remove`, `add_bulk`, `contains*` | no bitmap-level count read | deferred bitmap | none needed |
 | `size`, iteration, cardinalities, `equals`, `is_subset_of`, serialization, `validate`, `front`, `back`, operand use | read counts | deferred bitmap | not permitted; debug builds assert |
+| taking a view of a deferred bitmap (`view_of`), and with it every operation reading through the view | reads counts | deferred bitmap | not permitted until a finisher has run; `typed_view`'s constructor asserts in debug builds |
 | array and run containers | counts are always exact | | |
 
 `tests/lazy_fold_state.cpp` interleaves every permitted operation with the folds against a bit-per-key model, on random

@@ -61,6 +61,17 @@ bool any = bitmap.intersects( frsr::roaring::key_range::half_open( 100, 200 ) );
 auto n = bitmap.cardinality_in_range( 0, 1000 );
 ```
 
+A finished bitmap is also an operand through a view, and the complement of an operand through `!x` /
+`complement_of( x )`, without a copy or a temporary:
+
+```cpp
+bitmap.and_with( keys );
+bitmap &= !frsr::roaring::view_of( other );            // the keys of bitmap that other lacks
+bitmap |= frsr::roaring::view_of( other );             // other is only read
+bitmap -= frsr::roaring::complement_of( std::span<std::uint32_t const>{ keys } );
+auto common = bitmap.and_cardinality( !frsr::roaring::key_range::closed( 5, 9 ) );
+```
+
 See [docs/interop.md](docs/interop.md).
 
 ## Exceptions
@@ -98,8 +109,9 @@ selection policies, over the default container set. `bitmap.hpp` declares those 
 | compiled (default) | `FRSR_ROARING_HEADER_ONLY=OFF` | declarations and the inline fast paths | link `frsr::roaring` |
 | header-only | `-DFRSR_ROARING_HEADER_ONLY=ON` (`frsr::roaring` becomes an `INTERFACE` target defining `FRSR_ROARING_HEADER_ONLY`) | everything, in every translation unit that uses it | nothing to link |
 
-Which operands reach the compiled interop code: a `key_range`, a `bit_words` of any word width, and a
-contiguous range of `key_type` (also as `sorted_keys`). Every other operand (a `std::bitset`, a dynamic
+Which operands reach the compiled interop code: a `key_range`, a `bit_words` of any word width, a
+contiguous range of `key_type` (also as `sorted_keys`), and a `typed_view` of a bitmap of the same instantiation
+(`view_of( bitmap )`, the operand to use for a bitmap other threads read: it writes nothing the bitmap owns). Every other operand (a `std::bitset`, a dynamic
 bit-set, a range of another integer type or one that is not contiguous, `based_bits`) is applied by the
 engine in the calling translation unit.
 
