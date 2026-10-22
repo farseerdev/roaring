@@ -1246,11 +1246,10 @@ public:
         with_view_pointers( views, [ & ]( auto const operands ) { and_many_into( operands, out ); } );
     }
 
-    // `*this & view` into `out` (cleared first), as intersect_into does for a bitmap, without sharing a container of the view.
-    void intersect_into( typed_view<bitmap> const view, bitmap & out ) const noexcept( detail::allocation_failure_terminates ) {
-        assert( &out != this && &out != &view.get() );
-        and_many_into( std::array<bitmap const *, 2>{ this, &view.get() }, out );
-    }
+
+    // `*this & view` into `out` (cleared first, its parked payloads reused), as intersect_into does for a bitmap, without sharing a
+    // container of the view or of this bitmap: only the chunks both hold are visited, and what is kept is built in `out`.
+    void intersect_into( typed_view<bitmap> const view, bitmap & out ) const noexcept( detail::allocation_failure_terminates );
 
 private:
     static constexpr std::size_t and_many_inline_operands{ 16 };
@@ -1551,12 +1550,12 @@ public:
     // view is shared with the result.
     [[nodiscard]] friend bitmap operator&( typed_view<bitmap> const lhs, typed_view<bitmap> const rhs ) noexcept( detail::allocation_failure_terminates ) {
         bitmap result;
-        and_many_into( std::array<typed_view<bitmap>, 2>{ lhs, rhs }, result );
+        lhs.get().intersect_into( rhs, result );
         return result;
     }
     [[nodiscard]] friend bitmap operator&( bitmap const & lhs, typed_view<bitmap> const rhs ) noexcept( detail::allocation_failure_terminates ) {
         bitmap result;
-        and_many_into( std::array<bitmap const *, 2>{ &lhs, &rhs.get() }, result );
+        lhs.intersect_into( rhs, result );
         return result;
     }
     [[nodiscard]] friend bitmap operator&( typed_view<bitmap> const lhs, bitmap const & rhs ) noexcept( detail::allocation_failure_terminates ) { return rhs & lhs; }

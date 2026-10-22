@@ -1871,6 +1871,19 @@ FRSR_ROARING_DEFINITION_INLINE bool FRSR_ROARING_BITMAP::and_many_intersects( st
 }
 
 FRSR_ROARING_BITMAP_TEMPLATE
+FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::intersect_into( typed_view<bitmap> const view, bitmap & out ) const noexcept( detail::allocation_failure_terminates ) {
+    assert( &out != this && &out != &view.get() );
+    if ( &view.get() == this ) {
+        // the view names this bitmap: the answer is this bitmap, copied (a counted copy would write the counts of a view's bitmap)
+        std::array<bitmap const *, 1> const same{ this };
+        and_many_into( same, out );
+        return;
+    }
+    detail::store_source source{ view.get().chunks_ };
+    detail::interop_engine<bitmap>::and_stream_into( *this, source, out );
+}
+
+FRSR_ROARING_BITMAP_TEMPLATE
 FRSR_ROARING_DEFINITION_INLINE auto FRSR_ROARING_BITMAP::and_many( std::span<bitmap const * const> const operands ) -> bitmap {
     bitmap result;
     and_many_into( operands, result );
