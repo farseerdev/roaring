@@ -408,6 +408,36 @@ if(FRSR_ROARING_BUILD_BENCHMARKS)
         target_compile_definitions(frsr_roaring_interop_bench PRIVATE FRSR_ROARING_HAS_CROARING=1)
     endif()
 
+    add_executable(frsr_roaring_view_bench
+        bench/view_bench.cpp
+    )
+    target_link_libraries(frsr_roaring_view_bench PRIVATE frsr_roaring)
+    frsr_roaring_see_definitions(frsr_roaring_view_bench)
+    set_target_properties(frsr_roaring_view_bench PROPERTIES
+        CXX_STANDARD 26
+        CXX_STANDARD_REQUIRED ON
+        CXX_EXTENSIONS OFF
+    )
+    if(TARGET roaring)
+        target_link_libraries(frsr_roaring_view_bench PRIVATE roaring)
+        target_compile_definitions(frsr_roaring_view_bench PRIVATE FRSR_ROARING_HAS_CROARING=1)
+    endif()
+
+    add_executable(frsr_roaring_view_contention_bench
+        bench/view_contention_bench.cpp
+    )
+    find_package(Threads REQUIRED)
+    target_link_libraries(frsr_roaring_view_contention_bench PRIVATE frsr_roaring Threads::Threads)
+    set_target_properties(frsr_roaring_view_contention_bench PROPERTIES
+        CXX_STANDARD 26
+        CXX_STANDARD_REQUIRED ON
+        CXX_EXTENSIONS OFF
+    )
+    if(TARGET roaring)
+        target_link_libraries(frsr_roaring_view_contention_bench PRIVATE roaring)
+        target_compile_definitions(frsr_roaring_view_contention_bench PRIVATE FRSR_ROARING_HAS_CROARING=1)
+    endif()
+
     if(TARGET roaring)
         add_executable(frsr_roaring_symmetric_difference_bench
             bench/symmetric_difference_bench.cpp
