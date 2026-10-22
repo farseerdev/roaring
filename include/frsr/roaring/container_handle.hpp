@@ -427,6 +427,22 @@ public:
         return true;
     }
 
+    // Whether both handles are spilled onto the very same payload (a copy of a handle under a refcounted
+    // policy, or a borrowed alias of it). Inline payloads are values and never shared.
+    [[nodiscard]] bool shares_payload_with( container_handle const & other ) const noexcept {
+        return spilled() && other.spilled() && spill().data == other.spill().data;
+    }
+
+    // The reference count of a spilled payload under a refcounted policy; 0 for an inline payload, for a
+    // borrowed one, and under a policy without counts. A diagnostic for tests that pin down which operations
+    // leave a published payload's count alone.
+    [[nodiscard]] std::uint32_t payload_refcount() const noexcept {
+        if constexpr ( CowPolicy::refcounted ) {
+            if ( spilled() && owner_ != storage_ownership::borrowed ) { return CowPolicy::rc_load( rc_slot_of( spill().data ) ); }
+        }
+        return 0;
+    }
+
     // Header resets for a payload handed back by take_retired(): the storage
     // (and ownership/refcount word) stays, the logical contents restart empty.
     void reset_for_array_reuse() noexcept {

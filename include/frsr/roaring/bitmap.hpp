@@ -56,6 +56,12 @@
 
 namespace frsr::roaring {
 
+namespace detail {
+// Defined by the tests that look at the containers of a bitmap (see tests/view_support.hpp).
+template <typename Bitmap>
+struct bitmap_test_access;
+}
+
 // Container-set policy tags. Concrete storage is the type-erased
 // detail::container_handle (one 32-byte representation for every kind); these
 // types only name the alternatives a bitmap policy admits — the ContainerSet
@@ -1149,9 +1155,10 @@ public:
     // ---- n-way AND ------------------------------------------------------------------------------
     //
     // The AND of N bitmaps, answered one chunk at a time. Operands are only read: never reordered,
-    // copied or mutated, and neither is the span that names them (a wide key settles its deferred
-    // chunk sort first, as every set operation does; for a 32-bit key the walk writes nothing the
-    // operands own). Operands must be finalized, i.e. not in the middle of a bulk_or_intermediate
+    // copied or mutated, and neither is the span that names them. The walk writes nothing the
+    // operands own, whatever the key width (no reference count, container header or chunk table), so
+    // any number of threads may walk the same operands at once, and a result never keeps one of
+    // their containers. Operands must be finalized, i.e. not in the middle of a bulk_or_intermediate
     // fold: the walk reads cardinalities straight from the container headers.
     //
     // The chunk tables are walked together, leapfrogging from the operand with the fewest chunks, so
@@ -1977,6 +1984,7 @@ private:
     }
 
     friend struct detail::interop_engine<bitmap>;
+    friend struct detail::bitmap_test_access<bitmap>;
 
     chunk_store_type chunks_;
     size_type size_{};

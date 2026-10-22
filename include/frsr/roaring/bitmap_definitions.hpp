@@ -1882,7 +1882,9 @@ FRSR_ROARING_DEFINITION_INLINE auto FRSR_ROARING_BITMAP::and_many( std::span<bit
         }
         auto const count{ static_cast<size_type>( acc->cardinality() ) };
         if ( !owned ) {
-            result.chunks_.push_back( key, handle_type{ *acc } );
+            // the only operand: a copy of its container that shares nothing with it (a counted copy would write the
+            // operand's reference count)
+            result.chunks_.push_back( key, detail::interop_engine<bitmap>::own( *acc ) );
         } else if ( auto & mine{ const_cast<handle_type &>( *acc ) }; mine.holds_bitset() && count <= array_to_bitset_threshold ) {
             result.chunks_.push_back( key, detail::array_handle_from_container<layout_type, CowPolicy>( mine ) );
         } else {

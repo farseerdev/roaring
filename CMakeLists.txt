@@ -289,6 +289,7 @@ if(FRSR_ROARING_BUILD_TESTS)
         tests/bitmap_const_concurrency.cpp
         tests/chunk_tree.cpp
         tests/interop.cpp
+        tests/view_operands.cpp
         tests/symmetric_difference.cpp
         tests/noexcept_policy.cpp
     )

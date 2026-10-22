@@ -309,10 +309,11 @@ struct interop_engine {
         switch ( piece.kind() ) {
             case container_kind::array : result = handle_type::make_array_from_sorted( { piece.as_array().values.data(), piece.as_array().values.size() } ); break;
             case container_kind::bitset: result = handle_type::make_bitset_from_words( piece.as_bitset().words.as_array() ); break;
-            case container_kind::run   : return Bitmap::combine_containers_for_policy( handle_type{}, piece, set_operation::bit_or );
+            case container_kind::run   : result = Bitmap::combine_containers_for_policy( handle_type{}, piece, set_operation::bit_or ); break;
         }
-        if constexpr ( !Bitmap::uses_default_container_set ) { result = Bitmap::optimize_container_for_policy( std::move( result ) ); }
-        assert( result.payload_is_unshared() && "an owned copy aliases its piece" );
+        // a run piece comes back from the combine already settled for the policy
+        if constexpr ( !Bitmap::uses_default_container_set ) { if ( !piece.holds_run() ) { result = Bitmap::optimize_container_for_policy( std::move( result ) ); } }
+        assert( result.payload_is_unshared() && !result.shares_payload_with( piece ) && "an owned copy aliases its piece" );
         return result;
     }
 
@@ -548,6 +549,7 @@ struct interop_engine {
                 rewrite.keep( at );
             } else {
                 combine_into( self, slot, piece, set_operation::bit_and );
+                assert( slot.payload_is_unshared() && !slot.shares_payload_with( piece ) && "an intersection keeps its operand's container" );
                 if ( slot.cardinality() != 0 ) {
                     new_size += slot.cardinality();
                     rewrite.keep( at );
@@ -566,6 +568,7 @@ struct interop_engine {
             auto & slot{ self.chunks_.slot( at ) };
             auto const before{ slot.cardinality() };
             if ( is_full( piece ) ) { slot = handle_type{}; } else { combine_into( self, slot, piece, set_operation::bit_andnot ); }
+            assert( slot.payload_is_unshared() && !slot.shares_payload_with( piece ) && "a difference keeps its operand's container" );
             self.size_ -= before - slot.cardinality();
             any_empty |= slot.cardinality() == 0;
             return true;
@@ -588,6 +591,7 @@ struct interop_engine {
                     auto & slot{ self.chunks_.slot( at ) };
                     auto const before{ slot.cardinality() };
                     if ( is_full( piece ) ) { slot = own( piece ); } else { self.union_same_key( self.chunks_, slot, piece, false, union_scratch ); }
+                    assert( !slot.shares_payload_with( piece ) && "a union keeps its operand's container" );
                     self.size_ += slot.cardinality() - before;
                     ++at;
                 } else {
@@ -627,9 +631,11 @@ struct interop_engine {
             if ( auto const cardinality{ piece.cardinality() }; cardinality != 0 ) {
                 if ( at != self.chunks_.end() && self.chunks_.key( at ) == key ) {
                     auto & slot{ self.chunks_.slot( at ) };
+                    // both sides are non-empty: the kernel's shortcut for an empty side (a copy of the other) is not reached
                     assert( slot.cardinality() != 0 );
                     self.size_ -= slot.cardinality();
                     if constexpr ( is_interval_source_v<Source> ) { slot = flip_piece( std::move( slot ), piece ); } else { self.xor_same_key( self.chunks_, slot, piece ); }
+                    assert( !slot.shares_payload_with( piece ) && "an exclusive-or keeps its operand's container" );
                     self.size_ += slot.cardinality();
                     any_empty |= slot.cardinality() == 0;
                     ++at;
