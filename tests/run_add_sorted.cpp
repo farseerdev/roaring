@@ -139,6 +139,54 @@ TYPED_TEST( RunAddSorted, WritesThroughASharedCopyOnlyOnTheWrittenHandle ) {
     TestFixture::check( original, before );
 }
 
+// A batch whose every value is already inside some run opens no run: nothing is reserved, however many
+// groups the batch has.
+TYPED_TEST( RunAddSorted, AllPresentBatchAllocatesNothing ) {
+    auto handle{ TestFixture::make( { { 0, 30'000 }, { 30'002, 65'535 } } ) };
+    values_t evens;
+    for ( std::uint32_t value{ 0 }; value < 65'536U; value += 2 ) { evens.push_back( static_cast<low_type>( value ) ); }
+
+    auto const runs{ handle.as_run().runs };
+    auto const capacity{ runs.capacity() };
+    auto const data    { runs.data() };
+    EXPECT_EQ( TestFixture::add_and_check( handle, evens ), 0U );
+    EXPECT_EQ( handle.count(), 2U );
+    EXPECT_EQ( handle.as_run().runs.capacity(), capacity );
+    EXPECT_EQ( handle.as_run().runs.data(), data );
+}
+
+// Only groups outside the existing runs are reserved for.
+TYPED_TEST( RunAddSorted, ReservesOnlyForGroupsOutsideTheRuns ) {
+    auto handle{ TestFixture::make( { { 0, 3'000 }, { 5'000, 9'000 } } ) };
+    values_t every_other;
+    for ( std::uint32_t value{ 0 }; value <= 9'000U; value += 2 ) { every_other.push_back( static_cast<low_type>( value ) ); }
+    auto const capacity{ handle.as_run().runs.capacity() };
+    auto const required{ 2U + 999U };
+    TestFixture::add_and_check( handle, every_other );
+    // one growth step, sized by the groups that open runs and not by all of the batch's groups
+    EXPECT_EQ( handle.as_run().runs.capacity(), std::max( required, 2U * capacity ) );
+}
+
+// A result that fits the payload's capacity is written in place; one that does not grows it exactly once.
+TYPED_TEST( RunAddSorted, GrowsAtMostOncePerBatch ) {
+    auto handle{ TestFixture::make( { { 10, 20 }, { 40, 50 } } ) };
+    handle.as_run().runs.reserve( 8 );
+    auto const capacity{ handle.as_run().runs.capacity() };
+    auto const data    { handle.as_run().runs.data() };
+    ASSERT_GE( capacity, 8U );
+
+    values_t const fits( { 1, 3, 5, 25, 60, 62 } );
+    TestFixture::add_and_check( handle, fits );
+    EXPECT_EQ( handle.as_run().runs.capacity(), capacity );
+    EXPECT_EQ( handle.as_run().runs.data(), data );
+
+    values_t exceeds;
+    for ( std::uint32_t value{ 100 }; value < 100U + 2U * ( capacity + 5U ); value += 2 ) { exceeds.push_back( static_cast<low_type>( value ) ); }
+    auto const required{ handle.count() + static_cast<std::uint32_t>( exceeds.size() ) };
+    TestFixture::add_and_check( handle, exceeds );
+    EXPECT_EQ( handle.as_run().runs.capacity(), std::max( required, 2U * capacity ) );
+}
+
 // Random batches against random run lists: sparse, clustered and dense shapes, so batches land inside,
 // between, around and beyond runs, over both the inline and the spilled payload.
 TYPED_TEST( RunAddSorted, MatchesTheOracleOnRandomBatches ) {

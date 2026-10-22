@@ -66,6 +66,7 @@
 #include <cstdlib>
 #include <cassert>
 #include <cstring>
+#include <functional>
 #include <limits>
 #include <new>
 #include <optional>
@@ -1448,7 +1449,9 @@ public:
     // its capacity already holds the result). Adjacent and overlapping runs coalesce as they are written.
     // The caller owns the write barrier and any kind change the result calls for. Returns how many
     // values were new.
+    // Precondition: sorted_values is strictly ascending (sorted and duplicate-free).
     std::size_t add_sorted( std::span<low_type const> const sorted_values ) {
+        assert( std::ranges::adjacent_find( sorted_values, std::greater_equal<>{} ) == sorted_values.end() );
         if ( sorted_values.empty() ) {
             return 0;
         }
@@ -1470,13 +1473,27 @@ public:
             return 0;
         }
 
-        // At most one new run per maximal consecutive group of the batch.
-        auto groups{ std::uint32_t{ 1 } };
-        for ( auto index{ std::size_t{ 1 } }; index < sorted_values.size(); ++index ) {
-            groups += static_cast<std::uint32_t>(
-                static_cast<std::size_t>( sorted_values[ index ] ) != static_cast<std::size_t>( sorted_values[ index - 1 ] ) + 1U
-            );
+        // At most one new run per maximal consecutive group of the batch that does not lie wholly inside an
+        // existing run (one forward walk of the groups against the run list).
+        auto new_runs{ std::uint32_t{ 0 } };
+        {
+            auto cursor{ std::size_t{ first_touched } };
+            for ( auto batch{ sorted_values.begin() }; batch != sorted_values.end(); ) {
+                auto const group_begin{ std::size_t{ *batch } };
+                auto group_end{ group_begin };
+                for ( ++batch; batch != sorted_values.end() && std::size_t{ *batch } == group_end + 1U; ++batch ) {
+                    group_end = *batch;
+                }
+                while ( cursor != run_count && std::size_t{ runs[ cursor ].end } < group_begin ) {
+                    ++cursor;
+                }
+                new_runs += static_cast<std::uint32_t>( !( cursor != run_count && std::size_t{ runs[ cursor ].begin } <= group_begin && group_end <= std::size_t{ runs[ cursor ].end } ) );
+            }
         }
+        if ( new_runs == 0 ) {
+            return 0;
+        }
+        auto const groups{ new_runs };
 
         runs.reserve( run_count + groups );
         auto * const data{ runs.data() };
