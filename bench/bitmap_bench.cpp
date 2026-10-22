@@ -6748,6 +6748,22 @@ static std::vector<std::uint32_t> make_run_batch_values(RunBatchShape const &sha
     return { unique.begin(), unique.end() };
 }
 
+// Values of the batch that fall in a gap of the base: the base covers the first half of every period.
+static std::int64_t expected_run_batch_added(RunBatchShape const &shape, std::vector<std::uint32_t> const &batch) {
+    std::uint32_t const period = 65'536U / shape.runs;
+    std::int64_t added = 0;
+    for (auto const v : batch) { added += (v % period) >= period / 2; }
+    return added;
+}
+
+// Both arms must add what the base's layout says they add, or their timings are of different work.
+static void require_run_batch_added(char const *name, std::int64_t got, std::int64_t expected) {
+    if (got != expected) {
+        fprintf(stderr, "%s: added %lld values, expected %lld\n", name, static_cast<long long>(got), static_cast<long long>(expected));
+        std::abort();
+    }
+}
+
 template <class Arm>
 struct register_frsr_run_batch_registrar {
     using TestBitmap32 = typename Arm::bitmap;
@@ -6770,6 +6786,9 @@ struct register_frsr_run_batch_registrar {
             }
             s->base.optimize();
             s->batch = make_run_batch_values(shape);
+            TestBitmap32 check{ s->base };
+            check.add_many_sorted({ s->batch.data(), s->batch.size() });
+            require_run_batch_added("frsr run batch", static_cast<std::int64_t>(check.size() - s->base.size()), expected_run_batch_added(shape, s->batch));
             return s;
         };
         e.run = [](void *sv) -> int64_t {
@@ -6791,6 +6810,7 @@ template <class Arm>
 struct register_cpp_run_batch_registrar {
     struct S {
         roaring_bitmap_t *base{};
+        std::uint64_t base_cardinality{};
         std::vector<std::uint32_t> batch;
         ~S() { if (base) roaring_bitmap_free(base); }
     };
@@ -6810,13 +6830,19 @@ struct register_cpp_run_batch_registrar {
             }
             roaring_bitmap_run_optimize(s->base);
             s->batch = make_run_batch_values(shape);
+            // CRoaring sums the runs on every cardinality query, so the base's is taken once, outside the timed region.
+            s->base_cardinality = roaring_bitmap_get_cardinality(s->base);
+            auto *check = Arm::copy(s->base);
+            roaring_bitmap_add_many(check, s->batch.size(), s->batch.data());
+            require_run_batch_added("CRoaring run batch", static_cast<std::int64_t>(roaring_bitmap_get_cardinality(check) - s->base_cardinality), expected_run_batch_added(shape, s->batch));
+            roaring_bitmap_free(check);
             return s;
         };
         e.run = [](void *sv) -> int64_t {
             auto *s = static_cast<S *>(sv);
             auto *work = Arm::copy(s->base);
             roaring_bitmap_add_many(work, s->batch.size(), s->batch.data());
-            auto const added = static_cast<std::int64_t>(roaring_bitmap_get_cardinality(work) - roaring_bitmap_get_cardinality(s->base));
+            auto const added = static_cast<std::int64_t>(roaring_bitmap_get_cardinality(work) - s->base_cardinality);
             roaring_bitmap_free(work);
             return added;
         };
