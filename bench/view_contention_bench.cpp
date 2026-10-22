@@ -7,7 +7,8 @@
 //     per-container reference count of a copy is most of the work
 //     cow-copy      a copy of the smallest, then `&=` of each of the others (the counted copy, what a reader without views does)
 //     and-many-ptr  Bitmap::and_many over pointers to the bitmaps (the n-way AND walk, copies nothing)
-//     views         Bitmap::and_many over views
+//     views         Bitmap::and_many over views (the walk of and-many-ptr, over views)
+//     many-into     Bitmap::and_many_into over views, with a result bitmap reused by the thread
 //     views-into    intersect_into( view, scratch ), then `&= view` of the rest, with a scratch reused by the thread
 //     views-card    and_many_cardinality over views
 //     cr-and        CRoaring roaring_bitmap_and, then roaring_bitmap_and_inplace of the rest (copy-on-write off)
@@ -286,6 +287,15 @@ void and_bands( options const & opts, bool const small ) {
                 std::vector<typed_view<counted_bitmap>> views;
                 for ( auto const k : indices ) { views.push_back( view_of( ( *published )[ k ] ) ); }
                 return counted_bitmap::and_many( views ).size();
+            };
+        } );
+        arms.emplace_back( "many-into", [ published, operands, pick ]( unsigned const t ) {
+            return [ published, operands, pick, i = std::size_t{ t }, out = counted_bitmap{} ]() mutable -> std::uint64_t {
+                auto const indices{ pick( operands, i++ ) };
+                std::vector<typed_view<counted_bitmap>> views;
+                for ( auto const k : indices ) { views.push_back( view_of( ( *published )[ k ] ) ); }
+                counted_bitmap::and_many_into( views, out );
+                return out.size();
             };
         } );
         arms.emplace_back( "views-into", [ published, operands, pick ]( unsigned const t ) {
