@@ -8,8 +8,12 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <initializer_list>
+#include <iterator>
+#include <limits>
 #include <random>
 #include <vector>
 
@@ -228,6 +232,126 @@ TEST( UpstreamParity64, test_cpp_andnot_cardinality_64 ) {
     EXPECT_EQ( r1.andnot_cardinality( !view_of( r2 ) ), r1.and_cardinality( r2 ) );
 }
 
+template <typename Bitmap>
+Bitmap bitmap_of_keys( std::initializer_list<std::uint64_t> const keys ) {
+    Bitmap result;
+    for ( auto const key : keys ) { result.add( static_cast<typename Bitmap::key_type>( key ) ); }
+    return result;
+}
+
+// Every way to subtract: bitmap, view, view of both, and the complement forms, against the expected keys.
+template <typename Bitmap>
+void expect_difference_everywhere( Bitmap const & lhs, Bitmap const & rhs, Bitmap const & expected ) {
+    EXPECT_TRUE( ( lhs - rhs ) == expected );
+    EXPECT_TRUE( ( lhs - view_of( rhs ) ) == expected );
+    EXPECT_TRUE( ( view_of( lhs ) - rhs ) == expected );
+    EXPECT_TRUE( ( view_of( lhs ) - view_of( rhs ) ) == expected );
+    EXPECT_TRUE( ( lhs & !view_of( rhs ) ) == expected );
+    EXPECT_TRUE( ( view_of( lhs ) & !view_of( rhs ) ) == expected );
+    EXPECT_TRUE( ( view_of( lhs ) & !rhs ) == expected );
+    Bitmap copy{ lhs };
+    copy -= view_of( rhs );
+    EXPECT_TRUE( copy == expected );
+    copy = lhs;
+    copy &= !view_of( rhs );
+    EXPECT_TRUE( copy == expected );
+    EXPECT_EQ( lhs.andnot_cardinality( view_of( rhs ) ), expected.size() );
+}
+
+// tests/toplevel_unit.c: the bitmaps of test_andnot and test_andnot_inplace, and the keys they leave
+TYPED_TEST( UpstreamParity, test_andnot ) {
+    using Bitmap = TypeParam;
+    constexpr std::uint64_t c{ 65536 };
+    auto const rb1{ bitmap_of_keys<Bitmap>( { 1, 2, c * 2 + 1, c * 2 + 2, c * 3 + 1, c * 3 + 2, c * 10 + 1, c * 10 + 2, c * 16 + 1, c * 16 + 2, c * 20 + 1, c * 21 + 1 } ) };
+    auto const rb2{ bitmap_of_keys<Bitmap>( { 2, 3, c * 10 + 2, c * 10 + 3, c * 12 + 2, c * 12 + 3, c * 14 + 2, c * 14 + 3, c * 16 + 2, c * 16 + 3 } ) };
+    auto const rb3{ bitmap_of_keys<Bitmap>( { 2, 3, c * 10 + 1, c * 10 + 2, c * 12 + 2, c * 12 + 3, c * 14 + 2, c * 14 + 3, c * 16 + 2, c * 16 + 3 } ) };
+    expect_difference_everywhere( rb1, rb2, bitmap_of_keys<Bitmap>( { 1, c * 2 + 1, c * 2 + 2, c * 3 + 1, c * 3 + 2, c * 10 + 1, c * 16 + 1, c * 20 + 1, c * 21 + 1 } ) );
+    expect_difference_everywhere( rb1, rb3, bitmap_of_keys<Bitmap>( { 1, c * 2 + 1, c * 2 + 2, c * 3 + 1, c * 3 + 2, c * 16 + 1, c * 20 + 1, c * 21 + 1 } ) );
+    expect_difference_everywhere( rb2, rb1, bitmap_of_keys<Bitmap>( { 3, c * 10 + 3, c * 12 + 2, c * 12 + 3, c * 14 + 2, c * 14 + 3, c * 16 + 3 } ) );
+    expect_difference_everywhere( rb3, rb1, bitmap_of_keys<Bitmap>( { 3, c * 12 + 2, c * 12 + 3, c * 14 + 2, c * 14 + 3, c * 16 + 3 } ) );
+    expect_difference_everywhere( rb3, rb2, bitmap_of_keys<Bitmap>( { c * 10 + 1 } ) );
+    expect_difference_everywhere( rb1, rb1, Bitmap{} );
+    expect_difference_everywhere( rb1, Bitmap{}, rb1 );
+    expect_difference_everywhere( Bitmap{}, rb1, Bitmap{} );
+
+    Bitmap large_run;
+    large_run.add_closed_range( 2, 11 * c + 26 );
+    large_run.optimize();
+    expect_difference_everywhere( rb1, large_run, bitmap_of_keys<Bitmap>( { 1, c * 16 + 1, c * 16 + 2, c * 20 + 1, c * 21 + 1 } ) );
+
+    Bitmap r1, r2, expected;
+    for ( std::uint32_t i{ 0 }; i < 300; ++i ) {
+        if ( i % 2 == 0 ) { r1.add( i ); }
+        if ( i % 3 == 0 ) { r2.add( i ); }
+        if ( i % 2 == 0 && i % 3 != 0 ) { expected.add( i ); }
+    }
+    expect_difference_everywhere( r1, r2, expected );
+}
+
+// tests/toplevel_unit.c: test_xor, the 300 keys
+TYPED_TEST( UpstreamParity, test_xor ) {
+    using Bitmap = TypeParam;
+    Bitmap r1, r2, expected;
+    for ( std::uint32_t i{ 0 }; i < 300; ++i ) {
+        if ( i % 2 == 0 ) { r1.add( i ); }
+        if ( i % 3 == 0 ) { r2.add( i ); }
+        if ( ( i % 2 == 0 || i % 3 == 0 ) && i % 6 != 0 ) { expected.add( i ); }
+    }
+    EXPECT_TRUE( ( r1 ^ r2 ) == expected );
+    EXPECT_TRUE( ( r1 ^ view_of( r2 ) ) == expected );
+    EXPECT_TRUE( ( view_of( r1 ) ^ r2 ) == expected );
+    EXPECT_TRUE( ( view_of( r1 ) ^ view_of( r2 ) ) == expected );
+    EXPECT_EQ( r1.xor_cardinality( view_of( r2 ) ), expected.size() );
+    Bitmap copy{ r1 };
+    copy ^= view_of( r2 );
+    EXPECT_TRUE( copy == expected );
+}
+
+// the synthetic bitmaps of test_xor / test_andnot: gen_bitmap( start density, gradient, run length, blank range, universe )
+template <typename Bitmap>
+Bitmap synthetic_bitmap( std::mt19937_64 & rng, double const start, double const gradient, int const run, int const blank_begin, int const blank_end, int const universe ) {
+    Bitmap result;
+    for ( int i{ 0 }; i < universe; i += run ) {
+        auto const density{ start + i * gradient };
+        auto const draw{ std::uniform_real_distribution<double>{ 0.0, 1.0 }( rng ) };
+        if ( draw < density && !( i >= blank_begin && i < blank_end ) ) { result.add_closed_range( static_cast<typename Bitmap::key_type>( i ), static_cast<typename Bitmap::key_type>( i + run - 1 ) ); }
+    }
+    result.optimize();
+    return result;
+}
+
+TYPED_TEST( UpstreamParity, test_xor_andnot_synthetic ) {
+    using Bitmap = TypeParam;
+    std::mt19937_64 rng{ 20261023 };
+    std::vector<Bitmap> const r{
+        synthetic_bitmap<Bitmap>( rng, 0.0, 1e-6, 1, 0, 0, 1000000 ),
+        synthetic_bitmap<Bitmap>( rng, 1.0, -1e-6, 1, 0, 0, 1000000 ),
+        synthetic_bitmap<Bitmap>( rng, 1e-5, 0.0, 1, 0, 0, 2000000 ),
+        synthetic_bitmap<Bitmap>( rng, 1e-5, 0.0, 3, 0, 0, 2000000 ),
+        synthetic_bitmap<Bitmap>( rng, 1e-1, 0.0, 1, 0, 0, 2000000 ),
+        synthetic_bitmap<Bitmap>( rng, 0.5, -1e-6, 1, 600000, 800000, 1000000 ),
+        synthetic_bitmap<Bitmap>( rng, 1.0, -1e-6, 1, 300000, 500000, 1000000 ),
+    };
+    for ( std::size_t i{ 0 }; i < r.size(); ++i ) {
+        for ( std::size_t j{ i }; j < r.size(); ++j ) {
+            auto const left{ r[ i ].to_vector() };
+            auto const right{ r[ j ].to_vector() };
+            std::vector<typename Bitmap::key_type> expected_xor, expected_difference;
+            std::ranges::set_symmetric_difference( left, right, std::back_inserter( expected_xor ) );
+            std::ranges::set_difference( left, right, std::back_inserter( expected_difference ) );
+            EXPECT_EQ( ( r[ i ] ^ view_of( r[ j ] ) ).to_vector(), expected_xor ) << i << ' ' << j;
+            EXPECT_EQ( ( view_of( r[ i ] ) ^ view_of( r[ j ] ) ).to_vector(), expected_xor ) << i << ' ' << j;
+            EXPECT_EQ( r[ i ].xor_cardinality( view_of( r[ j ] ) ), expected_xor.size() ) << i << ' ' << j;
+            EXPECT_EQ( ( view_of( r[ i ] ) - view_of( r[ j ] ) ).to_vector(), expected_difference ) << i << ' ' << j;
+            EXPECT_EQ( ( r[ i ] & !view_of( r[ j ] ) ).to_vector(), expected_difference ) << i << ' ' << j;
+            Bitmap copy{ r[ i ] };
+            copy -= view_of( r[ j ] );
+            EXPECT_EQ( copy.to_vector(), expected_difference ) << i << ' ' << j;
+            EXPECT_EQ( copy.validate(), nullptr ) << i << ' ' << j;
+        }
+    }
+}
+
 // the interval operand: sizes, clipped to the keys the bitmap's key type has
 TYPED_TEST( UpstreamParity, IntervalOperand ) {
     using Bitmap = TypeParam;
@@ -248,6 +372,21 @@ TYPED_TEST( UpstreamParity, IntervalOperand ) {
         EXPECT_EQ( Bitmap{}.or_cardinality( key_range::closed( 0xFFFFFFF0ULL, 0x1'0000'0020ULL ) ), 16U );
         EXPECT_EQ( Bitmap{}.or_cardinality( key_range::all() ), std::uint64_t{ 1 } << 32 );
     }
+}
+
+// the interval of every 64-bit key has no size a 64-bit count holds: the queries that do not need it still answer
+TEST( UpstreamParity64, IntervalOfEveryKey ) {
+    using Bitmap = bitmap_of<std::uint64_t, detail::cow_value_semantics>;
+    Bitmap bitmap;
+    bitmap.add( 1 );
+    bitmap.add( ~std::uint64_t{ 0 } );
+    EXPECT_TRUE( bitmap.is_strict_subset_of( key_range::all() ) );
+    EXPECT_TRUE( Bitmap{}.is_strict_subset_of( key_range::all() ) );
+    EXPECT_TRUE( bitmap.is_strict_subset_of( key_range::closed( 1, ~std::uint64_t{ 0 } ) ) );
+    EXPECT_FALSE( bitmap.is_strict_subset_of( key_range::closed( 1, ~std::uint64_t{ 0 } - 1 ) ) );
+    EXPECT_FALSE( bitmap.is_strict_subset_of( key_range::from( 2 ) ) );
+    EXPECT_NEAR( bitmap.jaccard_index( key_range::all() ), 2.0 / 18446744073709551616.0, 1e-30 );
+    EXPECT_EQ( bitmap.andnot_cardinality( key_range::all() ), 0U );
 }
 
 } // namespace

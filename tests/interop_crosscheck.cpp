@@ -8,6 +8,7 @@
 #include <roaring/roaring.h>
 #include <roaring/roaring64.h>
 
+#include <array>
 #include <bitset>
 #include <cstring>
 #include <utility>
@@ -199,6 +200,79 @@ TYPED_TEST( InteropCrosscheck, KeysBitsAndWords ) {
         members.clear();
         for ( std::size_t i{ 0 }; i < 65536; ++i ) { if ( bits.test( i ) ) { members.push_back( 100 + i ); } }
         compare( bitmap, content, bits_at( bits, 100 ), members, "std::bitset<65536> off a chunk" );
+        if ( ::testing::Test::HasFatalFailure() ) { return; }
+    }
+}
+
+// Views of bitmaps, and the complement of a view, against CRoaring: every way to materialize and update, the n-way AND, and the
+// sizes and the strict subset.
+TYPED_TEST( InteropCrosscheck, ViewsAndComplements ) {
+    using Key = TypeParam;
+    using Bitmap = frsr::roaring::bitmap<Key>;
+    using ref = reference<Key>;
+    using frsr::roaring::view_of;
+    std::mt19937_64 rng{ 2024 };
+    for ( int round{ 0 }; round < 8; ++round ) {
+        auto const content_a{ random_content<Bitmap>( rng ) };
+        auto const content_b{ round % 3 == 2 ? content_a : random_related<Bitmap>( rng, content_a, false ) };
+        auto const content_c{ random_related<Bitmap>( rng, content_b, false ) };
+        auto const a{ make_bitmap<Bitmap>( content_a, round % 2 == 1 ) };
+        auto const b{ make_bitmap<Bitmap>( content_b, round % 4 >= 2 ) };
+        auto const c{ make_bitmap<Bitmap>( content_c, false ) };
+        auto const reference_b{ ref::make( content_b ) };
+        auto const reference_c{ ref::make( content_c ) };
+        auto const what{ "round " + std::to_string( round ) };
+        auto const expected_after{ [ & ]( auto const & operation ) {
+            auto const owner{ ref::make( content_a ) };
+            operation( owner.h );
+            auto const keys{ ref::contents( owner.h ) };
+            return std::vector<Key>( keys.begin(), keys.end() );
+        } };
+        auto const expected_and { expected_after( [ & ]( auto * h ) { ref::and_inplace   ( h, reference_b.h ); } ) };
+        auto const expected_or  { expected_after( [ & ]( auto * h ) { ref::or_inplace    ( h, reference_b.h ); } ) };
+        auto const expected_diff{ expected_after( [ & ]( auto * h ) { ref::andnot_inplace( h, reference_b.h ); } ) };
+        auto const expected_xor { expected_after( [ & ]( auto * h ) { ref::xor_inplace   ( h, reference_b.h ); } ) };
+        auto const expected_and3{ expected_after( [ & ]( auto * h ) { ref::and_inplace( h, reference_b.h ); ref::and_inplace( h, reference_c.h ); } ) };
+        auto const same{ [ & ]( Bitmap const & result, std::vector<Key> const & expected, char const * op ) {
+            ASSERT_EQ( result.validate(), nullptr ) << what << " " << op;
+            ASSERT_TRUE( result.to_vector() == expected ) << what << " " << op << " differs from CRoaring";
+        } };
+        same( view_of( a ) & view_of( b ), expected_and, "view & view" );
+        same( a & view_of( b ), expected_and, "bitmap & view" );
+        same( view_of( a ) | view_of( b ), expected_or, "view | view" );
+        same( a | view_of( b ), expected_or, "bitmap | view" );
+        same( view_of( a ) - view_of( b ), expected_diff, "view - view" );
+        same( a - view_of( b ), expected_diff, "bitmap - view" );
+        same( view_of( a ) - b, expected_diff, "view - bitmap" );
+        same( view_of( a ) ^ view_of( b ), expected_xor, "view ^ view" );
+        same( a ^ view_of( b ), expected_xor, "bitmap ^ view" );
+        same( a & !view_of( b ), expected_diff, "bitmap & !view" );
+        same( view_of( a ) & !view_of( b ), expected_diff, "view & !view" );
+        same( view_of( a ) & !b, expected_diff, "view & !bitmap" );
+        { Bitmap x{ a }; x &= !view_of( b ); same( x, expected_diff, "&= !view" ); }
+        { Bitmap x{ a }; x -= !view_of( b ); same( x, expected_and, "-= !view" ); }
+        {
+            Bitmap out;
+            a.intersect_into( view_of( b ), out );
+            same( out, expected_and, "intersect_into" );
+            a.difference_into( view_of( b ), out );
+            same( out, expected_diff, "difference_into" );
+            std::array<frsr::roaring::typed_view<Bitmap>, 3> const views{ view_of( a ), view_of( b ), view_of( c ) };
+            Bitmap::and_many_into( views, out );
+            same( out, expected_and3, "and_many_into" );
+            same( Bitmap::and_many( views ), expected_and3, "and_many" );
+        }
+        // sizes and the strict subset, from the primitives CRoaring has
+        auto const reference_a{ ref::make( content_a ) };
+        auto const common{ ref::and_card( reference_a.h, reference_b.h ) };
+        auto const united{ ref::cardinality( reference_a.h ) + ref::cardinality( reference_b.h ) - common };
+        EXPECT_EQ( a.or_cardinality( view_of( b ) ), united ) << what;
+        EXPECT_EQ( a.andnot_cardinality( view_of( b ) ), ref::cardinality( reference_a.h ) - common ) << what;
+        EXPECT_EQ( a.andnot_cardinality( !view_of( b ) ), common ) << what;
+        EXPECT_EQ( a.is_strict_subset_of( view_of( b ) ), ref::subset( reference_a.h, reference_b.h ) && ref::cardinality( reference_a.h ) < ref::cardinality( reference_b.h ) ) << what;
+        if ( united != 0 ) { EXPECT_DOUBLE_EQ( a.jaccard_index( view_of( b ) ), static_cast<double>( common ) / static_cast<double>( united ) ) << what; }
+        EXPECT_EQ( a.intersects( !view_of( b ) ), !ref::subset( reference_a.h, reference_b.h ) ) << what;
+        EXPECT_EQ( a.is_subset_of( !view_of( b ) ), !ref::intersect( reference_a.h, reference_b.h ) ) << what;
         if ( ::testing::Test::HasFatalFailure() ) { return; }
     }
 }

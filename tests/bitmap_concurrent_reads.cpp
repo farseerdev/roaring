@@ -243,6 +243,37 @@ TEST( FrsrRoaringConcurrentReads, ViewsOfPublishedBitmapsFromManyThreads ) {
     view_reads_from_many_threads<wide_cow_bitmap>();
 }
 
+// tests/threads_unit.cpp: copy-on-write bitmaps whose copies share payloads, copied and combined in place from several threads
+// at once (there the check is for data races); here the answers are checked too, and the same sequence runs through views.
+TEST( FrsrRoaringConcurrentReads, CopiesThatSharePayloadsCombinedFromManyThreads ) {
+    using frsr::roaring::view_of;
+    narrow_cow_bitmap r1;
+    for ( std::uint32_t i{ 0 }; i < 50000; ++i ) { if ( i != 300 ) { r1.add( 65536 + i ); } }
+    for ( std::uint32_t i{ 50000 }; i < 150000; ++i ) { if ( i % 500 == 0 ) { r1.add( i ); } }
+    for ( std::uint32_t i{ 150000 }; i < 200000; ++i ) { if ( i % 2 == 0 ) { r1.add( i ); } }
+    r1.optimize();
+    narrow_cow_bitmap const r2{ std::vector<std::uint32_t>{ 10010, 10020, 10030, 10040, 10050, 65537, 65900, 150002, 150003, 150500 } };
+    narrow_cow_bitmap const r3{ r1 };
+    auto const expected{ ( ( r1 & r2 ) - r3 ).to_vector() };
+    auto const expected_through_views{ ( r1 & r2 ).to_vector() };
+    EXPECT_TRUE( expected.empty() );
+    EXPECT_FALSE( expected_through_views.empty() );
+
+    narrow_cow_bitmap const sets[ 2 ][ 3 ]{ { r1, r2, r3 }, { r1, r2, r3 } };
+    run_readers( 2, [&]( unsigned const t ) {
+        auto const & set{ sets[ t ] };
+        for ( int i{ 0 }; i != 100; ++i ) {
+            narrow_cow_bitmap c1{ set[ 0 ] };
+            narrow_cow_bitmap const c2{ set[ 1 ] };
+            narrow_cow_bitmap const c3{ set[ 2 ] };
+            if ( i % 2 == 0 ) { c1 &= c2; c1 -= c3; if ( c1.to_vector() != expected ) { return false; } }
+            else              { c1 &= view_of( c2 ); if ( c1.to_vector() != expected_through_views ) { return false; } c1 -= view_of( c3 ); if ( !c1.empty() ) { return false; } }
+            if ( ( view_of( set[ 0 ] ) & view_of( c2 ) ).to_vector() != expected_through_views ) { return false; }
+        }
+        return true;
+    } );
+}
+
 TEST( FrsrRoaringConcurrentReads, WideKeyPointQueriesFromManyThreads ) { point_queries_from_many_threads<wide_bitmap>(); }
 TEST( FrsrRoaringConcurrentReads, NarrowKeyPointQueriesFromManyThreads ) { point_queries_from_many_threads<narrow_bitmap>(); }
 
