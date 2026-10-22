@@ -107,6 +107,12 @@ struct checks {
     static_assert( noexcept( std::declval<Bitmap const &>().and_cardinality( !std::declval<key_range>() ) ) );
     static_assert( noexcept( std::declval<Bitmap const &>().is_subset_of( !std::declval<view>() ) ) );
 
+    // the sizes of combinations
+    static_assert( noexcept( std::declval<Bitmap const &>().andnot_cardinality( std::declval<view>() ) ) );
+    static_assert( noexcept( std::declval<Bitmap const &>().or_cardinality( std::declval<view>() ) ) );
+    static_assert( noexcept( std::declval<Bitmap const &>().jaccard_index( std::declval<key_range>() ) ) );
+    static_assert( noexcept( std::declval<Bitmap const &>().is_strict_subset_of( std::declval<view>() ) ) );
+
     static_assert( noexcept( std::declval<Bitmap &>().optimize() ) == terminates );
     static_assert( noexcept( std::declval<Bitmap &>().optimize_for_storage() ) == terminates );
     static_assert( noexcept( std::declval<Bitmap &>().optimize_for_speed() ) == terminates );

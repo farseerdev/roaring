@@ -290,6 +290,7 @@ if(FRSR_ROARING_BUILD_TESTS)
         tests/chunk_tree.cpp
         tests/interop.cpp
         tests/view_operands.cpp
+        tests/upstream_parity_queries.cpp
         tests/symmetric_difference.cpp
         tests/noexcept_policy.cpp
     )

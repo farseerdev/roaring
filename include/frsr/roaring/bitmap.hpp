@@ -707,6 +707,39 @@ public:
     [[nodiscard]] bool equals( complement<Operand> const & ) const = FRSR_ROARING_DELETED_COMPLEMENT( "the complement of an operand is the rest of the key space: no bitmap is expected to equal it" );
 #undef FRSR_ROARING_DELETED_COMPLEMENT
 
+    // ---- sizes of combinations and the strict subset, without building the combination (the operand is a bitmap, a
+    // view of one or an interval where its size is needed; both sides are finished bitmaps).
+    // How many keys of this bitmap are not in the operand. [croaring-ref] deps/croaring/src/roaring.c:roaring_bitmap_andnot_cardinality
+    template <complementable Operand>
+    [[nodiscard]] size_type andnot_cardinality( Operand const & operand ) const noexcept( detail::complement_query_nothrow_v<Operand> ) { return size() - and_cardinality( operand ); }
+    // How many keys of this bitmap are in the operand's complement: the ones the operand has.
+    template <complementable Operand>
+    [[nodiscard]] size_type andnot_cardinality( complement<Operand> const & c ) const noexcept( detail::complement_query_nothrow_v<Operand> ) { return and_cardinality( c.operand ); }
+    // How many keys are in this bitmap or the operand. [croaring-ref] deps/croaring/src/roaring.c:roaring_bitmap_or_cardinality
+    // (An interval that holds every 64-bit key has a size no size_type can hold: not a valid operand here.)
+    template <typename Operand>
+        requires ( std::same_as<Operand, bitmap> || std::same_as<Operand, typed_view<bitmap>> || std::same_as<Operand, key_range> )
+    [[nodiscard]] size_type or_cardinality( Operand const & operand ) const noexcept( detail::complement_query_nothrow_v<Operand> ) {
+        return size() + operand_size( operand ) - and_cardinality( operand );
+    }
+    // |this & operand| / |this | operand|, NaN for two empty sets, as the reference. [croaring-ref] deps/croaring/src/roaring.c:roaring_bitmap_jaccard_index
+    template <typename Operand>
+        requires ( std::same_as<Operand, bitmap> || std::same_as<Operand, typed_view<bitmap>> || std::same_as<Operand, key_range> )
+    [[nodiscard]] double jaccard_index( Operand const & operand ) const noexcept( detail::complement_query_nothrow_v<Operand> ) {
+        auto const common{ and_cardinality( operand ) };
+        return static_cast<double>( common ) / static_cast<double>( size() + operand_size( operand ) - common );
+    }
+    // Whether every key of this bitmap is in the operand and the operand has more. [croaring-ref] deps/croaring/src/roaring.c:roaring_bitmap_is_strict_subset
+    template <typename Operand>
+        requires ( std::same_as<Operand, bitmap> || std::same_as<Operand, typed_view<bitmap>> || std::same_as<Operand, key_range> )
+    [[nodiscard]] bool is_strict_subset_of( Operand const & operand ) const noexcept( detail::complement_query_nothrow_v<Operand> ) {
+        return size() < operand_size( operand ) && is_subset_of( operand );
+    }
+    template <interop_operand Operand>
+        requires ( !std::same_as<Operand, typed_view<bitmap>> && !std::same_as<Operand, key_range> )
+    [[nodiscard]] bool is_strict_subset_of( Operand const & operand ) const noexcept( detail::interop_nothrow_v<Operand> ) {
+        return is_subset_of( operand ) && !equals( operand );
+    }
 
     // The half-open interval [lo, hi) (empty if hi <= lo); the whole key space and intervals that run to the
     // largest key are key_range::all() / key_range::from( lo ), through the operations above.
@@ -2128,6 +2161,17 @@ private:
     void interop_mutate( detail::interop_op op, detail::operand_view const & operand ) noexcept( detail::allocation_failure_terminates );
     [[nodiscard]] size_type interop_count( detail::interop_op op, detail::operand_view const & operand ) const;
     [[nodiscard]] bool interop_test( detail::interop_op op, detail::operand_view const & operand ) const;
+
+    // The number of keys of an operand whose size is known (the keys of an interval that the key type can hold).
+    [[nodiscard]] static size_type operand_size( bitmap const & operand ) noexcept { return operand.size(); }
+    [[nodiscard]] static size_type operand_size( typed_view<bitmap> const operand ) noexcept { return operand.size(); }
+    [[nodiscard]] static size_type operand_size( key_range const operand ) noexcept {
+        constexpr auto max{ static_cast<std::uint64_t>( std::numeric_limits<key_type>::max() ) };
+        if ( operand.empty() || operand.first > max ) { return 0; }
+        auto const count{ std::min( operand.last, max ) - operand.first + 1 };
+        assert( count != 0 && "an interval of every 64-bit key has no size" );
+        return static_cast<size_type>( count );
+    }
 
     template <detail::interop_op Op, typename Self, typename Operand>
     static decltype( auto ) interop_dispatch( Self & self, Operand const & operand ) {
