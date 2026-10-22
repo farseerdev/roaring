@@ -536,9 +536,7 @@ public:
 #if FRSR_ROARING_PAYLOAD_ALLOC_STATS
         ( spilled() ? payload_alloc_stats().grow_chain : payload_alloc_stats().grow_first ).fetch_add( 1, std::memory_order_relaxed );
 #endif
-        // never below what is copied: a payload that holds more than its capacity says (a small borrowed payload cloned into
-        // the body in a build whose inline capacity is zero) that is then shrunk is "grown" to fewer elements than it holds
-        auto const grown{ std::max( std::max( required, count_ ), payload_capacity<E>() * 2U ) };
+        auto const grown{ std::max( required, payload_capacity<E>() * 2U ) };
         auto * const fresh{ allocate_payload( std::size_t{ grown } * sizeof( E ) ) };
         std::memcpy( fresh, payload_data_raw(), std::size_t{ count_ } * sizeof( E ) );
         if ( spilled() ) {
@@ -770,7 +768,9 @@ private:
     [[gnu::cold]] void clone_borrowed_payload() noexcept( !CowPolicy::refcounted || detail::allocation_failure_terminates ) {
         auto const bytes{ std::size_t{ count_ } * element_size() };
         void const * const source{ spill().data };
-        if ( bytes <= body_size ) {   // bitsets (8 KB block) never fit ⇒ always take the spilled arm
+        // inline where the build has inline storage and the payload fits it (bitsets, the 8 KB block, never do): the
+        // inline capacity of the element type is what payload_capacity() reports for a payload that is not spilled
+        if ( !FRSR_ROARING_NO_SBO && bytes <= body_size ) {
             flags_ &= static_cast<std::uint8_t>( ~spilled_flag );
             owner_ = storage_ownership::unique;
             std::memcpy( body_.inline_bytes, source, bytes );

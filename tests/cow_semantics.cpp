@@ -310,12 +310,13 @@ TYPED_TEST( BorrowedPayload, SmallBorrowedPayloadClonesInline ) {
     EXPECT_EQ( master[ 3 ], low_type{ 4 } );
 }
 
-// A small borrowed payload that is cloned and then shrunk: where the clone is held in the handle's body but the build has no inline
-// capacity (FRSR_ROARING_NO_SBO), the shrink asks for fewer elements than the payload holds.
+// A small borrowed payload that is cloned and then shrunk: the clone is held in the handle's body only where the build has inline
+// capacity, so the capacity the handle reports is never below the elements it holds.
 TYPED_TEST( BorrowedPayload, SmallBorrowedPayloadShrinksAfterTheClone ) {
     low_type const master[]{ 1, 2, 3, 4 };
     auto handle{ handle_t<TypeParam>::make_borrowed( container_kind::array, master, 4U, 4U ) };
     ASSERT_TRUE( handle.as_array().remove( low_type{ 2 } ) );
+    EXPECT_GE( handle.template payload_capacity<low_type>(), handle.count() );
     EXPECT_EQ( handle.cardinality(), 3U );
     auto const values{ std::as_const( handle ).as_array().values };
     ASSERT_EQ( values.size(), 3U );
