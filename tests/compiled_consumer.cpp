@@ -117,6 +117,39 @@ void exercise() {
         EXPECT_EQ( keys_of( *back ), keys_of( lhs ) );
     }
 
+    // views as operands: the same compiled instantiations serve them, nothing of the engine is built here
+    {
+        using frsr::roaring::view_of;
+        Bitmap with_view{ lhs };
+        with_view |= view_of( rhs );
+        oracle = lhs_set; oracle.insert( rhs_keys.begin(), rhs_keys.end() );
+        check( with_view, oracle );
+        with_view &= view_of( lhs );
+        check( with_view, lhs_set );
+        with_view -= view_of( rhs );
+        oracle.clear(); std::ranges::set_difference( lhs_set, rhs_set, std::inserter( oracle, oracle.end() ) );
+        check( with_view, oracle );
+        with_view ^= view_of( rhs );   // (lhs minus rhs) xor rhs is lhs | rhs
+        oracle.clear(); std::ranges::set_union( lhs_set, rhs_set, std::inserter( oracle, oracle.end() ) );
+        check( with_view, oracle );
+        oracle.clear(); std::ranges::set_intersection( lhs_set, rhs_set, std::inserter( oracle, oracle.end() ) );
+        EXPECT_EQ( lhs.and_cardinality( view_of( rhs ) ), oracle.size() );
+        EXPECT_EQ( lhs.intersects( view_of( rhs ) ), !oracle.empty() );
+        EXPECT_FALSE( lhs.equals( view_of( rhs ) ) );
+        EXPECT_TRUE( lhs.is_subset_of( view_of( lhs ) ) );
+        EXPECT_TRUE( lhs.is_superset_of( view_of( lhs ) ) );
+        EXPECT_EQ( lhs.xor_cardinality( view_of( rhs ) ), lhs.xor_cardinality( rhs ) );
+        check( lhs & view_of( rhs ), oracle );
+        check( view_of( lhs ) & view_of( rhs ), oracle );
+        std::array<frsr::roaring::typed_view<Bitmap>, 2> const views{ view_of( lhs ), view_of( rhs ) };
+        check( Bitmap::and_many( views ), oracle );
+        EXPECT_EQ( Bitmap::and_many_cardinality( views ), oracle.size() );
+        EXPECT_EQ( Bitmap::and_many_intersects( views ), !oracle.empty() );
+        Bitmap into;
+        lhs.intersect_into( view_of( rhs ), into );
+        check( into, oracle );
+    }
+
     std::array<Bitmap const *, 3> const many{ &lhs, &rhs, &mutated };
     EXPECT_EQ( Bitmap::and_many_cardinality( many ), ( lhs & rhs & mutated ).size() );
     EXPECT_EQ( Bitmap::xor_many( many ).size(), ( lhs ^ rhs ^ mutated ).size() );

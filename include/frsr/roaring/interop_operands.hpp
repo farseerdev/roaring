@@ -8,6 +8,8 @@
 //   - dynamic bitset         anything shaped like boost::dynamic_bitset (no dependency on Boost headers)
 //   - a range of keys        a contiguous span or any forward/input range of unsigned integers; ascending
 //                            (duplicates allowed) is detected, or declared with `sorted_keys`
+//   - typed_view<Bitmap>     a finished bitmap of the bitmap's own instantiation, read without being copied
+//                            (`view_of( bitmap )`); see the contract on the class
 //
 // Each operand is presented to the bitmap as a stream of chunk-sized pieces in ascending chunk order, each a
 // transient container handle that VIEWS the caller's memory (or a small per-source scratch buffer) instead of
@@ -113,10 +115,63 @@ struct sorted_keys {
 template <std::ranges::forward_range Range>
 sorted_keys( Range const & ) -> sorted_keys<Range>;
 
+// A read-only, non-owning handle on a finished bitmap, for use as the operand of the set operations of a bitmap
+// of the same instantiation (`a &= view_of( b )`, `a.and_cardinality( view_of( b ) )`, ...). It is one pointer.
+//
+// What it is for: reading a bitmap that other threads read too, without writing anything it owns. Nothing the
+// operation does touches the viewed bitmap, not a reference count, not a container header, not the chunk table,
+// and nothing the operation keeps refers to it: whatever a result takes from the view is a fresh copy, so a
+// result outlives the viewed bitmap. (A bitmap passed as such, `a &= b`, keeps sharing the containers of `b` by
+// reference count where that is cheaper for a single thread, and that is a write to the counts of `b`.)
+//
+// Contract, the caller's to keep (as with std::string_view; release builds do not check it):
+//   - the bitmap is finished: not in the middle of a lazy fold (asserted in debug builds);
+//   - it is not modified, moved, swapped or destroyed while a view of it, or an operation reading through one,
+//     is alive. Any number of threads may read through views of it and read it directly at the same time.
+// Applying a view of a bitmap to the bitmap itself is defined: `a &= view_of( a )` and `a |= view_of( a )` leave
+// `a` as it is, `a -= view_of( a )` and `a ^= view_of( a )` empty it. A bitmap that is a copy-on-write copy of the
+// viewed one may be updated through its own view: dropping a payload it shares releases that payload's reference,
+// which is the copy's own.
+//
+// It is deliberately not a range (no begin / end), so it is never taken for a sequence of keys, and it is not the
+// type-erased bitmap_view of bitmap_view.hpp, which has no set operations (it converts to that one).
+template <typename Bitmap>
+class typed_view {
+public:
+    using bitmap_type = Bitmap;
+    using key_type    = typename Bitmap::key_type;
+    using size_type   = typename Bitmap::size_type;
+
+    explicit typed_view( Bitmap const & bitmap ) noexcept : bitmap_{ &bitmap } { assert( !bitmap.counts_deferred() && "a view is taken of a finished bitmap" ); }
+
+    [[nodiscard]] Bitmap const & get() const noexcept { return *bitmap_; }
+
+    [[nodiscard]] bool      contains( key_type const key ) const noexcept { return bitmap_->contains( key ); }
+    [[nodiscard]] size_type size    () const noexcept { return bitmap_->size(); }
+    [[nodiscard]] bool      empty   () const noexcept { return bitmap_->empty(); }
+    [[nodiscard]] key_type  front   () const noexcept { return bitmap_->front(); }
+    [[nodiscard]] key_type  back    () const noexcept { return bitmap_->back(); }
+
+    // Whether both name the same bitmap.
+    [[nodiscard]] friend bool operator==( typed_view const lhs, typed_view const rhs ) noexcept { return lhs.bitmap_ == rhs.bitmap_; }
+
+private:
+    Bitmap const * bitmap_;
+};
+
+template <typename Bitmap>
+    requires requires { typename Bitmap::chunk_type; typename Bitmap::layout_type; typename Bitmap::container_set_type; }
+[[nodiscard]] typed_view<Bitmap> view_of( Bitmap const & bitmap ) noexcept { return typed_view<Bitmap>{ bitmap }; }
+
 namespace detail {
 
 template <typename Bitmap>
 struct interop_engine;
+
+template <typename T>
+inline constexpr bool is_typed_view_v{ false };
+template <typename Bitmap>
+inline constexpr bool is_typed_view_v<typed_view<Bitmap>>{ true };
 
 template <typename T>
 inline constexpr bool is_sorted_keys_v{ false };
@@ -184,6 +239,8 @@ template <std::size_t N>
 inline constexpr bool interop_nothrow_v<std::bitset<N>>{ ( N + 63 ) / 64 <= 2048 };
 template <std::size_t N>
 inline constexpr bool interop_nothrow_v<based_bits<std::bitset<N>>>{ ( N + 63 ) / 64 <= 2048 };
+template <typename Bitmap>
+inline constexpr bool interop_nothrow_v<typed_view<Bitmap>>{ true };
 
 } // namespace detail
 
@@ -196,7 +253,8 @@ concept interop_operand =
     ( detail::is_based_bits_v<T> && detail::bit_container<std::remove_cvref_t<decltype( std::declval<T const &>().bits )>> ) ||
     detail::bit_container<T> ||
     detail::key_sequence<T> ||
-    detail::sorted_key_sequence<T>;
+    detail::sorted_key_sequence<T> ||
+    detail::is_typed_view_v<T>;
 
 namespace detail {
 
@@ -217,11 +275,11 @@ enum class interop_op : std::uint8_t {
 };
 
 struct operand_view {
-    enum class shape_type : std::uint8_t { interval, bits, sorted_keys, unsorted_keys };
+    enum class shape_type : std::uint8_t { interval, bits, sorted_keys, unsorted_keys, bitmap };
 
     shape_type    shape{};
     key_range     interval{};   // interval
-    void const *  data{};       // bits: the first byte; keys: the first key
+    void const *  data{};       // bits: the first byte; keys: the first key; bitmap: the viewed bitmap (of the applying bitmap's own type)
     std::size_t   count{};      // keys
     std::uint64_t bit_count{};  // bits
     std::uint64_t base{};       // bits: the key bit 0 stands for
@@ -236,9 +294,10 @@ inline constexpr bool sorted_keys_erasable{ false };
 template <typename Range, typename Key>
 inline constexpr bool sorted_keys_erasable<sorted_keys<Range>, Key>{ contiguous_keys_of<Range, Key> };
 
-template <typename Operand, typename Key>
+template <typename Operand, typename Bitmap>
 inline constexpr bool interop_erasable{
-    std::same_as<Operand, key_range> || is_bit_words_v<Operand> || contiguous_keys_of<Operand, Key> || sorted_keys_erasable<Operand, Key>
+    std::same_as<Operand, key_range> || is_bit_words_v<Operand> || contiguous_keys_of<Operand, typename Bitmap::key_type> ||
+    sorted_keys_erasable<Operand, typename Bitmap::key_type> || std::same_as<Operand, typed_view<Bitmap>>
 };
 
 template <typename Operand>
@@ -252,6 +311,9 @@ template <typename Operand>
         view.data      = operand.words.data();
         view.bit_count = operand.bit_count;
         view.base      = operand.base;
+    } else if constexpr ( is_typed_view_v<Operand> ) {
+        view.shape = operand_view::shape_type::bitmap;
+        view.data  = &operand.get();
     } else if constexpr ( is_sorted_keys_v<Operand> ) {
         view.shape = operand_view::shape_type::sorted_keys;
         view.data  = std::ranges::data( operand.keys );

@@ -65,6 +65,11 @@ public:
     [[nodiscard]] bitmap_type       * operator->()       noexcept { return &bitmap_; }
     [[nodiscard]] bitmap_type const * operator->() const noexcept { return &bitmap_; }
 
+    // A view of the bitmap over the mapping, for the set operations that must not alias the mapping: what a
+    // result takes through the view is a copy, whereas `x |= *pb` adopts the borrowed payloads and `x` is then valid
+    // only as long as the mapping is (see typed_view for the contract).
+    [[nodiscard]] typed_view<bitmap_type> view() const noexcept { return view_of( bitmap_ ); }
+
     persistent_bitmap( persistent_bitmap && )              = default;
     persistent_bitmap & operator=( persistent_bitmap && )  = default;
     persistent_bitmap( persistent_bitmap const & )             = delete;

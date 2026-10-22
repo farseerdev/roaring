@@ -77,6 +77,26 @@ struct checks {
     static_assert( noexcept( std::declval<Bitmap &>().and_range( key_type{}, key_type{} ) ) == terminates );
     static_assert( !noexcept( std::declval<Bitmap &>().xor_with( std::declval<std::vector<key_type> const &>() ) ), "a key sequence is walked by code that can throw" );
 
+    // against a view: the reads allocate nothing, the updates allocate exactly as the operand they reduce to
+    using view = typed_view<Bitmap>;
+    static_assert( noexcept( view_of( std::declval<Bitmap const &>() ) ) );
+    static_assert( std::is_nothrow_copy_constructible_v<view> );
+    static_assert( noexcept( std::declval<Bitmap const &>().intersects( std::declval<view>() ) ) );
+    static_assert( noexcept( std::declval<Bitmap const &>().and_cardinality( std::declval<view>() ) ) );
+    static_assert( noexcept( std::declval<Bitmap const &>().xor_cardinality( std::declval<view>() ) ) );
+    static_assert( noexcept( std::declval<Bitmap const &>().is_subset_of( std::declval<view>() ) ) );
+    static_assert( noexcept( std::declval<Bitmap const &>().is_superset_of( std::declval<view>() ) ) );
+    static_assert( noexcept( std::declval<Bitmap const &>().equals( std::declval<view>() ) ) );
+    static_assert( noexcept( std::declval<Bitmap &>() &= std::declval<view>() ) == terminates );
+    static_assert( noexcept( std::declval<Bitmap &>() |= std::declval<view>() ) == terminates );
+    static_assert( noexcept( std::declval<Bitmap &>() -= std::declval<view>() ) == terminates );
+    static_assert( noexcept( std::declval<Bitmap &>() ^= std::declval<view>() ) == terminates );
+    static_assert( noexcept( std::declval<view>() & std::declval<view>() ) == terminates );
+    static_assert( noexcept( std::declval<Bitmap const &>() | std::declval<view>() ) == terminates );
+    static_assert( noexcept( std::declval<Bitmap const &>().intersect_into( std::declval<view>(), std::declval<Bitmap &>() ) ) == terminates );
+    static_assert( noexcept( Bitmap::and_many( std::declval<std::span<view const>>() ) ) == terminates );
+    static_assert( noexcept( Bitmap::and_many_into( std::declval<std::span<view const>>(), std::declval<Bitmap &>() ) ) == terminates );
+
     static_assert( noexcept( std::declval<Bitmap &>().optimize() ) == terminates );
     static_assert( noexcept( std::declval<Bitmap &>().optimize_for_storage() ) == terminates );
     static_assert( noexcept( std::declval<Bitmap &>().optimize_for_speed() ) == terminates );

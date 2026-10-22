@@ -94,6 +94,10 @@ public:
     bitmap_view( Bitmap const & bm ) noexcept
         : obj_{ &bm }, vt_{ &vtable_for<Bitmap> } {}
 
+    // The type-erased form of a typed_view (the operand of the set operations, see interop_operands.hpp).
+    template <erasable_bitmap Bitmap>
+    bitmap_view( typed_view<Bitmap> const view ) noexcept : bitmap_view{ view.get() } {}
+
     [[nodiscard]] bool contains( value_type const value ) const noexcept { return vt_->contains( obj_, value ); }
 
     [[nodiscard]] size_type size     () const noexcept { return vt_->size     ( obj_ ); }

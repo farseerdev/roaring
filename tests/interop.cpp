@@ -60,6 +60,15 @@ static_assert( frsr::roaring::interop_operand<bit_words<std::uint64_t>> );
 static_assert( !frsr::roaring::interop_operand<std::vector<int>> );
 static_assert( !frsr::roaring::interop_operand<std::vector<double>> );
 static_assert( !frsr::roaring::interop_operand<frsr::roaring::bitmap<std::uint32_t>> );
+static_assert( frsr::roaring::interop_operand<frsr::roaring::typed_view<frsr::roaring::bitmap<std::uint32_t>>> );
+// a view is no sequence of keys (it would otherwise be taken for one), no bitmap (it would otherwise keep a bitmap's overloads away
+// from the bitmaps) and no bit-set
+static_assert( !std::ranges::input_range<frsr::roaring::typed_view<frsr::roaring::bitmap<std::uint32_t>>> );
+static_assert( !frsr::roaring::detail::key_sequence<frsr::roaring::typed_view<frsr::roaring::bitmap<std::uint32_t>>> );
+static_assert( !frsr::roaring::detail::bitmap_like<frsr::roaring::typed_view<frsr::roaring::bitmap<std::uint32_t>>> );
+static_assert( !frsr::roaring::detail::bit_container<frsr::roaring::typed_view<frsr::roaring::bitmap<std::uint32_t>>> );
+static_assert( sizeof( frsr::roaring::typed_view<frsr::roaring::bitmap<std::uint32_t>> ) == sizeof( void * ) );
+static_assert( std::is_trivially_copyable_v<frsr::roaring::typed_view<frsr::roaring::bitmap<std::uint32_t>>> );
 
 // the read-only operations cannot throw against operands they never copy out
 static_assert( noexcept( std::declval<frsr::roaring::bitmap<std::uint32_t> const &>().intersects( std::declval<key_range>() ) ) );
@@ -70,6 +79,11 @@ static_assert( noexcept( std::declval<frsr::roaring::bitmap<std::uint32_t> const
 static_assert( !noexcept( std::declval<frsr::roaring::bitmap<std::uint32_t> const &>().xor_cardinality( std::declval<std::vector<std::uint32_t>>() ) ) );
 static_assert( !noexcept( std::declval<frsr::roaring::bitmap<std::uint32_t> const &>().intersects( std::declval<std::vector<std::uint32_t>>() ) ) );
 static_assert( !noexcept( std::declval<frsr::roaring::bitmap<std::uint32_t> const &>().equals( std::declval<std::bitset<1000000>>() ) ) );
+// ... and so are the ones against a view, which allocates nothing
+static_assert( noexcept( std::declval<frsr::roaring::bitmap<std::uint32_t> const &>().intersects( std::declval<frsr::roaring::typed_view<frsr::roaring::bitmap<std::uint32_t>>>() ) ) );
+static_assert( noexcept( std::declval<frsr::roaring::bitmap<std::uint64_t> const &>().and_cardinality( std::declval<frsr::roaring::typed_view<frsr::roaring::bitmap<std::uint64_t>>>() ) ) );
+static_assert( noexcept( std::declval<frsr::roaring::bitmap<std::uint32_t> &>().and_with( std::declval<frsr::roaring::typed_view<frsr::roaring::bitmap<std::uint32_t>>>() ) )
+               == frsr::roaring::detail::allocation_failure_terminates );
 
 template <typename Bitmap>
 void expect_holds( Bitmap const & bitmap, oracle_set const & expected, std::string const & what ) {
@@ -350,6 +364,88 @@ TYPED_TEST( InteropTest, BitmapOperands ) {
             oracle_set smaller;
             for ( std::size_t i{ 0 }; i < content.size(); i += 3 ) { smaller.push_back( content[ i ] ); }
             check_operand( bitmap, content, make_bitmap<Bitmap>( smaller, false ), smaller, "a smaller bitmap" );
+            if ( ::testing::Test::HasFatalFailure() ) { return; }
+        }
+    }
+}
+
+// a view of a bitmap is an operand too, with the same answers as the bitmap itself, whatever either side holds
+TYPED_TEST( InteropTest, ViewOperands ) {
+    using Bitmap = TypeParam;
+    using frsr::roaring::view_of;
+    std::mt19937_64 rng{ 909 };
+    auto const run{ [ & ]( oracle_set const & content, oracle_set const & members, bool const optimize_receiver, bool const optimize_viewed, std::string const & what ) {
+        auto const bitmap{ make_bitmap<Bitmap>( content, optimize_receiver ) };
+        auto const viewed{ make_bitmap<Bitmap>( members, optimize_viewed ) };
+        check_operand( bitmap, content, view_of( viewed ), members, "view " + what );
+    } };
+    for ( int round{ 0 }; round < 2 * scale; ++round ) {
+        auto const content{ random_content<Bitmap>( rng ) };
+        for ( bool const optimize : { false, true } ) {
+            for ( int variant{ 0 }; variant < 3; ++variant ) {
+                run( content, random_related<Bitmap>( rng, content, false ), optimize, variant == 1, "related" );
+            }
+            run( content, content, optimize, !optimize, "equal" );
+            auto larger{ content };
+            larger.push_back( domain<Bitmap>::max );
+            finalize( larger );
+            run( content, larger, optimize, false, "larger" );
+            oracle_set smaller;
+            for ( std::size_t i{ 0 }; i < content.size(); i += 3 ) { smaller.push_back( content[ i ] ); }
+            run( content, smaller, optimize, false, "smaller" );
+            run( content, random_content<Bitmap>( rng ), optimize, optimize, "unrelated" );
+            run( content, {}, optimize, false, "empty" );
+            run( {}, content, optimize, optimize, "into an empty bitmap" );
+            if ( ::testing::Test::HasFatalFailure() ) { return; }
+        }
+    }
+    // chunks of one kind against chunks of every kind
+    constexpr shape shapes[]{ shape::sparse, shape::array, shape::dense_bitset, shape::runs, shape::full, shape::ends, shape::single, shape::mixed };
+    for ( auto const left : shapes ) {
+        for ( auto const right : shapes ) {
+            oracle_set content, members;
+            fill_chunk( content, 0, left, rng, domain<Bitmap>::max );
+            fill_chunk( members, 0, right, rng, domain<Bitmap>::max );
+            if ( !domain<Bitmap>::single_chunk ) {
+                fill_chunk( content, 1, right, rng, domain<Bitmap>::max );
+                fill_chunk( members, 1, left, rng, domain<Bitmap>::max );
+            }
+            finalize( content );
+            finalize( members );
+            for ( bool const optimize : { false, true } ) {
+                run( content, members, optimize, !optimize, "shape " + std::to_string( static_cast<int>( left ) ) + " against " + std::to_string( static_cast<int>( right ) ) );
+                if ( ::testing::Test::HasFatalFailure() ) { return; }
+            }
+        }
+    }
+}
+
+// a bitmap updated by a view of itself
+TYPED_TEST( InteropTest, ViewOfTheBitmapItself ) {
+    using Bitmap = TypeParam;
+    using frsr::roaring::view_of;
+    std::mt19937_64 rng{ 1010 };
+    for ( int round{ 0 }; round < 2 * scale; ++round ) {
+        auto const content{ random_content<Bitmap>( rng ) };
+        for ( bool const optimize : { false, true } ) {
+            auto const original{ make_bitmap<Bitmap>( content, optimize ) };
+            Bitmap b{ original };
+            b &= view_of( b );
+            expect_holds( b, content, "&= itself" );
+            b |= view_of( b );
+            expect_holds( b, content, "|= itself" );
+            EXPECT_TRUE( b.intersects( view_of( b ) ) == !content.empty() );
+            EXPECT_EQ( b.and_cardinality( view_of( b ) ), content.size() );
+            EXPECT_EQ( b.xor_cardinality( view_of( b ) ), 0U );
+            EXPECT_TRUE( b.is_subset_of( view_of( b ) ) );
+            EXPECT_TRUE( b.is_superset_of( view_of( b ) ) );
+            EXPECT_TRUE( b.equals( view_of( b ) ) );
+            Bitmap c{ original };
+            c ^= view_of( c );
+            expect_holds( c, {}, "^= itself" );
+            Bitmap d{ original };
+            d -= view_of( d );
+            expect_holds( d, {}, "-= itself" );
             if ( ::testing::Test::HasFatalFailure() ) { return; }
         }
     }

@@ -1873,6 +1873,14 @@ FRSR_ROARING_DEFINITION_INLINE bool FRSR_ROARING_BITMAP::and_many_intersects( st
 FRSR_ROARING_BITMAP_TEMPLATE
 FRSR_ROARING_DEFINITION_INLINE auto FRSR_ROARING_BITMAP::and_many( std::span<bitmap const * const> const operands ) -> bitmap {
     bitmap result;
+    and_many_into( operands, result );
+    return result;
+}
+
+FRSR_ROARING_BITMAP_TEMPLATE
+FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::and_many_into( std::span<bitmap const * const> const operands, bitmap & result ) noexcept( detail::allocation_failure_terminates ) {
+    assert( std::ranges::none_of( operands, [ &result ]( bitmap const * const operand ) { return operand == &result; } ) && "the result is none of the operands" );
+    result.clear_keep_capacity();
     and_many_scratch scratch;
     and_many_walk( operands, [ & ]( chunk_type const key, std::span<handle_type const * const> const ordered ) {
         bool owned{ false };
@@ -1893,7 +1901,6 @@ FRSR_ROARING_DEFINITION_INLINE auto FRSR_ROARING_BITMAP::and_many( std::span<bit
         result.size_ += count;
         return true;
     } );
-    return result;
 }
 
 FRSR_ROARING_BITMAP_TEMPLATE
@@ -2307,7 +2314,7 @@ FRSR_ROARING_DEFINITION_INLINE bool FRSR_ROARING_BITMAP::is_subset_of( bitmap co
 FRSR_ROARING_BITMAP_TEMPLATE
 FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::interop_mutate( detail::interop_op const op, detail::operand_view const & operand ) noexcept( detail::allocation_failure_terminates ) {
     using engine = detail::interop_engine<bitmap>;
-    detail::with_operand<key_type>( operand, [ & ]( auto const & concrete ) {
+    detail::with_operand<bitmap>( operand, [ & ]( auto const & concrete ) {
         switch ( op ) {
             case detail::interop_op::and_with:    engine::and_with   ( *this, concrete ); return;
             case detail::interop_op::or_with:     engine::or_with    ( *this, concrete ); return;
@@ -2321,7 +2328,7 @@ FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::interop_mutate( detail:
 FRSR_ROARING_BITMAP_TEMPLATE
 FRSR_ROARING_DEFINITION_INLINE auto FRSR_ROARING_BITMAP::interop_count( detail::interop_op const op, detail::operand_view const & operand ) const -> size_type {
     using engine = detail::interop_engine<bitmap>;
-    return detail::with_operand<key_type>( operand, [ & ]( auto const & concrete ) -> size_type {
+    return detail::with_operand<bitmap>( operand, [ & ]( auto const & concrete ) -> size_type {
         return op == detail::interop_op::and_cardinality ? engine::and_cardinality( *this, concrete ) : engine::xor_cardinality( *this, concrete );
     } );
 }
@@ -2329,7 +2336,7 @@ FRSR_ROARING_DEFINITION_INLINE auto FRSR_ROARING_BITMAP::interop_count( detail::
 FRSR_ROARING_BITMAP_TEMPLATE
 FRSR_ROARING_DEFINITION_INLINE bool FRSR_ROARING_BITMAP::interop_test( detail::interop_op const op, detail::operand_view const & operand ) const {
     using engine = detail::interop_engine<bitmap>;
-    return detail::with_operand<key_type>( operand, [ & ]( auto const & concrete ) -> bool {
+    return detail::with_operand<bitmap>( operand, [ & ]( auto const & concrete ) -> bool {
         switch ( op ) {
             case detail::interop_op::intersects:     return engine::intersects    ( *this, concrete );
             case detail::interop_op::is_subset_of:   return engine::is_subset_of  ( *this, concrete );

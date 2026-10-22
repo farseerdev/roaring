@@ -1216,9 +1216,52 @@ public:
     // The AND as a bitmap. A result bitset that fell to array size is stored as an array.
     [[nodiscard]] static bitmap and_many( std::span<bitmap const * const> const operands );
 
+    // The AND written into `out`, which is cleared first (its chunk table keeps its capacity). `out` is none of the operands.
+    static void and_many_into( std::span<bitmap const * const> const operands, bitmap & out ) noexcept( detail::allocation_failure_terminates );
+
+    // The same over views of finished bitmaps (see typed_view): the walk is the one above, it writes nothing the
+    // viewed bitmaps own, and the result keeps none of their containers.
+    template <typename F>
+    static void and_many_for_each_block( std::span<typed_view<bitmap> const> const views, F && f, and_many_scratch & scratch ) {
+        with_view_pointers( views, [ & ]( auto const operands ) { and_many_for_each_block( operands, std::forward<F>( f ), scratch ); } );
+    }
+    template <typename F>
+    static void and_many_for_each_block( std::span<typed_view<bitmap> const> const views, F && f ) {
+        with_view_pointers( views, [ & ]( auto const operands ) { and_many_for_each_block( operands, std::forward<F>( f ) ); } );
+    }
+    template <typename F>
+    static void and_many_for_each( std::span<typed_view<bitmap> const> const views, F && f ) {
+        with_view_pointers( views, [ & ]( auto const operands ) { and_many_for_each( operands, std::forward<F>( f ) ); } );
+    }
+    [[nodiscard]] static size_type and_many_cardinality( std::span<typed_view<bitmap> const> const views ) {
+        return with_view_pointers( views, []( auto const operands ) { return and_many_cardinality( operands ); } );
+    }
+    [[nodiscard]] static bool and_many_intersects( std::span<typed_view<bitmap> const> const views ) {
+        return with_view_pointers( views, []( auto const operands ) { return and_many_intersects( operands ); } );
+    }
+    [[nodiscard]] static bitmap and_many( std::span<typed_view<bitmap> const> const views ) noexcept( detail::allocation_failure_terminates ) {
+        return with_view_pointers( views, []( auto const operands ) { return and_many( operands ); } );
+    }
+    static void and_many_into( std::span<typed_view<bitmap> const> const views, bitmap & out ) noexcept( detail::allocation_failure_terminates ) {
+        with_view_pointers( views, [ & ]( auto const operands ) { and_many_into( operands, out ); } );
+    }
+
+    // `*this & view` into `out` (cleared first), as intersect_into does for a bitmap, without sharing a container of the view.
+    void intersect_into( typed_view<bitmap> const view, bitmap & out ) const noexcept( detail::allocation_failure_terminates ) {
+        assert( &out != this && &out != &view.get() );
+        and_many_into( std::array<bitmap const *, 2>{ this, &view.get() }, out );
+    }
+
 private:
     static constexpr std::size_t and_many_inline_operands{ 16 };
     static constexpr std::size_t and_many_block_values{ 256 };
+
+    template <typename F>
+    static decltype( auto ) with_view_pointers( std::span<typed_view<bitmap> const> const views, F && f ) {
+        and_many_buffer<bitmap const *> pointers{ views.size() };
+        for ( std::size_t i{ 0 }; i != views.size(); ++i ) { pointers.data[ i ] = &views[ i ].get(); }
+        return f( std::span<bitmap const * const>{ pointers.data, views.size() } );
+    }
 
     template <typename T>
     struct and_many_buffer {
@@ -1501,6 +1544,61 @@ public:
     [[nodiscard]] friend bitmap operator^( bitmap const & lhs, bitmap const & rhs ) noexcept( detail::allocation_failure_terminates ) {
         bitmap result;
         lhs.xor_into( rhs, result );
+        return result;
+    }
+
+    // The set operations with a view on either side, materialized like the ones between bitmaps. Nothing of a
+    // view is shared with the result.
+    [[nodiscard]] friend bitmap operator&( typed_view<bitmap> const lhs, typed_view<bitmap> const rhs ) noexcept( detail::allocation_failure_terminates ) {
+        bitmap result;
+        and_many_into( std::array<typed_view<bitmap>, 2>{ lhs, rhs }, result );
+        return result;
+    }
+    [[nodiscard]] friend bitmap operator&( bitmap const & lhs, typed_view<bitmap> const rhs ) noexcept( detail::allocation_failure_terminates ) {
+        bitmap result;
+        and_many_into( std::array<bitmap const *, 2>{ &lhs, &rhs.get() }, result );
+        return result;
+    }
+    [[nodiscard]] friend bitmap operator&( typed_view<bitmap> const lhs, bitmap const & rhs ) noexcept( detail::allocation_failure_terminates ) { return rhs & lhs; }
+    [[nodiscard]] friend bitmap operator|( typed_view<bitmap> const lhs, typed_view<bitmap> const rhs ) noexcept( detail::allocation_failure_terminates ) {
+        bitmap result;
+        result |= lhs;
+        result |= rhs;
+        return result;
+    }
+    [[nodiscard]] friend bitmap operator|( bitmap const & lhs, typed_view<bitmap> const rhs ) noexcept( detail::allocation_failure_terminates ) {
+        bitmap result{ lhs };
+        result |= rhs;
+        return result;
+    }
+    [[nodiscard]] friend bitmap operator|( typed_view<bitmap> const lhs, bitmap const & rhs ) noexcept( detail::allocation_failure_terminates ) { return rhs | lhs; }
+    [[nodiscard]] friend bitmap operator^( typed_view<bitmap> const lhs, typed_view<bitmap> const rhs ) noexcept( detail::allocation_failure_terminates ) {
+        bitmap result;
+        result |= lhs;
+        result ^= rhs;
+        return result;
+    }
+    [[nodiscard]] friend bitmap operator^( bitmap const & lhs, typed_view<bitmap> const rhs ) noexcept( detail::allocation_failure_terminates ) {
+        bitmap result{ lhs };
+        result ^= rhs;
+        return result;
+    }
+    [[nodiscard]] friend bitmap operator^( typed_view<bitmap> const lhs, bitmap const & rhs ) noexcept( detail::allocation_failure_terminates ) { return rhs ^ lhs; }
+    [[nodiscard]] friend bitmap operator-( typed_view<bitmap> const lhs, typed_view<bitmap> const rhs ) noexcept( detail::allocation_failure_terminates ) {
+        bitmap result;
+        result |= lhs;
+        result -= rhs;
+        return result;
+    }
+    [[nodiscard]] friend bitmap operator-( bitmap const & lhs, typed_view<bitmap> const rhs ) noexcept( detail::allocation_failure_terminates ) {
+        bitmap result{ lhs };
+        result -= rhs;
+        return result;
+    }
+    [[nodiscard]] friend bitmap operator-( typed_view<bitmap> const lhs, bitmap const & rhs ) noexcept( detail::allocation_failure_terminates ) {
+        bitmap result;
+        result |= lhs;
+        result -= rhs;
         return result;
     }
 
@@ -1964,11 +2062,22 @@ private:
 
     template <detail::interop_op Op, typename Self, typename Operand>
     static decltype( auto ) interop_dispatch( Self & self, Operand const & operand ) {
-        if constexpr ( Op == detail::interop_op::and_with || Op == detail::interop_op::or_with
-                    || Op == detail::interop_op::andnot_with || Op == detail::interop_op::xor_with ) {
+        constexpr bool mutating{ Op == detail::interop_op::and_with || Op == detail::interop_op::or_with
+                              || Op == detail::interop_op::andnot_with || Op == detail::interop_op::xor_with };
+        if constexpr ( mutating ) {
             self.settle_counts();
         }
-        if constexpr ( detail::interop_erasable<Operand, key_type> ) {
+        if constexpr ( detail::is_typed_view_v<Operand> ) {
+            static_assert( std::same_as<typename Operand::bitmap_type, bitmap>, "a view is an operand of bitmaps of its own instantiation" );
+            if constexpr ( mutating ) {
+                // the table that is read is the table that is rewritten: the answer is known without reading it
+                if ( &operand.get() == &self ) {
+                    if constexpr ( Op == detail::interop_op::andnot_with || Op == detail::interop_op::xor_with ) { self.clear(); }
+                    return;
+                }
+            }
+        }
+        if constexpr ( detail::interop_erasable<Operand, bitmap> ) {
             auto const view{ detail::make_operand_view( operand ) };
             if constexpr ( Op == detail::interop_op::and_with || Op == detail::interop_op::or_with
                         || Op == detail::interop_op::andnot_with || Op == detail::interop_op::xor_with ) {
@@ -1985,6 +2094,7 @@ private:
 
     friend struct detail::interop_engine<bitmap>;
     friend struct detail::bitmap_test_access<bitmap>;
+    template <typename> friend class typed_view;
 
     chunk_store_type chunks_;
     size_type size_{};

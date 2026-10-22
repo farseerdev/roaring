@@ -128,6 +128,10 @@ struct interop_engine {
         if constexpr ( std::same_as<Operand, key_range> ) {
             interval_source<layout_type, cow_policy> source{ operand };
             return v( source );
+        } else if constexpr ( is_typed_view_v<Operand> ) {
+            static_assert( std::same_as<typename Operand::bitmap_type, Bitmap>, "a view is an operand of bitmaps of its own instantiation" );
+            store_source source{ operand.get().chunks_ };
+            return v( source );
         } else if constexpr ( is_bit_words_v<Operand> ) {
             bits_source<layout_type, cow_policy> source{ operand.words.data(), operand.bit_count, operand.base };
             return v( source );
@@ -985,9 +989,12 @@ namespace frsr::roaring {
 namespace detail {
 
 // Calls f with the operand a view stands for, as one of the operand types the engine understands.
-template <typename Key, typename F>
+template <typename Bitmap, typename F>
 decltype( auto ) with_operand( operand_view const & view, F && f ) {
+    using Key = typename Bitmap::key_type;
     switch ( view.shape ) {
+        case operand_view::shape_type::bitmap:
+            return f( typed_view<Bitmap>{ *static_cast<Bitmap const *>( view.data ) } );
         case operand_view::shape_type::interval:
             return f( view.interval );
         case operand_view::shape_type::bits: {

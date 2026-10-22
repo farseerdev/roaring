@@ -24,6 +24,7 @@ using frsr::roaring::default_container_set;
 
 using wide_bitmap      = frsr::roaring::bitmap<std::uint64_t>;
 using narrow_bitmap    = frsr::roaring::bitmap<std::uint32_t>;
+using narrow_cow_bitmap = frsr::roaring::bitmap<std::uint32_t, default_container_set<std::uint32_t>, frsr::roaring::detail::cow_atomic_refcount>;
 using wide_cow_bitmap  = frsr::roaring::bitmap<std::uint64_t, default_container_set<std::uint64_t>, frsr::roaring::detail::cow_atomic_refcount>;
 
 // Chunk keys spread over the key space, inserted and removed in random order,
@@ -134,7 +135,99 @@ void whole_bitmap_queries_from_many_threads() {
     } );
 }
 
+// A bitmap as a consumer publishes one: dense, sparse and run chunks folded in lazily from several parts and finished
+// once, which leaves bitset endpoints stale (the one place a read-only path could be tempted to repair them).
+template <typename Bitmap>
+Bitmap make_published( std::uint32_t const seed ) {
+    using key_type = typename Bitmap::key_type;
+    std::mt19937_64 rng{ seed };
+    std::vector<std::uint64_t> chunks{ 0, 1, 2, 5, 9, 40 };
+    if constexpr ( std::numeric_limits<key_type>::digits == 64 ) { for ( auto & chunk : chunks ) { chunk = chunk * 1000003U + ( chunk << 20 ); } }
+    if constexpr ( std::numeric_limits<key_type>::digits == 16 ) { chunks = { 0 }; }
+    std::vector<Bitmap> parts( 4 );
+    for ( std::size_t p{ 0 }; p != parts.size(); ++p ) {
+        for ( auto const chunk : chunks ) {
+            auto const base{ chunk << 16 };
+            switch ( ( rng() + p ) % 4 ) {
+                case 0: for ( int i{ 0 }; i != 20000; ++i ) { parts[ p ].add( static_cast<key_type>( base + ( rng() & 0xFFFF ) ) ); } break;
+                case 1: for ( int i{ 0 }; i != 200; ++i )   { parts[ p ].add( static_cast<key_type>( base + ( rng() & 0xFFFF ) ) ); } break;
+                case 2: { auto const first{ rng() & 0x7FFF }; parts[ p ].add_closed_range( static_cast<key_type>( base + first ), static_cast<key_type>( base + first + 9000 ) ); break; }
+                default: for ( int i{ 0 }; i != 60000; ++i ) { parts[ p ].add( static_cast<key_type>( base + ( rng() & 0xFFFF ) ) ); } break;
+            }
+        }
+        if ( p % 2 == 1 ) { parts[ p ].optimize(); }
+    }
+    Bitmap published;
+    for ( auto const & part : parts ) { published.bulk_or_intermediate( part ); }
+    published.bulk_or_finish();
+    return published;
+}
+
+// Views of published bitmaps are what many readers share: every query and every update that takes a view goes through
+// the viewed bitmaps without writing to them (under -fsanitize=thread a store is a race), and each thread's result is
+// its own.
+template <typename Bitmap>
+void view_reads_from_many_threads() {
+    using key_type = typename Bitmap::key_type;
+    using frsr::roaring::view_of;
+    Bitmap const a{ make_published<Bitmap>( 11U ) };
+    Bitmap const b{ make_published<Bitmap>( 12U ) };
+    Bitmap const c{ make_published<Bitmap>( 13U ) };
+    auto const expected_and { ( a & b ).to_vector() };
+    auto const expected_or  { ( a | b ).to_vector() };
+    auto const expected_diff{ ( a - b ).to_vector() };
+    auto const expected_xor { ( a ^ b ).to_vector() };
+    auto const expected_and3{ ( a & b & c ).to_vector() };
+    auto const to_vector{ []( Bitmap const & bitmap ) { return bitmap.to_vector(); } };
+    run_readers( 8, [&]( unsigned const t ) {
+        auto const va{ view_of( a ) };
+        auto const vb{ view_of( b ) };
+        auto const vc{ view_of( c ) };
+        // updates of a private receiver through a view of a shared bitmap
+        for ( int round{ 0 }; round != 3; ++round ) {
+            Bitmap r;
+            if ( t % 2 == 0 ) { r |= va; } else { r = Bitmap{ a.to_vector() }; }   // a receiver filled through the view, and one built on its own
+            r &= vb;
+            if ( to_vector( r ) != expected_and ) { return false; }
+            r |= vb;
+            r ^= va;
+            r -= vb;
+            if ( to_vector( r ) != expected_diff ) { return false; }
+        }
+        { Bitmap r; r |= va; r &= vb; if ( to_vector( r ) != expected_and ) { return false; } }
+        { Bitmap r; r |= va; r |= vb; if ( to_vector( r ) != expected_or ) { return false; } }
+        { Bitmap r; r |= va; r -= vb; if ( to_vector( r ) != expected_diff ) { return false; } }
+        { Bitmap r; r |= va; r ^= vb; if ( to_vector( r ) != expected_xor ) { return false; } }
+        if ( to_vector( va & vb ) != expected_and || to_vector( va | vb ) != expected_or ) { return false; }
+        if ( to_vector( va - vb ) != expected_diff || to_vector( va ^ vb ) != expected_xor ) { return false; }
+        // the queries
+        if ( a.and_cardinality( vb ) != expected_and.size() ) { return false; }
+        if ( a.intersects( vb ) != !expected_and.empty() ) { return false; }
+        if ( a.xor_cardinality( vb ) != expected_xor.size() ) { return false; }
+        if ( a.is_subset_of( va ) != true || a.equals( va ) != true || a.is_superset_of( va ) != true ) { return false; }
+        if ( a.is_subset_of( vb ) != ( expected_and.size() == a.size() ) ) { return false; }
+        // the n-way forms and the scratch form
+        std::array<frsr::roaring::typed_view<Bitmap>, 3> const views{ va, vb, vc };
+        if ( to_vector( Bitmap::and_many( views ) ) != expected_and3 ) { return false; }
+        if ( Bitmap::and_many_cardinality( views ) != expected_and3.size() ) { return false; }
+        if ( Bitmap::and_many_intersects( views ) != !expected_and3.empty() ) { return false; }
+        Bitmap scratch;
+        a.intersect_into( vb, scratch );
+        if ( to_vector( scratch ) != expected_and ) { return false; }
+        std::size_t visited{ 0 };
+        Bitmap::and_many_for_each( views, [&]( key_type ) { ++visited; } );
+        return visited == expected_and3.size();
+    } );
+}
+
 } // namespace
+
+TEST( FrsrRoaringConcurrentReads, ViewsOfPublishedBitmapsFromManyThreads ) {
+    view_reads_from_many_threads<narrow_bitmap>();
+    view_reads_from_many_threads<wide_bitmap>();
+    view_reads_from_many_threads<narrow_cow_bitmap>();
+    view_reads_from_many_threads<wide_cow_bitmap>();
+}
 
 TEST( FrsrRoaringConcurrentReads, WideKeyPointQueriesFromManyThreads ) { point_queries_from_many_threads<wide_bitmap>(); }
 TEST( FrsrRoaringConcurrentReads, NarrowKeyPointQueriesFromManyThreads ) { point_queries_from_many_threads<narrow_bitmap>(); }
