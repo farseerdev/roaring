@@ -27,6 +27,7 @@
 #include <frsr/roaring/container_layout.hpp>
 #include <frsr/roaring/allocation_policy.hpp>
 #include <frsr/roaring/cow_policy.hpp>
+#include <frsr/roaring/hw_info.hpp>
 #include <frsr/roaring/run.hpp>
 #include <frsr/roaring/run_container.hpp>
 
@@ -1308,7 +1309,8 @@ public:
         auto       * dst{ src };
         auto const * rm    { sorted_values.data() };
         auto const * rm_end{ rm + sorted_values.size() };
-        while ( src != end && rm != rm_end ) {
+        // Line-aligned: under one cache line long, but on Zen it runs slower when it straddles a 64-byte boundary.
+        FRSR_ROARING_LOOP_ALIGN while ( src != end && rm != rm_end ) {
             if      ( *src < *rm ) { *dst++ = *src++; }
             else if ( *src == *rm ) { ++src; ++rm; }
             else                   { ++rm; }  // removal value not present
