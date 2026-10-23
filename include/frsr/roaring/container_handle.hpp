@@ -532,18 +532,39 @@ public:
         return old_bytes - new_bytes;
     }
 
+    // The block a payload of E moves into when it must hold `required` elements: at least that many, and at
+    // least double the current capacity. The caller fills it and hands it to adopt_grown_payload(); until then
+    // the current payload is untouched, so a caller that rewrites the payload anyway can write its result
+    // straight into the block instead of copying the payload across first.
     template <typename E>
-    [[using gnu: cold, noinline]] void grow_payload_capacity( std::uint32_t const required ) {
+    struct grown_payload {
+        E *           data;
+        std::uint32_t capacity;
+    };
+
+    template <typename E>
+    [[using gnu: cold, noinline]] grown_payload<E> allocate_grown_payload( std::uint32_t const required ) {
 #if FRSR_ROARING_PAYLOAD_ALLOC_STATS
         ( spilled() ? payload_alloc_stats().grow_chain : payload_alloc_stats().grow_first ).fetch_add( 1, std::memory_order_relaxed );
 #endif
         auto const grown{ std::max( required, payload_capacity<E>() * 2U ) };
-        auto * const fresh{ allocate_payload( std::size_t{ grown } * sizeof( E ) ) };
-        std::memcpy( fresh, payload_data_raw(), std::size_t{ count_ } * sizeof( E ) );
+        return { static_cast<E *>( allocate_payload( std::size_t{ grown } * sizeof( E ) ) ), grown };
+    }
+
+    // Makes the block the payload and returns the previous one to the allocator. count() is the caller's to set.
+    template <typename E>
+    void adopt_grown_payload( grown_payload<E> const grown ) noexcept {
         if ( spilled() ) {
             free_payload( spill().data, std::size_t{ spill().capacity } * sizeof( E ) );
         }
-        spill_to( fresh, grown );
+        spill_to( grown.data, grown.capacity );
+    }
+
+    template <typename E>
+    [[using gnu: cold, noinline]] void grow_payload_capacity( std::uint32_t const required ) {
+        auto const grown{ allocate_grown_payload<E>( required ) };
+        std::memcpy( grown.data, payload_data_raw(), std::size_t{ count_ } * sizeof( E ) );
+        adopt_grown_payload<E>( grown );
     }
 
 private:
@@ -1442,6 +1463,28 @@ public:
         return handle_->cardinality() != previous_size;
     }
 
+    // std::partition_point for a position expected near the front: probes at doubling distances from `first`
+    // and bisects only the span the last probe bracketed, so the cost follows the distance moved rather than
+    // the length of the range (a forward walk over a monotone sequence of queries then costs O(1) per step
+    // when the steps are short and O(log n) when they are long).
+    template <typename It, typename Pred>
+    [[nodiscard]] static It gallop_partition_point( It first, It const last, Pred const pred ) noexcept {
+        auto step{ std::ptrdiff_t{ 1 } };
+        while ( first != last && pred( *first ) ) {
+            ++first;
+            auto const remaining{ last - first };
+            if ( remaining <= step ) {
+                return std::partition_point( first, last, pred );
+            }
+            if ( !pred( first[ step - 1 ] ) ) {
+                return std::partition_point( first, first + step - 1, pred );
+            }
+            first += step;
+            step  *= 2;
+        }
+        return first;
+    }
+
     // The group form of add(): one forward merge of the sorted, duplicate-free batch into the run list.
     // Runs before the batch's first value stay where they are; the rest of the list is moved up by the
     // number of runs the batch can open, and the merge then writes from the front of that gap while it
@@ -1473,35 +1516,59 @@ public:
             return 0;
         }
 
-        // At most one new run per maximal consecutive group of the batch that does not lie wholly inside an
-        // existing run (one forward walk of the groups against the run list).
-        auto new_runs{ std::uint32_t{ 0 } };
+        // How many runs the batch opens, at most one per maximal consecutive group that does not lie wholly inside
+        // an existing run (one forward pass over the groups, each located in the run list by binary search from the
+        // previous). The count only decides how the result is stored, so it stops as soon as that is settled: once
+        // the runs opened outnumber the spare capacity the payload grows, and when the groups alone cannot take the
+        // result past the doubled capacity, the grown size does not depend on the exact count either.
+        auto groups{ std::uint32_t{ 1 } };
+        for ( auto index{ std::size_t{ 1 } }; index < sorted_values.size(); ++index ) {
+            groups += static_cast<std::uint32_t>( std::size_t{ sorted_values[ index ] } != std::size_t{ sorted_values[ index - 1 ] } + 1U );
+        }
+        auto const capacity  { runs.capacity() };
+        auto const stop_after{ std::uint64_t{ run_count } + groups <= std::uint64_t{ capacity } * 2U ? capacity - run_count : std::numeric_limits<std::uint32_t>::max() };
+        auto opened{ std::uint32_t{ 0 } };
         {
             auto cursor{ std::size_t{ first_touched } };
-            for ( auto batch{ sorted_values.begin() }; batch != sorted_values.end(); ) {
+            for ( auto batch{ sorted_values.begin() }; batch != sorted_values.end() && opened <= stop_after; ) {
                 auto const group_begin{ std::size_t{ *batch } };
                 auto group_end{ group_begin };
                 for ( ++batch; batch != sorted_values.end() && std::size_t{ *batch } == group_end + 1U; ++batch ) {
                     group_end = *batch;
                 }
-                while ( cursor != run_count && std::size_t{ runs[ cursor ].end } < group_begin ) {
-                    ++cursor;
-                }
-                new_runs += static_cast<std::uint32_t>( !( cursor != run_count && std::size_t{ runs[ cursor ].begin } <= group_begin && group_end <= std::size_t{ runs[ cursor ].end } ) );
+                cursor = static_cast<std::size_t>( gallop_partition_point(
+                    runs.begin() + static_cast<std::ptrdiff_t>( cursor ), runs.end(),
+                    [ group_begin ]( run_type const & current ) noexcept { return std::size_t{ current.end } < group_begin; }
+                ) - runs.begin() );
+                opened += static_cast<std::uint32_t>( !( cursor != run_count && std::size_t{ runs[ cursor ].begin } <= group_begin && group_end <= std::size_t{ runs[ cursor ].end } ) );
             }
         }
-        if ( new_runs == 0 ) {
+        if ( opened == 0 ) {
             return 0;
         }
-        auto const groups{ new_runs };
 
-        runs.reserve( run_count + groups );
-        auto * const data{ runs.data() };
+        // The merge reads the original runs from `source` and writes the result to `data`. Within the payload
+        // the suffix is first moved up by the number of runs the batch opens. When that does not fit, the
+        // result is written straight into the larger block the payload moves to, so the runs are copied once
+        // (a reserve would copy them all across, and the merge would then move the suffix again).
         auto const suffix_count{ run_count - first_touched };
-        std::memmove( data + first_touched + groups, data + first_touched, std::size_t{ suffix_count } * sizeof( run_type ) );
+        auto grown{ typename container_handle<Layout, CowPolicy>::template grown_payload<run_type>{} };
+        run_type * data;
+        run_type const * source;
+        auto const in_place{ run_count + opened <= capacity };
+        if ( in_place ) {
+            data = runs.data();
+            std::memmove( data + first_touched + opened, data + first_touched, std::size_t{ suffix_count } * sizeof( run_type ) );
+            source = data + opened;
+        } else {
+            grown  = handle_->template allocate_grown_payload<run_type>( run_count + ( opened > stop_after ? groups : opened ) );
+            data   = grown.data;
+            source = runs.data();
+            std::memcpy( data, source, std::size_t{ first_touched } * sizeof( run_type ) );
+        }
 
-        auto read { std::size_t{ first_touched } + groups };
-        auto const read_end{ std::size_t{ run_count } + groups };
+        auto read { std::size_t{ first_touched } };
+        auto const read_end{ std::size_t{ run_count } };
         auto write{ std::size_t{ first_touched } };
         auto added{ std::size_t{ 0 } };
 
@@ -1523,11 +1590,11 @@ public:
                 group_end = *batch;
             }
 
-            auto const block_end{ static_cast<std::size_t>( std::partition_point(
-                data + read, data + read_end,
+            auto const block_end{ static_cast<std::size_t>( gallop_partition_point(
+                source + read, source + read_end,
                 [ group_begin ]( run_type const & current ) noexcept { return std::size_t{ current.end } + 1U < group_begin; }
-            ) - data ) };
-            std::memmove( data + write, data + read, ( block_end - read ) * sizeof( run_type ) );
+            ) - source ) };
+            std::memmove( data + write, source + read, ( block_end - read ) * sizeof( run_type ) );
             write += block_end - read;
             read   = block_end;
 
@@ -1542,16 +1609,20 @@ public:
             if ( write != 0 && std::size_t{ data[ write - 1 ].end } + 1U >= group_begin ) {
                 absorb( data[ --write ] );
             }
-            while ( read != read_end && std::size_t{ data[ read ].begin } <= merged_end + 1U ) {
-                absorb( data[ read++ ] );
+            while ( read != read_end && std::size_t{ source[ read ].begin } <= merged_end + 1U ) {
+                absorb( source[ read++ ] );
             }
             added += group_end - group_begin + 1U - already_present;
             data[ write++ ] = run_type{ static_cast<low_type>( merged_begin ), static_cast<low_type>( merged_end ) };
         }
 
         // The runs after the last group are untouched.
-        std::memmove( data + write, data + read, ( read_end - read ) * sizeof( run_type ) );
+        std::memmove( data + write, source + read, ( read_end - read ) * sizeof( run_type ) );
         write += read_end - read;
+
+        if ( !in_place ) {
+            handle_->template adopt_grown_payload<run_type>( grown );
+        }
 
         runs.resize_uninitialized( static_cast<std::uint32_t>( write ) );
         handle_->adjust_cardinality( static_cast<std::int32_t>( added ) );
