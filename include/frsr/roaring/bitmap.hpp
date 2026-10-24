@@ -505,7 +505,7 @@ public:
     // bitmap are safe. [croaring-ref] roaring_bitmap_contains -> containerptr_roaring is
     // likewise a read-only container lookup; amortization is opt-in through
     // roaring_bitmap_contains_bulk, mirrored here by contains_bulk.
-    [[nodiscard]] bool contains( key_type const value ) const noexcept {
+    [[nodiscard]] [[gnu::always_inline]] bool contains( key_type const value ) const noexcept {
         auto const chunk{ layout_type::chunk_key( value ) };
         auto const at{ chunks_.find( chunk ) };
         if ( at == chunks_.end() ) { return false; }

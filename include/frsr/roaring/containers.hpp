@@ -89,14 +89,25 @@ template <typename Layout, typename CowPolicy>
     return container.cardinality();
 }
 
+// The array lookup (block search) is outlined, as the reference tail-calls array_container_contains: inlined,
+// its loops give the dispatcher a stack frame and register saves that the bitset test (one word load and a
+// bit test) would then pay as well.
+template <typename Layout, typename CowPolicy>
+[[nodiscard]] [[gnu::noinline]] bool array_container_contains(
+    container_handle<Layout, CowPolicy> const & container,
+    typename Layout::low_type const value
+) noexcept {
+    return container.as_array().contains( value );
+}
+
 template <typename Layout, typename CowPolicy>
 [[nodiscard]] inline bool container_contains(
     container_handle<Layout, CowPolicy> const & container,
     typename Layout::low_type const value
 ) noexcept {
     switch ( container.kind() ) {
-        case container_kind::array : return container.as_array ().contains( value );
-        case container_kind::run   : return container.as_run   ().contains( value );
+        case container_kind::array : return array_container_contains( container, value );
+        case container_kind::run   : return container.as_run().contains( value );
         case container_kind::bitset: return container.as_bitset().contains( value );
     }
     std::unreachable();
