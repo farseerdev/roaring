@@ -209,6 +209,9 @@ void run_mutation_bands( config const & cfg, pattern const p, std::size_t const 
     if ( selected( cfg, "addAscending", "frsr" ) ) {
         report( "addAscending", "frsr", p, n, best_ns_per_op( cfg.reps, n, [&] { frsr_bitmap b; for ( auto const v : values ) { (void)b.add( v ); } return b.size(); } ) );
     }
+    if ( selected( cfg, "addDescending", "frsr" ) ) {
+        report( "addDescending", "frsr", p, n, best_ns_per_op( cfg.reps, n, [&] { frsr_bitmap b; for ( auto it{ values.rbegin() }; it != values.rend(); ++it ) { (void)b.add( *it ); } return b.size(); } ) );
+    }
     if ( selected( cfg, "addMany", "frsr" ) ) {
         report( "addMany", "frsr", p, n, best_ns_per_op( cfg.reps, n, [&] { frsr_bitmap b; b.add_many( values ); return b.size(); } ) );
     }
@@ -267,6 +270,9 @@ void run_mutation_bands( config const & cfg, pattern const p, std::size_t const 
     }
     if ( selected( cfg, "addAscending", "r64" ) ) {
         report( "addAscending", "r64", p, n, best_ns_per_op( cfg.reps, n, [&] { auto * r{ roaring64_bitmap_create() }; for ( auto const v : values ) { roaring64_bitmap_add( r, v ); } auto c{ roaring64_bitmap_get_cardinality( r ) }; roaring64_bitmap_free( r ); return c; } ) );
+    }
+    if ( selected( cfg, "addDescending", "r64" ) ) {
+        report( "addDescending", "r64", p, n, best_ns_per_op( cfg.reps, n, [&] { auto * r{ roaring64_bitmap_create() }; for ( auto it{ values.rbegin() }; it != values.rend(); ++it ) { roaring64_bitmap_add( r, *it ); } auto c{ roaring64_bitmap_get_cardinality( r ) }; roaring64_bitmap_free( r ); return c; } ) );
     }
     if ( selected( cfg, "addMany", "r64" ) ) {
         report( "addMany", "r64", p, n, best_ns_per_op( cfg.reps, n, [&] { auto * r{ roaring64_bitmap_create() }; roaring64_bitmap_add_many( r, values.size(), values.data() ); auto c{ roaring64_bitmap_get_cardinality( r ) }; roaring64_bitmap_free( r ); return c; } ) );
