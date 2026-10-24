@@ -680,32 +680,33 @@ inline void apply_range_to_words(
     auto const first_bit{ static_cast<unsigned>( begin ) & 63U };
     auto const last_bit{ static_cast<unsigned>( end ) & 63U };
 
-    auto mask_for{ []( unsigned const start_bit, unsigned const end_bit ) noexcept {
-        auto const leading{ std::numeric_limits<std::uint64_t>::max() << start_bit };
-        auto const trailing{
-            end_bit == 63U
-                ? std::numeric_limits<std::uint64_t>::max()
-                : ( std::uint64_t{ 1 } << ( end_bit + 1U ) ) - 1U
-        };
-        return leading & trailing;
-    } };
+    // the end words take a partial mask, the words between them are taken whole
+    auto const first_mask{ std::numeric_limits<std::uint64_t>::max() << first_bit };
+    auto const last_mask { std::numeric_limits<std::uint64_t>::max() >> ( 63U - last_bit ) };
 
-    for ( auto word_index{ first_word }; word_index <= last_word; ++word_index ) {
-        auto const start_bit{ word_index == first_word ? first_bit : 0U };
-        auto const end_bit{ word_index == last_word ? last_bit : 63U };
-        auto const mask{ mask_for( start_bit, end_bit ) };
+    auto const apply{ [ op ]( std::uint64_t & word, std::uint64_t const mask ) noexcept {
         switch ( op ) {
             case range_operation::add:
-                words[ word_index ] |= mask;
+                word |= mask;
                 break;
             case range_operation::remove:
-                words[ word_index ] &= ~mask;
+                word &= ~mask;
                 break;
             case range_operation::flip:
-                words[ word_index ] ^= mask;
+                word ^= mask;
                 break;
         }
+    } };
+
+    if ( first_word == last_word ) {
+        apply( words[ first_word ], first_mask & last_mask );
+        return;
     }
+    apply( words[ first_word ], first_mask );
+    for ( auto word_index{ first_word + 1U }; word_index < last_word; ++word_index ) {
+        apply( words[ word_index ], std::numeric_limits<std::uint64_t>::max() );
+    }
+    apply( words[ last_word ], last_mask );
 }
 
 template <typename Layout>
