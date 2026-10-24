@@ -1322,11 +1322,12 @@ private:
             append_staged( key, staged );
             return last();
         }
-        if ( at.index_ != 0 ) {   // between two keys of one leaf, so it belongs here
+        if ( at.index_ != 0 || prev_leaf( at.leaf_ ) == nullptr ) {   // between two keys of one leaf, or below every key: it belongs here
             auto const & hd{ head( at.leaf_ ) };
             if ( hd.size < hd.cap ) {
                 leaf_put( at.leaf_, at.index_, key, staged );
                 ++size_;
+                if ( dir_ != nullptr && at.index_ == 0 ) { note_new_minimum( at.leaf_, key ); }
                 return at;
             }
         }
