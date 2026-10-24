@@ -551,6 +551,43 @@ template <typename T>
     return value;
 }
 
+// Whether the values are strictly ascending. The compiler turns the obvious loop into one that
+// carries the previous lane across vectors and widens every mask to 32 bits, which costs more than
+// the copy of the values it checks; this compares the neighbouring pairs of a whole vector at a time
+// and reads one verdict at the end. The last vector overlaps the one before it instead of leaving a
+// scalar remainder.
+[[nodiscard]] inline bool strictly_ascending( std::byte const * const values, std::size_t const count ) noexcept {
+    if ( count < 2U ) {
+        return true;
+    }
+    auto const pairs{ count - 1U };
+#if defined( __AVX2__ )
+    constexpr std::size_t lanes{ 16 };
+    if ( pairs >= lanes ) {
+        __m256i unordered{ _mm256_setzero_si256() };
+        auto const compare{ [&]( std::size_t const at ) noexcept {
+            auto const current{ _mm256_loadu_si256( reinterpret_cast<__m256i const *>( values + at * sizeof( std::uint16_t ) ) ) };
+            auto const next   { _mm256_loadu_si256( reinterpret_cast<__m256i const *>( values + ( at + 1U ) * sizeof( std::uint16_t ) ) ) };
+            // current >= next  <=>  max( current, next ) == current
+            unordered = _mm256_or_si256( unordered, _mm256_cmpeq_epi16( _mm256_max_epu16( current, next ), current ) );
+        } };
+        std::size_t at{ 0 };
+        for ( ; at + lanes <= pairs; at += lanes ) {
+            compare( at );
+        }
+        if ( at != pairs ) {
+            compare( pairs - lanes );
+        }
+        return _mm256_testz_si256( unordered, unordered ) != 0;
+    }
+#endif
+    std::uint32_t unordered{ 0 };
+    for ( std::size_t i{ 0 }; i < pairs; ++i ) {
+        unordered |= std::uint32_t{ portable_get<std::uint16_t>( values + i * sizeof( std::uint16_t ) ) >= portable_get<std::uint16_t>( values + ( i + 1U ) * sizeof( std::uint16_t ) ) };
+    }
+    return unordered == 0;
+}
+
 template <typename Handle>
 [[nodiscard]] inline std::byte * portable_write_container( Handle const & container, portable_wire const & wire, std::byte * out ) noexcept {
     switch ( wire.kind ) {
@@ -855,20 +892,16 @@ bool bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy>::portable_read_32(
             if ( available() < std::size_t{ cardinality } * sizeof( std::uint16_t ) ) {
                 return false;
             }
+            // Checked where it lies: the values are read back from the buffer, not from the
+            // copy that was just written, which a load straddling two stores would have to wait for.
+            if ( !strictly_ascending( p, cardinality ) ) {
+                return false;
+            }
             container = handle_type::make_array();
             auto array{ container.as_array() };
             array.values.resize_uninitialized( cardinality );
-            auto * const dst{ array.values.data() };
-            std::memcpy( dst, p, std::size_t{ cardinality } * sizeof( std::uint16_t ) );
+            std::memcpy( array.values.data(), p, std::size_t{ cardinality } * sizeof( std::uint16_t ) );
             p += std::size_t{ cardinality } * sizeof( std::uint16_t );
-            // Branch-free so the strictly-increasing check vectorizes.
-            std::uint32_t unordered{ 0 };
-            for ( std::uint32_t i{ 1 }; i < cardinality; ++i ) {
-                unordered |= std::uint32_t{ dst[ i - 1 ] >= dst[ i ] };
-            }
-            if ( unordered != 0 ) {
-                return false;
-            }
             array.sync_header();
         }
         total += cardinality;

@@ -321,6 +321,29 @@ TEST( FrsrRoaringPortable, RejectsEveryTruncation ) {
     }
 }
 
+TEST( FrsrRoaringPortable, RejectsAnArrayOutOfOrderAtAnyPosition ) {
+    // One array container: cookie, count, (key, card-1), offset, then the values.
+    constexpr std::size_t payload{ 16 };
+    for ( std::size_t const cardinality : { 2U, 15U, 16U, 17U, 18U, 31U, 32U, 33U, 100U, 4096U } ) {
+        std::vector<std::uint64_t> values;
+        for ( std::size_t i{ 0 }; i < cardinality; ++i ) {
+            values.push_back( 10 + 2 * i );
+        }
+        auto const valid{ frsr_bytes<Reference32>( build_frsr<Reference32>( values, false ) ) };
+        ASSERT_EQ( valid.size(), payload + 2 * cardinality );
+        ASSERT_TRUE( Bitmap32::portable_deserialize( valid ).has_value() ) << cardinality;
+        for ( std::size_t at{ 1 }; at < cardinality; ++at ) {
+            auto const previous{ static_cast<std::uint16_t>( values[ at - 1 ] ) };
+            auto equal{ valid };
+            poke<std::uint16_t>( equal, payload + 2 * at, previous );
+            EXPECT_FALSE( Bitmap32::portable_deserialize( equal ).has_value() ) << "duplicate at " << at << " of " << cardinality;
+            auto below{ valid };
+            poke<std::uint16_t>( below, payload + 2 * at, static_cast<std::uint16_t>( previous - 1 ) );
+            EXPECT_FALSE( Bitmap32::portable_deserialize( below ).has_value() ) << "descent at " << at << " of " << cardinality;
+        }
+    }
+}
+
 TEST( FrsrRoaringPortable, RejectsStructurallyInvalidInput ) {
     // Cookie 12346: [cookie][count] then (key, card-1) pairs, offsets, payloads.
     std::vector<std::uint64_t> two_arrays{ 1, 2, 3, 65536 + 9 };
