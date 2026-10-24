@@ -639,8 +639,16 @@ TEST(ChunkTree, NodeBytesPerChunk) {
         tree scattered;
         for ( auto const k : keys ) { scattered.insert( scattered.lower_bound( k ), k, make( 1 ) ); }
         ASSERT_EQ( scattered.validate(), nullptr );
-        std::printf( "[ bytes   ] %8llu chunks: ascending %6.1f B/chunk, scattered %6.1f B/chunk\n", static_cast<unsigned long long>( count ),
+        tree descending;
+        for ( std::uint64_t k{ count }; k-- > 0; ) { descending.insert( descending.lower_bound( 2 * k ), 2 * k, make( 1 ) ); }
+        ASSERT_EQ( descending.validate(), nullptr );
+        if ( count >= 1000 ) {
+            // a table built from the largest key down fills its leaves like one built upward does
+            EXPECT_LE( descending.node_bytes(), ascending.node_bytes() + ascending.node_bytes() / 10 ) << count;
+        }
+        std::printf( "[ bytes   ] %8llu chunks: ascending %6.1f B/chunk, descending %6.1f B/chunk, scattered %6.1f B/chunk\n", static_cast<unsigned long long>( count ),
             static_cast<double>( ascending.node_bytes() ) / static_cast<double>( count ),
+            static_cast<double>( descending.node_bytes() ) / static_cast<double>( count ),
             static_cast<double>( scattered.node_bytes() ) / static_cast<double>( count ) );
     }
 }

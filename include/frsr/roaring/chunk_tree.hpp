@@ -1366,7 +1366,9 @@ private:
             separator = key;
             result = cursor{ right, 0 };
         } else {
-            auto const kept { n / 2 };
+            // A new smallest key in the full first leaf moves the whole leaf up and starts afresh in this
+            // one, as a key past the last one starts a new leaf: a table built downward fills its leaves.
+            auto const kept { ( index == 0 && prev_leaf( leaf ) == nullptr ) ? 0U : n / 2 };
             auto const moved{ n - kept };
             std::memcpy( right, leaf + kept, moved * sizeof( key_t ) );
             std::fill( leaf + kept, leaf + n, pad );
