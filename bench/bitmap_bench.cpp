@@ -11,6 +11,7 @@
 #include <functional>
 #include <limits>
 #include <memory>
+#include <new>
 #include <numeric>
 #include <optional>
 #include <random>
@@ -6366,10 +6367,27 @@ static std::vector<std::uint32_t> to_array_values(ToArrayShape const &shape, std
     return values;
 }
 
+// The decode buffer both arms write to, 64-byte aligned: the band measures the decode kernels, and a
+// 32-byte vector store that straddles a cache line on every other store (what an allocator's 16-byte
+// aligned block gives, depending on what was allocated before it) is a quarter slower once the buffer
+// outgrows the L2 cache, for either library.
+struct aligned_u32_buffer {
+    struct deleter { void operator()(std::uint32_t *p) const noexcept { ::operator delete( p, std::align_val_t{ 64 } ); } };
+    std::unique_ptr<std::uint32_t[], deleter> data_;
+    std::size_t size_{};
+    void resize(std::size_t const count) {
+        data_.reset(static_cast<std::uint32_t *>(::operator new(count * sizeof(std::uint32_t) + 1, std::align_val_t{ 64 })));
+        std::fill_n(data_.get(), count, std::uint32_t{});
+        size_ = count;
+    }
+    [[nodiscard]] std::uint32_t *data() const noexcept { return data_.get(); }
+    [[nodiscard]] std::size_t size() const noexcept { return size_; }
+};
+
 template <class Arm>
 struct register_frsr_to_array_registrar {
     using TestBitmap32 = typename Arm::bitmap;
-    struct S { TestBitmap32 bm; std::vector<std::uint32_t> out; };
+    struct S { TestBitmap32 bm; aligned_u32_buffer out; };
     static void run(std::size_t chunks, ToArrayShape const &shape) {
         Entry e;
         char buf[128];
@@ -6400,7 +6418,7 @@ struct register_frsr_to_array_registrar {
 #if FRSR_ROARING_HAS_CROARING
 template <class Arm>
 struct register_cpp_to_array_registrar {
-    struct S { roaring_bitmap_t *bm{}; std::vector<std::uint32_t> out; ~S() { if (bm) roaring_bitmap_free(bm); } };
+    struct S { roaring_bitmap_t *bm{}; aligned_u32_buffer out; ~S() { if (bm) roaring_bitmap_free(bm); } };
     static void run(std::size_t chunks, ToArrayShape const &shape) {
         Entry e;
         char buf[128];
