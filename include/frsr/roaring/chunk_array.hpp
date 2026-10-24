@@ -108,11 +108,24 @@ public:
         return cursor{ static_cast<index_type>( position - first ) };
     }
 
-    // The entry holding `key` (end() if there is none). A probe in the final chunk, the usual
-    // shape for a dense set or a miss just past the end, is answered by one compare of the last
-    // key, as the reference does. A pure read.
+    // The entry holding `key` (end() if there is none). A table of up to two cache lines of keys is
+    // searched by a branchless halving alone: its keys are in cache after the first probe, so nothing
+    // is prefetched, and no branch is spent on a shortcut that a random probe would mispredict. In a
+    // larger table a probe in the final chunk, the usual shape for a dense set or a miss just past the
+    // end, is answered by one compare of the last key, as the reference does. A pure read.
     [[nodiscard]] cursor find( chunk_type const key ) const noexcept {
         if ( size_ == 0 ) { return end(); }
+        if ( std::size_t{ size_ } * sizeof( chunk_type ) <= resident_keys_bytes ) {
+            // The halving ends on the last key not above `key`, which either is `key` or no key is.
+            auto base  { index_type{ 0 } };
+            auto length{ size_ };
+            while ( length > 1 ) {
+                auto const half{ length / 2 };
+                base    = select_unpredictable( keys_[ base + half ] <= key, base + half, base );
+                length -= half;
+            }
+            return keys_[ base ] == key ? cursor{ base } : end();
+        }
         if ( keys_[ size_ - 1 ] == key ) { return last(); }
         auto const at{ lower_bound( key ) };
         return ( at == end() || keys_[ at.index_ ] != key ) ? end() : at;
@@ -374,6 +387,19 @@ public:
     }
 
 private:
+    // `condition ? if_true : if_false`, kept a conditional move where the compiler is told how to.
+    template <typename T>
+    [[nodiscard]] static T select_unpredictable( bool const condition, T const if_true, T const if_false ) noexcept {
+#if defined( FRSR_ROARING_HAS_PSI_VM )
+        return psi::vm::unpredictable_select( condition, if_true, if_false );
+#else
+        return condition ? if_true : if_false;
+#endif
+    }
+
+    // A table whose keys fit this many bytes (two cache lines) is searched without prefetching.
+    static constexpr std::size_t resident_keys_bytes{ 2 * 64 };
+
     [[nodiscard]] static constexpr std::size_t bytes_for( index_type const capacity ) noexcept { return std::size_t{ capacity } * ( sizeof( handle_type ) + sizeof( chunk_type ) ); }
     [[nodiscard]] static constexpr std::size_t keys_offset( index_type const capacity ) noexcept { return std::size_t{ capacity } * sizeof( handle_type ); }
 
