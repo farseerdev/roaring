@@ -606,12 +606,15 @@ template <typename Layout, typename CowPolicy>
         case container_kind::run: {
             for ( auto const & run : container.as_run().runs ) {
                 auto const first{ base + static_cast<key_type>( run.begin ) };
-                auto const count{ static_cast<std::size_t>( run.end - run.begin ) + 1U };  // end is inclusive
-                // Counted, index-addressed loop (not a pointer-incrementing one):
-                // this is the shape clang vectorises into a broadcast + index-vector
-                // add + store, which a run of thousands of values needs.
+                using index_type = std::common_type_t<key_type, std::uint32_t>;
+                auto const count{ static_cast<index_type>( run.end - run.begin ) + 1U };  // end is inclusive
+                // Counted, index-addressed loop (not a pointer-incrementing one) whose index has the
+                // width of the values it is added to (never narrower than 32 bits, as a run of 65536
+                // values does not fit a 16-bit index): the shape both compilers vectorise into a
+                // broadcast + index-vector add + store. A pointer-sized index makes GCC count in 64-bit
+                // lanes and narrow every vector.
                 // [croaring-ref] deps/croaring/src/containers/run.c:run_container_to_uint32_array
-                for ( std::size_t i{ 0 }; i < count; ++i ) {
+                for ( index_type i{ 0 }; i < count; ++i ) {
                     out[ i ] = first + static_cast<key_type>( i );
                 }
                 out += count;
