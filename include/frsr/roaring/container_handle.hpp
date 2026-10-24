@@ -544,7 +544,7 @@ public:
     };
 
     template <typename E>
-    [[using gnu: cold, noinline]] grown_payload<E> allocate_grown_payload( std::uint32_t const required ) {
+    [[using gnu: cold]] grown_payload<E> allocate_grown_payload( std::uint32_t const required ) {
 #if FRSR_ROARING_PAYLOAD_ALLOC_STATS
         ( spilled() ? payload_alloc_stats().grow_chain : payload_alloc_stats().grow_first ).fetch_add( 1, std::memory_order_relaxed );
 #endif
@@ -554,7 +554,7 @@ public:
 
     // Makes the block the payload and returns the previous one to the allocator. count() is the caller's to set.
     template <typename E>
-    void adopt_grown_payload( grown_payload<E> const grown ) noexcept {
+    [[gnu::always_inline]] void adopt_grown_payload( grown_payload<E> const grown ) noexcept {
         if ( spilled() ) {
             free_payload( spill().data, std::size_t{ spill().capacity } * sizeof( E ) );
         }
