@@ -444,8 +444,10 @@ struct interop_engine {
         switch ( slot.kind() ) {
             case container_kind::array: {
                 auto const values{ slot.as_array().values };
-                auto const from{ std::lower_bound( values.begin(), values.end(), first ) };
-                return static_cast<size_type>( std::upper_bound( from, values.end(), last ) - from );
+                // two independent searches (their latencies overlap); a bound at the end of the chunk's key space needs none
+                auto const from{ first == 0 ? values.begin() : std::lower_bound( values.begin(), values.end(), first ) };
+                auto const to  { last == std::numeric_limits<low_type>::max() ? values.end() : std::upper_bound( values.begin(), values.end(), last ) };
+                return static_cast<size_type>( to - from );
             }
             case container_kind::run: {
                 auto const runs{ slot.as_run().runs };
@@ -460,14 +462,17 @@ struct interop_engine {
                 auto const & words{ slot.as_bitset().words };
                 auto const first_word{ static_cast<size_type>( first ) >> 6U };
                 auto const last_word { static_cast<size_type>( last  ) >> 6U };
-                size_type count{ 0 };
-                for ( auto w{ first_word }; w <= last_word; ++w ) {
-                    auto mask{ ~std::uint64_t{ 0 } };
-                    if ( w == first_word ) { mask &= ~std::uint64_t{ 0 } << ( static_cast<unsigned>( first ) & 63U ); }
-                    if ( w == last_word  ) { mask &= ~std::uint64_t{ 0 } >> ( 63U - ( static_cast<unsigned>( last ) & 63U ) ); }
-                    count += static_cast<size_type>( std::popcount( words[ w ] & mask ) );
+                auto const first_mask{ ~std::uint64_t{ 0 } << ( static_cast<unsigned>( first ) & 63U ) };
+                auto const last_mask { ~std::uint64_t{ 0 } >> ( 63U - ( static_cast<unsigned>( last ) & 63U ) ) };
+                if ( first_word == last_word ) {
+                    return static_cast<size_type>( std::popcount( words[ first_word ] & first_mask & last_mask ) );
                 }
-                return count;
+                // the end words are masked, the words between them are counted whole
+                auto count{ static_cast<size_type>( std::popcount( words[ first_word ] & first_mask ) ) };
+                for ( auto w{ first_word + 1U }; w < last_word; ++w ) {
+                    count += static_cast<size_type>( std::popcount( words[ w ] ) );
+                }
+                return count + static_cast<size_type>( std::popcount( words[ last_word ] & last_mask ) );
             }
         }
         std::unreachable();
@@ -1024,16 +1029,43 @@ struct interop_engine {
         } );
     }
 
+    // |self ∩ interval|: the chunks the interval covers entirely add their cardinality, only its end chunks are
+    // counted (as CRoaring's range cardinality does).
+    [[nodiscard]] static size_type and_cardinality_interval( Bitmap const & self, key_range const range ) {
+        constexpr auto max_key{ static_cast<std::uint64_t>( std::numeric_limits<key_type>::max() ) };
+        if ( range.empty() || range.first > max_key ) { return 0; }
+        auto const first{ static_cast<key_type>( range.first ) };
+        auto const last { static_cast<key_type>( std::min( range.last, max_key ) ) };
+        auto const first_chunk{ layout_type::chunk_key( first ) };
+        auto const last_chunk { layout_type::chunk_key( last  ) };
+        auto const first_low  { layout_type::low_key  ( first ) };
+        auto const last_low   { layout_type::low_key  ( last  ) };
+        size_type count{ 0 };
+        for ( auto at{ self.chunks_.lower_bound( first_chunk ) }; at != self.chunks_.end(); ++at ) {
+            auto const key{ self.chunks_.key( at ) };
+            if ( last_chunk < key ) { break; }
+            auto const & slot{ self.chunks_.slot( at ) };
+            auto const begin{ key == first_chunk ? first_low : low_type{ 0 } };
+            auto const end  { key == last_chunk  ? last_low  : std::numeric_limits<low_type>::max() };
+            count += ( begin == 0 && end == std::numeric_limits<low_type>::max() ) ? size_type{ slot.cardinality() } : count_in_range( slot, begin, end );
+        }
+        return count;
+    }
+
     template <typename Operand>
     [[nodiscard]] static size_type and_cardinality( Bitmap const & self, Operand const & operand ) {
-        return visit( operand, overloaded{
-            [ & ]( auto & source ) { return and_cardinality_stream( self, source ); },
-            [ & ]( unsorted_keys_tag, auto const & keys ) {
-                if ( probe_is_cheaper( keys ) ) { return and_cardinality_probe( self, keys ); }
-                auto merge{ overloaded{ [ & ]( auto & source ) { return and_cardinality_stream( self, source ); } } };
-                return sorted_copy_visit( keys, merge );
-            }
-        } );
+        if constexpr ( std::same_as<Operand, key_range> ) {
+            return and_cardinality_interval( self, operand );
+        } else {
+            return visit( operand, overloaded{
+                [ & ]( auto & source ) { return and_cardinality_stream( self, source ); },
+                [ & ]( unsorted_keys_tag, auto const & keys ) {
+                    if ( probe_is_cheaper( keys ) ) { return and_cardinality_probe( self, keys ); }
+                    auto merge{ overloaded{ [ & ]( auto & source ) { return and_cardinality_stream( self, source ); } } };
+                    return sorted_copy_visit( keys, merge );
+                }
+            } );
+        }
     }
 
     template <typename Operand>
