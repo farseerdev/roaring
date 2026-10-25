@@ -5,6 +5,15 @@
 #include <cstddef>
 #include <cstdint>
 
+// Whether the chunk key scans (the nodes of the wide-key tree and the flat table of 16-bit keys) use
+// vector compares. FRSR_ROARING_PORTABLE_NODE_SCAN forces the portable scans on a target that has them.
+#if defined( __AVX2__ ) && !defined( FRSR_ROARING_PORTABLE_NODE_SCAN )
+#   define FRSR_ROARING_NODE_SCAN_AVX2 1
+#   include <immintrin.h>
+#else
+#   define FRSR_ROARING_NODE_SCAN_AVX2 0
+#endif
+
 namespace frsr::roaring::detail {
 
 // Inline storage size for small array containers: covers the typical sparse

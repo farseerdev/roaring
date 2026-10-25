@@ -236,8 +236,9 @@ template <typename Bitmap>
 void contains_in_all_states_sweep( std::initializer_list<typename Bitmap::key_type> strides ) {
     for ( auto const stride : strides ) {
         for ( auto const k : { kinds::arrays, kinds::bitsets, kinds::runs, kinds::mixed } ) {
-            // Below and above the 512 chunk lookup-index threshold and the 64 chunk limit of the unprefetched search.
-            for ( std::size_t const chunks : { 3, 40, 64, 65, 700 } ) {
+            // Around the limits of the lookup forms: 4 chunks (no last-key shortcut up to it), 16 (one vector), 64
+            // (unprefetched search) and the 512 chunk lookup-index threshold.
+            for ( std::size_t const chunks : { 1, 2, 3, 4, 5, 15, 16, 17, 40, 64, 65, 700 } ) {
                 if ( static_cast<std::uint64_t>( stride ) == ( std::uint64_t{ 1 } << 40 ) && chunks > 40 && k != kinds::mixed ) { continue; }
                 contains_in_all_states_case<Bitmap>( k, chunks, stride );
             }

@@ -1,8 +1,10 @@
 #pragma once
 
 #include <frsr/roaring/container_handle.hpp>
+#include <frsr/roaring/tuning.hpp>
 
 #include <algorithm>
+#include <bit>
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
@@ -108,27 +110,39 @@ public:
         return cursor{ static_cast<index_type>( position - first ) };
     }
 
-    // The entry holding `key` (end() if there is none). A table of up to two cache lines of keys is
-    // searched by a branchless halving alone: its keys are in cache after the first probe, so nothing
-    // is prefetched, and no branch is spent on a shortcut that a random probe would mispredict. In a
-    // larger table a probe in the final chunk, the usual shape for a dense set or a miss just past the
-    // end, is answered by one compare of the last key, as the reference does. A pure read.
-    [[nodiscard]] cursor find( chunk_type const key ) const noexcept {
-        if ( size_ == 0 ) { return end(); }
-        if ( std::size_t{ size_ } * sizeof( chunk_type ) <= resident_keys_bytes ) {
-            // The halving ends on the last key not above `key`, which either is `key` or no key is.
-            auto base  { index_type{ 0 } };
-            auto length{ size_ };
-            while ( length > 1 ) {
-                auto const half{ length / 2 };
-                base    = select_unpredictable( keys_[ base + half ] <= key, base + half, base );
-                length -= half;
+    // The entry holding `key` (end() if there is none). A probe in the final chunk, the usual shape for a
+    // dense set or a miss just past the end, is answered by one compare of the last key, as the reference
+    // does, unless the table is so short that a probe spread over its chunks lands in the final one often
+    // enough for that branch to be mispredicted (up to four chunks). A table of up to 16 chunks has its
+    // keys compared in one vector (no branch, whatever the probe) but for one of one or two, which the
+    // halving settles in a step; a larger table up to two cache lines of keys is searched by the halving
+    // (its keys are in cache after the first probe, so nothing is prefetched), and a still larger one by
+    // the prefetching lower bound. A pure read. Always inlined: a call would cost about what the vector
+    // compare does.
+    [[nodiscard]] [[gnu::always_inline]] cursor find( chunk_type const key ) const noexcept {
+        if ( size_ > window_max_keys ) {
+            if ( keys_[ size_ - 1 ] == key ) { return last(); }
+            if ( std::size_t{ size_ } * sizeof( chunk_type ) > resident_keys_bytes ) {
+                auto const at{ lower_bound( key ) };
+                return ( at == end() || keys_[ at.index_ ] != key ) ? end() : at;
             }
-            return keys_[ base ] == key ? cursor{ base } : end();
+        } else if ( size_ < window_min_keys ) {
+            if ( size_ == 0 ) { return end(); }
+        } else {
+            if ( size_ >= shortcut_min_chunks && keys_[ size_ - 1 ] == key ) { return last(); }
+#if FRSR_ROARING_NODE_SCAN_AVX2
+            if constexpr ( sizeof( chunk_type ) == sizeof( std::uint16_t ) ) { return find_in_window( key ); }
+#endif
         }
-        if ( keys_[ size_ - 1 ] == key ) { return last(); }
-        auto const at{ lower_bound( key ) };
-        return ( at == end() || keys_[ at.index_ ] != key ) ? end() : at;
+        // The halving ends on the last key not above `key`, which either is `key` or no key is.
+        auto base  { index_type{ 0 } };
+        auto length{ size_ };
+        while ( length > 1 ) {
+            auto const half{ length / 2 };
+            base    = select_unpredictable( keys_[ base + half ] <= key, base + half, base );
+            length -= half;
+        }
+        return keys_[ base ] == key ? cursor{ base } : end();
     }
 
     // lower_bound() for a caller that already stands at `from` and only moves forward (a
@@ -387,15 +401,39 @@ public:
     }
 
 private:
-    // `condition ? if_true : if_false`, kept a conditional move where the compiler is told how to.
+    // `condition ? if_true : if_false`, kept a conditional move where the compiler is told how to: in a loop it
+    // would otherwise turn it into a branch on the probe.
     template <typename T>
     [[nodiscard]] static T select_unpredictable( bool const condition, T const if_true, T const if_false ) noexcept {
-#if defined( FRSR_ROARING_HAS_PSI_VM )
+#if defined( __GNUC__ ) && !defined( __clang__ )
+        return __builtin_expect_with_probability( condition, 1, 0.5 ) ? if_true : if_false;
+#elif defined( FRSR_ROARING_HAS_PSI_VM )
         return psi::vm::unpredictable_select( condition, if_true, if_false );
 #else
         return condition ? if_true : if_false;
 #endif
     }
+
+    // A table of fewer chunks gets no last-key shortcut in find().
+    static constexpr index_type shortcut_min_chunks{ 5 };
+
+    // The tables find() compares in one 32-byte vector of 16-bit keys: from window_min_keys to window_max_keys. The
+    // halving tells fewer apart in a step or two, which the vector does not beat.
+    static constexpr index_type window_min_keys{ 3 };
+    static constexpr index_type window_max_keys{ 16 };
+
+#if FRSR_ROARING_NODE_SCAN_AVX2
+    // find() of a table of 16-bit keys that fits the window: the 32 bytes that end at the last key are
+    // compared with `key` at once. The window starts before the first key of a table of fewer, but
+    // inside the block: the handles, 32 bytes each, precede the keys. Those lanes are shifted out of
+    // the mask, which has two bits per key.
+    [[nodiscard]] [[gnu::always_inline]] cursor find_in_window( chunk_type const key ) const noexcept {
+        auto const window{ _mm256_loadu_si256( reinterpret_cast<__m256i const *>( keys_ + size_ ) - 1 ) };
+        auto const equal { _mm256_cmpeq_epi16( window, _mm256_set1_epi16( static_cast<short>( key ) ) ) };
+        auto const found { static_cast<unsigned>( _mm256_movemask_epi8( equal ) ) >> ( 2 * ( window_max_keys - size_ ) ) };
+        return found != 0 ? cursor{ static_cast<index_type>( std::countr_zero( found ) / 2 ) } : end();
+    }
+#endif
 
     // A table whose keys fit this many bytes (two cache lines) is searched without prefetching.
     static constexpr std::size_t resident_keys_bytes{ 2 * 64 };

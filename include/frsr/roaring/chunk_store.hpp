@@ -70,7 +70,7 @@ public:
     [[nodiscard]] cursor lower_bound( chunk_type const key ) const noexcept { return live_.lower_bound( key ); }
 
     // The entry holding `key` (end() if there is none). A pure read.
-    [[nodiscard]] cursor find( chunk_type const key ) const noexcept { return live_.find( key ); }
+    [[nodiscard]] [[gnu::always_inline]] cursor find( chunk_type const key ) const noexcept { return live_.find( key ); }
 
     // lower_bound() for a caller that already stands at `from` and only moves forward (a
     // leapfrogging walk over several tables).

@@ -15,14 +15,6 @@
 #include <type_traits>
 #include <utility>
 
-// FRSR_ROARING_PORTABLE_NODE_SCAN forces the portable scan on a target that has the vector one.
-#if defined( __AVX2__ ) && !defined( FRSR_ROARING_PORTABLE_NODE_SCAN )
-#   define FRSR_ROARING_NODE_SCAN_AVX2 1
-#   include <immintrin.h>
-#else
-#   define FRSR_ROARING_NODE_SCAN_AVX2 0
-#endif
-
 namespace frsr::roaring::detail {
 
 // A key slot that holds no key. Every key stored in a node is below it, so the unused tail of a
