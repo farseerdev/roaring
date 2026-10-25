@@ -2120,6 +2120,42 @@ private:
         }
     }
 
+    // Calls process( chunk, lows ) for every chunk the ascending `sorted_values` touch, in chunk order, with the low
+    // parts of that chunk's values, duplicates dropped, in a buffer that is reused from chunk to chunk.
+    template <typename Process>
+    static void for_each_chunk_group( std::span<key_type const> const sorted_values, Process && process ) {
+        if ( sorted_values.empty() ) {
+            return;
+        }
+        // A chunk holds at most 65536 distinct lows (one more slot takes the store of a duplicate).
+        constexpr std::size_t max_lows{ std::size_t{ 1 } << 16 };
+        detail::small_array_values<low_type> lows;
+        auto capacity{ std::min( sorted_values.size(), std::size_t{ 2048 } ) + 1 };
+        detail::resize_uninitialized( lows, capacity );
+        auto *       out     { lows.data() };
+        auto         chunk   { layout_type::chunk_key( sorted_values.front() ) };
+        std::size_t  count   { 0 };
+        auto         previous{ layout_type::low_key( sorted_values.front() ) };   // the value before the current one: ascending, so a duplicate equals it
+        for ( auto const value : sorted_values ) {
+            auto const value_chunk{ layout_type::chunk_key( value ) };
+            auto const low        { layout_type::low_key  ( value ) };
+            if ( value_chunk != chunk ) [[unlikely]] {
+                process( chunk, std::span<low_type const>{ out, count } );
+                chunk = value_chunk;
+                count = 0;
+            }
+            if ( count + 1 == capacity ) [[unlikely]] {
+                capacity = std::min( capacity * 2, max_lows + 1 );
+                detail::resize_uninitialized( lows, capacity );
+                out = lows.data();
+            }
+            out[ count ] = low;
+            count       += ( count == 0 ) | ( low != previous );
+            previous     = low;
+        }
+        process( chunk, std::span<low_type const>{ out, count } );
+    }
+
     [[nodiscard]] bool add_impl( key_type const value, bulk_context * const ctx ) {
         auto const chunk{ layout_type::chunk_key( value ) };
         auto const low{ layout_type::low_key( value ) };

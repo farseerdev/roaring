@@ -181,50 +181,16 @@ FRSR_ROARING_DEFINITION_INLINE bool FRSR_ROARING_BITMAP::intersects( bitmap cons
 FRSR_ROARING_BITMAP_TEMPLATE
 FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::add_many_sorted( std::span<key_type const> const sorted_values ) noexcept( detail::allocation_failure_terminates ) {
     settle_counts();
-    if ( sorted_values.empty() ) {
-        return;
-    }
-
-    chunk_type current_chunk{};
-    detail::small_array_values<low_type> grouped_values;
-    auto flush_group{ [&]() {
-        if ( grouped_values.empty() ) {
-            return;
-        }
-
-        auto const at{ chunks_.lower_bound( current_chunk ) };
-        if ( at == chunks_.end() || chunks_.key( at ) != current_chunk ) {
-            chunks_.insert( at, current_chunk, make_policy_container_from_sorted_values(
-                { grouped_values.data(), grouped_values.size() },
-                array_to_bitset_threshold
-            ) );
-            size_ += grouped_values.size();
+    for_each_chunk_group( sorted_values, [ & ]( chunk_type const chunk, std::span<low_type const> const lows ) {
+        auto const at{ chunks_.lower_bound( chunk ) };
+        if ( at == chunks_.end() || chunks_.key( at ) != chunk ) {
+            chunks_.insert( at, chunk, make_policy_container_from_sorted_values( lows, array_to_bitset_threshold ) );
+            size_ += lows.size();
         } else {
-            size_ += detail::container_add_sorted(
-                chunks_.slot( at ), { grouped_values.data(), grouped_values.size() }
-            );
+            size_ += detail::container_add_sorted( chunks_.slot( at ), lows );
             promote_if_needed( chunks_.slot( at ) );
         }
-
-        grouped_values.clear();
-    } };
-
-    for ( auto const value : sorted_values ) {
-        auto const chunk{ layout_type::chunk_key( value ) };
-        auto const low{ layout_type::low_key( value ) };
-        if ( grouped_values.empty() ) {
-            current_chunk = chunk;
-        } else if ( chunk != current_chunk ) {
-            flush_group();
-            current_chunk = chunk;
-        }
-
-        if ( grouped_values.empty() || grouped_values.back() != low ) {
-            grouped_values.push_back( low );
-        }
-    }
-
-    flush_group();
+    } );
 }
 
 FRSR_ROARING_BITMAP_TEMPLATE
@@ -292,38 +258,10 @@ FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::add_sorted_many( std::s
 
     chunks_.clear();
     size_ = 0;
-    if ( sorted_values.empty() ) {
-        return;
-    }
-
-    chunk_type current_chunk{};
-    detail::small_array_values<low_type> grouped_values;
-    auto flush_group{ [&]() {
-        if ( grouped_values.empty() ) {
-            return;
-        }
-        chunks_.push_back( current_chunk, make_policy_container_from_sorted_values(
-            { grouped_values.data(), grouped_values.size() },
-            bitset_threshold
-        ) );
-        size_ += grouped_values.size();
-        grouped_values.clear();
-    } };
-
-    for ( auto const value : sorted_values ) {
-        auto const chunk{ layout_type::chunk_key( value ) };
-        auto const low{ layout_type::low_key( value ) };
-        if ( grouped_values.empty() ) {
-            current_chunk = chunk;
-        } else if ( chunk != current_chunk ) {
-            flush_group();
-            current_chunk = chunk;
-        }
-        if ( grouped_values.empty() || grouped_values.back() != low ) {
-            grouped_values.push_back( low );
-        }
-    }
-    flush_group();
+    for_each_chunk_group( sorted_values, [ & ]( chunk_type const chunk, std::span<low_type const> const lows ) {
+        chunks_.push_back( chunk, make_policy_container_from_sorted_values( lows, bitset_threshold ) );
+        size_ += lows.size();
+    } );
 }
 
 FRSR_ROARING_BITMAP_TEMPLATE
