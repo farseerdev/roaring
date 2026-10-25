@@ -56,10 +56,21 @@
 
 namespace frsr::roaring {
 
+// Options of the frozen image writer (docs/frozen-format.md). A ranked image carries, per chunk, the data that
+// turns count_below / index_of / select into constant-time reads (see ranked_view.hpp); it is format version 2,
+// while an unranked image stays byte-identical version 1. A ranked image needs a key type of at most 32 bits and
+// fewer than 2^32 values.
+struct frozen_options {
+    bool ranked{ false };
+};
+
 namespace detail {
 // Defined by the tests that look at the containers of a bitmap (see tests/view_support.hpp).
 template <typename Bitmap>
 struct bitmap_test_access;
+// Defined by ranked_view.hpp: the reader of the frozen image's rank data, a friend of frozen_view.
+template <typename Bitmap>
+struct frozen_reader_access;
 }
 
 // Container-set policy tags. Concrete storage is the type-erased
@@ -866,7 +877,8 @@ public:
         std::uint32_t payload_count{};
         std::uint32_t cardinality{};
         std::uint8_t container_kind{};
-        std::uint8_t reserved[ 7 ]{};
+        std::uint8_t reserved[ 3 ]{};
+        std::uint32_t base{};   // version 2: the number of values in all earlier chunks; zero in version 1
     };
 
     enum class frozen_container_kind : std::uint8_t {
@@ -879,7 +891,17 @@ public:
     public:
         frozen_view() = default;
 
+        // The result of a rank lookup in one chunk: the number of values below the probe, and whether the probe is present.
+        struct position {
+            std::uint32_t below;
+            bool          present;
+        };
+
         [[nodiscard]] explicit operator bool() const noexcept { return header_ != nullptr; }
+        // Whether the image carries the rank data (format version 2).
+        [[nodiscard]] bool ranked() const noexcept { return header_ != nullptr && header_->version == frozen_ranked_format_version; }
+        // The bytes of the image the view covers (header, index, payloads and rank data).
+        [[nodiscard]] std::size_t byte_size() const noexcept { return bytes_; }
         [[nodiscard]] std::size_t size() const noexcept {
             return header_ == nullptr ? 0U : static_cast<std::size_t>( header_->value_count );
         }
@@ -888,6 +910,37 @@ public:
         [[nodiscard]] bool contains( key_type const value ) const noexcept;
 
         [[nodiscard]] bitmap materialize() const;
+
+        // f( key ) for every value >= `first`, in key order. The first chunk is decoded whole and filtered.
+        template <typename F>
+        void for_each_from( key_type const first, F && f ) const {
+            if ( header_ == nullptr || header_->chunk_count == 0U ) {
+                return;
+            }
+            auto const first_chunk{ static_cast<std::uint64_t>( layout_type::chunk_key( first ) ) };
+            auto const first_low{ layout_type::low_key( first ) };
+            auto const index_span{ std::span<frozen_chunk_index const>{ index_, static_cast<std::size_t>( header_->chunk_count ) } };
+            auto at{ std::ranges::lower_bound( index_span, first_chunk, {}, &frozen_chunk_index::chunk ) };
+            for ( ; at != index_span.end(); ++at ) {
+                auto const & entry{ *at };
+                auto const container{ detail::container_handle<layout_type, CowPolicy>::make_borrowed(
+                    container_kind_of( static_cast<frozen_container_kind>( entry.container_kind ) ),
+                    data_ + entry.payload_offset,
+                    entry.payload_count,
+                    entry.cardinality
+                ) };
+                auto const chunk_key{ static_cast<chunk_type>( entry.chunk ) };
+                // only the chunk of `first` can hold values below it
+                auto const from_low{ entry.chunk == first_chunk ? first_low : low_type{} };
+                detail::container_for_each( container, [&]( low_type const low ) {
+                    if ( low >= from_low ) {
+                        f( layout_type::compose( chunk_key, low ) );
+                    }
+                } );
+        }
+        }
+        template <typename F>
+        void for_each( F && f ) const { for_each_from( key_type{}, std::forward<F>( f ) ); }
 
         // The zero-copy sibling of materialize(): rebuilds `out` with container
         // handles that BORROW the frozen payloads in place (the mmap-master /
@@ -899,17 +952,38 @@ public:
 
     private:
         friend class bitmap;
+        template <typename>
+        friend struct detail::frozen_reader_access;
 
         frozen_view(
             frozen_header const * header,
             frozen_chunk_index const * index,
-            std::byte const * data
+            std::byte const * data,
+            std::size_t const bytes
         ) noexcept
-            : header_{ header }, index_{ index }, data_{ data } {}
+            : header_{ header }, index_{ index }, data_{ data }, bytes_{ bytes } {}
+
+        // The number of values below `value` (the insertion point) in a sorted array payload.
+        [[nodiscard]] static std::int32_t array_lower_bound(
+            low_type const * values,
+            std::size_t const count,
+            low_type const value
+        ) noexcept;
 
         [[nodiscard]] static bool array_contains_payload(
             low_type const * values,
             std::size_t const count,
+            low_type const value
+        ) noexcept {
+            auto const below{ static_cast<std::size_t>( array_lower_bound( values, count, value ) ) };
+            return below < count && values[ below ] == value;
+        }
+
+        // Rank of `value` in a run payload whose per-run cumulative counts are `run_ranks` (the ranked image's rank block).
+        [[nodiscard]] static position run_position(
+            typename run_container_type::run const * runs,
+            std::uint16_t const * run_ranks,
+            std::int32_t const count,
             low_type const value
         ) noexcept;
 
@@ -922,6 +996,7 @@ public:
         frozen_header const * header_{};
         frozen_chunk_index const * index_{};
         std::byte const * data_{};
+        std::size_t bytes_{};
     };
 
     static constexpr std::uint32_t serialization_magic{ 0x314D4252U }; // "RBM1"
@@ -929,24 +1004,30 @@ public:
     // Bump on any layout change to frozen_header / frozen_chunk_index / the
     // payload encodings; spec: docs/frozen-format.md.
     static constexpr std::uint16_t frozen_format_version{ 1 };
+    // The version of an image that carries the rank data (frozen_options::ranked); readers accept both.
+    static constexpr std::uint16_t frozen_ranked_format_version{ 2 };
 
     [[nodiscard]] std::size_t serialized_size_bytes() const noexcept;
 
-    [[nodiscard]] std::size_t frozen_size_bytes() const;
+    [[nodiscard]] std::size_t frozen_size_bytes( frozen_options options = {} ) const;
 
     void serialize_to_vm_vector( serialized_byte_vector & out ) const;
 
-    void serialize_frozen_to_vm_vector( serialized_byte_vector & out ) const;
+    void serialize_frozen_to_vm_vector( serialized_byte_vector & out, frozen_options options = {} ) const;
 
     // The frozen image written into caller storage, which needs
     // `out.size() >= frozen_size_bytes()` and an 8-byte aligned `out.data()` (the image's
     // offsets are relative to its start; a programming error otherwise) and need not
-    // be zeroed; returns the bytes written (== frozen_size_bytes()).
-    std::size_t frozen_serialize( std::span<std::byte> out ) const;
+    // be zeroed; returns the bytes written (== frozen_size_bytes( options )).
+    std::size_t frozen_serialize( std::span<std::byte> out, frozen_options options = {} ) const;
 
     [[nodiscard]] static bitmap deserialize_from_vm_vector( serialized_byte_vector const & in );
 
     [[nodiscard]] static frozen_view frozen_view_from_vm_vector( serialized_byte_vector const & in );
+
+    // The validating reader over caller-owned bytes (a flat buffer, a mapped file): null if the image is malformed.
+    // `image.data()` must be 8-byte aligned, and the bytes must outlive the view.
+    [[nodiscard]] static frozen_view frozen_view_from( std::span<std::byte const> image );
 
     [[nodiscard]] static bitmap deserialize_frozen_from_vm_vector( serialized_byte_vector const & in );
 
@@ -1780,6 +1861,36 @@ private:
                 return alignof( std::uint64_t );
         }
         return 0U;
+    }
+
+    // The bytes of the rank block that follows a payload in a ranked image: a u16 per word of a bitset (the values in the
+    // earlier words) and a u16 per run of a run container (the values in the earlier runs); none for an array, whose
+    // position is its rank.
+    [[nodiscard]] static constexpr std::size_t frozen_rank_bytes( frozen_container_kind const kind, std::size_t const payload_count ) noexcept {
+        switch ( kind ) {
+            case frozen_container_kind::array : return 0U;
+            case frozen_container_kind::run   : return payload_count * sizeof( std::uint16_t );
+            case frozen_container_kind::bitset: return static_cast<std::size_t>( layout_type::word_count ) * sizeof( std::uint16_t );
+        }
+        return 0U;
+    }
+
+    [[nodiscard]] static std::size_t frozen_rank_bytes( handle_type const & container ) noexcept {
+        switch ( container.kind() ) {
+            case detail::container_kind::array : return 0U;
+            case detail::container_kind::run   : return frozen_rank_bytes( frozen_container_kind::run, container.count() );
+            case detail::container_kind::bitset: return frozen_rank_bytes( frozen_container_kind::bitset, layout_type::word_count );
+        }
+        std::unreachable();
+    }
+
+    [[nodiscard]] static constexpr detail::container_kind container_kind_of( frozen_container_kind const kind ) noexcept {
+        switch ( kind ) {
+            case frozen_container_kind::array : return detail::container_kind::array ;
+            case frozen_container_kind::run   : return detail::container_kind::run   ;
+            case frozen_container_kind::bitset: return detail::container_kind::bitset;
+        }
+        std::unreachable();
     }
 
     [[nodiscard]] static constexpr std::size_t frozen_expected_payload_bytes(

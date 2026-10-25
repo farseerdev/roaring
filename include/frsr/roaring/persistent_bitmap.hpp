@@ -48,12 +48,13 @@ public:
 
     // Writes `source` to `file_name` in the frozen format (creating or
     // truncating it), through a file mapping — the same bytes open() borrows.
-    [[nodiscard]] static bool store( auto const * const file_name, bitmap_type const & source ) {
+    // `options.ranked` stores the rank data too (see ranked_view.hpp); open() accepts both.
+    [[nodiscard]] static bool store( auto const * const file_name, bitmap_type const & source, frozen_options const options = {} ) {
         typename bitmap_type::serialized_byte_vector out;
         if ( !out.map_file( file_name, psi::vm::flags::named_object_construction_policy::create_new_or_truncate_existing ).succeeded() ) {
             return false;
         }
-        source.serialize_frozen_to_vm_vector( out );
+        source.serialize_frozen_to_vm_vector( out, options );
         return true;
     }
 
@@ -64,6 +65,9 @@ public:
     [[nodiscard]] bitmap_type const & operator*()  const noexcept { return  bitmap_; }
     [[nodiscard]] bitmap_type       * operator->()       noexcept { return &bitmap_; }
     [[nodiscard]] bitmap_type const * operator->() const noexcept { return &bitmap_; }
+
+    // The frozen image the mapping holds, for readers of the image itself (ranked_view::from).
+    [[nodiscard]] typename bitmap_type::frozen_view frozen() const { return bitmap_type::frozen_view_from_vm_vector( storage_ ); }
 
     // A view of the bitmap over the mapping, for the set operations that must not alias the mapping: what a
     // result takes through the view is a copy, whereas `x |= *pb` adopts the borrowed payloads and `x` is then valid

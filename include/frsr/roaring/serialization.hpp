@@ -38,13 +38,17 @@ std::size_t bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy>::serialized
 
 template <std::unsigned_integral Key, typename ContainerSet, typename CowPolicy, typename RunSelectionPolicy>
     requires detail::valid_container_set<Key, ContainerSet>
-std::size_t bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy>::frozen_size_bytes() const {
+std::size_t bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy>::frozen_size_bytes( frozen_options const options ) const {
     // No container is empty (validate()), so the index holds one entry per chunk.
     auto offset{ sizeof( frozen_header ) + chunks_.size() * sizeof( frozen_chunk_index ) };
     for ( auto const & slot : chunks_.slots() ) {
         auto const [alignment, payload_size] = frozen_payload_layout( slot );
         offset = align_up( offset, alignment );
         offset += payload_size;
+        if ( options.ranked ) {
+            // before the next align_up: the rank block sits between this payload and the next
+            offset += frozen_rank_bytes( slot );
+        }
     }
     return offset;
 }
@@ -82,8 +86,8 @@ void bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy>::serialize_to_vm_v
 
 template <std::unsigned_integral Key, typename ContainerSet, typename CowPolicy, typename RunSelectionPolicy>
     requires detail::valid_container_set<Key, ContainerSet>
-void bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy>::serialize_frozen_to_vm_vector( serialized_byte_vector & out ) const {
-    auto const byte_count{ static_cast<std::uint32_t>( frozen_size_bytes() ) };
+void bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy>::serialize_frozen_to_vm_vector( serialized_byte_vector & out, frozen_options const options ) const {
+    auto const byte_count{ static_cast<std::uint32_t>( frozen_size_bytes( options ) ) };
 #if defined(FRSR_ROARING_HAS_PSI_VM) && defined(FRSR_ROARING_ENABLE_VM_VECTOR_SERIALIZATION)
     if ( out.has_attached_storage() ) {
         // Pre-mapped storage (e.g. file-backed via persistent_bitmap::store):
@@ -95,14 +99,15 @@ void bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy>::serialize_frozen_
 #else
     out.resize( byte_count );
 #endif
-    frozen_serialize( std::span{ out.data(), out.size() } );
+    frozen_serialize( std::span{ out.data(), out.size() }, options );
 }
 
 template <std::unsigned_integral Key, typename ContainerSet, typename CowPolicy, typename RunSelectionPolicy>
     requires detail::valid_container_set<Key, ContainerSet>
-std::size_t bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy>::frozen_serialize( std::span<std::byte> const out ) const {
-    assert( out.size() >= frozen_size_bytes() );
+std::size_t bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy>::frozen_serialize( std::span<std::byte> const out, frozen_options const options ) const {
+    assert( out.size() >= frozen_size_bytes( options ) );
     assert( reinterpret_cast<std::uintptr_t>( out.data() ) % alignof( std::uint64_t ) == 0 );
+    assert( ( !options.ranked || ( std::numeric_limits<key_type>::digits <= 32 && size_ < ( std::size_t{ 1 } << 32 ) ) ) && "a ranked image holds a key type of at most 32 bits and fewer than 2^32 values" );
 
     auto * const data{ out.data() };
     auto const chunk_count{ static_cast<std::uint32_t>( chunks_.size() ) };
@@ -113,7 +118,7 @@ std::size_t bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy>::frozen_ser
     auto & header{ *reinterpret_cast<frozen_header *>( data ) };
     header.magic       = frozen_serialization_magic;
     header.key_bits    = static_cast<std::uint16_t>( std::numeric_limits<key_type>::digits );
-    header.version     = frozen_format_version;
+    header.version     = options.ranked ? frozen_ranked_format_version : frozen_format_version;
     header.chunk_count = chunk_count;
     header.value_count = static_cast<std::uint64_t>( size_ );
 
@@ -122,6 +127,7 @@ std::size_t bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy>::frozen_ser
     };
     std::size_t payload_offset{ sizeof( frozen_header ) + std::size_t{ chunk_count } * sizeof( frozen_chunk_index ) };
     std::uint32_t frozen_index{};
+    std::uint32_t base{};
     for ( auto chunk_at{ chunks_.begin() }; chunk_at != chunks_.end(); ++chunk_at ) {
         auto const & container{ chunks_.slot( chunk_at ) };
 
@@ -150,6 +156,14 @@ std::size_t bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy>::frozen_ser
                 payload_count = static_cast<std::uint32_t>( run.runs.size() );
                 cardinality   = static_cast<std::uint32_t>( container.cardinality() );
                 std::memcpy( payload, run.runs.data(), payload_size );
+                if ( options.ranked ) {
+                    auto * const ranks{ reinterpret_cast<std::uint16_t *>( payload + payload_size ) };
+                    std::uint32_t before{};
+                    for ( std::uint32_t i{ 0 }; i < payload_count; ++i ) {
+                        ranks[ i ] = static_cast<std::uint16_t>( before );   // at most 65535: the last run holds at least one value
+                        before += static_cast<std::uint32_t>( run.runs[ i ].end - run.runs[ i ].begin ) + 1U;
+                    }
+                }
                 break;
             }
             case detail::container_kind::bitset: {
@@ -158,6 +172,15 @@ std::size_t bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy>::frozen_ser
                 payload_count = static_cast<std::uint32_t>( layout_type::word_count );
                 cardinality   = static_cast<std::uint32_t>( container.cardinality() );
                 std::memcpy( payload, bitset.words.as_array().data(), payload_size );
+                if ( options.ranked ) {
+                    auto const * const words{ bitset.words.as_array().data() };
+                    auto * const ranks{ reinterpret_cast<std::uint16_t *>( payload + payload_size ) };
+                    std::uint32_t before{};
+                    for ( std::uint32_t i{ 0 }; i < payload_count; ++i ) {
+                        ranks[ i ] = static_cast<std::uint16_t>( before );   // at most 64 * 1023
+                        before += static_cast<std::uint32_t>( std::popcount( words[ i ] ) );
+                    }
+                }
                 break;
             }
         }
@@ -167,9 +190,14 @@ std::size_t bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy>::frozen_ser
             .payload_bytes  = static_cast<std::uint32_t>( payload_size ),
             .payload_count  = payload_count,
             .cardinality    = cardinality,
-            .container_kind = static_cast<std::uint8_t>( kind )
+            .container_kind = static_cast<std::uint8_t>( kind ),
+            .base           = options.ranked ? base : 0U
         };
+        base += cardinality;
         payload_offset += payload_size;
+        if ( options.ranked ) {
+            payload_offset += frozen_rank_bytes( container );
+        }
     }
     return payload_offset;
 }
@@ -207,17 +235,29 @@ bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy> bitmap<Key, ContainerSe
 template <std::unsigned_integral Key, typename ContainerSet, typename CowPolicy, typename RunSelectionPolicy>
     requires detail::valid_container_set<Key, ContainerSet>
 typename bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy>::frozen_view bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy>::frozen_view_from_vm_vector( serialized_byte_vector const & in ) {
+    return frozen_view_from( std::span<std::byte const>{ in.data(), in.size() } );
+}
+
+template <std::unsigned_integral Key, typename ContainerSet, typename CowPolicy, typename RunSelectionPolicy>
+    requires detail::valid_container_set<Key, ContainerSet>
+typename bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy>::frozen_view bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy>::frozen_view_from( std::span<std::byte const> const in ) {
     if ( in.size() < sizeof( frozen_header ) ) {
         return {};
     }
+    assert( reinterpret_cast<std::uintptr_t>( in.data() ) % alignof( std::uint64_t ) == 0 && "the image must be 8-byte aligned" );
 
     auto const * const data{ in.data() };
     auto const * const header{ reinterpret_cast<frozen_header const *>( data ) };
     if (
         header->magic != frozen_serialization_magic ||
         header->key_bits != static_cast<std::uint16_t>( std::numeric_limits<key_type>::digits ) ||
-        header->version != frozen_format_version
+        ( header->version != frozen_format_version && header->version != frozen_ranked_format_version )
     ) {
+        return {};
+    }
+    auto const ranked{ header->version == frozen_ranked_format_version };
+    // The rank data is 16 bits per count and a rank is 32 bits, with one value of that range left for "absent".
+    if ( ranked && ( std::numeric_limits<key_type>::digits > 32 || header->value_count >= ( std::uint64_t{ 1 } << 32 ) ) ) {
         return {};
     }
 
@@ -230,7 +270,9 @@ typename bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy>::frozen_view b
     auto const * const index{
         reinterpret_cast<frozen_chunk_index const *>( data + index_offset )
     };
-    auto const min_payload_offset{ index_offset + index_bytes };
+    // Where the next payload may start: the end of the index, and, in a ranked image, where the previous chunk's
+    // payload and rank block end (the payloads are in index order).
+    std::uint64_t payload_floor{ index_offset + index_bytes };
     std::uint64_t total_cardinality{};
     std::uint64_t previous_chunk{};
     bool first_chunk{ true };
@@ -250,7 +292,7 @@ typename bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy>::frozen_view b
         if ( expected_alignment == 0U || ( entry.payload_offset % expected_alignment ) != 0U ) {
             return {};
         }
-        if ( entry.payload_offset < min_payload_offset || entry.payload_offset > in.size() ) {
+        if ( entry.payload_offset < payload_floor || entry.payload_offset > in.size() ) {
             return {};
         }
         if ( entry.payload_bytes > in.size() - entry.payload_offset ) {
@@ -258,6 +300,19 @@ typename bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy>::frozen_view b
         }
         if ( entry.payload_bytes != frozen_expected_payload_bytes( entry ) ) {
             return {};
+        }
+        if ( ranked ) {
+            if ( entry.base != total_cardinality ) {
+                return {};
+            }
+            auto const rank_end{
+                std::uint64_t{ entry.payload_offset } + entry.payload_bytes
+                + frozen_rank_bytes( static_cast<frozen_container_kind>( entry.container_kind ), entry.payload_count )
+            };
+            if ( rank_end > in.size() ) {
+                return {};
+            }
+            payload_floor = rank_end;
         }
         total_cardinality += entry.cardinality;
         any_empty |= ( entry.cardinality == 0 );
@@ -267,7 +322,7 @@ typename bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy>::frozen_view b
         return {};
     }
 
-    return frozen_view{ header, index, data };
+    return frozen_view{ header, index, data, ranked ? static_cast<std::size_t>( payload_floor ) : in.size() };
 }
 
 template <std::unsigned_integral Key, typename ContainerSet, typename CowPolicy, typename RunSelectionPolicy>
@@ -386,14 +441,7 @@ void bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy>::frozen_view::borr
     out.size_ = static_cast<std::size_t>( header_->value_count );
     for ( std::uint32_t i = 0; i < header_->chunk_count; ++i ) {
         auto const & entry{ index_[ i ] };
-        auto const kind{ [&] {
-            switch ( static_cast<frozen_container_kind>( entry.container_kind ) ) {
-                case frozen_container_kind::array : return detail::container_kind::array ;
-                case frozen_container_kind::run   : return detail::container_kind::run   ;
-                case frozen_container_kind::bitset: return detail::container_kind::bitset;
-            }
-            std::unreachable();
-        }() };
+        auto const kind{ container_kind_of( static_cast<frozen_container_kind>( entry.container_kind ) ) };
         out.chunks_.push_back(
             static_cast<chunk_type>( entry.chunk ),
             detail::container_handle<layout_type, CowPolicy>::make_borrowed(
@@ -408,7 +456,7 @@ void bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy>::frozen_view::borr
 
 template <std::unsigned_integral Key, typename ContainerSet, typename CowPolicy, typename RunSelectionPolicy>
     requires detail::valid_container_set<Key, ContainerSet>
-bool bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy>::frozen_view::array_contains_payload(
+std::int32_t bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy>::frozen_view::array_lower_bound(
     low_type const * values,
     std::size_t const count,
     low_type const value
@@ -418,10 +466,10 @@ bool bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy>::frozen_view::arra
     if ( cardinality < gap ) {
         for ( int32_t j = 0; j < cardinality; ++j ) {
             if ( values[ j ] >= value ) {
-                return values[ j ] == value;
+                return j;
             }
         }
-        return false;
+        return cardinality;
     }
 
     auto const num_blocks{ cardinality / gap };
@@ -444,32 +492,57 @@ bool bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy>::frozen_view::arra
         n -= half;
     }
 
+    // Every value of the blocks before `lo` is below `value`: a block is passed only when its last value is.
     auto const lo{ ( values[ ( base + 1 ) * gap - 1 ] < value ) ? base + 1 : base };
     if ( lo < num_blocks ) {
         auto const * const block{ values + static_cast<std::ptrdiff_t>( lo * gap ) };
 #if defined(_M_X64) || defined(__x86_64__) || defined(__i386__)
-        __m128i const needle{ _mm_set1_epi16( static_cast<short>( value ) ) };
-        __m128i const v0{ _mm_loadu_si128( reinterpret_cast<__m128i const *>( block ) ) };
-        __m128i const v1{ _mm_loadu_si128( reinterpret_cast<__m128i const *>( block + 8 ) ) };
-        __m128i const hit{ _mm_or_si128( _mm_cmpeq_epi16( v0, needle ), _mm_cmpeq_epi16( v1, needle ) ) };
-        return _mm_movemask_epi8( hit ) != 0;
+        // The values are unsigned and the vector compare is signed: both sides are biased by 0x8000.
+        __m128i const bias{ _mm_set1_epi16( static_cast<short>( 0x8000 ) ) };
+        __m128i const needle{ _mm_xor_si128( _mm_set1_epi16( static_cast<short>( value ) ), bias ) };
+        __m128i const v0{ _mm_xor_si128( _mm_loadu_si128( reinterpret_cast<__m128i const *>( block ) ), bias ) };
+        __m128i const v1{ _mm_xor_si128( _mm_loadu_si128( reinterpret_cast<__m128i const *>( block + 8 ) ), bias ) };
+        auto const below{ _mm_movemask_epi8( _mm_packs_epi16( _mm_cmplt_epi16( v0, needle ), _mm_cmplt_epi16( v1, needle ) ) ) };
+        return lo * gap + std::popcount( static_cast<unsigned>( below ) );
 #else
+        int32_t below{ 0 };
         for ( int32_t j = 0; j < gap; ++j ) {
-            if ( block[ j ] >= value ) {
-                return block[ j ] == value;
-            }
+            below += block[ j ] < value;
         }
-        return false;
+        return lo * gap + below;
 #endif
     }
 
     for ( int32_t j = num_blocks * gap; j < cardinality; ++j ) {
-        auto const current{ values[ j ] };
-        if ( current >= value ) {
-            return current == value;
+        if ( values[ j ] >= value ) {
+            return j;
         }
     }
-    return false;
+    return cardinality;
+}
+
+template <std::unsigned_integral Key, typename ContainerSet, typename CowPolicy, typename RunSelectionPolicy>
+    requires detail::valid_container_set<Key, ContainerSet>
+typename bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy>::frozen_view::position bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy>::frozen_view::run_position(
+    typename run_container_type::run const * runs,
+    std::uint16_t const * run_ranks,
+    std::int32_t const count,
+    low_type const value
+) noexcept {
+    // The last run that begins at or below `value`; an exact begin match is that run, otherwise
+    // interleaved_binary_search returns -(insertion point + 1). The arithmetic is in 32 bits: a run rank tops out at
+    // 65535 and end + 1 reaches 65536, neither of which fits low_type.
+    auto last{ interleaved_binary_search( runs, count, value ) };
+    if ( last < 0 ) {
+        last = -last - 2;
+        if ( last < 0 ) {
+            return { 0U, false };
+        }
+    }
+    auto const & run{ runs[ last ] };
+    std::uint32_t const covered_end{ std::uint32_t{ run.end } + 1U };
+    std::uint32_t const covered{ std::min<std::uint32_t>( value, covered_end ) - run.begin };
+    return { std::uint32_t{ run_ranks[ last ] } + covered, value <= run.end };
 }
 
 template <std::unsigned_integral Key, typename ContainerSet, typename CowPolicy, typename RunSelectionPolicy>
