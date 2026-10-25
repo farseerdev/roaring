@@ -1310,6 +1310,26 @@ inline void xor_array_into_bitset_inplace(
     lhs.mark_endpoints_stale();
 }
 
+// Calls `apply( word index, mask )` for every word the runs touch, with the bits of the runs that lie in it.
+template <typename Layout, typename CowPolicy, typename Apply>
+[[ gnu::always_inline ]] inline void for_each_run_word_mask( run_cref<Layout, CowPolicy> const runs, Apply && apply ) noexcept {
+    for ( auto const & current : runs.runs ) {
+        auto const first_word{ static_cast<std::size_t>( current.begin ) >> 6U };
+        auto const last_word { static_cast<std::size_t>( current.end   ) >> 6U };
+        auto const first_mask{ std::uint64_t{ 0 } - ( std::uint64_t{ 1 } << ( current.begin & 63U ) ) };
+        auto const last_mask { ( std::uint64_t{ 2 } << ( current.end & 63U ) ) - 1U };
+        if ( first_word == last_word ) {
+            apply( first_word, first_mask & last_mask );
+            continue;
+        }
+        apply( first_word, first_mask );
+        for ( auto index{ first_word + 1U }; index < last_word; ++index ) {
+            apply( index, ~std::uint64_t{ 0 } );
+        }
+        apply( last_word, last_mask );
+    }
+}
+
 // Flips every bit of every run in a bitset's own words, then, unless `Lazy`, counts the words once.
 // [croaring-ref] deps/croaring/src/containers/mixed_xor.c:run_bitset_container_xor
 template <bool Lazy, typename Layout, typename CowPolicy = cow_value_semantics>
@@ -1318,26 +1338,41 @@ inline void xor_runs_into_bitset_inplace(
     run_cref<Layout, CowPolicy> const rhs
 ) noexcept {
     auto & words{ lhs.words.as_array() };
-    auto const flip{ [ & ]( std::size_t const index, std::uint64_t const mask ) noexcept { words[ index ] ^= mask; } };
-    for ( auto const & current : rhs.runs ) {
-        auto const first_word{ static_cast<std::size_t>( current.begin ) >> 6U };
-        auto const last_word { static_cast<std::size_t>( current.end   ) >> 6U };
-        auto const first_mask{ std::uint64_t{ 0 } - ( std::uint64_t{ 1 } << ( current.begin & 63U ) ) };
-        auto const last_mask { ( std::uint64_t{ 2 } << ( current.end & 63U ) ) - 1U };
-        if ( first_word == last_word ) {
-            flip( first_word, first_mask & last_mask );
-            continue;
-        }
-        flip( first_word, first_mask );
-        for ( auto index{ first_word + 1U }; index < last_word; ++index ) {
-            flip( index, ~std::uint64_t{ 0 } );
-        }
-        flip( last_word, last_mask );
-    }
+    for_each_run_word_mask<Layout, CowPolicy>( rhs, [ & ]( std::size_t const index, std::uint64_t const mask ) noexcept { words[ index ] ^= mask; } );
     if constexpr ( Lazy ) {
         lhs.mark_cardinality_unknown();
     } else {
         lhs.cardinality = static_cast<std::uint32_t>( popcount_words( words.data(), words.size() ) );
+    }
+    lhs.mark_endpoints_stale();
+}
+
+// Sets (`Set`) or clears every bit of every run in a bitset's own words, keeping the cardinality exact by
+// the bits that change.
+// [croaring-ref] deps/croaring/src/containers/mixed_union.c:run_bitset_container_union
+// [croaring-ref] deps/croaring/src/containers/mixed_andnot.c:bitset_run_container_andnot
+template <bool Set, typename Layout, typename CowPolicy = cow_value_semantics>
+inline void apply_runs_to_bitset_inplace(
+    bitset_ref<Layout, CowPolicy> lhs,
+    run_cref<Layout, CowPolicy> const rhs
+) noexcept {
+    settle_stale_cardinality( lhs );
+    auto & words{ lhs.words.as_array() };
+    std::size_t changed{ 0 };
+    for_each_run_word_mask<Layout, CowPolicy>( rhs, [ & ]( std::size_t const index, std::uint64_t const mask ) noexcept {
+        auto & word{ words[ index ] };
+        if constexpr ( Set ) {
+            changed += static_cast<std::size_t>( std::popcount( mask & ~word ) );
+            word |= mask;
+        } else {
+            changed += static_cast<std::size_t>( std::popcount( mask & word ) );
+            word &= ~mask;
+        }
+    } );
+    if constexpr ( Set ) {
+        lhs.cardinality += static_cast<std::uint32_t>( changed );
+    } else {
+        lhs.cardinality -= static_cast<std::uint32_t>( changed );
     }
     lhs.mark_endpoints_stale();
 }

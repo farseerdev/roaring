@@ -604,6 +604,11 @@ void FRSR_ROARING_BITMAP::union_same_key( detail::chunk_store<layout_type, CowPo
         detail::or_array_into_bitset_inplace<false, layout_type>( left_bitset, right_container.as_array() );
         return;
     }
+    // Runs into an unshared bitset: set their bits in place, as CRoaring's run_bitset_container_union does.
+    if ( !lazy && mutate_left && left_container.holds_bitset() && right_container.holds_run() ) {
+        detail::apply_runs_to_bitset_inplace<true, layout_type>( left_container.as_bitset(), right_container.as_run() );
+        return;
+    }
     // Same-key mixed array/bitset in the lazy bulk-union path: accumulate
     // into a bitset in place, mirroring CRoaring's LAZY_OR_BITSET_CONVERSION
     // (roaring.c:roaring_bitmap_lazy_or_inplace). Promote the accumulator

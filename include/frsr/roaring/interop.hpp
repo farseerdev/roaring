@@ -361,6 +361,11 @@ struct interop_engine {
                         difference_bitset_array_inplace<layout_type, cow_policy>( slot.as_bitset(), piece.as_array() );
                         return;
                     }
+                    if ( op == set_operation::bit_andnot && piece.holds_run() ) {
+                        apply_runs_to_bitset_inplace<false, layout_type, cow_policy>( slot.as_bitset(), piece.as_run() );
+                        if ( demotes_sparse_result( op, and_demotes ) ) { slot = Bitmap::demote_sparse_bitset( std::move( slot ), self.chunks_ ); }
+                        return;
+                    }
                 } else if ( slot.holds_array() ) {
                     auto const keep_matches{ op == set_operation::bit_and };
                     if ( piece.holds_bitset() ) {

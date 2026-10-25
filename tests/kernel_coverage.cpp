@@ -912,4 +912,55 @@ TEST( KernelCoverage, RemoveManyDuplicateAfterEmptyingChunk ) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Runs updating a chunk: every receiver form against every operand form, by the bitmap operators and by the
+// view forms. A copy of the receiver is kept alive in the second round, so that a copy-on-write payload is
+// shared with it: the update must leave the copy as it was.
+// ---------------------------------------------------------------------------
+
+template <typename Bitmap>
+void operand_updating_every_form_case() {
+    using key_type = typename Bitmap::key_type;
+    std::mt19937_64 rng{ 0xB175E7 };
+    constexpr key_type base{ key_type{ 3 } << 16 };
+    auto const sources{ flip_sources( rng ) };
+    for ( auto const & receiver : sources ) {
+        auto const received{ in_chunk<key_type>( receiver.lows, base ) };
+        for ( auto const & operand : sources ) {
+            auto const operated{ in_chunk<key_type>( operand.lows, base ) };
+            std::vector<key_type> united;
+            std::vector<key_type> differed;
+            std::ranges::set_union( received, operated, std::back_inserter( united ) );
+            std::ranges::set_difference( received, operated, std::back_inserter( differed ) );
+            Bitmap operand_bitmap;
+            operand_bitmap.add_many( operated );
+            operand_bitmap.optimize();
+            auto const check{ [ & ]( auto const & update, std::vector<key_type> const & expected, char const * const what, bool const difference = false ) {
+                for ( bool const keep_a_copy : { false, true } ) {
+                    SCOPED_TRACE( ::testing::Message() << receiver.name << ' ' << what << ' ' << operand.name << ( keep_a_copy ? " with a copy kept" : "" ) );
+                    Bitmap bm;
+                    bm.add_many( received );
+                    Bitmap const copy{ keep_a_copy ? Bitmap{ bm } : Bitmap{} };
+                    update( bm );
+                    ASSERT_TRUE( matches( bm, expected ) );
+                    ASSERT_EQ( bm.size(), expected.size() );
+                    ASSERT_EQ( bm.validate( false ), nullptr );
+                    // a bitset that runs are taken from is an array again below the array limit
+                    if ( difference && operand.name.starts_with( "runs/" ) && expected.size() < Bitmap::array_to_bitset_threshold ) { ASSERT_EQ( bm.statistics().bitset_containers, 0U ); }
+                    if ( keep_a_copy ) { ASSERT_TRUE( matches( copy, received ) ); }
+                }
+            } };
+            check( [ & ]( Bitmap & bm ) { bm |= operand_bitmap; }, united, "|=" );
+            check( [ & ]( Bitmap & bm ) { bm -= operand_bitmap; }, differed, "-=" );
+            check( [ & ]( Bitmap & bm ) { bm.or_with( view_of( operand_bitmap ) ); }, united, "or_with( view )" );
+            check( [ & ]( Bitmap & bm ) { bm.andnot_with( view_of( operand_bitmap ) ); }, differed, "andnot_with( view )", true );
+            if ( ::testing::Test::HasFatalFailure() ) { return; }
+        }
+    }
+}
+
+TEST( KernelCoverage, OperandUpdatingEveryReceiverForm32 ) { operand_updating_every_form_case<Bitmap32>(); }
+TEST( KernelCoverage, OperandUpdatingEveryReceiverFormCow32 ) { operand_updating_every_form_case<CowBitmap32>(); }
+TEST( KernelCoverage, OperandUpdatingEveryReceiverFormLazyRuns ) { operand_updating_every_form_case<LazyCowBitmap32>(); }
+
 } // namespace
