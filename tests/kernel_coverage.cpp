@@ -377,9 +377,32 @@ void export_small_arrays_case() {
 TEST( KernelCoverage, SmallArrayExport32 ) { export_small_arrays_case<Bitmap32>(); }
 TEST( KernelCoverage, SmallArrayExport64 ) { export_small_arrays_case<Bitmap64>(); }
 
+// A sparse bitset demotes to the array of the same values at every cardinality around the break-even of the
+// vector decoder (1024), whichever decoder serves it.
+template <typename Bitmap>
+void bitset_demotion_case() {
+    using key_type = typename Bitmap::key_type;
+    std::mt19937_64 rng{ 0xDE507E };
+    for ( std::size_t const cardinality : { 1, 2, 63, 1023, 1024, 1025, 4000, 4095 } ) {
+        SCOPED_TRACE( ::testing::Message() << cardinality << " values" );
+        auto const values{ in_chunk<key_type>( make_pattern( pattern::random, cardinality, rng ), key_type{ 3 } << 16 ) };
+        Bitmap bm;
+        bm.add_many( values );
+        bm.optimize_for_speed( 1 ); // every array into a bitset
+        expect_export_exact( bm, values );
+        bm.optimize();              // and the sparse ones back into arrays
+        expect_export_exact( bm, values );
+    }
+}
+
+TEST( KernelCoverage, BitsetDemotion32 ) { bitset_demotion_case<Bitmap32>(); }
+TEST( KernelCoverage, BitsetDemotion64 ) { bitset_demotion_case<Bitmap64>(); }
+
 // ---------------------------------------------------------------------------
 // Big target |= few keys: the target holds 1000 containers of every kind, the
-// operand 1..20 keys that hit existing keys, fall between them, or lie before/after.
+// operand 1..125 keys that hit existing keys, fall between them, or lie before/after
+// (124 keys is the largest operand taken key by key, 125 the smallest merged; only the
+// existing and between modes have that many candidate keys).
 // ---------------------------------------------------------------------------
 
 enum class key_mode : std::uint8_t { existing, between, before, after, mixed };

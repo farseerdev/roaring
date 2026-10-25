@@ -587,11 +587,12 @@ template <typename Layout, typename CowPolicy = cow_value_semantics, typename Ru
         if ( cardinality >= bitset_threshold && bitset_bytes <= array_bytes && bitset_bytes <= run_bytes ) {
             return container;  // identity — no extraction, no allocation
         }
-        auto values{ sorted_values_from_container<Layout>( container ) };
         if ( can_consider_run && run_bytes < array_bytes ) {
+            auto values{ sorted_values_from_container<Layout>( container ) };
             return run_handle_from_sorted_values<Layout, CowPolicy>( { values.data(), values.size() } );
         }
-        return container_handle<Layout, CowPolicy>::make_array_from_sorted( { values.data(), values.size() } );
+        // Decoded from the words straight into the array's own payload.
+        return array_from_bitset<Layout, CowPolicy>( std::as_const( container ).as_bitset(), static_cast<std::uint32_t>( cardinality ) );
     }
     if ( container.holds_array() ) {
         // An array container IS its sorted-values span already: decide on it in
