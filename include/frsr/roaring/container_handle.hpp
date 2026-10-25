@@ -564,7 +564,9 @@ public:
     template <typename E>
     [[using gnu: cold, noinline]] void grow_payload_capacity( std::uint32_t const required ) {
         auto const grown{ allocate_grown_payload<E>( required ) };
-        std::memcpy( grown.data, payload_data_raw(), std::size_t{ count_ } * sizeof( E ) );
+        // memmove, not memcpy: g++ lowers a variable-length memcpy inline to a string-move instruction, which costs a few
+        // tens of cycles even for no bytes, and the first growth of a fresh container copies none
+        std::memmove( grown.data, payload_data_raw(), std::size_t{ count_ } * sizeof( E ) );
         adopt_grown_payload<E>( grown );
     }
 
