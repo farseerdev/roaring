@@ -1186,6 +1186,20 @@ template <typename Layout, typename CowPolicy = cow_value_semantics>
     combine_bitset_bitset_inplace<Layout, CowPolicy>( lhs, rhs, set_operation::bit_or );
 }
 
+// A 16-bit value as a whole 32-bit register. gcc loads a value that only feeds a shift count and a word index into
+// the low half of a register and narrows the arithmetic to 16 bits, and a partial-register write waits for the
+// previous writer of the whole register: the loads of a scatter then form one chain, each waiting for the one
+// before. An empty asm that takes the value as a 32-bit operand makes the load a zero-extending one.
+template <typename Low>
+[[ gnu::always_inline ]] inline unsigned whole_register( Low const loaded ) noexcept {
+    static_assert( sizeof( Low ) <= sizeof( unsigned ) );
+    unsigned value{ loaded };
+#if defined( __GNUC__ ) && ( defined( __x86_64__ ) || defined( __i386__ ) )
+    __asm__( "" : "+r"( value ) );
+#endif
+    return value;
+}
+
 // Span-to-count ratio at or below which the scatter switches to the word-grouped
 // loop. The per-value read-modify-write costs a store-to-load forwarding round
 // trip whenever consecutive values land in the SAME word — worst case a
@@ -1218,11 +1232,13 @@ template <bool Lazy, typename Layout, typename CowPolicy = cow_value_semantics>
     array_cref<Layout, CowPolicy> const rhs
 ) noexcept {
     auto       & words { lhs.words.as_array() };
-    auto const & values{ rhs.values };
-    auto const   count { values.size() };
+    auto const   count { rhs.values.size() };
     if ( count == 0 ) [[unlikely]] {
         return;
     }
+    // The values are read through a pointer taken once: the array handle's flag byte, which locates the payload, may
+    // alias the words stored to, so a read through the handle is repeated after every store.
+    auto const * const values{ rhs.values.data() };
     if constexpr ( !Lazy ) {
         settle_stale_cardinality( lhs );
     }
@@ -1239,19 +1255,27 @@ template <bool Lazy, typename Layout, typename CowPolicy = cow_value_semantics>
     // cheapest way to ask "does this array cluster?" without touching the middle.
     auto const span{ static_cast<std::size_t>( values[ count - 1 ] ) - values[ 0 ] + 1U };
     if ( span <= kScatterGroupingSpanRatio * count ) {
-        std::size_t index{ 0 };
+        auto const * next{ values };
+        auto const * const end{ values + count };
         do {
-            auto const    word_index{ static_cast<std::size_t>( values[ index ] ) >> 6U };
+            auto          value{ whole_register( *next ) };
+            auto const    word_index{ std::size_t{ value >> 6U } };
             std::uint64_t mask{ 0 };
-            do {
-                mask |= std::uint64_t{ 1 } << ( static_cast<unsigned>( values[ index ] ) & 63U );
-                ++index;
-            } while ( ( index < count ) && ( ( static_cast<std::size_t>( values[ index ] ) >> 6U ) == word_index ) );
+            for ( ;; ) {
+                mask |= std::uint64_t{ 1 } << ( value & 63U );
+                if ( ++next == end ) {
+                    break;
+                }
+                value = whole_register( *next );
+                if ( ( value >> 6U ) != word_index ) {
+                    break;
+                }
+            }
             if constexpr ( !Lazy ) {
                 gained += static_cast<std::size_t>( std::popcount( mask & ~words[ word_index ] ) );
             }
             words[ word_index ] |= mask;
-        } while ( index < count );
+        } while ( next != end );
         finish();
         return;
     }
@@ -1262,9 +1286,10 @@ template <bool Lazy, typename Layout, typename CowPolicy = cow_value_semantics>
     // serialising. Written out rather than left to the optimiser because this
     // function is gnu::cold, and a cold function is compiled for size: clang
     // then neither unrolls this loop nor lowers the set to bts.
-    auto const set_bit{ [ & ]( auto const value ) {
-        auto &       word{ words[ static_cast<std::size_t>( value ) >> 6U ] };
-        auto const   bit { std::uint64_t{ 1 } << ( static_cast<unsigned>( value ) & 63U ) };
+    auto const set_bit{ [ & ]( auto const loaded ) {
+        auto const   value{ whole_register( loaded ) };
+        auto &       word{ words[ value >> 6U ] };
+        auto const   bit { std::uint64_t{ 1 } << ( value & 63U ) };
         if constexpr ( !Lazy ) {
             gained += static_cast<std::size_t>( ( word & bit ) == 0 );
         }
