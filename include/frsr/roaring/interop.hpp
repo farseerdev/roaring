@@ -1088,13 +1088,40 @@ struct interop_engine {
         }
     }
 
+    // Whether every key of the interval is held: each chunk it touches has to be there, and only its end chunks are
+    // looked into (as CRoaring's contains_range does), the ones it covers entirely have to be full.
+    [[nodiscard]] static bool is_superset_of_interval( Bitmap const & self, key_range const range ) {
+        constexpr auto max_key{ static_cast<std::uint64_t>( std::numeric_limits<key_type>::max() ) };
+        if ( range.empty() || range.first > max_key ) { return true; }
+        auto const first{ static_cast<key_type>( range.first ) };
+        auto const last { static_cast<key_type>( std::min( range.last, max_key ) ) };
+        auto const first_chunk{ layout_type::chunk_key( first ) };
+        auto const last_chunk { layout_type::chunk_key( last  ) };
+        auto const first_low  { layout_type::low_key  ( first ) };
+        auto const last_low   { layout_type::low_key  ( last  ) };
+        auto at{ self.chunks_.find( first_chunk ) };
+        for ( auto chunk{ first_chunk };; ++chunk ) {
+            if ( at == self.chunks_.end() || self.chunks_.key( at ) != chunk ) { return false; }
+            auto const & slot{ self.chunks_.slot( at ) };
+            auto const begin{ chunk == first_chunk ? first_low : low_type{ 0 } };
+            auto const end  { chunk == last_chunk  ? last_low  : std::numeric_limits<low_type>::max() };
+            if ( ( begin == 0 && end == std::numeric_limits<low_type>::max() ) ? slot.cardinality() != chunk_capacity : !covers_range( slot, begin, end ) ) { return false; }
+            if ( chunk == last_chunk ) { return true; }
+            ++at;
+        }
+    }
+
     template <typename Operand>
     [[nodiscard]] static bool is_superset_of( Bitmap const & self, Operand const & operand ) {
-        if constexpr ( is_typed_view_v<Operand> ) { if ( operand.get().size() > self.size() ) { return false; } }
-        return visit( operand, overloaded{
-            [ & ]( auto & source ) { size_type total{ 0 }; return superset_stream( self, source, total ); },
-            [ & ]( unsorted_keys_tag, auto const & keys ) { return superset_probe( self, keys ); }
-        } );
+        if constexpr ( std::same_as<Operand, key_range> ) {
+            return is_superset_of_interval( self, operand );
+        } else {
+            if constexpr ( is_typed_view_v<Operand> ) { if ( operand.get().size() > self.size() ) { return false; } }
+            return visit( operand, overloaded{
+                [ & ]( auto & source ) { size_type total{ 0 }; return superset_stream( self, source, total ); },
+                [ & ]( unsorted_keys_tag, auto const & keys ) { return superset_probe( self, keys ); }
+            } );
+        }
     }
 
     template <typename Operand>

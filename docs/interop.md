@@ -52,8 +52,8 @@ kernels that serve bitmap against bitmap. Nothing is built for the chunks the op
 ever stored in a bitmap: what an operation keeps is built in fresh storage.
 
 * An **interval** is a run piece per chunk made on demand. A chunk it covers entirely is kept (`and_with`),
-  dropped (`andnot_with`) or counted from its header (`and_cardinality`) without being opened; a long interval
-  over a few chunks costs the few chunks. `xor_with( key_range )` flips the interval in one pass over the chunks
+  dropped (`andnot_with`) or counted from its header (`and_cardinality`) without being opened; `is_superset_of`
+  looks into the two end chunks only, the others have to be full; a long interval over a few chunks costs the few chunks. `xor_with( key_range )` flips the interval in one pass over the chunks
   it covers (a chunk it covers entirely is complemented without being read twice), as `flip_closed_range` does.
 * A **sorted range of keys** is grouped by chunk in a scratch array (or a bitset past the array limit);
   random-access ranges are searched by galloping, so a few keys against a large bitmap cost the keys.

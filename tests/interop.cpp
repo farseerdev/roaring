@@ -843,6 +843,51 @@ TYPED_TEST( InteropTest, NamedRangeOperations ) {
     }
 }
 
+// An interval over several chunks: the end chunks are looked into, the ones between have to be there and full.
+TYPED_TEST( InteropTest, ContainsRangeAcrossChunks ) {
+    using Bitmap = TypeParam;
+    using key_type = typename Bitmap::key_type;
+    if constexpr ( domain<Bitmap>::max < 4 * 65536 - 1 ) { return; }   // the keys below do not exist in a narrower key type
+    else {
+        constexpr key_type chunk{ 65536 };
+        Bitmap bitmap;
+        bitmap.add_closed_range( 100, 3 * chunk + 50 );
+        EXPECT_TRUE( bitmap.contains_range( 100, 3 * chunk + 51 ) );
+        EXPECT_FALSE( bitmap.contains_range( 99, 3 * chunk + 51 ) );
+        EXPECT_FALSE( bitmap.contains_range( 100, 3 * chunk + 52 ) );
+        EXPECT_TRUE( bitmap.contains_range( chunk, 3 * chunk ) );
+        EXPECT_FALSE( bitmap.contains_range( 3 * chunk, 4 * chunk ) );
+        static_cast<void>( bitmap.remove( 2 * chunk + 7 ) );
+        EXPECT_FALSE( bitmap.contains_range( chunk, 3 * chunk ) );
+        EXPECT_TRUE( bitmap.contains_range( chunk, 2 * chunk ) );
+        EXPECT_TRUE( bitmap.contains_range( 2 * chunk + 8, 3 * chunk + 51 ) );
+        Bitmap gap;
+        gap.add_closed_range( 0, chunk - 1 );
+        gap.add_closed_range( 2 * chunk, 3 * chunk - 1 );
+        EXPECT_TRUE( gap.contains_range( 0, chunk ) );
+        EXPECT_FALSE( gap.contains_range( 0, 3 * chunk ) );
+        EXPECT_FALSE( gap.contains_range( chunk - 1, 2 * chunk + 1 ) );
+        EXPECT_TRUE( gap.contains_range( 2 * chunk, 3 * chunk ) );
+        // an interval that starts at the last key of one chunk and ends in a chunk the bitmap does not have
+        Bitmap seam;
+        seam.add_closed_range( chunk - 1, 2 * chunk );
+        EXPECT_TRUE( seam.contains_range( chunk - 1, 2 * chunk + 1 ) );
+        EXPECT_FALSE( seam.contains_range( 2 * chunk - 1, 3 * chunk + 2 ) );
+        // an interval over many chunks, ended one key past the last
+        Bitmap many;
+        many.add_closed_range( 1, 1900543 );
+        EXPECT_TRUE( many.contains_range( 1, 1900544 ) );
+        EXPECT_FALSE( many.contains_range( 1900543, 1900545 ) );
+        if constexpr ( std::numeric_limits<key_type>::digits >= 64 ) {
+            constexpr key_type high{ key_type{ 1 } << 32 };
+            Bitmap distant;
+            distant.add_closed_range( high + chunk - 1, high + 2 * chunk );
+            EXPECT_FALSE( distant.contains_range( high + 2 * chunk - 1, high + 3 * chunk + 2 ) );
+            EXPECT_TRUE( distant.contains_range( high + chunk - 1, high + 2 * chunk + 1 ) );
+        }
+    }
+}
+
 TYPED_TEST( InteropTest, EmptyOperandsAndBitmaps ) {
     using Bitmap = TypeParam;
     Bitmap empty;
