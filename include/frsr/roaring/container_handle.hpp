@@ -1178,8 +1178,14 @@ public:
         return false;
     }
 
-    [[nodiscard]] bool add( low_type const value ) {
-        if ( try_append( value ) ) { return true; }
+    [[nodiscard]] [[gnu::always_inline]] bool add( low_type const value ) {
+        if ( try_append( value ) ) [[likely]] { return true; }
+        return add_out_of_order( value );
+    }
+
+    // Everything but the in-order append into a payload with room: the first value, a payload that must grow, an
+    // out-of-order value. Out of line, as the reference's array_container_add is.
+    [[nodiscard]] [[gnu::noinline]] bool add_out_of_order( low_type const value ) {
         auto const cardinality{ values.size() };
         if ( cardinality == 0 || values.back() < value ) {
             // Append into a payload that must first grow (or is empty).
