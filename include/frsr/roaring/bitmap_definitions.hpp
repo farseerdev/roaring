@@ -682,7 +682,10 @@ FRSR_ROARING_BITMAP_TEMPLATE
 template <bool Lazy>
 FRSR_ROARING_DEFINITION_INLINE auto FRSR_ROARING_BITMAP::union_merge( bitmap const & other ) -> bitmap & {
     constexpr bool lazy{ Lazy };
-    if ( std::uint64_t{ other.chunks_.size() } * 32 < chunks_.size() ) {
+    // A key-by-key insertion costs a search of this table per key of the other (about log2 of its size, a tenth
+    // of it or less); the single merge pass costs a move of every entry of this table. The searches win until the
+    // other holds about an eighth of the keys of this table.
+    if ( std::uint64_t{ other.chunks_.size() } * 8 < chunks_.size() ) {
         return union_few<lazy>( other );
     }
     detail::small_array_values<low_type> array_union_scratch;

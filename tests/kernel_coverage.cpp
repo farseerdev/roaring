@@ -477,12 +477,15 @@ void big_by_few_case() {
     ASSERT_TRUE( matches( target, target_values ) );
     ASSERT_GE( target.container_count(), target_chunks );
 
-    for ( std::size_t const keys : { 1, 2, 4, 8, 16, 20 } ) {
+    for ( std::size_t const keys : { 1, 2, 4, 8, 16, 20, 32, 124, 125 } ) {
         for ( auto const mode : { key_mode::existing, key_mode::between, key_mode::before, key_mode::after, key_mode::mixed } ) {
             SCOPED_TRACE( ::testing::Message() << keys << " keys, mode " << int( mode ) );
             auto const few_values{ make_few_values( keys, mode, rng ) };
             Bitmap few;
             few.add_many( few_values );
+            if ( mode == key_mode::existing || mode == key_mode::between ) {
+                ASSERT_EQ( few.container_count(), keys ) << "the operand must hold the number of keys the case names";
+            }
             auto const expected{ set_union_of( target_values, few_values ) };
 
             // Unshared: the target is a private copy of the prebuilt one (a value copy
