@@ -212,6 +212,9 @@ public:
         auto const probe{ static_cast<key_t>( key ) };
         if ( dir_ != nullptr ) {
             auto leaf{ search_start( probe ) };
+            // A probe above the keys of this leaf moves on to the next one, and its link lies at the far end of the block from the
+            // keys: it is requested along with them instead of after them.
+            __builtin_prefetch( links( leaf ) );
             while ( leaf != nullptr ) {
                 auto const index{ count_below<16>( leaf, probe ) };
                 if ( leaf[ index ] != pad ) { return cursor{ leaf, index }; }
