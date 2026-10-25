@@ -294,6 +294,7 @@ if(FRSR_ROARING_BUILD_TESTS)
         tests/upstream_parity_queries.cpp
         tests/symmetric_difference.cpp
         tests/noexcept_policy.cpp
+        tests/ranked_view.cpp
     )
     target_link_libraries(frsr_roaring_tests
         PRIVATE
@@ -348,6 +349,7 @@ if(FRSR_ROARING_BUILD_TESTS)
             tests/kernel_crosscheck.cpp
             tests/interop_crosscheck.cpp
             tests/symmetric_difference_crosscheck.cpp
+            tests/ranked_view_crosscheck.cpp
         )
         target_link_libraries(frsr_roaring_croaring_crosscheck
             PRIVATE
