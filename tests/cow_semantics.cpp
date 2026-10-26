@@ -68,6 +68,24 @@ void operator delete  ( void * const p ) noexcept { counted_free( p ); }
 void operator delete[]( void * const p ) noexcept { counted_free( p ); }
 void operator delete  ( void * const p, std::size_t ) noexcept { counted_free( p ); }
 void operator delete[]( void * const p, std::size_t ) noexcept { counted_free( p ); }
+// The non-throwing forms are replaced too: a library allocating with operator new( size, nothrow ) (the temporary buffer
+// of std::stable_sort) would otherwise get a sanitizer allocation that the replaced operator delete releases with free.
+void * operator new  ( std::size_t const size, std::nothrow_t const & ) noexcept {
+    try {
+        return counted_allocate( size );
+    } catch ( ... ) {
+        return nullptr;
+    }
+}
+void * operator new[]( std::size_t const size, std::nothrow_t const & ) noexcept {
+    try {
+        return counted_allocate( size );
+    } catch ( ... ) {
+        return nullptr;
+    }
+}
+void operator delete  ( void * const p, std::nothrow_t const & ) noexcept { counted_free( p ); }
+void operator delete[]( void * const p, std::nothrow_t const & ) noexcept { counted_free( p ); }
 #endif // FRSR_TESTS_COUNT_ALLOCATIONS
 
 namespace {
