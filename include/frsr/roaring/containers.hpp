@@ -576,6 +576,19 @@ template <typename Layout, typename CowPolicy = cow_value_semantics, typename Ru
         constexpr auto bitset_bytes     { Layout::word_count * sizeof( std::uint64_t ) };
         auto const array_bytes{ cardinality * sizeof( typename Layout::low_type ) };
         auto const can_consider_run{ RunSelectionPolicy::eager && cardinality >= 64U };
+        if ( array_bytes < bitset_bytes ) {
+            // Fewer values than the array limit: the bitset cannot stay one. The values are decoded from the words
+            // once, straight into the array's own payload, and a run encoding is considered from them (counting
+            // the runs of a few values is cheaper than a second pass over every word).
+            auto array{ array_from_bitset<Layout, CowPolicy>( std::as_const( container ).as_bitset(), static_cast<std::uint32_t>( cardinality ) ) };
+            if ( !can_consider_run ) { return array; }
+            auto const view{ std::as_const( array ).as_array().values };
+            std::span<typename Layout::low_type const> const values{ view.data(), view.size() };
+            if ( run_count_from_sorted_values<Layout>( values, array_bytes / run_bytes_per_run + 1U ) * run_bytes_per_run < array_bytes ) {
+                return run_handle_from_sorted_values<Layout, CowPolicy>( values );
+            }
+            return array;
+        }
         auto const run_bytes{
             can_consider_run
                 ? run_count_from_bitset_words<Layout>(

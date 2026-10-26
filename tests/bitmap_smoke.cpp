@@ -141,6 +141,46 @@ TEST(FrsrRoaringSmoke, SortedBulkMutationsAndPromotionHelpersWork) {
     EXPECT_GT( bitmap.container_count(), 0U );
 }
 
+TEST(FrsrRoaringSmoke, OptimizingABitsetChoosesTheFormTheValuesWouldHave) {
+    // The lazy run policy leaves a bitset a bitset even for contiguous values, which the eager policy would store as runs.
+    using BitsetFormBitmap = frsr::roaring::bitmap<
+        std::uint32_t,
+        frsr::roaring::default_container_set<std::uint32_t>,
+        frsr::roaring::detail::cow_value_semantics,
+        frsr::roaring::detail::run_selection_lazy
+    >;
+    // A bitset with fewer values than the array limit becomes an array or, when runs hold them in fewer bytes, a
+    // run container: the same form a container built from those values gets, whatever the shape of the values.
+    auto const range_values = []( std::uint32_t const first, std::uint32_t const last, std::uint32_t const stride ) {
+        std::vector<std::uint32_t> values;
+        for ( auto value{ first }; value <= last; value += stride ) {
+            values.push_back( value );
+        }
+        return values;
+    };
+    std::vector<std::vector<std::uint32_t>> const shapes{
+        range_values( 0U, 59U, 1U ),          // under 64 values: never a run
+        range_values( 0U, 99U, 1U ),          // one run
+        range_values( 0U, 6000U, 100U ),      // isolated values
+        range_values( 10U, 3000U, 1U ),       // one long run
+        range_values( 0U, 60000U, 20U ),      // 3000 isolated values
+        range_values( 0U, 5000U, 1U ),        // 5001 values in one run
+        range_values( 0U, 65535U, 13U )       // 5043 isolated values: stays a bitset
+    };
+    for ( auto const & values : shapes ) {
+        auto expected{ TestBitmap{ values } };
+        expected.optimize();
+        BitsetFormBitmap bitset_form;
+        bitset_form.add_sorted_many( values, 1U );
+        ASSERT_EQ( bitset_form.statistics().bitset_containers, 1U ) << values.size();
+        bitset_form.optimize();
+        EXPECT_EQ( bitset_form.to_vector(), values );
+        EXPECT_EQ( bitset_form.statistics().array_containers, expected.statistics().array_containers ) << values.size();
+        EXPECT_EQ( bitset_form.statistics().run_containers, expected.statistics().run_containers ) << values.size();
+        EXPECT_EQ( bitset_form.statistics().bitset_containers, expected.statistics().bitset_containers ) << values.size();
+    }
+}
+
 TEST(FrsrRoaringSmoke, SortedBulkConstructionHonorsAnExplicitBitsetThreshold) {
     // A chunk between an explicit (lowered) threshold and the byte-parity point:
     // the default decision keeps it an array (smaller), the explicit threshold
