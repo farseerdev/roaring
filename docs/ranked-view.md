@@ -63,24 +63,46 @@ keep no cache, so concurrent readers need no synchronisation.
 
 Rank is `O(1)` only in a bitset chunk; array and run chunks cost a search. The default bitmap picks a run container by
 itself whenever it serializes smaller (`run_selection_eager`), and so does `optimize()`. For a nearly contiguous table
-(range / entries of about 1.001 to 1.03) that means dozens of short runs per chunk and a binary search where a bitset is
-one popcount. Measured with `bench/ranked_view_bench.cpp` (`index_of`, independent probes of present ids, one
-x86-64 core, 16.7M ids of range):
+(range / entries of about 1.001 to 1.1) that means a binary search of dozens of short runs where a bitset is one popcount.
+Build a ranked table with a bitmap that selects no runs (`detail::run_selection_lazy`), and, only when memory matters more
+than the last nanoseconds, let `optimize_run_shaped( 4096 )` turn chunks with a mean run length of at least 4096 (at most
+16 runs per chunk) into runs. Lower bars (64, 1024) still pick runs for tables with a range / entries of 1.001 to 1.01
+and are 5 to 10 times slower there.
 
-| range / entries | default bitmap + `optimize()` | bitmap with `run_selection_lazy` | lazy + `optimize_run_shaped( 1024 )` |
-|---|---|---|---|
-| 1.001 | 26 ns, 0.007 B/entry | 4.4 ns, 0.157 B/entry | 14 ns, 0.097 B/entry |
-| 1.01 | 42 ns | 5.1 ns | 5.1 ns |
-| 1.03 | 56 ns | 5.1 ns | 4.4 ns |
-| 1.1 | 5.1 ns | 4.9 ns | 4.4 ns |
-| 16 / 68 / 590 (arrays) | 14 / 16 / 12 ns | the same | the same |
+Measured with `bench/rank_bench.cpp` on one pinned core of a Zen 4 machine, clang 23 and g++ 16 (glibc), `index_of` of
+present ids, independent probes, a table of 10^6 ids, nanoseconds per lookup, the fastest of 9 rounds (clang; g++ is
+within 15% of it except for the sorted array, which is up to 2x slower, and CRoaring on the dense tables):
 
-So build a ranked table with a bitmap that selects no runs (`detail::run_selection_lazy`) and, only when memory matters
-more than the last nanoseconds, let `optimize_run_shaped( bar )` turn chunks with a mean run length of at least `bar`
-into runs. The image does not depend on the bitmap type that wrote it. A flat bit string with a `u32` prefix count per
-64 ids is faster still on dense tables (1.2 to 1.9 ns) but costs 0.19 bytes per id of range at any density, 110 bytes
-per entry at 590x, where the ranked image takes about 2.3; CRoaring's `roaring_bitmap_get_index` walks the chunk
-cardinalities and costs 0.13 to 13 microseconds on the dense shapes.
+| range / entries | bit string + u32 per 64 ids | ranked, default bitmap | ranked, lazy bitmap | sorted array | CRoaring `get_index` |
+|---|---|---|---|---|---|
+| 1.001 | 0.8 | 21 | 2.2 | 44 | 79 |
+| 1.01 | 0.8 | 33 | 2.2 | 44 | 329 |
+| 1.03 | 0.8 | 40 | 2.2 | 45 | 833 |
+| 1.1 | 0.8 | 2.2 | 2.2 | 43 | 228 |
+| 2 | 0.8 | 2.3 | 2.3 | 44 | 234 |
+| 16 | 1.4 | 13 | 13 | 44 | 254 |
+| 68 | 1.3 | 22 | 22 | 44 | 473 |
+| 590 | 1.4 | 17 | 16 | 45 | 3815 |
+
+Bytes per id of the same tables: the bit string takes 0.19 (1.01), 3.0 (16), 12.7 (68) and 111 (590); the ranked image
+0.16 to 0.18 for every range / entries up to 1.1 with the lazy bitmap (0.006 to 0.17 with the default bitmap, whose
+smaller size is paid for in the lookup time above), 0.32 at 2, 2.3 at 16 and 2.0 to 2.3 at 68 and 590. A sorted array takes 4.
+
+Where it wins and loses:
+
+- A dense table (up to about 2x): a flat bit string with a count per word is 2.5 to 3 times faster than the ranked image
+  for independent lookups and 1.5 to 1.7 times faster for dependent ones, at the same size. A ranked image there is for
+  a consumer that wants the bytes in a file or a mapping, with `select` and ordered iteration, not for speed.
+- A sparse table (16x and beyond): the bit string takes 3 to 111 bytes per id and the ranked image about 2; lookups cost
+  13 to 22 ns instead of 1.3 to 1.4 when the table is larger than the caches, comparable to a sorted array's binary
+  search at smaller sizes (8 to 12 ns against 17 for 10^4 ids) and 2 to 4 times faster than it at 10^6 ids.
+  Dependent chains are the worst case for it (21 to 34 ns at 10^6 ids).
+- Against CRoaring's `roaring_bitmap_get_index`, which walks the chunk cardinalities, the ranked image (lazy build) is 8 to
+  400 times faster for independent lookups in tables of 10^4 or more ids, and for dependent chains from 1.7 times
+  (10^4 ids, 68x sparse: a tie) to several hundred times. Below about a hundred ids CRoaring is slightly faster
+  (4.5 against 5.7 ns independent, 4.8 against 16 ns dependent).
+- Fewer than about a hundred ids (one chunk): 5.7 to 6.1 ns independent and 14 to 16 ns dependent, against 0.6 and 3.5 for
+  the bit string; a sorted array is as fast independently (4.7 to 5.1 ns) and faster dependently (10 ns).
 
 ## Memory
 

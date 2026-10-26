@@ -79,14 +79,14 @@ struct frozen_reader_access {
 
 // Build recipe. Rank costs O(1) in a bitset chunk and O(log) in an array or run chunk, and the default bitmap picks a
 // run container by itself whenever that serializes smaller, which for a nearly contiguous table (range/entries of 1.001
-// to 1.03) means a binary search over dozens of runs where a bitset is one popcount (about 5 ns against 25 to 55 ns in
-// bench/ranked_view_bench.cpp). Build the table with a bitmap that does not select runs, and add runs only for chunks
+// to 1.1) means a binary search over dozens of runs where a bitset is one popcount (about 2 ns against 20 to 40 ns in
+// bench/rank_bench.cpp). Build the table with a bitmap that does not select runs, and add runs only for chunks
 // that are strongly run-shaped:
 //
 //   using table_type = bitmap<std::uint32_t, default_container_set<std::uint32_t>, detail::cow_value_semantics, detail::run_selection_lazy>;
 //   table_type table;
 //   table.add_sorted_many( ids );            // arrays and bitsets only
-//   table.optimize_run_shaped( 1024 );       // optional: runs where the mean run length is at least the bar
+//   table.optimize_run_shaped( 4096 );       // optional: runs where the mean run length is at least the bar
 //   std::vector<std::uint64_t> storage( ( table.frozen_size_bytes( { .ranked = true } ) + 7 ) / 8 );   // 8-byte aligned
 //   std::span const image{ reinterpret_cast<std::byte *>( storage.data() ), table.frozen_size_bytes( { .ranked = true } ) };
 //   table.frozen_serialize( image, { .ranked = true } );
