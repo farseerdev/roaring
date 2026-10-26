@@ -68,10 +68,11 @@ namespace detail {
 // Defined by the tests that look at the containers of a bitmap (see tests/view_support.hpp).
 template <typename Bitmap>
 struct bitmap_test_access;
-// Defined by ranked_view.hpp: the reader of the frozen image's rank data, a friend of frozen_view.
-template <typename Bitmap>
-struct frozen_reader_access;
 }
+
+// Defined by ranked_view.hpp: the reader of the frozen image's rank data, a friend of frozen_view.
+template <std::unsigned_integral Key, typename Bitmap>
+class ranked_view;
 
 // Container-set policy tags. Concrete storage is the type-erased
 // detail::container_handle (one 32-byte representation for every kind); these
@@ -900,7 +901,8 @@ public:
         [[nodiscard]] explicit operator bool() const noexcept { return header_ != nullptr; }
         // Whether the image carries the rank data (format version 2).
         [[nodiscard]] bool ranked() const noexcept { return header_ != nullptr && header_->version == frozen_ranked_format_version; }
-        // The bytes of the image the view covers (header, index, payloads and rank data).
+        // The bytes of the image up to the end of its last payload (and rank block), for either version: the span the
+        // view was opened on may be longer.
         [[nodiscard]] std::size_t byte_size() const noexcept { return bytes_; }
         [[nodiscard]] std::size_t size() const noexcept {
             return header_ == nullptr ? 0U : static_cast<std::size_t>( header_->value_count );
@@ -911,7 +913,7 @@ public:
 
         [[nodiscard]] bitmap materialize() const;
 
-        // f( key ) for every value >= `first`, in key order. The first chunk is decoded whole and filtered.
+        // f( key ) for every value >= `first`, in key order.
         template <typename F>
         void for_each_from( key_type const first, F && f ) const {
             if ( header_ == nullptr || header_->chunk_count == 0U ) {
@@ -923,21 +925,40 @@ public:
             auto at{ std::ranges::lower_bound( index_span, first_chunk, {}, &frozen_chunk_index::chunk ) };
             for ( ; at != index_span.end(); ++at ) {
                 auto const & entry{ *at };
+                auto const kind{ static_cast<frozen_container_kind>( entry.container_kind ) };
+                auto const chunk_key{ static_cast<chunk_type>( entry.chunk ) };
+                // only the chunk of `first` can hold values below it
+                auto const from_low{ entry.chunk == first_chunk ? first_low : low_type{} };
+                auto const emit{ [ & ]( low_type const low ) { f( layout_type::compose( chunk_key, low ) ); } };
+                if ( from_low != 0 && kind == frozen_container_kind::bitset ) {
+                    // a bitset starts at the word of `from_low`
+                    auto const * const words{ reinterpret_cast<std::uint64_t const *>( data_ + entry.payload_offset ) };
+                    auto word_at{ static_cast<std::size_t>( from_low ) >> 6U };
+                    auto word{ words[ word_at ] & ( ~std::uint64_t{} << ( from_low & 63U ) ) };
+                    for ( ;; ) {
+                        while ( word != 0 ) {
+                            emit( static_cast<low_type>( word_at * 64U + static_cast<unsigned>( std::countr_zero( word ) ) ) );
+                            word &= word - 1U;
+                        }
+                        if ( ++word_at == layout_type::word_count ) {
+                            break;
+                        }
+                        word = words[ word_at ];
+                    }
+                    continue;
+                }
                 auto const container{ detail::container_handle<layout_type, CowPolicy>::make_borrowed(
-                    container_kind_of( static_cast<frozen_container_kind>( entry.container_kind ) ),
+                    container_kind_of( kind ),
                     data_ + entry.payload_offset,
                     entry.payload_count,
                     entry.cardinality
                 ) };
-                auto const chunk_key{ static_cast<chunk_type>( entry.chunk ) };
-                // only the chunk of `first` can hold values below it
-                auto const from_low{ entry.chunk == first_chunk ? first_low : low_type{} };
-                detail::container_for_each( container, [&]( low_type const low ) {
+                detail::container_for_each( container, [ & ]( low_type const low ) {
                     if ( low >= from_low ) {
-                        f( layout_type::compose( chunk_key, low ) );
+                        emit( low );
                     }
                 } );
-        }
+            }
         }
         template <typename F>
         void for_each( F && f ) const { for_each_from( key_type{}, std::forward<F>( f ) ); }
@@ -952,8 +973,8 @@ public:
 
     private:
         friend class bitmap;
-        template <typename>
-        friend struct detail::frozen_reader_access;
+        template <std::unsigned_integral, typename>
+        friend class ranked_view;
 
         frozen_view(
             frozen_header const * header,
@@ -963,6 +984,17 @@ public:
         ) noexcept
             : header_{ header }, index_{ index }, data_{ data }, bytes_{ bytes } {}
 
+        // The first of the `count` index entries whose chunk is >= `chunk`; index + count when there is none. The chunk
+        // table of a frozen image is searched by the chunk key in the index itself (the image owns no chunk array).
+        [[nodiscard, gnu::always_inline]] static frozen_chunk_index const * lower_bound_entry(
+            frozen_chunk_index const * const index,
+            std::size_t const count,
+            std::uint64_t const chunk
+        ) noexcept {
+            auto const index_span{ std::span<frozen_chunk_index const>{ index, count } };
+            return index + ( std::ranges::lower_bound( index_span, chunk, {}, &frozen_chunk_index::chunk ) - index_span.begin() );
+        }
+
         // The number of values below `value` (the insertion point) in a sorted array payload.
         [[nodiscard]] static std::int32_t array_lower_bound(
             low_type const * values,
@@ -970,14 +1002,19 @@ public:
             low_type const value
         ) noexcept;
 
+        // The block of an array payload (16 values each, the last value of a block as its key) that holds the insertion
+        // point of `value`; `num_blocks` when it lies in the tail.
+        [[nodiscard, gnu::always_inline]] static std::int32_t array_block_search(
+            low_type const * values,
+            std::int32_t num_blocks,
+            low_type value
+        ) noexcept;
+
         [[nodiscard]] static bool array_contains_payload(
             low_type const * values,
             std::size_t const count,
             low_type const value
-        ) noexcept {
-            auto const below{ static_cast<std::size_t>( array_lower_bound( values, count, value ) ) };
-            return below < count && values[ below ] == value;
-        }
+        ) noexcept;
 
         // Rank of `value` in a run payload whose per-run cumulative counts are `run_ranks` (the ranked image's rank block).
         [[nodiscard]] static position run_position(
@@ -1891,6 +1928,21 @@ private:
             case frozen_container_kind::bitset: return detail::container_kind::bitset;
         }
         std::unreachable();
+    }
+
+    // What a reader of the rank data indexes with, checked when a ranked image is opened (O(1) per chunk): the counts
+    // that size the payload and the rank block agree with the cardinality, so no read of either leaves its block.
+    // The contents of the rank blocks and the cardinalities of bitset and run payloads are not read here.
+    [[nodiscard]] static constexpr bool frozen_ranked_counts_match( frozen_chunk_index const & entry ) noexcept {
+        if ( entry.cardinality == 0U || entry.cardinality > layout_type::low_domain_size ) {
+            return false;
+        }
+        switch ( static_cast<frozen_container_kind>( entry.container_kind ) ) {
+            case frozen_container_kind::array : return entry.payload_count == entry.cardinality;
+            case frozen_container_kind::run   : return entry.payload_count != 0U && entry.payload_count <= entry.cardinality;   // a run holds a value at least
+            case frozen_container_kind::bitset: return entry.payload_count == layout_type::word_count;
+        }
+        return false;
     }
 
     [[nodiscard]] static constexpr std::size_t frozen_expected_payload_bytes(

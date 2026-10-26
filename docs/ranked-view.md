@@ -11,7 +11,7 @@ answers, without decoding anything:
 | `select( i )` | the id with ordinal `i` (`i < size()`) |
 | `for_each_indexed( f )` | `f( id, ordinal )` in key order |
 | `for_each_indexed_from( first, f )` | the same from the first id `>= first`, with ordinals counted from `count_below( first )` |
-| `size()`, `byte_size()`, `front()`, `back()` | cardinality, bytes of the image, first and last id |
+| `size()`, `byte_size()`, `front()`, `back()` | cardinality, bytes of the image (up to the end of its last payload and rank block), first and last id |
 
 `count_below` is exclusive. CRoaring's `roaring_bitmap_rank` is inclusive (ids `<= x`); the two differ by
 `contains( x )`. `index_of( x )` is CRoaring's `roaring_bitmap_get_index` with `npos` for its `-1`.
@@ -22,9 +22,7 @@ edited.
 ## Building and reading
 
 ```cpp
-using table_type = frsr::roaring::bitmap<std::uint32_t, frsr::roaring::default_container_set<std::uint32_t>,
-                                         frsr::roaring::detail::cow_value_semantics, frsr::roaring::detail::run_selection_lazy>;
-table_type table;
+frsr::roaring::rank_table_bitmap<std::uint32_t> table;
 table.add_sorted_many( ids );                        // table: a bitmap that selects no runs, see "Choosing the containers"
 
 frsr::roaring::frozen_options const options{ .ranked = true };
@@ -64,7 +62,7 @@ keep no cache, so concurrent readers need no synchronisation.
 Rank is `O(1)` only in a bitset chunk; array and run chunks cost a search. The default bitmap picks a run container by
 itself whenever it serializes smaller (`run_selection_eager`), and so does `optimize()`. For a nearly contiguous table
 (range / entries of about 1.001 to 1.1) that means a binary search of dozens of short runs where a bitset is one popcount.
-Build a ranked table with a bitmap that selects no runs (`detail::run_selection_lazy`), and, only when memory matters more
+Build a ranked table with a bitmap that selects no runs (`rank_table_bitmap`), and, only when memory matters more
 than the last nanoseconds, let `optimize_run_shaped( 4096 )` turn chunks with a mean run length of at least 4096 (at most
 16 runs per chunk) into runs. Lower bars (64, 1024) still pick runs for tables with a range / entries of 1.001 to 1.01
 and are 5 to 10 times slower there.

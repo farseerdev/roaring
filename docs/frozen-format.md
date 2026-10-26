@@ -87,8 +87,16 @@ payload offsets, payload_bytes not matching the kind-derived size, and
 Σ cardinality ≠ header value_count. A v2 image is also rejected for a key type wider than 32 bits, for `value_count`
 of 2^32 or more (so that "absent" is never a valid rank), for a `base` that is not the running Σ cardinality, for a
 payload that starts before the previous chunk's rank block ends, and for a rank block that runs past the image.
-The counts themselves are trusted like the declared cardinalities: a wrong count gives wrong ranks, never a read
-outside the image, because every index into a rank block is bounded by the kind.
+Per chunk, a v2 image is also rejected unless its counts agree: an array has `payload_count` equal to `cardinality`,
+a run chunk has between 1 and `cardinality` runs, a bitset has `word_count` words, and `cardinality` is between 1 and
+the chunk's capacity. The contents of the rank blocks, and the cardinality of a bitset or run chunk against its
+payload, are not read at open (that would touch the whole image). What is guaranteed: every read of `ranked_view`
+(`count_below`, `index_of`, `contains`, `select`) stays inside the payload and the rank block of one chunk whatever
+those contents are; a rank block or cardinality that does not describe its payload gives a wrong answer, never a read
+outside the image.
+
+`byte_size()` of the view is the end of the last payload (and, in v2, its rank block), for either version, not the size
+of the span the image was opened on.
 
 `frozen_view_from( std::span<std::byte const> )` is the primitive (a flat buffer or a mapping; the data must be
 8-byte aligned); the vm_vector overload forwards to it.

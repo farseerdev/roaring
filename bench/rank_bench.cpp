@@ -43,7 +43,7 @@ namespace {
 
 using namespace frsr::roaring;
 using table      = bitmap<std::uint32_t>;
-using lazy_table = bitmap<std::uint32_t, default_container_set<std::uint32_t>, detail::cow_value_semantics, detail::run_selection_lazy>;
+using lazy_table = rank_table_bitmap<std::uint32_t>;
 
 constexpr std::uint32_t absent{ ranked_view<std::uint32_t>::npos };
 

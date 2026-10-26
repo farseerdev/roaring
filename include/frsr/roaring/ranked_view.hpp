@@ -31,35 +31,20 @@
 
 namespace frsr::roaring {
 
+// The bitmap to build a ranked table with: it picks no run containers by itself (see the build recipe below).
+template <std::unsigned_integral Key>
+using rank_table_bitmap = bitmap<Key, default_container_set<Key>, detail::cow_value_semantics, detail::run_selection_lazy>;
+
 namespace detail {
 
-template <typename Bitmap>
-struct frozen_reader_access {
-    using view_type  = typename Bitmap::frozen_view;
-    using entry_type = typename Bitmap::frozen_chunk_index;
-    using low_type   = typename Bitmap::low_type;
-    using run_type   = typename Bitmap::run_container_type::run;
-
-    [[nodiscard]] static auto const * index_of ( view_type const & view ) noexcept { return view.index_; }
-    [[nodiscard]] static auto const * data_of  ( view_type const & view ) noexcept { return view.data_; }
-    [[nodiscard]] static std::uint32_t chunk_count( view_type const & view ) noexcept { return view.header_->chunk_count; }
-
-    [[nodiscard]] static std::int32_t array_lower_bound( low_type const * const values, std::size_t const count, low_type const value ) noexcept {
-        return view_type::array_lower_bound( values, count, value );
-    }
-    [[nodiscard]] static typename view_type::position run_position(
-        run_type const * const runs, std::uint16_t const * const ranks, std::int32_t const count, low_type const value
-    ) noexcept {
-        return view_type::run_position( runs, ranks, count, value );
-    }
-};
-
-// The position of the `rank`-th (0-based) set bit of `word`, which has more than `rank` set bits.
+// The position of the `rank`-th (0-based) set bit of `word`, which has more than `rank` set bits. A `rank` the word
+// does not have gives a position of at most 64 and reads nothing (a rank block of an image that was not written by
+// the library can say so).
 [[nodiscard]] inline unsigned select_in_word( std::uint64_t word, unsigned rank ) noexcept {
 #if defined( __BMI2__ )
     // pdep is microcoded on older AMD cores, which is why it is taken only when the build targets BMI2 explicitly
-    // (the library does not dispatch on the CPU at run time).
-    return static_cast<unsigned>( std::countr_zero( _pdep_u64( std::uint64_t{ 1 } << rank, word ) ) );
+    // (the library does not dispatch on the CPU at run time). The mask is the shift's own (shlx masks as well).
+    return static_cast<unsigned>( std::countr_zero( _pdep_u64( std::uint64_t{ 1 } << ( rank & 63U ), word ) ) );
 #else
     // Halving: skip the low half when it holds no more than `rank` bits.
     unsigned position{ 0 };
@@ -83,8 +68,7 @@ struct frozen_reader_access {
 // bench/rank_bench.cpp). Build the table with a bitmap that does not select runs, and add runs only for chunks
 // that are strongly run-shaped:
 //
-//   using table_type = bitmap<std::uint32_t, default_container_set<std::uint32_t>, detail::cow_value_semantics, detail::run_selection_lazy>;
-//   table_type table;
+//   rank_table_bitmap<std::uint32_t> table;
 //   table.add_sorted_many( ids );            // arrays and bitsets only
 //   table.optimize_run_shaped( 4096 );       // optional: runs where the mean run length is at least the bar
 //   std::vector<std::uint64_t> storage( ( table.frozen_size_bytes( { .ranked = true } ) + 7 ) / 8 );   // 8-byte aligned
@@ -98,7 +82,6 @@ class ranked_view {
     static_assert( std::same_as<Key, std::uint32_t>, "a rank is a 32-bit count and a chunk key 16 bits: the keys are 32-bit" );
     static_assert( std::same_as<typename Bitmap::key_type, Key> );
 
-    using access     = detail::frozen_reader_access<Bitmap>;
     using view_type  = typename Bitmap::frozen_view;
     using entry_type = typename Bitmap::frozen_chunk_index;
     using kind_type  = typename Bitmap::frozen_container_kind;
@@ -122,9 +105,9 @@ public:
             return result;
         }
         result.view_        = view;
-        result.index_       = access::index_of( view );
-        result.data_        = access::data_of( view );
-        result.chunk_count_ = access::chunk_count( view );
+        result.index_       = view.index_;
+        result.data_        = view.data_;
+        result.chunk_count_ = view.header_->chunk_count;
         result.size_        = static_cast<index_type>( view.size() );   // below 2^32: validated when the image was opened
         if ( result.chunk_count_ != 0 ) {
             result.first_chunk_ = static_cast<std::uint32_t>( result.index_[ 0 ].chunk );
@@ -179,8 +162,6 @@ public:
 private:
     using position = typename view_type::position;
 
-    // The chunk table of a gapped image is searched by the chunk key in the index itself: a different search from the
-    // bitmap's chunk_array::find, which this reader has no use for (it owns no chunk array).
     [[nodiscard]] [[gnu::always_inline]] position find( key_type const x ) const noexcept {
         auto const chunk{ static_cast<std::uint32_t>( x >> 16U ) };
         entry_type const * entry;
@@ -195,15 +176,14 @@ private:
             }
             entry = index_ + at;
         } else {
-            auto const span{ std::span<entry_type const>{ index_, chunk_count_ } };
-            auto const it{ std::ranges::lower_bound( span, chunk, {}, [](entry_type const & e) { return static_cast<std::uint32_t>( e.chunk ); } ) };
-            if ( it == span.end() ) {
+            auto const it{ view_type::lower_bound_entry( index_, chunk_count_, chunk ) };
+            if ( it == index_ + chunk_count_ ) {
                 return { size_, false };
             }
             if ( static_cast<std::uint32_t>( it->chunk ) != chunk ) {
                 return { it->base, false };   // the values of all chunks before the next one
             }
-            entry = &*it;
+            entry = it;
         }
 
         auto const low{ static_cast<low_type>( x & 0xFFFFU ) };
@@ -231,12 +211,12 @@ private:
     [[gnu::noinline]] static position array_position( entry_type const & entry, std::byte const * const payload, low_type const low ) noexcept {
         auto const * const values{ reinterpret_cast<low_type const *>( payload ) };
         auto const count{ static_cast<std::size_t>( entry.payload_count ) };
-        auto const below{ static_cast<std::size_t>( access::array_lower_bound( values, count, low ) ) };
+        auto const below{ static_cast<std::size_t>( view_type::array_lower_bound( values, count, low ) ) };
         return { entry.base + static_cast<std::uint32_t>( below ), below < count && values[ below ] == low };
     }
 
     [[gnu::noinline]] static position run_position( entry_type const & entry, std::byte const * const payload, low_type const low ) noexcept {
-        auto const in_run{ access::run_position(
+        auto const in_run{ view_type::run_position(
             reinterpret_cast<run_type const *>( payload ),
             reinterpret_cast<std::uint16_t const *>( payload + entry.payload_bytes ),
             static_cast<std::int32_t>( entry.payload_count ),
@@ -257,25 +237,33 @@ private:
 template <std::unsigned_integral Key, typename Bitmap>
 typename ranked_view<Key, Bitmap>::key_type ranked_view<Key, Bitmap>::select( index_type const i ) const noexcept {
     assert( i < size_ );
-    // the last chunk whose first ordinal is <= i
+    // The last chunk whose first ordinal is <= i. The bases were checked when the image was opened to be the running
+    // sum of the cardinalities, which end in size(): `within` is below the cardinality of the chunk.
     auto const span{ std::span<entry_type const>{ index_, chunk_count_ } };
     auto const it{ std::ranges::upper_bound( span, i, {}, &entry_type::base ) - 1 };
     auto const within{ i - it->base };
     auto const * const payload{ data_ + it->payload_offset };
-    auto const compose{ [ & ]( std::uint32_t const low ) { return static_cast<key_type>( ( static_cast<std::uint32_t>( it->chunk ) << 16U ) | low ); } };
+    auto const compose{ [ & ]( std::uint32_t const low ) { return static_cast<key_type>( ( static_cast<std::uint32_t>( it->chunk ) << 16U ) | static_cast<low_type>( low ) ); } };
+    // A rank block is searched from its second count on (the first is 0 by construction, so the result is an index
+    // into the block whatever the counts are): a block that does not add up gives a wrong id, never a read outside
+    // the payload or its rank block. Opening the image checked the sizes of both against the cardinality.
     switch ( static_cast<kind_type>( it->container_kind ) ) {
         case kind_type::array:
+            assert( within < it->payload_count );
             return compose( reinterpret_cast<low_type const *>( payload )[ within ] );
         case kind_type::run: {
             auto const * const runs{ reinterpret_cast<run_type const *>( payload ) };
-            auto const ranks{ std::span{ reinterpret_cast<std::uint16_t const *>( payload + it->payload_bytes ), it->payload_count } };
-            auto const run_at{ static_cast<std::size_t>( std::ranges::upper_bound( ranks, within ) - ranks.begin() ) - 1U };
+            auto const * const ranks{ reinterpret_cast<std::uint16_t const *>( payload + it->payload_bytes ) };
+            auto const later{ std::span{ ranks + 1, it->payload_count - 1U } };
+            auto const run_at{ static_cast<std::size_t>( std::ranges::upper_bound( later, within ) - later.begin() ) };
             return compose( runs[ run_at ].begin + ( within - ranks[ run_at ] ) );
         }
         case kind_type::bitset: {
+            constexpr auto word_count{ Bitmap::layout_type::word_count };
             auto const * const words{ reinterpret_cast<std::uint64_t const *>( payload ) };
-            auto const ranks{ std::span{ reinterpret_cast<std::uint16_t const *>( payload + it->payload_bytes ), Bitmap::layout_type::word_count } };
-            auto const word_at{ static_cast<std::size_t>( std::ranges::upper_bound( ranks, within ) - ranks.begin() ) - 1U };
+            auto const * const ranks{ reinterpret_cast<std::uint16_t const *>( payload + it->payload_bytes ) };
+            auto const later{ std::span{ ranks + 1, word_count - 1U } };
+            auto const word_at{ static_cast<std::size_t>( std::ranges::upper_bound( later, within ) - later.begin() ) };
             return compose( static_cast<std::uint32_t>( word_at * 64U ) + detail::select_in_word( words[ word_at ], within - ranks[ word_at ] ) );
         }
     }
