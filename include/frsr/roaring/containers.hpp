@@ -954,6 +954,55 @@ template <typename Layout, typename CowPolicy>
     return result;
 }
 
+// The smallest form of a non-empty set held as `run_count` runs: the runs as they are, an array of the values, or
+// a bitset.
+template <typename Layout>
+[[nodiscard]] constexpr container_kind choose_run_container_kind(
+    std::size_t const cardinality,
+    std::size_t const run_count,
+    std::size_t const bitset_threshold
+) noexcept {
+    auto const array_bytes { cardinality * sizeof( typename Layout::low_type ) };
+    auto const run_bytes   { run_count * sizeof( ::frsr::roaring::run<typename Layout::low_type> ) };
+    auto const bitset_bytes{ Layout::word_count * sizeof( std::uint64_t ) };
+    if ( cardinality >= bitset_threshold && bitset_bytes <= array_bytes && bitset_bytes <= run_bytes ) {
+        return container_kind::bitset;
+    }
+    return run_bytes <= array_bytes ? container_kind::run : container_kind::array;
+}
+
+// A standalone run container in the smallest of its three forms.
+template <typename Layout, typename CowPolicy = cow_value_semantics>
+[[nodiscard]] inline container_handle<Layout, CowPolicy> make_container_from_runs(
+    run_container<Layout> run,
+    std::size_t const bitset_threshold
+) {
+    if ( run.size() == 0 ) {
+        return container_handle<Layout, CowPolicy>{};
+    }
+
+    switch ( choose_run_container_kind<Layout>( run.size(), run.runs.size(), bitset_threshold ) ) {
+        case container_kind::bitset: {
+            word_array<Layout> words{};
+            for ( auto const & current : run.runs ) {
+                apply_range_to_words<Layout>( words, current.begin, current.end, range_operation::add );
+            }
+            return make_container_from_words<Layout, CowPolicy>( words, bitset_threshold );
+        }
+        case container_kind::run: return handle_from_run_container<Layout, CowPolicy>( run );
+        case container_kind::array: break;
+    }
+
+    // Expand the runs into a sorted array handle.
+    container_handle<Layout, CowPolicy> result;
+    auto array{ result.as_array() };
+    resize_uninitialized( array.values, run.size() );
+    auto * out{ array.values.data() };
+    run.for_each( [&]( typename Layout::low_type const value ) { *out++ = value; } );
+    array.sync_header();
+    return result;
+}
+
 // A freshly built run container (at least one run, header synced) in the smallest of its three forms: the
 // runs as they are, an array of the values, or a bitset.
 template <typename Layout, typename CowPolicy>
@@ -1035,6 +1084,39 @@ template <typename Layout, typename CowPolicy>
     return container;
 }
 
+// Removal of [begin, end] from a run container: the runs are clipped to the range's two sides and the rest keeps
+// its run form while that is the smaller one (as the run-array and run-run differences do).
+template <typename Layout, typename CowPolicy>
+[[nodiscard]] inline container_handle<Layout, CowPolicy> remove_run_range(
+    container_handle<Layout, CowPolicy> const & container,
+    typename Layout::low_type const begin,
+    typename Layout::low_type const end,
+    std::size_t const bitset_threshold
+) {
+    using low_type = typename Layout::low_type;
+    using run_type = ::frsr::roaring::run<low_type>;
+    auto const source{ container.as_run().runs };
+    run_container<Layout> kept;
+    kept.runs.reserve( static_cast<std::uint32_t>( source.size() + 1U ) );
+    auto const keep{ [ & ]( low_type const first, low_type const last ) {
+        kept.runs.push_back( run_type{ first, last } );
+        kept.cardinality += static_cast<typename run_container<Layout>::cardinality_type>( last - first + 1U );
+    } };
+    for ( auto const & current : source ) {
+        if ( current.end < begin || current.begin > end ) {
+            keep( current.begin, current.end );
+            continue;
+        }
+        if ( current.begin < begin ) {
+            keep( current.begin, static_cast<low_type>( begin - 1U ) );
+        }
+        if ( current.end > end ) {
+            keep( static_cast<low_type>( end + 1U ), current.end );
+        }
+    }
+    return make_container_from_runs<Layout, CowPolicy>( std::move( kept ), bitset_threshold );
+}
+
 // Applies add/remove/flip of the closed range [begin, end] to one chunk's
 // container (an empty handle for an absent chunk).
 template <typename Layout, typename CowPolicy, typename RunSelectionPolicy = run_selection_eager>
@@ -1047,6 +1129,9 @@ template <typename Layout, typename CowPolicy, typename RunSelectionPolicy = run
 ) {
     using handle_type = container_handle<Layout, CowPolicy>;
     using low_type    = typename Layout::low_type;
+    if ( op == range_operation::remove && container.cardinality() != 0 && container.kind() == container_kind::run ) {
+        return remove_run_range<Layout, CowPolicy>( container, begin, end, bitset_threshold );
+    }
     if ( op != range_operation::flip ) {
         auto words{ words_from_container<Layout>( container ) };
         apply_range_to_words<Layout>( words, begin, end, op );

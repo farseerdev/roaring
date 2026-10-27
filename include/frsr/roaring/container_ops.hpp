@@ -18,8 +18,10 @@ namespace frsr::roaring::detail {
 // RunSelectionPolicy gates only the array/bitset-vs-run size-estimate decisions
 // this function forwards into make_container_from_sorted_vector (the array∩array,
 // array∩run, array-andnot-run, and array∩bitset/array-andnot-bitset arms below).
-// The run∩run / run∪run / run-andnot-run / union(run,array) arms feed an
-// already-run-shaped kernel result into make_container_from_runs, a materially
+// The run∩run / run∪run / run-andnot-run / run-andnot-array / run-andnot-bitset /
+// union(run,array) arms feed an already-run-shaped kernel result into
+// make_container_from_runs (run-andnot-bitset counts its survivors' runs and
+// chooses the form from that count, by the same rule), a materially
 // different decision (keep-vs-downgrade an existing run result, not "should sorted
 // values become a run") that is intentionally left unconditional: under
 // run_selection_lazy those kernels are only reachable at all if an operand was
@@ -137,6 +139,11 @@ template <typename Layout, typename CowPolicy = cow_value_semantics, typename Ru
             }
             return filter_into_container( right, left, true );
         } else if constexpr ( std::same_as<left_type, run_cref<Layout, CowPolicy>> && std::same_as<right_type, bitset_cref<Layout, CowPolicy>> ) {
+            if ( op == set_operation::bit_andnot ) {
+                // A subtraction only thins the left runs: they stay runs while that is the smaller form (like the
+                // run-array and run-run arms), instead of being scattered into a bitset.
+                return difference_run_bitset<Layout, CowPolicy>( left, right, bitset_threshold );
+            }
             return make_bitset_container_from_words<Layout, CowPolicy>( combine_run_bitset_words( left, right, op ) );
         } else if constexpr ( std::same_as<left_type, bitset_cref<Layout, CowPolicy>> && std::same_as<right_type, run_cref<Layout, CowPolicy>> ) {
             if ( op == set_operation::bit_andnot ) {

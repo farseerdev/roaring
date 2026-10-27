@@ -285,6 +285,7 @@ if(FRSR_ROARING_BUILD_TESTS)
         tests/bitmap_concurrent_reads.cpp
         tests/kernel_coverage.cpp
         tests/run_add_sorted.cpp
+        tests/andnot_keeps_runs.cpp
         tests/contains_states.cpp
         tests/lazy_fold_state.cpp
         tests/bitmap_const_concurrency.cpp
@@ -350,6 +351,7 @@ if(FRSR_ROARING_BUILD_TESTS)
             tests/interop_crosscheck.cpp
             tests/symmetric_difference_crosscheck.cpp
             tests/ranked_view_crosscheck.cpp
+            tests/andnot_runs_crosscheck.cpp
         )
         target_link_libraries(frsr_roaring_croaring_crosscheck
             PRIVATE

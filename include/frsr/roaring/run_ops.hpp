@@ -1,12 +1,16 @@
 #pragma once
 
 #include <frsr/roaring/containers.hpp>
+#include <frsr/roaring/bitset_ops.hpp>
 #include <frsr/roaring/hw_info.hpp>
 
 #include <algorithm>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <tuple>
+#include <utility>
 
 namespace frsr::roaring::detail {
 
@@ -422,36 +426,263 @@ template <typename Layout>
     return n;
 }
 
+// ---- run minus bitset ---------------------------------------------------------------------------------
+//
+// The survivors of a run container after a bitset is taken out of it are the zero bits of the bitset under the
+// runs. They are read as a stream of words (a word where the bitset is all zero or all one under the runs is
+// skipped four at a time) and consumed twice: once to count them and their runs, which decides the form the result
+// takes before anything is built, and once to write that form. A result with more runs than a bitset holds is
+// written as words.
+//
+// [croaring-ref] deps/croaring/src/containers/mixed_andnot.c:run_bitset_container_andnot
+
+// Calls sink.word( index, survivors ) for every word with survivors that is not part of a longer stretch and
+// sink.ones( first index, count ) for the stretches of words that are all survivors, in index order. A sink call
+// returns false to stop the scan, which then returns false too. The words that are not reported have no survivors.
+template <typename Layout, typename CowPolicy, typename Sink>
+[[ gnu::always_inline ]] inline bool scan_run_bitset_difference(
+    run_cref<Layout, CowPolicy> const lhs,
+    word_array<Layout> const & bits,
+    Sink & sink
+) {
+    constexpr auto none{ ~std::size_t{ 0 } };
+    constexpr auto all { ~std::uint64_t{ 0 } };
+    auto pending_index{ none };
+    auto pending{ std::uint64_t{ 0 } };
+    auto const flush{ [ & ]() {
+        auto const index{ std::exchange( pending_index, none ) };
+        return index == none || sink.word( index, pending );
+    } };
+    auto const put{ [ & ]( std::size_t const index, std::uint64_t const survivors ) {
+        if ( index == pending_index ) {
+            pending |= survivors;
+            return true;
+        }
+        if ( !flush() ) {
+            return false;
+        }
+        pending_index = index;
+        pending       = survivors;
+        return true;
+    } };
+    for ( auto const & current : lhs.runs ) {
+        auto const first_word{ static_cast<std::size_t>( current.begin ) >> 6U };
+        auto const last_word { static_cast<std::size_t>( current.end   ) >> 6U };
+        auto const first_mask{ all << ( current.begin & 63U ) };
+        auto const last_mask { all >> ( 63U - ( current.end & 63U ) ) };
+        if ( first_word == last_word ) {
+            if ( !put( first_word, first_mask & last_mask & ~bits[ first_word ] ) ) {
+                return false;
+            }
+            continue;
+        }
+        if ( !put( first_word, first_mask & ~bits[ first_word ] ) ) {
+            return false;
+        }
+        auto index{ first_word + 1U };
+        while ( index < last_word ) {
+            auto const word{ bits[ index ] };
+            if ( word != 0 && word != all ) {
+                if ( !flush() || !sink.word( index, ~word ) ) {
+                    return false;
+                }
+                ++index;
+                continue;
+            }
+            auto end{ index + 1U };
+            if ( word == 0 ) {
+                while ( end + 4U <= last_word && ( bits[ end ] | bits[ end + 1U ] | bits[ end + 2U ] | bits[ end + 3U ] ) == 0 ) {
+                    end += 4U;
+                }
+                while ( end < last_word && bits[ end ] == 0 ) {
+                    ++end;
+                }
+                if ( !flush() || !sink.ones( index, end - index ) ) {
+                    return false;
+                }
+            } else {
+                while ( end + 4U <= last_word && ( bits[ end ] & bits[ end + 1U ] & bits[ end + 2U ] & bits[ end + 3U ] ) == all ) {
+                    end += 4U;
+                }
+                while ( end < last_word && bits[ end ] == all ) {
+                    ++end;
+                }
+            }
+            index = end;
+        }
+        if ( !put( last_word, last_mask & ~bits[ last_word ] ) ) {
+            return false;
+        }
+    }
+    return flush();
+}
+
+// Counts the survivors and their runs, giving up once the runs are more than `run_limit`.
+struct run_survivor_counter {
+    std::size_t   run_limit;
+    std::size_t   cardinality{ 0 };
+    std::size_t   runs{ 0 };
+    std::size_t   last_index{ ~std::size_t{ 0 } };
+    std::uint64_t last_top{ 0 };
+
+    [[nodiscard]] std::uint64_t carry_into( std::size_t const index ) const noexcept {
+        return index == last_index + 1U ? last_top : 0U;
+    }
+    [[nodiscard]] bool word( std::size_t const index, std::uint64_t const survivors ) noexcept {
+        auto const starts{ survivors & ~( ( survivors << 1U ) | carry_into( index ) ) };
+        runs        += static_cast<std::size_t>( std::popcount( starts ) );
+        cardinality += static_cast<std::size_t>( std::popcount( survivors ) );
+        last_index = index;
+        last_top   = survivors >> 63U;
+        return runs <= run_limit;
+    }
+    [[nodiscard]] bool ones( std::size_t const first_index, std::size_t const count ) noexcept {
+        runs        += carry_into( first_index ) == 0 ? 1U : 0U;
+        cardinality += count * 64U;
+        last_index = first_index + count - 1U;
+        last_top   = 1U;
+        return runs <= run_limit;
+    }
+};
+
+// Writes the survivors as runs, `out` holding exactly as many as the counter found.
+template <typename Layout>
+struct run_survivor_writer {
+    using low_type = typename Layout::low_type;
+    using run_type = ::frsr::roaring::run<low_type>;
+
+    run_type    * out;
+    std::size_t   written{ 0 };
+    bool          open{ false };
+    std::size_t   open_begin{ 0 };
+    std::size_t   last_index{ ~std::size_t{ 0 } };
+
+    void close_at( std::size_t const end ) noexcept {
+        out[ written++ ] = run_type{ static_cast<low_type>( open_begin ), static_cast<low_type>( end ) };
+        open = false;
+    }
+    void leave_open_run_if_not_adjacent( std::size_t const index ) noexcept {
+        if ( open && index != last_index + 1U ) {
+            close_at( last_index * 64U + 63U );
+        }
+    }
+    [[nodiscard]] bool word( std::size_t const index, std::uint64_t survivors ) noexcept {
+        leave_open_run_if_not_adjacent( index );
+        auto const base{ index * 64U };
+        if ( open ) {
+            auto const lead{ static_cast<unsigned>( std::countr_one( survivors ) ) };
+            if ( lead == 64U ) {
+                last_index = index;
+                return true;
+            }
+            close_at( base + lead - 1U );
+            survivors &= all_bits_from( lead );
+        }
+        while ( survivors != 0 ) {
+            auto const start { static_cast<unsigned>( std::countr_zero( survivors ) ) };
+            auto const length{ static_cast<unsigned>( std::countr_one( survivors >> start ) ) };
+            if ( start + length == 64U ) {
+                open       = true;
+                open_begin = base + start;
+                break;
+            }
+            out[ written++ ] = run_type{ static_cast<low_type>( base + start ), static_cast<low_type>( base + start + length - 1U ) };
+            survivors &= all_bits_from( start + length );
+        }
+        last_index = index;
+        return true;
+    }
+    [[nodiscard]] bool ones( std::size_t const first_index, std::size_t const count ) noexcept {
+        leave_open_run_if_not_adjacent( first_index );
+        if ( !open ) {
+            open       = true;
+            open_begin = first_index * 64U;
+        }
+        last_index = first_index + count - 1U;
+        return true;
+    }
+    void finish() noexcept {
+        if ( open ) {
+            close_at( last_index * 64U + 63U );
+        }
+    }
+
+private:
+    // The bits at and above `position` (below 64).
+    [[nodiscard]] static constexpr std::uint64_t all_bits_from( unsigned const position ) noexcept {
+        return ~std::uint64_t{ 0 } << position;
+    }
+};
+
+// Run minus bitset, in the smallest of its three forms.
 template <typename Layout, typename CowPolicy = cow_value_semantics>
-[[nodiscard]] inline container_handle<Layout, CowPolicy> make_container_from_runs(
-    run_container<Layout> run,
+[[nodiscard]] inline container_handle<Layout, CowPolicy> difference_run_bitset(
+    run_cref<Layout, CowPolicy> const lhs,
+    bitset_cref<Layout, CowPolicy> const rhs,
     std::size_t const bitset_threshold
 ) {
-    if ( run.size() == 0 ) {
-        return container_handle<Layout, CowPolicy>{};
+    using handle_type = container_handle<Layout, CowPolicy>;
+    using run_type    = ::frsr::roaring::run<typename Layout::low_type>;
+    constexpr auto bitset_bytes{ Layout::word_count * sizeof( std::uint64_t ) };
+    // More runs than this take more bytes than a bitset does.
+    constexpr auto run_limit{ bitset_bytes / sizeof( run_type ) };
+    auto const & bits{ rhs.words.as_array() };
+
+    run_survivor_counter counter{ .run_limit = run_limit };
+    auto const counted{ scan_run_bitset_difference<Layout, CowPolicy>( lhs, bits, counter ) };
+    if ( counted && counter.cardinality == 0 ) {
+        return handle_type{};
+    }
+    auto const kind{ counted
+        ? choose_run_container_kind<Layout>( counter.cardinality, counter.runs, bitset_threshold )
+        : container_kind::bitset
+    };
+
+    if ( kind != container_kind::bitset ) {
+        auto result{ handle_type::make_run() };
+        auto ref{ result.as_run() };
+        ref.runs.resize_uninitialized( static_cast<std::uint32_t>( counter.runs ) );
+        run_survivor_writer<Layout> writer{ .out = ref.runs.data() };
+        std::ignore = scan_run_bitset_difference<Layout, CowPolicy>( lhs, bits, writer );
+        writer.finish();
+        assert( writer.written == counter.runs );
+        ref.sync_header();
+        return kind == container_kind::run ? std::move( result ) : array_handle_from_container<Layout, CowPolicy>( result );
     }
 
-    auto const array_bytes{ run.size() * sizeof( typename Layout::low_type ) };
-    auto const run_bytes{ run.runs.size() * sizeof( typename run_container<Layout>::run ) };
-    auto const bitset_bytes{ Layout::word_count * sizeof( std::uint64_t ) };
-    if ( run.size() >= bitset_threshold && bitset_bytes <= array_bytes && bitset_bytes <= run_bytes ) {
-        word_array<Layout> words{};
-        for ( auto const & current : run.runs ) {
-            apply_range_to_words<Layout>( words, current.begin, current.end, range_operation::add );
+    // The survivors as words: the bitset's zero bits under the runs, nothing elsewhere.
+    auto result{ handle_type::make_bitset_uninitialized() };
+    auto * const out{ static_cast<std::uint64_t *>( result.payload_data_raw() ) };
+    auto next_word{ std::size_t{ 0 } };
+    for ( auto const & current : lhs.runs ) {
+        auto const first_word{ static_cast<std::size_t>( current.begin ) >> 6U };
+        auto const last_word { static_cast<std::size_t>( current.end   ) >> 6U };
+        auto const first_mask{ ~std::uint64_t{ 0 } << ( current.begin & 63U ) };
+        auto const last_mask { ~std::uint64_t{ 0 } >> ( 63U - ( current.end & 63U ) ) };
+        if ( first_word < next_word ) {  // shares its first word with the previous run
+            out[ first_word ] |= first_mask & ( first_word == last_word ? last_mask : ~std::uint64_t{ 0 } ) & ~bits[ first_word ];
+        } else {
+            std::fill( out + next_word, out + first_word, std::uint64_t{ 0 } );
+            out[ first_word ] = first_mask & ( first_word == last_word ? last_mask : ~std::uint64_t{ 0 } ) & ~bits[ first_word ];
         }
-        return make_container_from_words<Layout, CowPolicy>( words, bitset_threshold );
+        if ( first_word != last_word ) {
+            for ( auto index{ first_word + 1U }; index < last_word; ++index ) {
+                out[ index ] = ~bits[ index ];
+            }
+            out[ last_word ] = last_mask & ~bits[ last_word ];
+        }
+        next_word = last_word + 1U;
     }
-    if ( run_bytes <= array_bytes ) {
-        return handle_from_run_container<Layout, CowPolicy>( run );
+    std::fill( out + next_word, out + Layout::word_count, std::uint64_t{ 0 } );
+    auto const cardinality{ counted ? counter.cardinality : popcount_words( out, Layout::word_count ) };
+    if ( cardinality == 0 ) {
+        return handle_type{};
     }
-
-    // Expand the runs into a sorted array handle.
-    container_handle<Layout, CowPolicy> result;
-    auto array{ result.as_array() };
-    resize_uninitialized( array.values, run.size() );
-    auto * out{ array.values.data() };
-    run.for_each( [&]( typename Layout::low_type const value ) { *out++ = value; } );
-    array.sync_header();
+    if ( !is_bitset_cardinality<Layout>( cardinality, bitset_threshold ) ) {
+        return array_from_bitset<Layout, CowPolicy>( std::as_const( result ).as_bitset(), static_cast<std::uint32_t>( cardinality ) );
+    }
+    result.set_cardinality( static_cast<std::uint32_t>( cardinality ) );
+    result.mark_endpoints_stale();
     return result;
 }
 
