@@ -121,7 +121,7 @@ template <typename Layout, typename CowPolicy = cow_value_semantics, typename Ru
                 return make_container_from_sorted_vector<Layout, CowPolicy, RunSelectionPolicy>( intersect_array_run<Layout, CowPolicy>( right, left ), bitset_threshold );
             }
             if ( op == set_operation::bit_andnot ) {
-                return make_container_from_runs<Layout, CowPolicy>( difference_run_array<Layout, CowPolicy>( left, right ), bitset_threshold );
+                return difference_run_array<Layout, CowPolicy>( left, right, bitset_threshold );
             }
         } else if constexpr ( std::same_as<left_type, array_cref<Layout, CowPolicy>> && std::same_as<right_type, bitset_cref<Layout, CowPolicy>> ) {
             if ( op == set_operation::bit_or ) {
@@ -164,7 +164,7 @@ template <typename Layout, typename CowPolicy = cow_value_semantics, typename Ru
                 return make_container_from_runs<Layout, CowPolicy>( union_run_run<Layout, CowPolicy>( left, right ), bitset_threshold );
             }
             if ( op == set_operation::bit_andnot ) {
-                return make_container_from_runs<Layout, CowPolicy>( difference_run_run<Layout, CowPolicy>( left, right ), bitset_threshold );
+                return difference_run_run<Layout, CowPolicy>( left, right, bitset_threshold );
             }
         }
 

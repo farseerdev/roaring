@@ -298,12 +298,17 @@ template <typename Layout, typename CowPolicy = cow_value_semantics>
 }
 
 template <typename Layout, typename CowPolicy = cow_value_semantics>
-[[nodiscard]] inline run_container<Layout> difference_run_run(
+[[nodiscard]] inline container_handle<Layout, CowPolicy> difference_run_run(
     run_cref<Layout, CowPolicy> const lhs,
-    run_cref<Layout, CowPolicy> const rhs
+    run_cref<Layout, CowPolicy> const rhs,
+    std::size_t const bitset_threshold
 ) {
-    run_container<Layout> result;
-    result.runs.reserve( lhs.runs.size() );
+    auto result{ container_handle<Layout, CowPolicy>::make_run() };
+    auto ref{ result.as_run() };
+    // Cutting runs out of runs leaves at most one more run per run taken out.
+    ref.runs.resize_uninitialized( static_cast<std::uint32_t>( lhs.runs.size() + rhs.runs.size() ) );
+    auto * const out{ ref.runs.data() };
+    std::size_t n{ 0 };
 
     auto ri{ rhs.runs.begin() };
     for ( auto const & left : lhs.runs ) {
@@ -317,8 +322,7 @@ template <typename Layout, typename CowPolicy = cow_value_semantics>
         while ( scan != rhs.runs.end() && scan->begin <= left.end ) {
             if ( current_begin < scan->begin ) {
                 auto const end{ static_cast<typename Layout::low_type>( scan->begin - 1U ) };
-                result.runs.push_back( run<typename Layout::low_type>{ current_begin, end } );
-                result.cardinality += static_cast<std::size_t>( end ) - static_cast<std::size_t>( current_begin ) + 1U;
+                out[ n++ ] = ::frsr::roaring::run<typename Layout::low_type>{ current_begin, end };
             }
 
             if ( scan->end == std::numeric_limits<typename Layout::low_type>::max() || scan->end >= left.end ) {
@@ -331,20 +335,29 @@ template <typename Layout, typename CowPolicy = cow_value_semantics>
         }
 
         if ( !exhausted && current_begin <= left.end ) {
-            result.runs.push_back( run<typename Layout::low_type>{ current_begin, left.end } );
-            result.cardinality += static_cast<std::size_t>( left.end ) - static_cast<std::size_t>( current_begin ) + 1U;
+            out[ n++ ] = ::frsr::roaring::run<typename Layout::low_type>{ current_begin, left.end };
         }
     }
-    return result;
+    if ( n == 0 ) {
+        return container_handle<Layout, CowPolicy>{};
+    }
+    ref.runs.resize_uninitialized( static_cast<std::uint32_t>( n ) );
+    ref.sync_header();
+    return settle_run_result<Layout, CowPolicy>( std::move( result ), bitset_threshold );
 }
 
 template <typename Layout, typename CowPolicy = cow_value_semantics>
-[[nodiscard]] inline run_container<Layout> difference_run_array(
+[[nodiscard]] inline container_handle<Layout, CowPolicy> difference_run_array(
     run_cref<Layout, CowPolicy> const lhs,
-    array_cref<Layout, CowPolicy> const rhs
+    array_cref<Layout, CowPolicy> const rhs,
+    std::size_t const bitset_threshold
 ) {
-    run_container<Layout> result;
-    result.runs.reserve( lhs.runs.size() + rhs.values.size() );
+    auto result{ container_handle<Layout, CowPolicy>::make_run() };
+    auto ref{ result.as_run() };
+    // Every value taken out splits at most one run in two.
+    ref.runs.resize_uninitialized( static_cast<std::uint32_t>( lhs.runs.size() + rhs.values.size() ) );
+    auto * const out{ ref.runs.data() };
+    std::size_t n{ 0 };
 
     auto value_it{ rhs.values.begin() };
     for ( auto const & run : lhs.runs ) {
@@ -358,8 +371,7 @@ template <typename Layout, typename CowPolicy = cow_value_semantics>
         while ( scan != rhs.values.end() && *scan <= run.end ) {
             if ( current_begin < *scan ) {
                 auto const end{ static_cast<typename Layout::low_type>( *scan - 1U ) };
-                result.runs.push_back( frsr::roaring::run<typename Layout::low_type>{ current_begin, end } );
-                result.cardinality += static_cast<std::size_t>( end ) - static_cast<std::size_t>( current_begin ) + 1U;
+                out[ n++ ] = ::frsr::roaring::run<typename Layout::low_type>{ current_begin, end };
             }
             if ( *scan == std::numeric_limits<typename Layout::low_type>::max() ) {
                 exhausted = true;
@@ -371,11 +383,15 @@ template <typename Layout, typename CowPolicy = cow_value_semantics>
 
         value_it = scan;
         if ( !exhausted && current_begin <= run.end ) {
-            result.runs.push_back( frsr::roaring::run<typename Layout::low_type>{ current_begin, run.end } );
-            result.cardinality += static_cast<std::size_t>( run.end ) - static_cast<std::size_t>( current_begin ) + 1U;
+            out[ n++ ] = ::frsr::roaring::run<typename Layout::low_type>{ current_begin, run.end };
         }
     }
-    return result;
+    if ( n == 0 ) {
+        return container_handle<Layout, CowPolicy>{};
+    }
+    ref.runs.resize_uninitialized( static_cast<std::uint32_t>( n ) );
+    ref.sync_header();
+    return settle_run_result<Layout, CowPolicy>( std::move( result ), bitset_threshold );
 }
 
 // The symmetric difference of two run lists, merged by begin with every run exclusive-or-appended to what is
