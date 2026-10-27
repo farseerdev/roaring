@@ -7992,6 +7992,9 @@ enum class bop : std::uint8_t {
     flip,                // copy of a, then flip_closed_range
     copy_only,           // the control for the copying operations
     to_array,            // every value of a decoded into a reused buffer
+    andnot_inplace,      // copy of a, then a -= b
+    and_after_andnot,    // a is first reduced to a - b (untimed), then timed: a & c
+    and_inplace_after_andnot,   // the same, timed: a copy of a, then a &= c
 };
 
 struct band {
@@ -7999,6 +8002,8 @@ struct band {
     std::string shape;
     bop op;
     shared_values32 a, b;
+    shared_values32 c;                           // the *_after_andnot operations: the operand of the timed intersection
+    bool run_encode_a{};                         // a is fully run-optimized (a bitset a stays a run when that is smaller)
     std::uint32_t range_first{}, range_last{};   // flip
     std::uint32_t spare_value{};                 // or_inplace_spare
     std::int64_t ops_per_run{ 1 };
@@ -8027,8 +8032,18 @@ struct frsr_band_registrar {
             auto * const s = new state;
             s->a.add_many( *d.a );
             if ( d.b ) { s->b.add_many( *d.b ); }
-            s->a.optimize_keep_bitsets();
+            if ( d.run_encode_a ) {
+                s->a.optimize();
+            } else {
+                s->a.optimize_keep_bitsets();
+            }
             s->b.optimize_keep_bitsets();
+            if ( d.op == bop::and_after_andnot || d.op == bop::and_inplace_after_andnot ) {
+                s->a -= s->b;
+                s->b = Bitmap{};
+                s->b.add_many( *d.c );
+                s->b.optimize_keep_bitsets();
+            }
             s->out.resize( d.a->size() );
             return s;
         };
@@ -8037,7 +8052,10 @@ struct frsr_band_registrar {
             std::int64_t checksum = 0;
             for ( std::size_t i = 0; i < d.repeat; ++i ) {
                 switch ( d.op ) {
-                    case bop::and_op:    { Bitmap const r{ s->a & s->b }; checksum += static_cast<std::int64_t>( r.size() ); break; }
+                    case bop::and_op:
+                    case bop::and_after_andnot: { Bitmap const r{ s->a & s->b }; checksum += static_cast<std::int64_t>( r.size() ); break; }
+                    case bop::andnot_inplace:           { Bitmap t{ s->a }; t -= s->b; checksum += static_cast<std::int64_t>( t.size() ); break; }
+                    case bop::and_inplace_after_andnot: { Bitmap t{ s->a }; t &= s->b; checksum += static_cast<std::int64_t>( t.size() ); break; }
                     case bop::or_op:     { Bitmap const r{ s->a | s->b }; checksum += static_cast<std::int64_t>( r.size() ); break; }
                     case bop::andnot_op: { Bitmap const r{ s->a - s->b }; checksum += static_cast<std::int64_t>( r.size() ); break; }
                     case bop::or_inplace:        { Bitmap t{ s->a }; t |= s->b; checksum += static_cast<std::int64_t>( t.size() ); break; }
@@ -8086,6 +8104,13 @@ struct cpp_band_registrar {
             if ( d.b ) { roaring_bitmap_add_many( s->b.r, d.b->size(), d.b->data() ); }
             roaring_bitmap_run_optimize( s->a.r );
             roaring_bitmap_run_optimize( s->b.r );
+            if ( d.op == bop::and_after_andnot || d.op == bop::and_inplace_after_andnot ) {
+                roaring_bitmap_andnot_inplace( s->a.r, s->b.r );
+                roaring_bitmap_free( s->b.r );
+                s->b.r = Arm::create();
+                roaring_bitmap_add_many( s->b.r, d.c->size(), d.c->data() );
+                roaring_bitmap_run_optimize( s->b.r );
+            }
             s->out.resize( d.a->size() );
             return s;
         };
@@ -8094,7 +8119,10 @@ struct cpp_band_registrar {
             std::int64_t checksum = 0;
             for ( std::size_t i = 0; i < d.repeat; ++i ) {
                 switch ( d.op ) {
-                    case bop::and_op:    { croaring_handle const r{ roaring_bitmap_and( s->a.r, s->b.r ) };    checksum += static_cast<std::int64_t>( roaring_bitmap_get_cardinality( r.r ) ); break; }
+                    case bop::and_op:
+                    case bop::and_after_andnot: { croaring_handle const r{ roaring_bitmap_and( s->a.r, s->b.r ) };    checksum += static_cast<std::int64_t>( roaring_bitmap_get_cardinality( r.r ) ); break; }
+                    case bop::andnot_inplace:           { croaring_handle const t{ Arm::copy( s->a.r ) }; roaring_bitmap_andnot_inplace( t.r, s->b.r ); checksum += static_cast<std::int64_t>( roaring_bitmap_get_cardinality( t.r ) ); break; }
+                    case bop::and_inplace_after_andnot: { croaring_handle const t{ Arm::copy( s->a.r ) }; roaring_bitmap_and_inplace( t.r, s->b.r ); checksum += static_cast<std::int64_t>( roaring_bitmap_get_cardinality( t.r ) ); break; }
                     case bop::or_op:     { croaring_handle const r{ roaring_bitmap_or( s->a.r, s->b.r ) };     checksum += static_cast<std::int64_t>( roaring_bitmap_get_cardinality( r.r ) ); break; }
                     case bop::andnot_op: { croaring_handle const r{ roaring_bitmap_andnot( s->a.r, s->b.r ) }; checksum += static_cast<std::int64_t>( roaring_bitmap_get_cardinality( r.r ) ); break; }
                     case bop::or_inplace:        { croaring_handle const t{ Arm::copy( s->a.r ) }; roaring_bitmap_or_inplace( t.r, s->b.r ); checksum += static_cast<std::int64_t>( roaring_bitmap_get_cardinality( t.r ) ); break; }
@@ -8326,6 +8354,80 @@ static void register_array_array() {
     }
 }
 
+// ---- run receiver under subtraction -------------------------------------------------------------------
+// One chunk holding the single run [0, 59999], minus operands of each kind: the run keeps its runs where they are
+// the smallest form, so the later intersections are measured over the kept runs too. A bitset operand is the
+// receiver's values but the survivors, plus every second value above the receiver (thousands of runs, so it is a
+// bitset in both libraries).
+static void register_run_andnot() {
+    constexpr std::uint32_t base = 5U << 16;
+    constexpr std::uint32_t run_last = 59'999;
+    auto const receiver = [&]() { values32 v; for ( std::uint32_t i = 0; i <= run_last; ++i ) { v.push_back( base + i ); } return share( std::move( v ) ); }();
+    auto const bitset_leaving = [&]( auto const & survives ) {
+        values32 v;
+        for ( std::uint32_t i = 0; i < 65536; ++i ) {
+            if ( i <= run_last ? !survives( i ) : i % 2U == 0U ) { v.push_back( base + i ); }
+        }
+        return share( std::move( v ) );
+    };
+    struct operand { std::string name; shared_values32 values; shared_values32 own_receiver{}; };
+    std::vector<operand> operands;
+    operands.push_back( { "run_array/holes=4", share( values32{ base + 100, base + 20'000, base + 40'000, base + 59'000 } ) } );
+    {
+        values32 v;
+        for ( std::uint32_t i = 0; i < 4000; i += 4 ) { v.push_back( base + i ); }
+        operands.push_back( { "run_array/holes=1000", share( std::move( v ) ) } );
+    }
+    {
+        values32 v;
+        for ( std::uint32_t i = 1000; i <= 2000; ++i ) { v.push_back( base + i ); }
+        operands.push_back( { "run_run/one_cut", share( std::move( v ) ) } );
+    }
+    operands.push_back( { "run_bitset/residue=one_stretch", bitset_leaving( []( std::uint32_t const i ) { return i >= 100 && i < 40'100; } ) } );
+    operands.push_back( { "run_bitset/residue=three_stretches", bitset_leaving( []( std::uint32_t const i ) { return ( i >= 10 && i <= 20 ) || ( i >= 5'000 && i < 5'500 ) || i == run_last; } ) } );
+    operands.push_back( { "run_bitset/residue=nine_values", bitset_leaving( []( std::uint32_t const i ) { return i == 3 || i == 12 || i == 13 || i == 70 || i == 71 || i == 4'000 || i == 4'001 || i == 59'000 || i == run_last; } ) } );
+    operands.push_back( { "run_bitset/residue=dense", bitset_leaving( []( std::uint32_t const i ) { return i % 3U == 0U; } ) } );
+    {
+        // The receiver here is [0, 19999]; the operand is a bitset that starts after it.
+        values32 shorter;
+        for ( std::uint32_t i = 0; i < 20'000; ++i ) { shorter.push_back( base + i ); }
+        values32 v;
+        for ( std::uint32_t i = 30'000; i < 65536; ++i ) { if ( i % 3U != 0U ) { v.push_back( base + i ); } }
+        operands.push_back( { "run_bitset/no_overlap", share( std::move( v ) ), share( std::move( shorter ) ) } );
+    }
+    // The intersection operand that follows: a run that covers half of the receiver.
+    values32 later;
+    for ( std::uint32_t i = 15'000; i < 45'000; ++i ) { later.push_back( base + i ); }
+    auto const shared_later = share( std::move( later ) );
+    for ( auto const & o : operands ) {
+        for ( auto const [op, name] : { std::pair{ bop::andnot_inplace, "RunAndNotInplace" }, std::pair{ bop::andnot_op, "RunAndNot" } } ) {
+            band d;
+            d.op = op;
+            d.op_name = name;
+            d.shape = o.name;
+            d.a = o.own_receiver ? o.own_receiver : receiver;
+            d.b = o.values;
+            d.run_encode_a = true;
+            d.inner_reps = 50;
+            d.description = std::string( name ) + ": the one-run chunk [0, 59999] minus an operand (" + o.name + "), " + ( op == bop::andnot_inplace ? "on a copy sharing the runs of the receiver." : "materialized." );
+            register_band( d );
+        }
+        for ( auto const [op, name] : { std::pair{ bop::and_after_andnot, "AndAfterRunAndNot" }, std::pair{ bop::and_inplace_after_andnot, "AndInplaceAfterRunAndNot" } } ) {
+            band d;
+            d.op = op;
+            d.op_name = name;
+            d.shape = o.name;
+            d.a = o.own_receiver ? o.own_receiver : receiver;
+            d.b = o.values;
+            d.c = shared_later;
+            d.run_encode_a = true;
+            d.inner_reps = 50;
+            d.description = std::string( name ) + ": the one-run chunk [0, 59999] minus an operand (" + o.name + ", untimed), then intersected with the run [15000, 44999].";
+            register_band( d );
+        }
+    }
+}
+
 // ---- random-order contains --------------------------------------------------------------------------
 struct probe_set {
     values64 stored;                  // sorted
@@ -8549,6 +8651,7 @@ static void register_benchmarks() {
     register_sparse_flip();
     register_big_by_few_or_inplace();
     register_array_array();
+    register_run_andnot();
     register_random_contains_bands();
 }
 
