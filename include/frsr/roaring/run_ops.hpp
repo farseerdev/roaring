@@ -614,6 +614,30 @@ private:
     }
 };
 
+// Writes the survivors as array values, `out` holding exactly as many as the counter found.
+template <typename Layout>
+struct array_survivor_writer {
+    using low_type = typename Layout::low_type;
+
+    low_type * out;
+
+    [[nodiscard]] bool word( std::size_t const index, std::uint64_t survivors ) noexcept {
+        auto const base{ index * 64U };
+        while ( survivors != 0 ) {
+            *out++ = static_cast<low_type>( base + static_cast<unsigned>( std::countr_zero( survivors ) ) );
+            survivors &= survivors - 1U;
+        }
+        return true;
+    }
+    [[nodiscard]] bool ones( std::size_t const first_index, std::size_t const count ) noexcept {
+        auto const end{ ( first_index + count ) * 64U };
+        for ( auto value{ first_index * 64U }; value != end; ++value ) {
+            *out++ = static_cast<low_type>( value );
+        }
+        return true;
+    }
+};
+
 // Run minus bitset, in the smallest of its three forms.
 template <typename Layout, typename CowPolicy = cow_value_semantics>
 [[nodiscard]] inline container_handle<Layout, CowPolicy> difference_run_bitset(
@@ -638,7 +662,18 @@ template <typename Layout, typename CowPolicy = cow_value_semantics>
         : container_kind::bitset
     };
 
-    if ( kind != container_kind::bitset ) {
+    if ( kind == container_kind::array ) {
+        handle_type result;
+        auto array{ result.as_array() };
+        resize_uninitialized( array.values, counter.cardinality );
+        array_survivor_writer<Layout> writer{ .out = array.values.data() };
+        std::ignore = scan_run_bitset_difference<Layout, CowPolicy>( lhs, bits, writer );
+        assert( writer.out == array.values.data() + counter.cardinality );
+        array.sync_header();
+        return result;
+    }
+
+    if ( kind == container_kind::run ) {
         auto result{ handle_type::make_run() };
         auto ref{ result.as_run() };
         ref.runs.resize_uninitialized( static_cast<std::uint32_t>( counter.runs ) );
@@ -647,7 +682,7 @@ template <typename Layout, typename CowPolicy = cow_value_semantics>
         writer.finish();
         assert( writer.written == counter.runs );
         ref.sync_header();
-        return kind == container_kind::run ? std::move( result ) : array_handle_from_container<Layout, CowPolicy>( result );
+        return result;
     }
 
     // The survivors as words: the bitset's zero bits under the runs, nothing elsewhere.
