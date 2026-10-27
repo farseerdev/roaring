@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <span>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace {
@@ -24,6 +25,10 @@ using eager_bitmap       = bitmap<std::uint32_t>;
 using lazy_bitmap        = bitmap<std::uint32_t, default_container_set<std::uint32_t>, detail::cow_value_semantics, detail::run_selection_lazy>;
 using atomic_bitmap      = bitmap<std::uint32_t, default_container_set<std::uint32_t>, detail::cow_atomic_refcount>;
 using atomic_lazy_bitmap = bitmap<std::uint32_t, default_container_set<std::uint32_t>, detail::cow_atomic_refcount, detail::run_selection_lazy>;
+
+// A container set without bitsets: a run result that would be a bitset must come out as an array.
+using array_run_set    = std::variant<array_container<std::uint32_t>, run_container<std::uint32_t>>;
+using array_run_bitmap = bitmap<std::uint32_t, array_run_set>;
 
 enum class shape : std::uint8_t { empty, array, run, bitset };
 
@@ -363,6 +368,129 @@ TYPED_TEST( AndnotKeepsRuns, remove_many_sorted ) {
     }
     check( alternating, shape::bitset, "3000 alternating keys" );
     check( receiver_values_but( members_of( scattered_nine() ) ), shape::array, "all but 9 keys" );
+}
+
+// ---- the size boundary between runs and a bitset ---------------------------------------------------------------
+// A run container takes four bytes per run plus its two-byte count, so 2047 runs are smaller than the 8 KB bitset
+// and 2048 are not. Past 2048 runs the bitset difference stops counting and finishes in words.
+
+// The receiver minus isolated values 1, 3, ..., 2 * holes - 1: holes + 1 runs.
+[[nodiscard]] members receiver_with_holes( std::uint32_t const holes ) {
+    auto result{ receiver_members() };
+    for ( std::uint32_t hole{ 0 }; hole != holes; ++hole ) {
+        result[ 2U * hole + 1U ] = false;
+    }
+    return result;
+}
+
+TYPED_TEST( AndnotKeepsRuns, the_run_count_decides_between_runs_and_a_bitset ) {
+    auto const check{ [ & ]( std::uint32_t const runs, shape const expected_shape ) {
+        auto const survivors{ receiver_with_holes( runs - 1U ) };
+        auto const operand{ TestFixture::from_members( bitset_operand_leaving( survivors ) ) };
+        ASSERT_EQ( TestFixture::shape_of( operand ), shape::bitset );
+        TestFixture::expect_subtraction( operand, expected_shape, "run - bitset leaving isolated holes" );
+
+        members holes( chunk_size );
+        for ( std::uint32_t hole{ 0 }; hole != runs - 1U; ++hole ) {
+            holes[ 2U * hole + 1U ] = true;
+        }
+        TestFixture::expect_subtraction( TestFixture::from_members( holes ), expected_shape, "run - the holes as an array" );
+    } };
+    check( 2'047U, shape::run );
+    check( 2'048U, shape::bitset );
+    check( 2'049U, shape::bitset );
+}
+
+TYPED_TEST( AndnotKeepsRuns, a_bitset_leaving_more_runs_than_fit_but_few_values_makes_an_array ) {
+    // 2100 isolated survivors: the runs outnumber what a bitset holds, the values are fewer than a bitset's threshold.
+    members survivors( chunk_size );
+    for ( std::uint32_t index{ 0 }; index != 2'100U; ++index ) {
+        survivors[ 3U * index ] = true;
+    }
+    auto const operand{ TestFixture::from_members( bitset_operand_leaving( survivors ) ) };
+    ASSERT_EQ( TestFixture::shape_of( operand ), shape::bitset );
+    TestFixture::expect_subtraction( operand, shape::array, "run - bitset leaving 2100 isolated values" );
+    auto const as_runs{ TestFixture::from_members( bitset_operand_leaving( survivors ), true ) };
+    TestFixture::expect_subtraction( as_runs, shape::array, "run - run leaving 2100 isolated values" );
+}
+
+// ---- a receiver run that ends at the top of the chunk ------------------------------------------------------
+
+TYPED_TEST( AndnotKeepsRuns, a_run_ending_at_the_top_of_the_chunk ) {
+    auto const top_members{ closed_range_members( 10'000, 65'535 ) };
+    auto const check{ [ & ]( members const & survivors_in_run, shape const expected_shape, char const * const what ) {
+        members operand_members( chunk_size );
+        for ( std::uint32_t value{ 0 }; value < chunk_size; ++value ) {
+            operand_members[ value ] = value < 10'000U ? value % 2U == 0U : !survivors_in_run[ value ];
+        }
+        auto const operand{ TestFixture::from_members( operand_members ) };
+        ASSERT_EQ( TestFixture::shape_of( operand ), shape::bitset ) << what;
+
+        TypeParam receiver;
+        receiver.add_closed_range( 10'000, 65'535 );
+        receiver.optimize();
+        ASSERT_EQ( TestFixture::shape_of( receiver ), shape::run ) << what;
+        auto shared{ receiver };
+        shared -= operand;
+        TestFixture::expect_result( shared, without( top_members, operand_members ), expected_shape, what );
+        EXPECT_EQ( TestFixture::shape_of( receiver ), shape::run ) << what << ": the other holder of the runs";
+    } };
+    check( closed_range_members( 65'000, 65'535 ), shape::run, "top stretch survives" );
+    check( members_of( { 65'535 } ), shape::array, "only the top value survives" );
+
+    // the array and run operands, a hole at the top
+    TypeParam receiver;
+    receiver.add_closed_range( 10'000, 65'535 );
+    receiver.optimize();
+    auto shared{ receiver };
+    shared.remove_closed_range( 65'000, 65'535 );
+    TestFixture::expect_result( shared, without( top_members, closed_range_members( 65'000, 65'535 ) ), shape::run, "top range removed" );
+    auto top_value{ receiver };
+    top_value.remove( 65'535 );
+    TestFixture::expect_result( top_value, without( top_members, members_of( { 65'535 } ) ), shape::run, "top value removed" );
+}
+
+// ---- a container set without bitsets -------------------------------------------------------------------------
+
+TEST( AndnotKeepsRunsArrayRunSet, results_that_would_be_bitsets_are_arrays ) {
+    auto const holes{ [] {
+        std::vector<std::uint32_t> result;
+        for ( std::uint32_t value{ 1 }; value < 6'000U; value += 2U ) {
+            result.push_back( value );
+        }
+        return result;
+    }() };
+    auto const expected{ without( receiver_members(), members_of( holes ) ) };
+    auto const check{ [ & ]( auto const & subtract, char const * const what ) {
+        array_run_bitmap receiver;
+        receiver.add_closed_range( 0, run_end );
+        receiver.optimize_for_speed();
+        ASSERT_EQ( receiver.statistics().run_containers, 1U ) << what;
+        subtract( receiver );
+        auto const stats{ receiver.statistics() };
+        EXPECT_EQ( stats.bitset_containers, 0U ) << what;
+        EXPECT_EQ( receiver.validate(), nullptr ) << what;
+        EXPECT_TRUE( std::ranges::equal( receiver.to_vector(), values_of( expected ) ) ) << what;
+    } };
+    check( [ & ]( array_run_bitmap & receiver ) { receiver.remove_many_sorted( { holes.data(), holes.size() } ); }, "remove_many_sorted" );
+    check( [ & ]( array_run_bitmap & receiver ) {
+        array_run_bitmap operand;
+        operand.add_many_sorted( { holes.data(), holes.size() } );
+        receiver -= operand;
+    }, "-= an array" );
+    check( [ & ]( array_run_bitmap & receiver ) {
+        for ( std::uint32_t first{ 1 }; first < 6'000U; first += 2U ) {
+            receiver.remove_closed_range( first, first );
+        }
+    }, "remove_closed_range one value at a time" );
+}
+
+// A range that misses every run leaves the container, and a copy that shares it, alone.
+TYPED_TEST( AndnotKeepsRuns, a_range_that_misses_the_runs_keeps_the_shared_runs ) {
+    auto const receiver{ TestFixture::run_receiver() };
+    auto copy{ receiver };
+    copy.remove_closed_range( 61'000, 62'000 );
+    TestFixture::expect_result( copy, receiver_members(), shape::run, "range past the runs" );
 }
 
 // ---- the reference's own run-minus-bitset cases, on bare containers ------------------------------------------

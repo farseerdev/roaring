@@ -225,12 +225,10 @@ FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::remove_many_sorted( std
                 chunks_.erase( at );
             } else if ( chunks_.slot( at ).holds_run() ) {
                 // A run slot that only lost values keeps or gives up its runs by size alone, whichever the policy.
-                auto const runs{ std::as_const( chunks_.slot( at ) ).as_run() };
-                if ( detail::choose_run_container_kind<layout_type>( runs.size(), runs.runs.size(), array_to_bitset_threshold ) != detail::container_kind::run ) {
-                    chunks_.slot( at ) = detail::make_container_from_runs<layout_type, CowPolicy>(
-                        detail::run_container_from<layout_type, CowPolicy>( runs ),
-                        array_to_bitset_threshold
-                    );
+                auto & slot{ chunks_.slot( at ) };
+                slot = detail::settle_run_result<layout_type, CowPolicy>( std::move( slot ), array_to_bitset_threshold );
+                if constexpr ( !uses_default_container_set ) {
+                    slot = optimize_container_for_policy( std::move( slot ) );
                 }
             } else {
                 chunks_.slot( at ) = optimize_container_for_policy( std::move( chunks_.slot( at ) ) );
