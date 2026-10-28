@@ -1,6 +1,7 @@
 #include <frsr/roaring/bitmap.hpp>
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <chrono>
 #include <cinttypes>
@@ -8428,6 +8429,329 @@ static void register_run_andnot() {
     }
 }
 
+// ---- batch deletion from a run-heavy bitmap, each round followed by intersections ---------------------
+// A bitmap of about a million ids kept mostly as long runs over many chunks (plus bitset-dense and scattered
+// chunks) goes through four rounds of batch deletion. The doomed set of a round is one of: scattered singles,
+// whole sub-ranges, or bitset-dense chunks (or those in turn). After each round the bitmap is intersected
+// with a run-heavy filter (&=) or with all four filters at once (and-many). Every timed run starts from a copy of
+// the bitmap, in every arm. Arms: the library as shipped; CRoaring with nothing between the deletion and the
+// intersection; CRoaring with roaring_bitmap_run_optimize after each deletion (the best a CRoaring user can do to
+// keep what the deletion leaves small). The portable serialized size of the final bitmap is printed once per
+// entry, as a "#bytes" line.
+namespace keep_runs {
+
+constexpr std::size_t rounds = 4;
+constexpr std::size_t filter_count = 4;
+constexpr std::uint32_t chunk_span = 192;
+
+using range_list = std::vector<std::pair<std::uint32_t, std::uint32_t>>;   // closed ranges
+
+enum class mode : std::uint8_t {
+    remove,              // -= per round
+    remove_many,         // remove_many_sorted / roaring_bitmap_remove_many per round
+    remove_and,          // -= then &= a filter, per round
+    remove_and_many,     // -= then the intersection of the bitmap with all the filters, per round
+};
+
+struct data {
+    shared_values32 base;
+    std::vector<shared_values32> doomed;     // per round
+    std::vector<range_list> filters;
+};
+
+struct band {
+    std::string op_name;
+    std::string shape;
+    mode m;
+    std::shared_ptr<data const> d;
+    std::string description;
+};
+
+[[nodiscard]] static values32 sorted_unique( values32 && v ) {
+    std::ranges::sort( v );
+    v.erase( std::unique( v.begin(), v.end() ), v.end() );
+    return std::move( v );
+}
+
+[[nodiscard]] static values32 make_base( std::mt19937_64 & rng ) {
+    values32 v;
+    // 64 run chunks: six runs of about two thousand ids.
+    for ( std::uint32_t i = 0; i < 64; ++i ) {
+        auto const chunk = ( 3U * i ) << 16;
+        std::uint32_t start = static_cast<std::uint32_t>( rng() % 3000 );
+        for ( int r = 0; r < 6; ++r ) {
+            auto const length = 1500U + static_cast<std::uint32_t>( rng() % 1000 );
+            for ( std::uint32_t k = 0; k < length; ++k ) {
+                v.push_back( chunk + start + k );
+            }
+            start += length + 6000U + static_cast<std::uint32_t>( rng() % 3000 );
+        }
+    }
+    // Eight bitset chunks: a bit under half of the chunk, at random.
+    for ( std::uint32_t i = 0; i < 64; i += 8 ) {
+        auto const chunk = ( ( 3U * i ) + 1U ) << 16;
+        for ( std::uint32_t k = 0; k < 65536; ++k ) {
+            if ( rng() % 100 < 45 ) {
+                v.push_back( chunk + k );
+            }
+        }
+    }
+    // Sixteen array chunks.
+    for ( std::uint32_t i = 0; i < 64; i += 4 ) {
+        auto const chunk = ( ( 3U * i ) + 2U ) << 16;
+        for ( int k = 0; k < 1500; ++k ) {
+            v.push_back( chunk + static_cast<std::uint32_t>( rng() % 65536 ) );
+        }
+    }
+    return sorted_unique( std::move( v ) );
+}
+
+enum class shape : std::uint8_t { singles, ranges, dense_chunks };
+
+[[nodiscard]] static values32 make_doomed( std::mt19937_64 & rng, values32 const & base, shape const s ) {
+    values32 v;
+    switch ( s ) {
+        case shape::singles:
+            for ( int k = 0; k < 12'000; ++k ) {
+                v.push_back( base[ rng() % base.size() ] );
+            }
+            break;
+        case shape::ranges:
+            for ( int k = 0; k < 100; ++k ) {
+                auto const first = base[ rng() % base.size() ];
+                auto const length = 200U + static_cast<std::uint32_t>( rng() % 1300 );
+                for ( std::uint32_t i = 0; i < length; ++i ) {
+                    v.push_back( first + i );
+                }
+            }
+            break;
+        case shape::dense_chunks:
+            for ( int k = 0; k < 6; ++k ) {
+                // A chunk that holds ids: run chunks and bitset chunks alike.
+                auto const chunk = base[ rng() % base.size() ] & ~std::uint32_t{ 0xFFFF };
+                for ( std::uint32_t i = 0; i < 65536; ++i ) {
+                    if ( rng() % 100 < 55 ) {
+                        v.push_back( chunk + i );
+                    }
+                }
+            }
+            break;
+    }
+    return sorted_unique( std::move( v ) );
+}
+
+[[nodiscard]] static range_list make_filter( std::size_t const k ) {
+    constexpr std::uint32_t period[ filter_count ]{ 7000, 9000, 11000, 13000 };
+    auto const p = period[ k ];
+    auto const length = p * 88U / 100U;
+    range_list ranges;
+    for ( std::uint32_t c = 0; c < 3U * chunk_span; ++c ) {
+        for ( std::uint32_t start = static_cast<std::uint32_t>( k ) * 1300U; start < 65536; start += p ) {
+            auto const last = std::min<std::uint32_t>( start + length, 65536 ) - 1U;
+            ranges.emplace_back( ( c << 16 ) + start, ( c << 16 ) + last );
+        }
+    }
+    return ranges;
+}
+
+[[nodiscard]] static std::shared_ptr<data const> make_data( std::optional<shape> const fixed ) {
+    static auto const base = share( [] { std::mt19937_64 rng{ 20261028 }; return make_base( rng ); }() );
+    static auto const filters = [] {
+        std::vector<range_list> f;
+        for ( std::size_t k = 0; k < filter_count; ++k ) {
+            f.push_back( make_filter( k ) );
+        }
+        return f;
+    }();
+    std::mt19937_64 rng{ 77U + ( fixed ? static_cast<unsigned>( *fixed ) : 9U ) };
+    auto result = std::make_shared<data>();
+    result->base = base;
+    result->filters = filters;
+    for ( std::size_t r = 0; r < rounds; ++r ) {
+        auto const s = fixed ? *fixed : std::array{ shape::singles, shape::ranges, shape::dense_chunks, shape::ranges }[ r ];
+        result->doomed.push_back( share( make_doomed( rng, *base, s ) ) );
+    }
+    return result;
+}
+
+template <class Arm>
+struct frsr_registrar {
+    using Bitmap = typename Arm::bitmap;
+    struct state {
+        Bitmap base;
+        std::vector<Bitmap> doomed;
+        std::vector<Bitmap> filters;
+    };
+
+    static std::int64_t pipeline( state const & s, band const & b, std::size_t * const bytes ) {
+        std::int64_t checksum = 0;
+        Bitmap cur{ s.base };
+        for ( std::size_t r = 0; r < rounds; ++r ) {
+            if ( b.m == mode::remove_many ) {
+                cur.remove_many_sorted( *b.d->doomed[ r ] );
+            } else {
+                cur -= s.doomed[ r ];
+            }
+            if ( b.m == mode::remove_and ) {
+                cur &= s.filters[ r ];
+            }
+            if ( b.m == mode::remove_and_many ) {
+                std::vector<Bitmap const *> operands{ &cur };
+                for ( auto const & f : s.filters ) {
+                    operands.push_back( &f );
+                }
+                Bitmap const m{ Bitmap::and_many( std::span<Bitmap const * const>{ operands } ) };
+                checksum += static_cast<std::int64_t>( m.size() );
+            }
+        }
+        checksum += static_cast<std::int64_t>( cur.size() );
+        if ( bytes != nullptr ) {
+            *bytes = cur.portable_size_in_bytes();
+        }
+        return checksum;
+    }
+
+    static void run( band const & b ) {
+        auto const name = "kernel/" + std::string( Arm::label() ) + b.op_name + "/" + b.shape;
+        Entry e;
+        e.name        = name;
+        e.description = "frsr::roaring::bitmap<uint32_t>: " + b.description;
+        e.setup       = [b, name]() -> void * {
+            auto * const s = new state;
+            s->base.add_many( *b.d->base );
+            s->base.optimize();
+            for ( auto const & d : b.d->doomed ) {
+                Bitmap x;
+                x.add_many( *d );
+                x.optimize();
+                s->doomed.push_back( std::move( x ) );
+            }
+            for ( auto const & ranges : b.d->filters ) {
+                Bitmap f;
+                for ( auto const [first, last] : ranges ) {
+                    f.add_closed_range( first, last );
+                }
+                f.optimize();
+                s->filters.push_back( std::move( f ) );
+            }
+            std::size_t bytes = 0;
+            auto const checksum = pipeline( *s, b, &bytes );
+            printf( "#bytes\t%s\t%zu\tchecksum=%lld\n", name.c_str(), bytes, static_cast<long long>( checksum ) );
+            return s;
+        };
+        e.run            = [b]( void * sv ) -> int64_t { return pipeline( *static_cast<state *>( sv ), b, nullptr ); };
+        e.teardown       = []( void * sv ) { delete static_cast<state *>( sv ); };
+        e.inner_reps     = 10;
+        e.reusable_state = true;
+        g_benchmarks.push_back( std::move( e ) );
+    }
+};
+
+template <class Arm>
+struct cpp_registrar {
+    struct state {
+        croaring_handle base;
+        std::vector<std::unique_ptr<croaring_handle>> doomed;
+        std::vector<std::unique_ptr<croaring_handle>> filters;
+    };
+
+    template <bool Optimize>
+    static std::int64_t pipeline( state const & s, band const & b, std::size_t * const bytes ) {
+        std::int64_t checksum = 0;
+        croaring_handle const cur{ Arm::copy( s.base.r ) };
+        for ( std::size_t r = 0; r < rounds; ++r ) {
+            if ( b.m == mode::remove_many ) {
+                roaring_bitmap_remove_many( cur.r, b.d->doomed[ r ]->size(), b.d->doomed[ r ]->data() );
+            } else {
+                roaring_bitmap_andnot_inplace( cur.r, s.doomed[ r ]->r );
+            }
+            if constexpr ( Optimize ) {
+                roaring_bitmap_run_optimize( cur.r );
+            }
+            if ( b.m == mode::remove_and ) {
+                roaring_bitmap_and_inplace( cur.r, s.filters[ r ]->r );
+            }
+            if ( b.m == mode::remove_and_many ) {
+                croaring_handle const m{ roaring_bitmap_and( cur.r, s.filters[ 0 ]->r ) };
+                for ( std::size_t k = 1; k < s.filters.size(); ++k ) {
+                    roaring_bitmap_and_inplace( m.r, s.filters[ k ]->r );
+                }
+                checksum += static_cast<std::int64_t>( roaring_bitmap_get_cardinality( m.r ) );
+            }
+        }
+        checksum += static_cast<std::int64_t>( roaring_bitmap_get_cardinality( cur.r ) );
+        if ( bytes != nullptr ) {
+            *bytes = roaring_bitmap_portable_size_in_bytes( cur.r );
+        }
+        return checksum;
+    }
+
+    template <bool Optimize>
+    static void run_arm( band const & b ) {
+        auto const name = "kernel/" + std::string( Arm::label() ) + ( Optimize ? "-opt" : "" ) + b.op_name + "/" + b.shape;
+        Entry e;
+        e.name        = name;
+        e.description = std::string( "CRoaring roaring_bitmap_t counterpart" ) + ( Optimize ? " with run_optimize after each deletion" : "" ) + ": " + b.description;
+        e.setup       = [b, name]() -> void * {
+            auto * const s = new state;
+            s->base.r = Arm::create();
+            roaring_bitmap_add_many( s->base.r, b.d->base->size(), b.d->base->data() );
+            roaring_bitmap_run_optimize( s->base.r );
+            for ( auto const & d : b.d->doomed ) {
+                auto x = std::make_unique<croaring_handle>( Arm::create() );
+                roaring_bitmap_add_many( x->r, d->size(), d->data() );
+                roaring_bitmap_run_optimize( x->r );
+                s->doomed.push_back( std::move( x ) );
+            }
+            for ( auto const & ranges : b.d->filters ) {
+                auto f = std::make_unique<croaring_handle>( Arm::create() );
+                for ( auto const [first, last] : ranges ) {
+                    roaring_bitmap_add_range_closed( f->r, first, last );
+                }
+                roaring_bitmap_run_optimize( f->r );
+                s->filters.push_back( std::move( f ) );
+            }
+            std::size_t bytes = 0;
+            auto const checksum = pipeline<Optimize>( *s, b, &bytes );
+            printf( "#bytes\t%s\t%zu\tchecksum=%lld\n", name.c_str(), bytes, static_cast<long long>( checksum ) );
+            return s;
+        };
+        e.run            = [b]( void * sv ) -> int64_t { return pipeline<Optimize>( *static_cast<state *>( sv ), b, nullptr ); };
+        e.teardown       = []( void * sv ) { delete static_cast<state *>( sv ); };
+        e.inner_reps     = 10;
+        e.reusable_state = true;
+        g_benchmarks.push_back( std::move( e ) );
+    }
+
+    static void run( band const & b ) {
+        run_arm<false>( b );
+        run_arm<true>( b );
+    }
+};
+
+static void register_keep_runs_rounds() {
+    struct shape_entry { char const * name; std::optional<shape> s; };
+    struct mode_entry { char const * op; mode m; char const * what; };
+    for ( auto const & [name, s] : { shape_entry{ "singles", shape::singles }, shape_entry{ "ranges", shape::ranges }, shape_entry{ "dense_chunks", shape::dense_chunks }, shape_entry{ "mixed", std::nullopt } } ) {
+        auto const d = make_data( s );
+        for ( auto const & [op, m, what] : { mode_entry{ "KeepRunsRemove", mode::remove, "batch deletion (-=)" },
+                                              mode_entry{ "KeepRunsRemoveMany", mode::remove_many, "batch deletion (remove_many of the sorted doomed ids)" },
+                                              mode_entry{ "KeepRunsRemoveAnd", mode::remove_and, "batch deletion, then &= a run-heavy filter" },
+                                              mode_entry{ "KeepRunsRemoveAndMany", mode::remove_and_many, "batch deletion, then the intersection with four run-heavy filters" } } ) {
+            band b;
+            b.op_name = op;
+            b.shape = name;
+            b.m = m;
+            b.d = d;
+            b.description = std::string( "a run-heavy bitmap of about a million ids, four rounds of " ) + what + "; doomed sets: " + name + ".";
+            arms::for_each_frsr<frsr_registrar>( b );
+            arms::for_each_croaring<cpp_registrar>( b );
+        }
+    }
+}
+
+} // namespace keep_runs
+
 // ---- random-order contains --------------------------------------------------------------------------
 struct probe_set {
     values64 stored;                  // sorted
@@ -8652,6 +8976,7 @@ static void register_benchmarks() {
     register_big_by_few_or_inplace();
     register_array_array();
     register_run_andnot();
+    keep_runs::register_keep_runs_rounds();
     register_random_contains_bands();
 }
 
