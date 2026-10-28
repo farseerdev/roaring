@@ -164,7 +164,52 @@ void subtraction_trials( std::uint64_t const seed ) {
     }
 }
 
+// An array receiver (a few thousand scattered values per chunk, never run-optimized) minus a run operand of every
+// kind of cover: a few long runs, many short ones, runs that touch the ends of the chunk, and none at all in a
+// chunk. The receiver is shared by a copy for `-` and `-=`, then taken alone.
+template <typename Bitmap>
+void array_receiver_trials( std::uint64_t const seed ) {
+    std::mt19937_64 rng{ seed };
+    for ( int trial{ 0 }; trial < 400; ++trial ) {
+        auto const chunks{ 1U + static_cast<unsigned>( rng() % 3 ) };
+        auto const receiver_values{ random_values( rng, 2, chunks, 20 + rng() % 4'000 ) };
+        values_t operand_values;
+        switch ( rng() % 4 ) {
+            case 0: operand_values = random_runs( rng, 2, chunks + 1, 1U + static_cast<std::uint32_t>( rng() % 3'000 ), 1U + static_cast<std::uint32_t>( rng() % 30'000 ) ); break;
+            case 1: operand_values = random_runs( rng, 2, chunks + 1, 1U + static_cast<std::uint32_t>( rng() % 20 ), 1U + static_cast<std::uint32_t>( rng() % 200 ) ); break;
+            case 2: operand_values = random_runs( rng, 2, chunks + 1, 40'000, 4 ); break;
+            default: operand_values = { 2U << 16, ( 2U << 16 ) + 65'535U, ( 3U << 16 ) + 1U, ( 3U << 16 ) + 2U }; break;
+        }
+        SCOPED_TRACE( ::testing::Message() << "trial " << trial << " receiver " << receiver_values.size() << " operand " << operand_values.size() );
+
+        Bitmap receiver;
+        receiver.add_many_sorted( { receiver_values.data(), receiver_values.size() } );
+        Bitmap operand;
+        operand.add_many_sorted( { operand_values.data(), operand_values.size() } );
+        operand.optimize();
+        croaring const theirs_receiver{ receiver_values, false };
+        croaring const theirs_operand{ operand_values, true };
+        croaring const expected{ roaring_bitmap_andnot( theirs_receiver.r, theirs_operand.r ) };
+
+        EXPECT_TRUE( same_contents( receiver - operand, expected ) ) << "binary";
+        {
+            auto copy{ receiver };
+            copy -= operand;
+            EXPECT_TRUE( same_contents( copy, expected ) ) << "-= on a shared copy";
+            EXPECT_TRUE( same_contents( receiver, theirs_receiver ) ) << "the other holder";
+        }
+        {
+            Bitmap sole;
+            sole.add_many_sorted( { receiver_values.data(), receiver_values.size() } );
+            sole -= operand;
+            EXPECT_TRUE( same_contents( sole, expected ) ) << "-= on a sole holder";
+        }
+    }
+}
+
 TEST( AndnotRunsCrosscheck, eager ) { subtraction_trials<eager_bitmap>( 0xA11D07 ); }
 TEST( AndnotRunsCrosscheck, atomic_lazy ) { subtraction_trials<atomic_lazy_bitmap>( 0xA11D08 ); }
+TEST( AndnotRunsCrosscheck, array_receiver_eager ) { array_receiver_trials<eager_bitmap>( 0xA11D09 ); }
+TEST( AndnotRunsCrosscheck, array_receiver_atomic_lazy ) { array_receiver_trials<atomic_lazy_bitmap>( 0xA11D0A ); }
 
 }  // namespace

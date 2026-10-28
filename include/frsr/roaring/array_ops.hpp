@@ -1561,13 +1561,16 @@ template <bool Greater, typename E>
     return static_cast<std::size_t>( found - keys );
 }
 
-template <typename Layout, typename OutVector, typename CowPolicy = cow_value_semantics>
+template <typename Layout, typename OutVector, typename CowPolicy = cow_value_semantics, typename Keep = std::true_type>
 [[ gnu::hot ]] inline void filter_array_run_into(
     array_cref<Layout, CowPolicy> const lhs,
     run_cref<Layout, CowPolicy> const rhs,
-    OutVector & result
+    OutVector & result,
+    Keep = {}
 ) {
     using low_type = typename Layout::low_type;
+    // true_type: the intersection, false_type: the difference.
+    constexpr bool keep_matches{ Keep::value };
     auto const * const keys{ lhs.values.data() };
     auto const card{ static_cast<std::size_t>( lhs.values.size() ) };
     resize_uninitialized( result, lhs.values.size() );
@@ -1583,27 +1586,48 @@ template <typename Layout, typename OutVector, typename CowPolicy = cow_value_se
     // reference — and an inline copy in its place lost 1.7x on long runs, while
     // this loop is at parity on both. (run.end is inclusive, matching
     // difference_array_run.)
+    // The difference (keep_matches == false) keeps what the run does not cover,
+    // and the stretch it keeps before a run is the long one when the runs are few,
+    // so that stretch is bounded by a gallop and moved in one copy.
     // [croaring-ref] deps/croaring/src/containers/mixed_intersection.c:array_run_container_intersection
+    // [croaring-ref] deps/croaring/src/containers/mixed_andnot.c:array_run_container_andnot
     auto       run_it { rhs.runs.begin() };
     auto const run_end{ rhs.runs.end  () };
+    auto const finish{ [ & ] {
+        if constexpr ( !keep_matches ) {
+            // past the last run: every remaining value misses
+            std::copy_n( keys + ap, card - ap, out + written );
+            written += card - ap;
+        }
+        resize_uninitialized( result, static_cast<std::uint32_t>( written ) );
+    } };
     if ( run_it == run_end ) {
         // a run chunk emptied by removals and kept as a lazily erased slot holds no runs
-        resize_uninitialized( result, 0U );
+        finish();
         return;
     }
     while ( ap < card ) {
         auto const value{ keys[ ap ] };
         while ( static_cast<low_type>( run_it->end ) < value ) {
             if ( ++run_it == run_end ) {
-                resize_uninitialized( result, static_cast<std::uint32_t>( written ) );
+                finish();
                 return;
             }
         }
         if ( value >= static_cast<low_type>( run_it->begin ) ) {
-            out[ written++ ] = value;
-            ++ap;
-        } else {
+            if constexpr ( keep_matches ) {
+                out[ written++ ] = value;
+                ++ap;
+            } else {
+                ap = gallop_forward<true>( keys, ap, card, static_cast<low_type>( run_it->end ) );
+            }
+        } else if constexpr ( keep_matches ) {
             ap = gallop_forward<false>( keys, ap, card, static_cast<low_type>( run_it->begin ) );
+        } else {
+            auto const stretch_end{ gallop_forward<false>( keys, ap, card, static_cast<low_type>( run_it->begin ) ) };
+            std::copy_n( keys + ap, stretch_end - ap, out + written );
+            written += stretch_end - ap;
+            ap = stretch_end;
         }
     }
     resize_uninitialized( result, static_cast<std::uint32_t>( written ) );
@@ -1625,17 +1649,7 @@ template <typename Layout, typename CowPolicy = cow_value_semantics>
     run_cref<Layout, CowPolicy> const rhs
 ) {
     small_array_values<typename Layout::low_type> result;
-    result.reserve( static_cast<std::uint32_t>( lhs.values.size() ) );
-
-    auto run_it{ rhs.runs.begin() };
-    for ( auto const value : lhs.values ) {
-        while ( run_it != rhs.runs.end() && run_it->end < value ) {
-            ++run_it;
-        }
-        if ( run_it == rhs.runs.end() || value < run_it->begin ) {
-            result.push_back( value );
-        }
-    }
+    filter_array_run_into<Layout>( lhs, rhs, result, std::false_type{} );
     return result;
 }
 
