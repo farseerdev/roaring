@@ -95,7 +95,7 @@ pass over the runs and the sorted values, clears the bits of a bitset chunk in o
 one pass, and is 0.19x to 0.39x the time of CRoaring's `roaring_bitmap_remove_many` on all four doomed sets.
 
 * `KeepRunsRemove` (`-=`) with scattered singles, and with the mixed set that starts with them: 2.9x to 3.6x plain
-  CRoaring. This is the price of the smaller form, not overhead around it. A run chunk that loses more than a few
+  CRoaring. This is the cost of keeping the smaller form rather than overhead around it. A run chunk that loses more than a few
   hundred values to an array is, in CRoaring, converted to a bitset from the runs and cleared bit by bit
   (`run_array_container_andnot`), which costs the same whatever the number of runs, and every later round on that
   chunk is a bitset minus an array. frsr keeps the runs (a chunk of 190 holes is 760 bytes against 8 KB), so each round
@@ -106,6 +106,12 @@ one pass, and is 0.19x to 0.39x the time of CRoaring's `roaring_bitmap_remove_ma
   about a fifth. The mispredictions are the data-dependent choice between taking the next run and the next value, and
   a branch-free form of the same merge measured 2x to 5x slower (a load-latency chain per step). Against the arm that
   re-optimizes after each deletion to stay as small, the same rounds are 3.6x to 4.8x faster.
+  Not every remedy of the merge helps: galloping over the runs to the one that holds the next doomed value and
+  copying the untouched runs between in one piece (the shape of the array-minus-runs kernel) was measured against the
+  loop, same session, minimum of 9, plain and 64-byte-aligned builds. The singles bands came out 3% to 7% slower
+  (`KeepRunsRemove` 1.06x to 1.07x, `KeepRunsRemoveAnd` 1.03x to 1.05x), mixed, ranges and dense chunks within 1%, the
+  single-chunk run-array and run-run bands within 5% either way, so the loop stays. The cost is therefore not in
+  stepping over untouched runs.
 * `KeepRunsRemove` with sub-ranges: 1.15x to 1.6x, and `KeepRunsRemoveAnd` with sub-ranges 1.1x to 1.2x. The first
   round's difference of an array chunk and the runs used to test every array value against the runs; it now gallops
   past the stretch a run covers and copies the stretch it keeps (the sub-ranges rows were 1.8x to 2.5x and 1.1x to

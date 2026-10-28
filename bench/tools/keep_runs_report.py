@@ -29,6 +29,10 @@ known_above = {
     'AndAfterRunAndNot/run_bitset/residue=nine_values': 1.22,
     'AndInplaceAfterRunAndNot/run_array/holes=1000': 4.12,
     'AndInplaceAfterRunAndNot/run_bitset/residue=dense': 1.31,
+    # Noise, not a regression: the whole band is 55 to 60 ns, so a nanosecond or two moves the ratio by several percent.
+    # Measured against the build before the batch removal and the array difference (same session, minimum of 9,
+    # SCHED_FIFO, plain and 64-byte-aligned builds): the shipped arm is 0.97x to 1.00x of it, and the unchanged
+    # CRoaring arm moves by the same amount (0.95x to 1.00x); the ratio between the two arms is about 1.04.
     'AndInplaceAfterRunAndNot/run_bitset/residue=nine_values': 1.18,
     'AndInplaceAfterRunAndNot/run_bitset/residue=three_stretches': 1.26,
     'AndInplaceAfterRunAndNot/run_run/one_cut': 1.25,
