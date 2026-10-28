@@ -99,8 +99,8 @@ one pass, and is 0.19x to 0.39x the time of CRoaring's `roaring_bitmap_remove_ma
   hundred values to an array is, in CRoaring, converted to a bitset from the runs and cleared bit by bit
   (`run_array_container_andnot`), which costs the same whatever the number of runs, and every later round on that
   chunk is a bitset minus an array. frsr keeps the runs (a chunk of 190 holes is 760 bytes against 8 KB), so each round
-  is one merge of the chunk's runs (up to about a thousand after four rounds) against the doomed values. Per run of
-  four rounds, from the instruction counters, that is about 4.0 million instructions and 39 thousand mispredicted
+  is one merge of the chunk's runs (up to about a thousand after four rounds) against the doomed values. Per benchmark
+  iteration (four rounds), from the instruction counters, that is about 4.0 million instructions and 39 thousand mispredicted
   branches against 1.7 million and 0.4 thousand, at 2.1 instructions per cycle against 3.0; the merge kernel
   (`difference_run_values`) is more than half of the time, allocation under 1%, and the per-chunk work around it
   about a fifth. The mispredictions are the data-dependent choice between taking the next run and the next value, and
@@ -114,8 +114,8 @@ one pass, and is 0.19x to 0.39x the time of CRoaring's `roaring_bitmap_remove_ma
 * `KeepRunsRemoveAndMany` (the intersection of the bitmap with four run-heavy filters): 1.2x to 2.4x plain CRoaring's
   chained `and`, and on ranges 1.4x to 1.7x the arm that re-optimizes, whose containers are the same forms and the same
   bytes. That gap is the intersection, not the deletion: on ranges, 44% of the time is `array & runs` and 27% is
-  `run & bitset`, both of them kernels shared with `&=`; the array-with-runs and run-run intersections are the subject
-  of their own branch.
+  `run & bitset`, both of them kernels shared with `&=`; the array-with-runs and run-run intersections are not
+  changed here.
 * `AndAfterRunAndNot` and `AndInplaceAfterRunAndNot` on a run with a thousand holes: 2.2x to 3.8x, an intersection
   of two run containers of a thousand runs each against CRoaring's array path. Unchanged by keeping runs.
 * Under 0.1 us per operation, `RunAndNot*` of a run minus a run (`run_run/one_cut`) and a few single-chunk bitset
