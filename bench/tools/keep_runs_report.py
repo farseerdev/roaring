@@ -1,10 +1,16 @@
 """Tabulates the bands that keep runs under subtraction: the minimum time over all the samples given and
 the serialized size of the final bitmap, for the shipped arm and CRoaring with and without run_optimize.
-Usage: keep_runs_report.py <bench-output> [<bench-output> ...] [--markdown]
+Usage: keep_runs_report.py <bench-output> [<bench-output> ...] [--markdown] [--check]
 
 Every bench-output file holds result lines ("<name>\t<n> us/op ...") and, for the end-to-end bands, "#bytes"
 lines. A band takes the minimum time over every file given. Bands with a "-opt" CRoaring arm (the end-to-end
-ones) show the ratio against it too; the single-chunk bands have only the plain CRoaring arm."""
+ones) show the ratio against it too; the single-chunk bands have only the plain CRoaring arm.
+
+--check is the regression gate: a band is expected at or below 1.05x each CRoaring arm (the margin is the
+noise of a minimum over a few repeats) unless it is listed in known_above, which holds a ceiling for each band that
+is slower than that today; the exit status is 1 when any band is over its ceiling. The ceilings are the worst of
+four builds (clang and g++, glibc and mimalloc) plus ten percent, so a band that improves is not reported and
+a band that gets worse than its ceiling is. Lower a ceiling when a band is made faster."""
 import re
 import sys
 
@@ -13,7 +19,44 @@ plain = 'cpp-cow'
 optimized = 'cpp-cow-opt'
 families = ( 'KeepRuns', 'RunAndNot', 'AndAfterRunAndNot', 'AndInplaceAfterRunAndNot' )
 
+# Bands expected above 1.05x the plain CRoaring arm, and the ceiling of each. The KeepRunsRemoveMany bands are
+# deliberately absent: remove_many_sorted on a run chunk removes value by value, and the gate keeps failing on it
+# until it does not.
+known_above = {
+    'AndAfterRunAndNot/run_array/holes=1000': 4.22,
+    'AndAfterRunAndNot/run_bitset/residue=dense': 1.39,
+    'AndAfterRunAndNot/run_bitset/residue=nine_values': 1.22,
+    'AndInplaceAfterRunAndNot/run_array/holes=1000': 4.12,
+    'AndInplaceAfterRunAndNot/run_bitset/residue=dense': 1.31,
+    'AndInplaceAfterRunAndNot/run_bitset/residue=three_stretches': 1.26,
+    'AndInplaceAfterRunAndNot/run_run/one_cut': 1.25,
+    'KeepRunsRemove/dense_chunks': 1.29,
+    'KeepRunsRemove/mixed': 2.04,
+    'KeepRunsRemove/ranges': 2.69,
+    'KeepRunsRemove/singles': 4.07,
+    'KeepRunsRemoveAnd/dense_chunks': 1.17,
+    'KeepRunsRemoveAnd/mixed': 1.62,
+    'KeepRunsRemoveAnd/ranges': 1.62,
+    'KeepRunsRemoveAnd/singles': 3.08,
+    'KeepRunsRemoveAndMany/dense_chunks': 1.79,
+    'KeepRunsRemoveAndMany/mixed': 1.84,
+    'KeepRunsRemoveAndMany/ranges': 2.5,
+    'KeepRunsRemoveAndMany/singles': 2.81,
+    'RunAndNot/run_bitset/residue=dense': 1.28,
+    'RunAndNot/run_bitset/residue=one_stretch': 1.17,
+    'RunAndNot/run_run/one_cut': 1.19,
+    'RunAndNotInplace/run_bitset/residue=dense': 1.3,
+    'RunAndNotInplace/run_run/one_cut': 1.25,
+}
+# The same, against the CRoaring arm that runs run_optimize after each deletion.
+known_above_optimized = {
+    'KeepRunsRemoveAndMany/dense_chunks': 1.53,
+    'KeepRunsRemoveAndMany/ranges': 2.17,
+}
+margin = 1.05
+
 markdown = '--markdown' in sys.argv
+check = '--check' in sys.argv
 paths = [ a for a in sys.argv[ 1 : ] if not a.startswith( '--' ) ]
 
 times = {}
@@ -60,3 +103,17 @@ for ratio, band, t, p, o, bf, bp, bo in rows:
     print( ( '| ' + ' | '.join( cells ) + ' |' ) if markdown else '\t'.join( cells ) )
 above = [ r for r in rows if r[ 0 ] > 1.0 ]
 print( f'\n{len( rows )} bands, {len( above )} above 1.0x the plain CRoaring arm', file = sys.stderr )
+if check:
+    failed = 0
+    for ratio, band, t, p, o, bf, bp, bo in rows:
+        if ratio > known_above.get( band, margin ):
+            print( f'over its ceiling against CRoaring: {band}  {ratio:.2f}x > {known_above.get( band, margin ):.2f}x', file = sys.stderr )
+            failed += 1
+        if o is not None and t / o > known_above_optimized.get( band, margin ):
+            print( f'over its ceiling against CRoaring + run_optimize: {band}  {t / o:.2f}x > {known_above_optimized.get( band, margin ):.2f}x', file = sys.stderr )
+            failed += 1
+        if bf is not None and bo is not None and bf > bo:
+            print( f'larger than CRoaring + run_optimize: {band}  {bf} > {bo} bytes', file = sys.stderr )
+            failed += 1
+    print( f'{failed} band checks failed', file = sys.stderr )
+    sys.exit( 1 if failed else 0 )
