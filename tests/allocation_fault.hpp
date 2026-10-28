@@ -4,8 +4,10 @@
 // consults this: while a thread is armed, every `period`-th allocation of that thread throws
 // std::bad_alloc. Disarmed (the default) it costs one thread-local load.
 //
-// Under ThreadSanitizer the global operators are the sanitizer's own and cannot be replaced, so
-// nothing is injected there: FRSR_TESTS_COUNT_ALLOCATIONS is 0 and tests that need failures skip.
+// Under ThreadSanitizer the global operators are the runtime's own, defined as one object of its static
+// archive, so replacing any of them is a link error (multiple definition); nothing is injected there:
+// FRSR_TESTS_COUNT_ALLOCATIONS is 0 and tests that need failures skip. Those tests are single-threaded, so
+// the skip loses no race coverage; the failure paths run under AddressSanitizer and the plain builds.
 
 #include <cstdint>
 
