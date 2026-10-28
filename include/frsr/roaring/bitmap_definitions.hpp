@@ -87,7 +87,7 @@ FRSR_ROARING_DEFINITION_INLINE char const * FRSR_ROARING_BITMAP::validate( bool 
             case detail::container_kind::array: {
                 auto const & values{ slot.as_array().values };
                 if ( static_cast<size_type>( values.size() ) != cardinality ) { return "an array's cardinality header differs from its length"; }
-                if ( cardinality > array_to_bitset_threshold ) { return "an array holds more values than the array limit"; }
+                if ( supports_bitset_container && cardinality > array_to_bitset_threshold ) { return "an array holds more values than the array limit"; }
                 for ( size_type i{ 1 }; i < cardinality; ++i ) {
                     if ( !( values[ i - 1 ] < values[ i ] ) ) { return "an array's values are not strictly ascending"; }
                 }
