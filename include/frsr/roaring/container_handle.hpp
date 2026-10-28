@@ -1975,7 +1975,13 @@ public:
         }
         if ( removals != 0 ) {
             handle_->adjust_cardinality( -static_cast<std::int32_t>( removals ) );
-            handle_->mark_endpoints_stale();
+            // Only a removal that reaches an endpoint can move it.
+            if (
+                handle_->endpoints_valid() &&
+                ( sorted_values.front() <= handle_->min_value() || sorted_values.back() >= handle_->max_value() )
+            ) {
+                handle_->mark_endpoints_stale();
+            }
         }
         return removals;
     }
