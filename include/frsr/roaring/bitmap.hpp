@@ -2204,6 +2204,68 @@ private:
         handle_type && reuse = {}
     );
 
+    // `run_side ∩ bitset_side` by the kernel the coverage of the runs calls for, written into a payload `store` retired.
+    // The one place that picks among the run∩bitset kernels; the walk of bitmap against bitmap and the streams of
+    // interop.hpp both come here.
+    template <typename Store>
+    [[nodiscard]] static handle_type intersect_run_bitset_by_coverage( handle_type const & run_side, handle_type const & bitset_side, Store & store ) {
+        auto const run_cardinality{ detail::container_size( run_side ) };
+        if ( run_cardinality >= layout_type::low_domain_size / 2U ) {
+            // Runs covering at least half the domain (incl. the full-domain run — CRoaring's run_container_is_full
+            // short-circuit): clone the bitset payload and clear only the gaps, with the cardinality maintained by
+            // subtraction. The masked fill costs per covered word, this form per gap word plus one 8 KB copy; measured
+            // on 64 runs the two tie at half coverage and this form wins 40 % at three quarters.
+            auto container{ detail::intersect_run_bitset_dense_runs<layout_type, CowPolicy>(
+                run_side.as_run(),
+                bitset_side.as_bitset(),
+                detail::container_size( bitset_side ),
+                store.take_retired( detail::container_kind::bitset )
+            ) };
+            if constexpr ( uses_default_container_set ) {
+                return container;
+            } else {
+                return optimize_container_for_policy( std::move( container ) );
+            }
+        }
+        if ( run_cardinality < array_to_bitset_threshold ) {
+            // Sparse runs (result ⊆ runs, guaranteed under the array threshold): extract directly into an array — the
+            // full-block fill reads/writes all words regardless of run coverage.
+            return detail::intersect_run_bitset_sparse<layout_type, CowPolicy>(
+                run_side.as_run(),
+                bitset_side.as_bitset(),
+                static_cast<std::uint32_t>( std::min( run_cardinality, detail::container_size( bitset_side ) ) ),
+                store.take_retired( detail::container_kind::array )
+            );
+        }
+        // Many runs covering 3/16 to 7/16 of the domain: clone, clear the gaps and recount once. The masked fill grows
+        // with the covered words (a mask setup, a store and a popcount each, per run); this form costs a block copy, the
+        // gap stores and one vector recount, flat across that range. Below it the fill's covered words cost less than
+        // the copy and recount, and on 64 runs the per-gap clears of this form lose from 7/16 on; from half coverage
+        // the subtracting clone above serves.
+        if ( run_side.as_run().runs.size() > 32U &&
+             run_cardinality >= layout_type::low_domain_size * 3U / 16U &&
+             run_cardinality <  layout_type::low_domain_size * 7U / 16U ) {
+            auto container{ detail::intersect_run_bitset_clone_and_recount<layout_type, CowPolicy>(
+                run_side.as_run(),
+                bitset_side.as_bitset(),
+                store.take_retired( detail::container_kind::bitset )
+            ) };
+            if constexpr ( uses_default_container_set ) {
+                return container;
+            } else {
+                return optimize_container_for_policy( std::move( container ) );
+            }
+        }
+        // Dense runs: materialize into a (retired or fresh) bitset. NOT demoted: chained folds keep re-intersecting
+        // runs against the SAME accumulator, and a demoted array accumulator loses the dense word-masked arm on every
+        // subsequent pair.
+        return intersect_run_bitset_for_policy(
+            run_side.as_run(),
+            bitset_side.as_bitset(),
+            store.take_retired( detail::container_kind::bitset )
+        );
+    }
+
     template <std::ranges::input_range Range>
         requires std::convertible_to<std::ranges::range_reference_t<Range>, key_type>
     [[nodiscard]] bool try_add_many_single_chunk_dense( Range && values ) {

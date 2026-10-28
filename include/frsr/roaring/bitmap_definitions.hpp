@@ -407,6 +407,7 @@ FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::union_into( bitmap cons
 
 FRSR_ROARING_BITMAP_TEMPLATE
 FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::difference_into( bitmap const & other, bitmap & scratch ) const noexcept( detail::allocation_failure_terminates ) {
+    assert( &scratch != this && &scratch != &other );
     if ( this == &other ) {
         scratch.clear_keep_capacity();
         return;
@@ -1194,84 +1195,9 @@ FRSR_ROARING_DEFINITION_INLINE auto FRSR_ROARING_BITMAP::combine( bitmap const &
             [ & ] [[ gnu::noinline ]] () {   // outlined: see the arm above
                 auto const & run_side   { left_container.holds_run() ? std::as_const( left_container ) : right_container };
                 auto const & bitset_side{ left_container.holds_run() ? right_container : std::as_const( left_container ) };
-                // Sparse runs (result ⊆ runs, guaranteed under the array
-                // threshold): extract directly into an array — the full-block
-                // fill reads/writes all Layout::word_count words regardless of
-                // run coverage, ~an order of magnitude more instructions on the
-                // production fold's sparse shapes (HW-counter A/B vs a downstream
-                // engine's sparse run∩bitset kernel, which croaring-arm ran here).
-                auto const run_cardinality{ detail::container_size( run_side ) };
-                if ( run_cardinality >= layout_type::low_domain_size / 2U ) {
-                    // Runs covering at least half the domain (incl. the full-domain
-                    // run — CRoaring's run_container_is_full short-circuit): clone
-                    // the bitset payload and clear only the gaps, with the
-                    // cardinality maintained by subtraction. The masked fill below
-                    // costs per covered word, this form per gap word plus one 8 KB
-                    // copy; measured on 64 runs the two tie at half coverage and
-                    // this form wins 40 % at three quarters — cheaper than masking
-                    // all 8 KB through the fill kernel below.
-                    auto container{ detail::intersect_run_bitset_dense_runs<layout_type, CowPolicy>(
-                        std::as_const( run_side ).as_run(),
-                        std::as_const( bitset_side ).as_bitset(),
-                        detail::container_size( bitset_side ),
-                        result_chunks.take_retired( detail::container_kind::bitset )
-                    ) };
-                    if constexpr ( !uses_default_container_set ) {
-                        container = optimize_container_for_policy( std::move( container ) );
-                    }
-                    if ( auto const bitset_size{ detail::container_size( container ) }; bitset_size != 0 ) {
-                        emit( left_key, std::move( container ), bitset_size );
-                    }
-                    return;
-                }
-                if ( run_cardinality < array_to_bitset_threshold ) {
-                    auto container{ detail::intersect_run_bitset_sparse<layout_type, CowPolicy>(
-                        run_side.as_run(),
-                        bitset_side.as_bitset(),
-                        static_cast<std::uint32_t>( std::min( run_cardinality, detail::container_size( bitset_side ) ) ),
-                        result_chunks.take_retired( detail::container_kind::array )
-                    ) };
-                    if ( auto const array_size{ detail::container_size( container ) }; array_size != 0 ) {
-                        emit( left_key, std::move( container ), array_size );
-                    }
-                    return;
-                }
-                // Many runs covering 3/16 to 7/16 of the domain: clone, clear the gaps
-                // and recount once. The masked fill below grows with the covered words
-                // (a mask setup, a store and a popcount each, per run); this form costs
-                // a block copy, the gap stores and one vector recount, flat across that
-                // range. Below it the fill's covered words cost less than the copy and
-                // recount, and on 64 runs the per-gap clears of this form lose from 7/16
-                // on; from half coverage the subtracting clone above serves.
-                if ( std::as_const( run_side ).as_run().runs.size() > 32U &&
-                     run_cardinality >= layout_type::low_domain_size * 3U / 16U &&
-                     run_cardinality <  layout_type::low_domain_size * 7U / 16U ) {
-                    auto container{ detail::intersect_run_bitset_clone_and_recount<layout_type, CowPolicy>(
-                        std::as_const( run_side ).as_run(),
-                        std::as_const( bitset_side ).as_bitset(),
-                        result_chunks.take_retired( detail::container_kind::bitset )
-                    ) };
-                    if constexpr ( !uses_default_container_set ) {
-                        container = optimize_container_for_policy( std::move( container ) );
-                    }
-                    if ( auto const bitset_size{ detail::container_size( container ) }; bitset_size != 0 ) {
-                        emit( left_key, std::move( container ), bitset_size );
-                    }
-                    return;
-                }
-                // Dense runs: materialize into a (retired or fresh) bitset. NOT
-                // demoted (unlike the bitset×bitset sites below/above): the
-                // run-heavy fold witness regressed ~12% with demotion here — its
-                // chained folds keep re-intersecting runs against the SAME
-                // accumulator, and a demoted array accumulator loses the dense
-                // word-masked arm on every subsequent pair.
-                auto container{ intersect_run_bitset_for_policy(
-                    run_side.as_run(),
-                    bitset_side.as_bitset(),
-                    result_chunks.take_retired( detail::container_kind::bitset )
-                ) };
-                if ( auto const bitset_size{ detail::container_size( container ) }; bitset_size != 0 ) {
-                    emit( left_key, std::move( container ), bitset_size );
+                auto container{ intersect_run_bitset_by_coverage( run_side, bitset_side, result_chunks ) };
+                if ( auto const container_count{ detail::container_size( container ) }; container_count != 0 ) {
+                    emit( left_key, std::move( container ), container_count );
                 }
             }();
             ++left;

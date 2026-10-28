@@ -313,18 +313,7 @@ struct interop_engine {
             if ( intersection && ( ( lhs.holds_run() && rhs.holds_bitset() ) || ( lhs.holds_bitset() && rhs.holds_run() ) ) ) {
                 auto const & run_side   { lhs.holds_run() ? lhs : rhs };
                 auto const & bitset_side{ lhs.holds_run() ? rhs : lhs };
-                // the form of the run∩bitset kernel the runs' coverage calls for (see the walk of bitmap against bitmap)
-                auto const run_cardinality{ container_size( run_side ) };
-                if ( run_cardinality >= layout_type::low_domain_size / 2U ) {
-                    out = intersect_run_bitset_dense_runs<layout_type, cow_policy>( run_side.as_run(), bitset_side.as_bitset(), container_size( bitset_side ), store.take_retired( container_kind::bitset ) );
-                } else if ( run_cardinality < Bitmap::array_to_bitset_threshold ) {
-                    out = intersect_run_bitset_sparse<layout_type, cow_policy>( run_side.as_run(), bitset_side.as_bitset(),
-                        static_cast<std::uint32_t>( std::min( run_cardinality, container_size( bitset_side ) ) ), store.take_retired( container_kind::array ) );
-                } else if ( run_side.as_run().runs.size() > 32U && run_cardinality >= layout_type::low_domain_size * 3U / 16U && run_cardinality < layout_type::low_domain_size * 7U / 16U ) {
-                    out = intersect_run_bitset_clone_and_recount<layout_type, cow_policy>( run_side.as_run(), bitset_side.as_bitset(), store.take_retired( container_kind::bitset ) );
-                } else {
-                    out = Bitmap::intersect_run_bitset_for_policy( run_side.as_run(), bitset_side.as_bitset(), store.take_retired( container_kind::bitset ) );
-                }
+                out = Bitmap::intersect_run_bitset_by_coverage( run_side, bitset_side, store );
                 return true;
             }
         }
