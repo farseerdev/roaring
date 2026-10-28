@@ -210,28 +210,12 @@ FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::remove_many_sorted( std
         auto const at{ chunks_.lower_bound( current_chunk ) };
         if ( at != chunks_.end() && chunks_.key( at ) == current_chunk ) {
             auto & slot{ chunks_.slot( at ) };
-            if ( slot.holds_array() ) {
-                // One merge walk over the array for the whole group; the
-                // per-value remove is a lower_bound + memmove each.
-                size_ -= static_cast<size_type>( slot.as_array().remove_sorted( grouped_values ) );
-            } else {
-                for ( auto const low : grouped_values ) {
-                    if ( detail::container_remove( slot, low ) ) {
-                        --size_;
-                    }
-                }
-            }
-            if ( detail::container_size( chunks_.slot( at ) ) == 0 ) {
+            size_ -= static_cast<size_type>( detail::container_remove_sorted( slot, std::span<low_type const>{ grouped_values.data(), grouped_values.size() }, array_to_bitset_threshold ) );
+            if ( detail::container_size( slot ) == 0 ) {
                 chunks_.erase( at );
-            } else if ( chunks_.slot( at ).holds_run() ) {
-                // A run slot that only lost values keeps or gives up its runs by size alone, whichever the policy.
-                auto & slot{ chunks_.slot( at ) };
-                slot = detail::settle_run_result<layout_type, CowPolicy>( std::move( slot ), array_to_bitset_threshold );
-                if constexpr ( !uses_default_container_set ) {
-                    slot = optimize_container_for_policy( std::move( slot ) );
-                }
-            } else {
-                chunks_.slot( at ) = optimize_container_for_policy( std::move( chunks_.slot( at ) ) );
+            } else if ( !slot.holds_run() || !uses_default_container_set ) {
+                // A run slot that only lost values already has the smallest form, whichever the policy.
+                slot = optimize_container_for_policy( std::move( slot ) );
             }
         }
 

@@ -346,29 +346,32 @@ template <typename Layout, typename CowPolicy = cow_value_semantics>
     return settle_run_result<Layout, CowPolicy>( std::move( result ), bitset_threshold );
 }
 
+// The runs minus a sorted, duplicate-free list of values: one merge pass over both, O(runs + values), written
+// straight into the result's run payload and settled to the smallest form. Used by the run-array difference and by
+// the batch removal of sorted values from a run chunk.
 template <typename Layout, typename CowPolicy = cow_value_semantics>
-[[nodiscard]] inline container_handle<Layout, CowPolicy> difference_run_array(
+[[nodiscard]] inline container_handle<Layout, CowPolicy> difference_run_values(
     run_cref<Layout, CowPolicy> const lhs,
-    array_cref<Layout, CowPolicy> const rhs,
+    std::span<typename Layout::low_type const> const values,
     std::size_t const bitset_threshold
 ) {
     auto result{ container_handle<Layout, CowPolicy>::make_run() };
     auto ref{ result.as_run() };
     // Every value taken out splits at most one run in two.
-    ref.runs.resize_uninitialized( static_cast<std::uint32_t>( lhs.runs.size() + rhs.values.size() ) );
+    ref.runs.resize_uninitialized( static_cast<std::uint32_t>( lhs.runs.size() + values.size() ) );
     auto * const out{ ref.runs.data() };
     std::size_t n{ 0 };
 
-    auto value_it{ rhs.values.begin() };
+    auto value_it{ values.begin() };
     for ( auto const & run : lhs.runs ) {
-        while ( value_it != rhs.values.end() && *value_it < run.begin ) {
+        while ( value_it != values.end() && *value_it < run.begin ) {
             ++value_it;
         }
 
         auto current_begin{ run.begin };
         auto exhausted{ false };
         auto scan{ value_it };
-        while ( scan != rhs.values.end() && *scan <= run.end ) {
+        while ( scan != values.end() && *scan <= run.end ) {
             if ( current_begin < *scan ) {
                 auto const end{ static_cast<typename Layout::low_type>( *scan - 1U ) };
                 out[ n++ ] = ::frsr::roaring::run<typename Layout::low_type>{ current_begin, end };
@@ -392,6 +395,15 @@ template <typename Layout, typename CowPolicy = cow_value_semantics>
     ref.runs.resize_uninitialized( static_cast<std::uint32_t>( n ) );
     ref.sync_header();
     return settle_run_result<Layout, CowPolicy>( std::move( result ), bitset_threshold );
+}
+
+template <typename Layout, typename CowPolicy = cow_value_semantics>
+[[nodiscard]] inline container_handle<Layout, CowPolicy> difference_run_array(
+    run_cref<Layout, CowPolicy> const lhs,
+    array_cref<Layout, CowPolicy> const rhs,
+    std::size_t const bitset_threshold
+) {
+    return difference_run_values<Layout, CowPolicy>( lhs, { rhs.values.data(), rhs.values.size() }, bitset_threshold );
 }
 
 // The symmetric difference of two run lists, merged by begin with every run exclusive-or-appended to what is

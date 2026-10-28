@@ -9,6 +9,7 @@
 #include <bit>
 #include <cassert>
 #include <cstddef>
+#include <functional>
 #include <limits>
 #include <type_traits>
 
@@ -27,6 +28,35 @@ namespace frsr::roaring::detail {
 // run_selection_lazy those kernels are only reachable at all if an operand was
 // already run-encoded (i.e. produced by an explicit optimize()/deserialization),
 // so it is not an implicit-run-creation site in the sense this policy targets.
+// The group form of container_remove(), one pass over the container for the whole sorted, duplicate-free group.
+// An array compacts in place, a bitset clears its bits, and a run container is replaced by the runs minus the
+// values, merged in one walk and settled to the smallest form (the container it replaces may be shared, so it is
+// never written). Returns how many values were removed.
+template <typename Layout, typename CowPolicy>
+[[nodiscard]] inline std::size_t container_remove_sorted(
+    container_handle<Layout, CowPolicy> & container,
+    std::span<typename Layout::low_type const> const sorted_values,
+    std::size_t const bitset_threshold
+) {
+    assert( !sorted_values.empty() );
+    assert( std::ranges::adjacent_find( sorted_values, std::greater_equal<>{} ) == sorted_values.end() );
+    switch ( container.kind() ) {
+        case container_kind::array : return container.as_array ().remove_sorted( sorted_values );
+        case container_kind::bitset: return container.as_bitset().remove_sorted( sorted_values );
+        case container_kind::run   : {
+            auto const runs{ std::as_const( container ).as_run() };
+            // Nothing to take out when the group lies wholly outside the covered span.
+            if ( runs.runs.empty() || sorted_values.back() < runs.runs.front().begin || runs.runs.back().end < sorted_values.front() ) {
+                return 0;
+            }
+            auto const before{ container_size<Layout>( container ) };
+            container = difference_run_values<Layout, CowPolicy>( runs, sorted_values, bitset_threshold );
+            return before - container_size<Layout>( container );
+        }
+    }
+    std::unreachable();
+}
+
 template <typename Layout, typename CowPolicy = cow_value_semantics, typename RunSelectionPolicy = run_selection_eager>
 [[nodiscard]] inline container_variant<Layout, CowPolicy> combine_containers(
     container_variant<Layout, CowPolicy> const & lhs,

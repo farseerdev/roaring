@@ -1960,6 +1960,26 @@ public:
         return additions;
     }
 
+    // The group form of remove(): the bits are cleared in one pass over the sorted, duplicate-free batch and the
+    // header's cardinality and endpoints are written once. Returns how many values were present.
+    std::size_t remove_sorted( std::span<low_type const> const sorted_values ) noexcept {
+        // The caller drops a container that this empties, which the count must be able to tell; it is settled
+        // before the bits change, since settling counts them.
+        handle_->settle_cardinality();
+        std::size_t removals{ 0 };
+        for ( auto const value : sorted_values ) {
+            auto       & word{ words[ static_cast<std::size_t>( value ) >> 6U ] };
+            auto const   mask{ std::uint64_t{ 1 } << ( static_cast<unsigned>( value ) & 63U ) };
+            removals += ( ( word & mask ) != 0 );
+            word &= ~mask;
+        }
+        if ( removals != 0 ) {
+            handle_->adjust_cardinality( -static_cast<std::int32_t>( removals ) );
+            handle_->mark_endpoints_stale();
+        }
+        return removals;
+    }
+
     [[nodiscard]] bool remove( low_type const value ) noexcept {
         auto const word_index{ static_cast<std::size_t>( value ) >> 6U };
         auto const bit_index{ static_cast<unsigned>( value ) & 63U };
