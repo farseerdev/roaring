@@ -1584,8 +1584,7 @@ template <typename Layout, typename OutVector, typename CowPolicy = cow_value_se
     // span) was measured against it: it loses on short runs — two gallops and a
     // libc call per run for a 20-element span put array∩run 12-19 % behind the
     // reference — and an inline copy in its place lost 1.7x on long runs, while
-    // this loop is at parity on both. (run.end is inclusive, matching
-    // difference_array_run.)
+    // this loop is at parity on both. (run.end is inclusive.)
     // The difference (keep_matches == false) keeps what the run does not cover,
     // and the stretch it keeps before a run is the long one when the runs are few,
     // so that stretch is bounded by a gallop and moved in one copy.
