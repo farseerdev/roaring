@@ -14,6 +14,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <iterator>
+#include <type_traits>
 #include <variant>
 #include <vector>
 
@@ -195,6 +196,221 @@ TYPED_TEST( RemoveManyChunks, one_call_cuts_chunks_of_every_kind ) {
         }
     }
     TestFixture::expect_removal( values, true, doomed, without( values, doomed ), "all kinds in one call" );
+}
+
+TYPED_TEST( RemoveManyChunks, values_of_several_chunks_in_any_order ) {
+    for ( auto const run_optimized : { false, true } ) {
+        auto const values{ closed_range( 0, 2 * chunk_size - 1 ) };
+        values_t const doomed{ chunk_size + 7, chunk_size + 5, 7, 5, 1, chunk_size + 1, chunk_size + 3, 3 };
+        values_t sorted{ doomed };
+        std::ranges::sort( sorted );
+
+        auto bitmap{ TestFixture::from( values, run_optimized ) };
+        bitmap.remove_many( doomed );
+        EXPECT_EQ( bitmap.validate(), nullptr );
+        EXPECT_TRUE( std::ranges::equal( bitmap.to_vector(), without( values, sorted ) ) ) << "run_optimized " << run_optimized;
+        EXPECT_EQ( bitmap.size(), values.size() - doomed.size() );
+    }
+}
+
+TYPED_TEST( RemoveManyChunks, no_values_and_values_that_are_not_there_change_nothing ) {
+    auto const values{ closed_range( 500, 500 ) };
+    auto bitmap{ TestFixture::from( values, false ) };
+    bitmap.remove_many( values_t{} );
+    bitmap.remove_many_sorted( {} );
+    bitmap.remove_many( values_t{ 501, 80'000 } );
+    EXPECT_EQ( bitmap.validate(), nullptr );
+    EXPECT_TRUE( std::ranges::equal( bitmap.to_vector(), values ) );
+}
+
+// One value per call from a full chunk to nothing: the container changes kind on the way down (a bitset or a run
+// becomes an array) and is dropped with its last value.
+TYPED_TEST( RemoveManyChunks, one_call_per_value_empties_a_full_chunk ) {
+    for ( auto const run_optimized : { false, true } ) {
+        auto bitmap{ TestFixture::from( closed_range( 0, chunk_size - 1U ), run_optimized ) };
+        for ( std::uint32_t value{ 0 }; value < chunk_size; ++value ) {
+            bitmap.remove_many( values_t{ value } );
+            ASSERT_EQ( bitmap.size(), chunk_size - 1U - value ) << "after removing " << value;
+            if ( value % 4'099U == 0 ) {
+                ASSERT_EQ( bitmap.validate(), nullptr ) << "after removing " << value;
+            }
+        }
+        EXPECT_TRUE( bitmap.empty() );
+        EXPECT_EQ( bitmap.statistics().container_count(), 0U );
+    }
+}
+
+TYPED_TEST( RemoveManyChunks, a_value_repeated_in_the_sorted_batch_is_removed_once ) {
+    values_t bitset_values;
+    for ( std::uint32_t value{ 0 }; value < chunk_size; value += 3U ) {
+        bitset_values.push_back( value );
+    }
+    values_t const array_values{ 4, 5, 6, 40, 90 };
+    values_t const run_values{ closed_range( 100, 30'000 ) };
+    values_t const doomed{ 6, 6, 6, 9, 9, 40, 40, 99, 100, 100, 101, 102, 102, 102, 30'000, 30'000 };
+    values_t distinct{ doomed };
+    distinct.erase( std::unique( distinct.begin(), distinct.end() ), distinct.end() );
+    for ( auto const & values : { bitset_values, array_values, run_values } ) {
+        for ( auto const run_optimized : { false, true } ) {
+            auto const expected{ without( values, distinct ) };
+            auto bitmap{ TestFixture::from( values, run_optimized ) };
+            bitmap.remove_many_sorted( { doomed.data(), doomed.size() } );
+            EXPECT_EQ( bitmap.validate(), nullptr );
+            EXPECT_EQ( bitmap.size(), expected.size() );
+            EXPECT_TRUE( std::ranges::equal( bitmap.to_vector(), expected ) );
+        }
+    }
+}
+
+// A bitmap in the middle of a lazy fold holds bitsets with a stale cardinality; values are removed from it correctly.
+TYPED_TEST( RemoveManyChunks, a_bitmap_in_the_middle_of_a_fold_loses_values_correctly ) {
+    if constexpr ( TestFixture::has_bitsets ) {
+        values_t first;
+        values_t second;
+        for ( std::uint32_t value{ 0 }; value + 1U < chunk_size; value += 3U ) {
+            first.push_back( value );
+            second.push_back( value + 1U );
+        }
+        values_t both{ first };
+        both.insert( both.end(), second.begin(), second.end() );
+        std::ranges::sort( both );
+
+        values_t doomed;
+        for ( std::uint32_t value{ 1 }; value < chunk_size; value += 5U ) {
+            doomed.push_back( value );
+        }
+        for ( auto const sorted_entry : { true, false } ) {
+            auto deferred{ TestFixture::from( first, false ) };
+            deferred.bulk_or_intermediate( TestFixture::from( second, false ) );
+            if ( sorted_entry ) {
+                deferred.remove_many_sorted( { doomed.data(), doomed.size() } );
+            } else {
+                deferred.remove_many( doomed );
+            }
+            deferred.bulk_or_finish();
+            auto const expected{ without( both, doomed ) };
+            EXPECT_EQ( deferred.validate(), nullptr );
+            EXPECT_EQ( deferred.size(), expected.size() );
+            EXPECT_TRUE( std::ranges::equal( deferred.to_vector(), expected ) );
+        }
+    }
+}
+
+// ---- copy on write -------------------------------------------------------------------------------------------
+// The mutator must unshare a chunk before editing it, or it edits the chunk that the copies still own.
+
+namespace cow_case {
+constexpr std::uint32_t dense_end{ 1U << 17 };
+constexpr std::uint32_t sparse_value{ 5U << 16 };
+
+[[nodiscard]] values_t source_values() {
+    auto result{ closed_range( 0, dense_end - 1U ) };
+    result.push_back( sparse_value );
+    return result;
+}
+
+[[nodiscard]] values_t several_chunks() { return { 1, 3, 5, 7, chunk_size + 1U, chunk_size + 3U, sparse_value }; }
+[[nodiscard]] values_t one_chunk      () { return { 1, 2, 3 }; }
+[[nodiscard]] values_t empties_chunk  () { return { sparse_value }; }
+}  // namespace cow_case
+
+TYPED_TEST( RemoveManyChunks, copies_keep_their_values_when_one_removes_many ) {
+    auto const values{ cow_case::source_values() };
+    for ( auto const run_optimized : { false, true } ) {
+        for ( auto const & doomed : { cow_case::several_chunks(), cow_case::one_chunk(), cow_case::empties_chunk() } ) {
+            TestFixture::expect_removal( values, run_optimized, doomed, without( values, doomed ), "copy on write" );
+        }
+    }
+}
+
+TYPED_TEST( RemoveManyChunks, four_copies_each_remove_without_touching_the_others ) {
+    auto const values{ cow_case::source_values() };
+    auto const source{ TestFixture::from( values, false ) };
+    std::vector<std::remove_const_t<decltype( source )>> copies( 4, source );
+    auto const doomed{ cow_case::several_chunks() };
+    for ( std::size_t i{ 0 }; i < copies.size(); ++i ) {
+        copies[ i ].remove_many( doomed );
+        EXPECT_EQ( copies[ i ].validate(), nullptr );
+        EXPECT_TRUE( std::ranges::equal( copies[ i ].to_vector(), without( values, doomed ) ) );
+        EXPECT_TRUE( std::ranges::equal( source.to_vector(), values ) );
+        for ( auto j{ i + 1 }; j < copies.size(); ++j ) {
+            EXPECT_TRUE( std::ranges::equal( copies[ j ].to_vector(), values ) );
+        }
+    }
+}
+
+// ---- 64-bit keys ---------------------------------------------------------------------------------------------
+
+TEST( RemoveMany64, removes_across_chunks_until_empty ) {
+    bitmap<std::uint64_t> bitmap;
+    std::vector<std::uint64_t> values;
+    for ( std::uint64_t value{ 0 }; value < 1'000; ++value ) {
+        values.push_back( value );
+        bitmap.add( value );
+    }
+    bitmap.remove_many( values );
+    EXPECT_TRUE( bitmap.empty() );
+    EXPECT_EQ( bitmap.validate(), nullptr );
+}
+
+TEST( RemoveMany64, values_that_are_not_there ) {
+    bitmap<std::uint64_t> bitmap;
+    bitmap.add( 123 );
+    bitmap.add( 124 );
+    bitmap.remove_many( std::vector<std::uint64_t>{ 125 } );
+    EXPECT_EQ( bitmap.size(), 2U );
+    bitmap.remove_many( std::vector<std::uint64_t>{ 123, 124, 125 } );
+    EXPECT_TRUE( bitmap.empty() );
+    EXPECT_EQ( bitmap.validate(), nullptr );
+}
+
+TEST( RemoveMany64, a_chunk_emptied_by_its_first_value_and_a_value_repeated ) {
+    bitmap<std::uint64_t> bitmap;
+    bitmap.add( 0 );
+    bitmap.add( std::uint64_t{ 1 } << 20 );
+    bitmap.remove_many( std::vector<std::uint64_t>{ 0, 0 } );
+    EXPECT_EQ( bitmap.validate(), nullptr );
+    EXPECT_EQ( bitmap.size(), 1U );
+    EXPECT_TRUE( bitmap.contains( std::uint64_t{ 1 } << 20 ) );
+
+    decltype( bitmap ) other;
+    other.add( 123 );
+    other.add( 124 );
+    other.remove_many( std::vector<std::uint64_t>{ 123, 124, 124 } );
+    EXPECT_TRUE( other.empty() );
+    EXPECT_EQ( other.validate(), nullptr );
+}
+
+// ---- the group removal on a bare container -------------------------------------------------------------------
+
+TEST( RemoveManyContainers, a_bitset_with_an_unknown_cardinality_is_counted_before_its_bits_change ) {
+    using layout_t    = detail::default_layout<std::uint32_t>;
+    using container_t = detail::container_handle<layout_t, detail::cow_value_semantics>;
+
+    auto container{ container_t::make_bitset_uninitialized() };
+    auto & words{ container.as_bitset().words.as_array() };
+    words.fill( 0 );
+    std::uint32_t count{ 0 };
+    for ( std::uint32_t value{ 10 }; value < chunk_size - 10U; value += 3U ) {
+        words[ value / 64U ] |= std::uint64_t{ 1 } << ( value % 64U );
+        ++count;
+    }
+    container.set_cardinality( count );
+    container.as_bitset().mark_cardinality_unknown();
+
+    // 13 and 16 are present, 14 and 15 are not; the endpoints (10 and the largest) stay
+    std::vector<std::uint16_t> const doomed{ 13, 14, 15, 16 };
+    auto const removed{ detail::container_remove_sorted<layout_t, detail::cow_value_semantics>( container, { doomed.data(), doomed.size() }, 4'096 ) };
+    EXPECT_EQ( removed, 2U );
+    EXPECT_EQ( detail::container_size<layout_t>( container ), count - 2U );
+    EXPECT_EQ( container.min_value(), 10U );
+
+    // the largest value goes: the endpoint moves
+    std::vector<std::uint16_t> const largest{ container.max_value() };
+    auto const second{ detail::container_remove_sorted<layout_t, detail::cow_value_semantics>( container, { largest.data(), largest.size() }, 4'096 ) };
+    EXPECT_EQ( second, 1U );
+    EXPECT_LT( container.max_value(), largest.front() );
+    EXPECT_EQ( container.max_value() % 3U, 1U );
 }
 
 }  // namespace

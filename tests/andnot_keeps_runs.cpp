@@ -12,6 +12,8 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
+#include <random>
 #include <span>
 #include <utility>
 #include <variant>
@@ -569,5 +571,177 @@ TEST( AndnotKeepsRunsContainers, the_reference_cases ) {
     EXPECT_EQ( detail::container_size( small_left ), 2U );
     EXPECT_TRUE( small_left.kind() != detail::container_kind::bitset );
 }
+
+// ---- the reference's own array cases, on bare containers -----------------------------------------------------
+// The data of the reference's run_andnot_test for the array operands (an array minus runs, runs minus an array),
+// with the form of every result the reference gives it.
+// [croaring-ref] tests/mixed_container_unit.c:run_andnot_test
+
+template <typename Member>
+[[nodiscard]] container_t array_container_of( Member const & member ) {
+    std::vector<std::uint16_t> values;
+    for ( std::uint32_t value{ 0 }; value < chunk_size; ++value ) {
+        if ( member( value ) ) {
+            values.push_back( static_cast<std::uint16_t>( value ) );
+        }
+    }
+    return container_t::make_array_from_sorted( { values.data(), values.size() } );
+}
+
+[[nodiscard]] std::size_t array_minus_runs( container_t const & array, container_t const & runs ) {
+    return detail::difference_array_run<container_layout_t, detail::cow_value_semantics>( array.as_array(), runs.as_run() ).size();
+}
+
+[[nodiscard]] container_t runs_minus_array( container_t const & runs, container_t const & array ) {
+    return detail::difference_run_array<container_layout_t, detail::cow_value_semantics>( runs.as_run(), array.as_array(), eager_bitmap::array_to_bitset_threshold );
+}
+
+TEST( AndnotKeepsRunsContainers, the_reference_array_cases ) {
+    auto const r1_member{ []( std::uint32_t const x ) { return x % 5U < 3U; } };
+    auto const m2_member{ []( std::uint32_t const x ) { return x % 62U < 37U; } };
+    auto const m3_member{ []( std::uint32_t const x ) { return x % 5U < 2U || ( x % 5U < 3U && x > 10'000U ); } };
+    auto const m4_member{ []( std::uint32_t const x ) {
+        // the reference's pseudo-random fill: three of every four positions
+        static auto const table{ [] {
+            std::vector<bool> result( chunk_size );
+            int state{ 1 };
+            for ( std::uint32_t at{ 0 }; at < chunk_size; ++at ) {
+                result[ at ] = state % 4 != 0;
+                state = ( 3432 * state + 6789 ) % 9973;
+            }
+            return result;
+        }() };
+        return static_cast<bool>( table[ x ] );
+    } };
+    auto const small{ []( std::uint32_t const x ) { return x >= 990U && x < 1'000U; } };
+
+    auto const a1{ array_container_of( r1_member ) };
+    auto const a2{ array_container_of( m2_member ) };
+    auto const a3{ array_container_of( m3_member ) };
+    auto const a4{ array_container_of( m4_member ) };
+    auto const a_small{ array_container_of( small ) };
+    auto const r1{ run_container_of( r1_member ) };
+    auto const r2{ run_container_of( m2_member ) };
+    auto const r3{ run_container_of( m3_member ) };
+    auto const r_small{ run_container_of( small ) };
+
+    auto const count_of{ []( auto const & keep ) {
+        std::size_t result{ 0 };
+        for ( std::uint32_t x{ 0 }; x < chunk_size; ++x ) {
+            result += keep( x ) ? 1U : 0U;
+        }
+        return result;
+    } };
+
+    // an empty result, and a result of only the ends of the array
+    EXPECT_EQ( array_minus_runs( a1, r1 ), 0U );
+    EXPECT_EQ( array_minus_runs( a1, r3 ), 2'000U );
+    EXPECT_EQ( array_minus_runs( a1, r2 ), count_of( [ & ]( std::uint32_t const x ) { return r1_member( x ) && !m2_member( x ); } ) );
+    EXPECT_EQ( array_minus_runs( a_small, r2 ), 2U );
+    EXPECT_EQ( array_minus_runs( a4, r3 ), count_of( [ & ]( std::uint32_t const x ) { return m4_member( x ) && !m3_member( x ); } ) );
+
+    // nothing to take out leaves the array whole; a run over all of it leaves nothing
+    auto const empty_runs{ container_t::make_run() };
+    EXPECT_EQ( array_minus_runs( a1, empty_runs ), a1.as_array().values.size() );
+    auto const full_runs{ run_container_of( []( std::uint32_t ) { return true; } ) };
+    EXPECT_EQ( array_minus_runs( a1, full_runs ), 0U );
+
+    auto const against_a3{ runs_minus_array( r1, a3 ) };
+    EXPECT_EQ( against_a3.kind(), detail::container_kind::array );
+    EXPECT_EQ( detail::container_size( against_a3 ), 2'000U );
+
+    auto const small_left{ runs_minus_array( r_small, a2 ) };
+    EXPECT_EQ( detail::container_size( small_left ), 2U );
+    EXPECT_TRUE( small_left.kind() != detail::container_kind::bitset );
+
+    // runs with a few holes stay runs: 13 values in five runs take less than the same values as an array
+    auto const complex_member{ []( std::uint32_t const x ) {
+        return x < 3U || ( x >= 10U && x < 12U ) || ( x >= 990U && x < 995U ) || ( x >= 10'000U && x < 10'003U ) || ( x >= 20'000U && x < 20'002U );
+    } };
+    auto const three_values{ container_t::make_array_from_sorted( std::vector<std::uint16_t>{ 993, 994, 2'000 } ) };
+    auto const complex_left{ runs_minus_array( run_container_of( complex_member ), three_values ) };
+    EXPECT_EQ( complex_left.kind(), detail::container_kind::run );
+    EXPECT_EQ( detail::container_size( complex_left ), 13U );
+}
+
+// ---- an array minus runs, over every container set and layout --------------------------------------------------
+// Random arrays minus random run operands, compared with a membership table: through the binary and the in-place
+// operator, a shared and a sole receiver. The container set without bitsets and the narrow layouts take the same
+// kernel with other element types and limits.
+
+template <typename Bitmap>
+void array_minus_runs_trials( std::uint64_t const seed ) {
+    using key_t = typename Bitmap::key_type;
+    constexpr std::uint64_t domain{ std::numeric_limits<key_t>::digits >= 32 ? std::uint64_t{ 3 } * chunk_size : std::uint64_t{ 1 } << std::numeric_limits<key_t>::digits };
+    std::mt19937_64 rng{ seed };
+    for ( int trial{ 0 }; trial < 300; ++trial ) {
+        std::vector<bool> receiver_table( domain );
+        std::vector<bool> operand_table( domain );
+        auto const density{ 1U + static_cast<unsigned>( rng() % 40 ) };
+        for ( std::uint64_t value{ 0 }; value < domain; ++value ) {
+            receiver_table[ value ] = rng() % 1'000 < density;
+        }
+        auto const longest{ 1U + static_cast<std::uint64_t>( rng() % ( domain / 8 + 1 ) ) };
+        auto const widest_gap{ 1U + static_cast<std::uint64_t>( rng() % ( domain / 4 + 1 ) ) };
+        for ( std::uint64_t value{ rng() % widest_gap }; value < domain; value += 1 + rng() % widest_gap ) {
+            auto const length{ 1 + rng() % longest };
+            for ( std::uint64_t i{ 0 }; i < length && value < domain; ++i, ++value ) {
+                operand_table[ value ] = true;
+            }
+        }
+        auto const listed{ [ & ]( std::vector<bool> const & table ) {
+            std::vector<key_t> result;
+            for ( std::uint64_t value{ 0 }; value < domain; ++value ) {
+                if ( table[ value ] ) {
+                    result.push_back( static_cast<key_t>( value ) );
+                }
+            }
+            return result;
+        } };
+        auto const receiver_values{ listed( receiver_table ) };
+        auto const operand_values { listed( operand_table ) };
+        std::vector<bool> left_table( domain );
+        for ( std::uint64_t value{ 0 }; value < domain; ++value ) {
+            left_table[ value ] = receiver_table[ value ] && !operand_table[ value ];
+        }
+        auto const expected{ listed( left_table ) };
+        SCOPED_TRACE( ::testing::Message() << "trial " << trial << " receiver " << receiver_values.size() << " operand " << operand_values.size() );
+
+        auto const build{ [ & ]( std::vector<key_t> const & values, bool const run_optimized ) {
+            Bitmap result;
+            for ( auto const value : values ) {
+                result.add( value );
+            }
+            if ( run_optimized ) {
+                result.optimize();
+            }
+            return result;
+        } };
+        auto const receiver{ build( receiver_values, false ) };
+        auto const operand { build( operand_values , true  ) };
+
+        auto const difference{ receiver - operand };
+        EXPECT_EQ( difference.validate(), nullptr ) << "binary";
+        EXPECT_TRUE( std::ranges::equal( difference.to_vector(), expected ) ) << "binary";
+        {
+            auto shared{ receiver };
+            shared -= operand;
+            EXPECT_EQ( shared.validate(), nullptr ) << "-= on a shared copy";
+            EXPECT_TRUE( std::ranges::equal( shared.to_vector(), expected ) ) << "-= on a shared copy";
+            EXPECT_TRUE( std::ranges::equal( receiver.to_vector(), receiver_values ) ) << "the other holder";
+        }
+        {
+            auto sole{ build( receiver_values, false ) };
+            sole -= operand;
+            EXPECT_EQ( sole.validate(), nullptr ) << "-= on a sole holder";
+            EXPECT_TRUE( std::ranges::equal( sole.to_vector(), expected ) ) << "-= on a sole holder";
+        }
+    }
+}
+
+TEST( ArrayMinusRuns, default_set ) { array_minus_runs_trials<eager_bitmap>( 0xA2201 ); }
+TEST( ArrayMinusRuns, array_and_run_set ) { array_minus_runs_trials<array_run_bitmap>( 0xA2202 ); }
+TEST( ArrayMinusRuns, sixteen_bit_keys ) { array_minus_runs_trials<bitmap<std::uint16_t>>( 0xA2203 ); }
+TEST( ArrayMinusRuns, eight_bit_keys ) { array_minus_runs_trials<bitmap<std::uint8_t>>( 0xA2204 ); }
 
 }  // namespace
