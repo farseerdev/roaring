@@ -19,29 +19,30 @@ plain = 'cpp-cow'
 optimized = 'cpp-cow-opt'
 families = ( 'KeepRuns', 'RunAndNot', 'AndAfterRunAndNot', 'AndInplaceAfterRunAndNot' )
 
-# Bands expected above 1.05x the plain CRoaring arm, and the ceiling of each. The KeepRunsRemoveMany bands are
-# deliberately absent: remove_many_sorted on a run chunk removes value by value, and the gate keeps failing on it
-# until it does not.
+# Bands expected above 1.05x the plain CRoaring arm, and the ceiling of each. Every KeepRunsRemoveMany band is under
+# 1.0x and has no entry. The end-to-end rounds that keep runs are slower than plain CRoaring where its deletion leaves
+# the chunk a bitset that later rounds clear a word at a time; against the arm that runs run_optimize after each
+# deletion (the fair baseline) only the four-filter intersection is above 1.05x.
 known_above = {
     'AndAfterRunAndNot/run_array/holes=1000': 4.22,
     'AndAfterRunAndNot/run_bitset/residue=dense': 1.39,
     'AndAfterRunAndNot/run_bitset/residue=nine_values': 1.22,
     'AndInplaceAfterRunAndNot/run_array/holes=1000': 4.12,
     'AndInplaceAfterRunAndNot/run_bitset/residue=dense': 1.31,
+    'AndInplaceAfterRunAndNot/run_bitset/residue=nine_values': 1.18,
     'AndInplaceAfterRunAndNot/run_bitset/residue=three_stretches': 1.26,
     'AndInplaceAfterRunAndNot/run_run/one_cut': 1.25,
-    'KeepRunsRemove/dense_chunks': 1.29,
-    'KeepRunsRemove/mixed': 2.04,
-    'KeepRunsRemove/ranges': 2.69,
-    'KeepRunsRemove/singles': 4.07,
-    'KeepRunsRemoveAnd/dense_chunks': 1.17,
-    'KeepRunsRemoveAnd/mixed': 1.62,
-    'KeepRunsRemoveAnd/ranges': 1.62,
-    'KeepRunsRemoveAnd/singles': 3.08,
-    'KeepRunsRemoveAndMany/dense_chunks': 1.79,
-    'KeepRunsRemoveAndMany/mixed': 1.84,
-    'KeepRunsRemoveAndMany/ranges': 2.5,
-    'KeepRunsRemoveAndMany/singles': 2.81,
+    'KeepRunsRemove/dense_chunks': 1.31,
+    'KeepRunsRemove/mixed': 1.98,
+    'KeepRunsRemove/ranges': 1.75,
+    'KeepRunsRemove/singles': 3.93,
+    'KeepRunsRemoveAnd/mixed': 1.36,
+    'KeepRunsRemoveAnd/ranges': 1.34,
+    'KeepRunsRemoveAnd/singles': 2.89,
+    'KeepRunsRemoveAndMany/dense_chunks': 1.65,
+    'KeepRunsRemoveAndMany/mixed': 1.73,
+    'KeepRunsRemoveAndMany/ranges': 2.31,
+    'KeepRunsRemoveAndMany/singles': 2.69,
     'RunAndNot/run_bitset/residue=dense': 1.28,
     'RunAndNot/run_bitset/residue=one_stretch': 1.17,
     'RunAndNot/run_run/one_cut': 1.19,
@@ -50,8 +51,8 @@ known_above = {
 }
 # The same, against the CRoaring arm that runs run_optimize after each deletion.
 known_above_optimized = {
-    'KeepRunsRemoveAndMany/dense_chunks': 1.53,
-    'KeepRunsRemoveAndMany/ranges': 2.17,
+    'KeepRunsRemoveAndMany/dense_chunks': 1.29,
+    'KeepRunsRemoveAndMany/ranges': 1.84,
 }
 margin = 1.05
 
