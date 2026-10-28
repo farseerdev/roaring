@@ -1528,11 +1528,20 @@ template <typename Layout, typename OutVector, typename CowPolicy = cow_value_se
 // a downstream engine's binary-search-per-run kernel on real model shapes,
 // whose skew the ArrayRunAndFold bench (which settled the linear walk) does
 // not reproduce.
-template <bool Greater, typename E>
+//
+// The elements need not be bare keys: `key_of` projects the compared key out of an element (the run
+// lists are searched by their end), so the run kernels share this search rather than carry their own.
+struct identity_key {
+    template <typename T>
+    [[nodiscard]] constexpr T const & operator()( T const & value ) const noexcept { return value; }
+};
+
+template <bool Greater, typename Element, typename Key, typename KeyOf = identity_key>
 [[nodiscard]] [[gnu::always_inline]] inline std::size_t gallop_forward(
-    E const * const keys, std::size_t lo, std::size_t const hi, E const limit
+    Element const * const keys, std::size_t lo, std::size_t const hi, Key const limit, KeyOf const key_of = {}
 ) noexcept {
-    auto const below{ []( E const key, E const lim ) noexcept {
+    auto const below{ [ key_of ]( Element const & element, Key const lim ) noexcept {
+        auto const key{ key_of( element ) };
         return Greater ? key <= lim : key < lim;
     } };
     if ( lo == hi || !below( keys[ lo ], limit ) ) {
@@ -1556,8 +1565,8 @@ template <bool Greater, typename E>
     // keys[lo] fails the bound; the first passing key lies in (lo, window_end].
     ++lo;
     auto const * const found{ Greater
-        ? std::upper_bound( keys + lo, keys + window_end, limit )
-        : std::lower_bound( keys + lo, keys + window_end, limit ) };
+        ? std::upper_bound( keys + lo, keys + window_end, limit, [ key_of ]( Key const lim, Element const & element ) noexcept { return lim < key_of( element ); } )
+        : std::lower_bound( keys + lo, keys + window_end, limit, [ key_of ]( Element const & element, Key const lim ) noexcept { return key_of( element ) < lim; } ) };
     return static_cast<std::size_t>( found - keys );
 }
 

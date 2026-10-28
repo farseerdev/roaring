@@ -509,4 +509,44 @@ TEST( KernelCrosscheck, ComparableSizeUnionRoundsMatchCRoaring ) {
     }
 }
 
+// ---- run-encoded chunks of very different run counts ---------------------------------------------------
+//
+// Intersecting two run lists crosses the stretch of one list that lies below the other's current run in one
+// step: lists of one run against thousands, of equal length, interleaved closely and far apart, in both
+// orders and through the cardinality-only form.
+TEST( KernelCrosscheck, RunListsOfDifferentLengthsIntersectLikeCRoaring ) {
+    std::mt19937_64 rng{ 0x7E11 };
+    auto const runs_of = [ & ]( std::uint32_t const count, std::uint32_t const max_length, std::uint32_t const max_gap ) {
+        Values32 out;
+        std::uint32_t at{ static_cast<std::uint32_t>( rng() % 200 ) };
+        for ( std::uint32_t r{ 0 }; r < count; ++r ) {
+            auto const length{ 1U + static_cast<std::uint32_t>( rng() % max_length ) };
+            if ( at + length > 65536U ) { break; }
+            for ( std::uint32_t k{ 0 }; k < length; ++k ) { out.push_back( ( 3U << 16 ) + at + k ); }
+            at += length + 1U + static_cast<std::uint32_t>( rng() % max_gap );
+        }
+        return out;
+    };
+    for ( int trial{ 0 }; trial < 800; ++trial ) {
+        static constexpr std::uint32_t counts[]{ 1, 2, 3, 40, 500, 3000 };
+        auto const left_count { counts[ rng() % std::size( counts ) ] };
+        auto const right_count{ counts[ rng() % std::size( counts ) ] };
+        auto const left_values { runs_of( left_count,  1U + static_cast<std::uint32_t>( rng() % 30'000 / left_count ),  1U + static_cast<std::uint32_t>( rng() % 20 ) ) };
+        auto const right_values{ runs_of( right_count, 1U + static_cast<std::uint32_t>( rng() % 30'000 / right_count ), 1U + static_cast<std::uint32_t>( rng() % 20 ) ) };
+        if ( left_values.empty() || right_values.empty() ) { continue; }
+        SCOPED_TRACE( ::testing::Message() << "trial " << trial << ": " << left_count << " and " << right_count << " runs" );
+        auto const left { make_ours( left_values, true ) };
+        auto const right{ make_ours( right_values, true ) };
+        auto const theirs_left { make_theirs( left_values, true ) };
+        auto const theirs_right{ make_theirs( right_values, true ) };
+        croaring const expected{ roaring_bitmap_and( theirs_left.r, theirs_right.r ) };
+        EXPECT_TRUE( same_contents( left & right, expected ) );
+        EXPECT_TRUE( same_contents( right & left, expected ) );
+        EXPECT_EQ( left.and_cardinality( right ), roaring_bitmap_and_cardinality( theirs_left.r, theirs_right.r ) );
+        auto copy{ left };
+        copy &= right;
+        EXPECT_TRUE( same_contents( copy, expected ) );
+    }
+}
+
 } // namespace

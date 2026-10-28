@@ -1,5 +1,6 @@
 #pragma once
 
+#include <frsr/roaring/array_ops.hpp>
 #include <frsr/roaring/containers.hpp>
 #include <frsr/roaring/bitset_ops.hpp>
 #include <frsr/roaring/hw_info.hpp>
@@ -34,6 +35,16 @@ template <typename Layout, typename CowPolicy = cow_value_semantics>
         run.runs.front().end == std::numeric_limits<typename Layout::low_type>::max();
 }
 
+// The first run after `index` that ends at or beyond `limit` (`size` if none): the runs wholly below the other
+// list's current run are crossed at once, so a list with few runs against one with many costs the few.
+template <typename Run>
+[[nodiscard]] [[gnu::always_inline]] inline std::size_t next_run_reaching( Run const * const runs, std::size_t const index, std::size_t const size, std::size_t const limit ) noexcept {
+    return gallop_forward<false>(
+        runs, index + 1U, size, limit,
+        []( Run const & run ) noexcept { return std::size_t{ run.end }; }
+    );
+}
+
 // Run∩run merge into `out`, which MUST hold lhs.size + rhs.size runs (the most an intersection can
 // produce, one more than it does). Returns the run count and the cardinality they cover.
 // [croaring-ref] deps/croaring/src/containers/run.c:run_container_intersection
@@ -59,7 +70,7 @@ template <typename Layout>
 
     FRSR_ROARING_LOOP_ALIGN while ( li < lhs_size && ri < rhs_size ) {
         if ( end <= xstart ) {
-            ++li;
+            li = next_run_reaching( lhs_runs, li, lhs_size, xstart );
             if ( li < lhs_size ) {
                 start = static_cast<std::size_t>( lhs_runs[ li ].begin );
                 end = static_cast<std::size_t>( lhs_runs[ li ].end ) + 1U;
@@ -67,7 +78,7 @@ template <typename Layout>
             continue;
         }
         if ( xend <= start ) {
-            ++ri;
+            ri = next_run_reaching( rhs_runs, ri, rhs_size, start );
             if ( ri < rhs_size ) {
                 xstart = static_cast<std::size_t>( rhs_runs[ ri ].begin );
                 xend = static_cast<std::size_t>( rhs_runs[ ri ].end ) + 1U;
@@ -128,13 +139,13 @@ template <typename Layout>
     auto xend{ static_cast<std::size_t>( rhs_runs[ ri ].end ) + 1U };
     FRSR_ROARING_LOOP_ALIGN while ( li < lhs_size && ri < rhs_size ) {
         if ( end <= xstart ) {
-            ++li;
+            li = next_run_reaching( lhs_runs, li, lhs_size, xstart );
             if ( li < lhs_size ) {
                 start = static_cast<std::size_t>( lhs_runs[ li ].begin );
                 end = static_cast<std::size_t>( lhs_runs[ li ].end ) + 1U;
             }
         } else if ( xend <= start ) {
-            ++ri;
+            ri = next_run_reaching( rhs_runs, ri, rhs_size, start );
             if ( ri < rhs_size ) {
                 xstart = static_cast<std::size_t>( rhs_runs[ ri ].begin );
                 xend = static_cast<std::size_t>( rhs_runs[ ri ].end ) + 1U;
