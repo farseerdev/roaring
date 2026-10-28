@@ -195,6 +195,7 @@ FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::add_many_sorted( std::s
 
 FRSR_ROARING_BITMAP_TEMPLATE
 FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::remove_many_sorted( std::span<key_type const> const sorted_values ) noexcept( detail::allocation_failure_terminates ) {
+    assert( std::ranges::is_sorted( sorted_values ) );
     settle_counts();
     if ( sorted_values.empty() ) {
         return;

@@ -765,6 +765,9 @@ public:
 
     [[ gnu::hot ]] void add_many_sorted( std::span<key_type const> const sorted_values ) noexcept( detail::allocation_failure_terminates );
 
+    // Removes the values, which must be in ascending order; a value may repeat. Out-of-order input is a precondition
+    // violation: it is asserted in debug builds and in release builds the result is unspecified (values that follow
+    // a larger one may be missed). remove_many() takes any order.
     [[ gnu::hot ]] void remove_many_sorted( std::span<key_type const> const sorted_values ) noexcept( detail::allocation_failure_terminates );
 
     // The values in any order, possibly repeated; a contiguous range of key_type reaches these through add_many /
