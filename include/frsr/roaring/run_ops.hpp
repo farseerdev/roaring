@@ -357,8 +357,10 @@ template <typename Layout, typename CowPolicy = cow_value_semantics>
 ) {
     auto result{ container_handle<Layout, CowPolicy>::make_run() };
     auto ref{ result.as_run() };
-    // Every value taken out splits at most one run in two.
-    ref.runs.resize_uninitialized( static_cast<std::uint32_t>( lhs.runs.size() + values.size() ) );
+    // Every value taken out splits at most one run in two, and disjoint runs that do not touch cannot be more than
+    // half the domain.
+    constexpr std::size_t most_runs{ Layout::low_domain_size / 2U };
+    ref.runs.resize_uninitialized( static_cast<std::uint32_t>( std::min<std::size_t>( lhs.runs.size() + values.size(), most_runs ) ) );
     auto * const out{ ref.runs.data() };
     std::size_t n{ 0 };
 
