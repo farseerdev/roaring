@@ -86,7 +86,8 @@ What it shows:
   sub-ranges (the time buys the size above); it is level on bitset-dense chunks.
 * The single-chunk bands, against the same bands before the runs were kept: a run minus a bitset is 1.2x to 4.7x faster
   (the intersection after it up to 4.5x; a dense residue is unchanged), a run minus an array with a thousand holes is
-  1.4x to 1.9x faster, the intersection after that one and the other single-chunk bands are unchanged.
+  1.4x to 1.9x faster, the intersection after that one (two run containers of a thousand runs each) is 5x to 8x faster and
+  now 0.4x to 0.5x CRoaring's time (it was 2.2x to 3.8x), and the other single-chunk bands are unchanged.
 
 ## Bands still above 1.0x CRoaring
 
@@ -122,8 +123,6 @@ one pass, and is 0.19x to 0.39x the time of CRoaring's `roaring_bitmap_remove_ma
   bytes. That gap is the intersection, not the deletion: on ranges, 44% of the time is `array & runs` and 27% is
   `run & bitset`, both of them kernels shared with `&=`; the array-with-runs and run-run intersections are not
   changed here.
-* `AndAfterRunAndNot` and `AndInplaceAfterRunAndNot` on a run with a thousand holes: 2.2x to 3.8x, an intersection
-  of two run containers of a thousand runs each against CRoaring's array path. Unchanged by keeping runs.
 * Under 0.1 us per operation, `RunAndNot*` of a run minus a run (`run_run/one_cut`) and a few single-chunk bitset
   residues sit at 1.0x to 1.3x; at that size a few nanoseconds of timer and loop overhead move the ratio.
 
