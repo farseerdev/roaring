@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <new>
@@ -7996,6 +7997,8 @@ enum class bop : std::uint8_t {
     andnot_inplace,      // copy of a, then a -= b
     and_after_andnot,    // a is first reduced to a - b (untimed), then timed: a & c
     and_inplace_after_andnot,   // the same, timed: a copy of a, then a &= c
+    back,                // the largest value of a, `repeat` times (a memory barrier per call keeps the compiler from computing it once)
+    front,               // the smallest value of a, `repeat` times
 };
 
 struct band {
@@ -8004,6 +8007,7 @@ struct band {
     bop op;
     shared_values32 a, b;
     shared_values32 c;                           // the *_after_andnot operations: the operand of the timed intersection
+    shared_values32 fill;                        // frsr only: built from these values, then reduced to a by removals, which leaves a bitset holding few values
     bool run_encode_a{};                         // a is fully run-optimized (a bitset a stays a run when that is smaller)
     std::uint32_t range_first{}, range_last{};   // flip
     std::uint32_t spare_value{};                 // or_inplace_spare
@@ -8031,7 +8035,14 @@ struct frsr_band_registrar {
         e.description = "frsr::roaring::bitmap<uint32_t>: " + d.description;
         e.setup       = [d]() -> void * {
             auto * const s = new state;
-            s->a.add_many( *d.a );
+            if ( d.fill ) {
+                s->a.add_many( *d.fill );
+                values32 surplus;
+                std::ranges::set_difference( *d.fill, *d.a, std::back_inserter( surplus ) );
+                s->a.remove_many( surplus );
+            } else {
+                s->a.add_many( *d.a );
+            }
             if ( d.b ) { s->b.add_many( *d.b ); }
             if ( d.run_encode_a ) {
                 s->a.optimize();
@@ -8065,6 +8076,8 @@ struct frsr_band_registrar {
                     case bop::flip:      { Bitmap t{ s->a }; t.flip_closed_range( d.range_first, d.range_last ); checksum += static_cast<std::int64_t>( t.size() ); break; }
                     case bop::copy_only: { Bitmap const t{ s->a }; checksum += static_cast<std::int64_t>( t.size() ); break; }
                     case bop::to_array:  { checksum += static_cast<std::int64_t>( s->a.to_array_into( s->out ) ); break; }
+                    case bop::back:      { asm volatile( "" ::: "memory" ); checksum += static_cast<std::int64_t>( s->a.back() ); break; }
+                    case bop::front:     { asm volatile( "" ::: "memory" ); checksum += static_cast<std::int64_t>( s->a.front() ); break; }
                 }
             }
             return checksum;
@@ -8132,6 +8145,8 @@ struct cpp_band_registrar {
                     case bop::flip:      { croaring_handle const t{ Arm::copy( s->a.r ) }; roaring_bitmap_flip_inplace_closed( t.r, d.range_first, d.range_last ); checksum += static_cast<std::int64_t>( roaring_bitmap_get_cardinality( t.r ) ); break; }
                     case bop::copy_only: { croaring_handle const t{ Arm::copy( s->a.r ) }; checksum += static_cast<std::int64_t>( roaring_bitmap_get_cardinality( t.r ) ); break; }
                     case bop::to_array:  { roaring_bitmap_to_uint32_array( s->a.r, s->out.data() ); checksum += static_cast<std::int64_t>( s->out.size() ); break; }
+                    case bop::back:      { asm volatile( "" ::: "memory" ); checksum += static_cast<std::int64_t>( roaring_bitmap_maximum( s->a.r ) ); break; }
+                    case bop::front:     { asm volatile( "" ::: "memory" ); checksum += static_cast<std::int64_t>( roaring_bitmap_minimum( s->a.r ) ); break; }
                 }
             }
             return checksum;
@@ -8969,7 +8984,79 @@ static void register_random_contains_bands() {
     }
 }
 
+// ---- B8: the largest and the smallest value of a bitmap whose last (first) chunk holds each container kind -------
+// The bitmap is a few array chunks followed (preceded) by the chunk under test, so the chunk walk is part of the
+// cost. The small bitset is a frsr shape the reference never holds (its removals turn a bitset with few values
+// back into an array), so its reference arm reads the same values from an array.
+static void register_back_front() {
+    struct shape {
+        char const * name;
+        char const * description;
+        values32 chunk;     // the low 16 bits of the chunk under test
+        values32 fill;      // frsr only: the chunk is built from these and reduced to `chunk` by removals
+    };
+    std::mt19937_64 rng{ 0xBAC4 };
+    std::vector<shape> shapes;
+    {
+        values32 array;
+        for ( auto const low : random_lows( rng, 4000 ) ) { array.push_back( low ); }
+        shapes.push_back( { "array_4000", "an array container of 4000 values", std::move( array ), {} } );
+    }
+    {
+        values32 dense;
+        for ( auto const low : random_lows( rng, 30000 ) ) { dense.push_back( low ); }
+        shapes.push_back( { "bitset_30000", "a bitset container of 30000 values", std::move( dense ), {} } );
+    }
+    {
+        values32 runs;
+        for ( std::uint32_t r = 0; r < 8; ++r ) { for ( std::uint32_t k = 0; k < 2000; ++k ) { runs.push_back( r * 8000 + k ); } }
+        shapes.push_back( { "run_8", "a run container of 8 runs", std::move( runs ), {} } );
+    }
+    {
+        values32 fill( 5000 );
+        std::iota( fill.begin(), fill.end(), 0U );
+        shapes.push_back( { "small_bitset_word0", "a bitset container holding {3, 5, 7, 9} (all in its first word)", { 3, 5, 7, 9 }, std::move( fill ) } );
+    }
+    for ( auto const & sh : shapes ) {
+        for ( bool const last : { true, false } ) {
+            constexpr std::uint32_t others = 16;
+            values32 values;
+            auto const chunk_index = last ? others : 0U;
+            for ( std::uint32_t c = 0; c < others + 1; ++c ) {
+                if ( c == chunk_index ) {
+                    for ( auto const low : sh.chunk ) { values.push_back( ( c << 16 ) + low ); }
+                } else {
+                    for ( std::uint32_t k = 0; k < 100; ++k ) { values.push_back( ( c << 16 ) + 10 * k + 1 ); }
+                }
+            }
+            band d;
+            d.op_name = last ? "Back" : "Front";
+            d.shape = sh.name;
+            d.op = last ? bop::back : bop::front;
+            d.a = share( std::move( values ) );
+            if ( !sh.fill.empty() ) {
+                values32 fill;
+                for ( std::uint32_t c = 0; c < others + 1; ++c ) {
+                    if ( c == chunk_index ) {
+                        for ( auto const low : sh.fill ) { fill.push_back( ( c << 16 ) + low ); }
+                    } else {
+                        for ( std::uint32_t k = 0; k < 100; ++k ) { fill.push_back( ( c << 16 ) + 10 * k + 1 ); }
+                    }
+                }
+                d.fill = share( std::move( fill ) );
+            }
+            d.run_encode_a = std::string_view{ sh.name }.starts_with( "run" );
+            d.repeat = 100000;
+            d.ops_per_run = 100000;
+            d.inner_reps = 20;
+            d.description = std::string( last ? "largest" : "smallest" ) + " value of a 17-chunk bitmap whose " + ( last ? "last" : "first" ) + " chunk is " + sh.description + "; cost per call.";
+            register_band( d );
+        }
+    }
+}
+
 static void register_benchmarks() {
+    register_back_front();
     register_small_array_export();
     register_bitset_and_to_array();
     register_sparse_flip();
