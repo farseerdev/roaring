@@ -1131,6 +1131,13 @@ public:
         return values.front();
     }
 
+    [[nodiscard]] std::optional<low_type> last() const noexcept {
+        if ( values.empty() ) {
+            return std::nullopt;
+        }
+        return values.back();
+    }
+
     [[nodiscard]] std::optional<low_type> next_after( low_type const value ) const noexcept {
         auto const pos{ std::upper_bound( values.begin(), values.end(), value ) };
         if ( pos == values.end() ) {
@@ -1410,6 +1417,13 @@ public:
             return std::nullopt;
         }
         return runs.front().begin;
+    }
+
+    [[nodiscard]] std::optional<low_type> last() const noexcept {
+        if ( runs.empty() ) {
+            return std::nullopt;
+        }
+        return runs.back().end;
     }
 
     [[nodiscard]] std::optional<low_type> next_after( low_type const value ) const noexcept {
@@ -1851,6 +1865,17 @@ public:
             auto const word{ words[ index ] };
             if ( word != 0 ) {
                 return static_cast<low_type>( ( index << 6U ) + static_cast<std::size_t>( std::countr_zero( word ) ) );
+            }
+        }
+        return std::nullopt;
+    }
+
+    // The top-down word scan reads word 0 as well: a bitset whose values all lie in its first word has its last one there.
+    [[nodiscard]] std::optional<low_type> last() const noexcept {
+        for ( std::size_t index{ words.size() }; index-- != 0; ) {
+            auto const word{ words[ index ] };
+            if ( word != 0 ) {
+                return static_cast<low_type>( ( index << 6U ) + ( 63U - static_cast<unsigned>( std::countl_zero( word ) ) ) );
             }
         }
         return std::nullopt;

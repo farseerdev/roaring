@@ -143,14 +143,9 @@ FRSR_ROARING_DEFINITION_INLINE auto FRSR_ROARING_BITMAP::back() const noexcept -
     while ( at != chunks_.begin() ) {
         at = chunks_.prev( at );
         auto const & container{ chunks_.slot( at ) };
-        auto next{ detail::container_first( container ) };
-        if ( !next ) {
-            continue;
+        if ( auto const last{ detail::container_last( container ) } ) {
+            return layout_type::compose( chunks_.key( at ), *last );
         }
-        while ( auto const after{ detail::container_next_after( container, *next ) } ) {
-            next = after;
-        }
-        return layout_type::compose( chunks_.key( at ), *next );
     }
     return {};
 }

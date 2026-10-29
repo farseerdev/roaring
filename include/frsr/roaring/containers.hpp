@@ -183,6 +183,13 @@ template <typename Layout, typename CowPolicy>
 }
 
 template <typename Layout, typename CowPolicy>
+[[nodiscard]] inline std::optional<typename Layout::low_type> container_last(
+    container_handle<Layout, CowPolicy> const & container
+) noexcept {
+    return container.visit( []( auto const & current ) noexcept { return current.last(); } );
+}
+
+template <typename Layout, typename CowPolicy>
 [[nodiscard]] inline std::optional<typename Layout::low_type> container_next_after(
     container_handle<Layout, CowPolicy> const & container,
     typename Layout::low_type const value
