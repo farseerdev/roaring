@@ -8108,6 +8108,7 @@ enum class bop : std::uint8_t {
     andnot_inplace,      // copy of a, then a -= b
     and_after_andnot,    // a is first reduced to a - b (untimed), then timed: a & c
     and_inplace_after_andnot,   // the same, timed: a copy of a, then a &= c
+    and_inplace,         // copy of a, then a &= b
     back,                // the largest value of a, `repeat` times (a memory barrier per call keeps the compiler from computing it once)
     front,               // the smallest value of a, `repeat` times
 };
@@ -8119,6 +8120,7 @@ struct band {
     shared_values32 a, b;
     shared_values32 c;                           // the *_after_andnot operations: the operand of the timed intersection
     shared_values32 fill;                        // frsr only: built from these values, then reduced to a by removals, which leaves a bitset holding few values
+    bool b_run_shaped{};                         // frsr only: b is run-encoded whatever its size (optimize() keeps a run list only when it is smaller than a bitset, which a list of thousands of runs is not); the reference holds it by its size rule
     bool run_encode_a{};                         // a is fully run-optimized (a bitset a stays a run when that is smaller)
     std::uint32_t range_first{}, range_last{};   // flip
     std::uint32_t spare_value{};                 // or_inplace_spare
@@ -8160,7 +8162,11 @@ struct frsr_band_registrar {
             } else {
                 s->a.optimize_keep_bitsets();
             }
-            s->b.optimize_keep_bitsets();
+            if ( d.b_run_shaped ) {
+                s->b.optimize_run_shaped( 1 );
+            } else {
+                s->b.optimize_keep_bitsets();
+            }
             if ( d.op == bop::and_after_andnot || d.op == bop::and_inplace_after_andnot ) {
                 s->a -= s->b;
                 s->b = Bitmap{};
@@ -8178,6 +8184,7 @@ struct frsr_band_registrar {
                     case bop::and_op:
                     case bop::and_after_andnot: { Bitmap const r{ s->a & s->b }; checksum += static_cast<std::int64_t>( r.size() ); break; }
                     case bop::andnot_inplace:           { Bitmap t{ s->a }; t -= s->b; checksum += static_cast<std::int64_t>( t.size() ); break; }
+                    case bop::and_inplace:
                     case bop::and_inplace_after_andnot: { Bitmap t{ s->a }; t &= s->b; checksum += static_cast<std::int64_t>( t.size() ); break; }
                     case bop::or_op:     { Bitmap const r{ s->a | s->b }; checksum += static_cast<std::int64_t>( r.size() ); break; }
                     case bop::andnot_op: { Bitmap const r{ s->a - s->b }; checksum += static_cast<std::int64_t>( r.size() ); break; }
@@ -8247,6 +8254,7 @@ struct cpp_band_registrar {
                     case bop::and_op:
                     case bop::and_after_andnot: { croaring_handle const r{ roaring_bitmap_and( s->a.r, s->b.r ) };    checksum += static_cast<std::int64_t>( roaring_bitmap_get_cardinality( r.r ) ); break; }
                     case bop::andnot_inplace:           { croaring_handle const t{ Arm::copy( s->a.r ) }; roaring_bitmap_andnot_inplace( t.r, s->b.r ); checksum += static_cast<std::int64_t>( roaring_bitmap_get_cardinality( t.r ) ); break; }
+                    case bop::and_inplace:
                     case bop::and_inplace_after_andnot: { croaring_handle const t{ Arm::copy( s->a.r ) }; roaring_bitmap_and_inplace( t.r, s->b.r ); checksum += static_cast<std::int64_t>( roaring_bitmap_get_cardinality( t.r ) ); break; }
                     case bop::or_op:     { croaring_handle const r{ roaring_bitmap_or( s->a.r, s->b.r ) };     checksum += static_cast<std::int64_t>( roaring_bitmap_get_cardinality( r.r ) ); break; }
                     case bop::andnot_op: { croaring_handle const r{ roaring_bitmap_andnot( s->a.r, s->b.r ) }; checksum += static_cast<std::int64_t>( roaring_bitmap_get_cardinality( r.r ) ); break; }
@@ -9245,8 +9253,73 @@ static void register_run_shaped_listed() {
     }
 }
 
+// ---- B10: a sparse array chunk against a run chunk -----------------------------------------------------------
+// A few array keys against thousands of short runs (the run list is crossed by a gallop, not stepped), and, as
+// the guard, a long array against a few long runs (the array side is the one that gallops). Half of the keys lie
+// inside a run, half in the gap after one, spread evenly over the runs. This library holds the run list as runs
+// (optimize() would turn thousands of short runs into a bitset); the reference's run_optimize keeps a list only
+// when it is smaller than the alternative, so it may hold the 10k-run chunk as a bitset.
+static void register_array_run() {
+    struct run_list {
+        char const * name;
+        std::uint32_t first, length, stride, count;
+    };
+    auto const runs_of = [](run_list const & r) {
+        values32 out;
+        for ( std::uint32_t i = 0; i < r.count; ++i ) {
+            for ( std::uint32_t k = 0; k < r.length; ++k ) { out.push_back( ( 3U << 16 ) + r.first + i * r.stride + k ); }
+        }
+        return out;
+    };
+    auto const register_ops = [](std::string const & shape, shared_values32 const & array, shared_values32 const & runs, std::string const & what) {
+        for ( auto const [op, name] : { std::pair{ bop::and_op, "ArrayRunAnd" }, std::pair{ bop::and_inplace, "ArrayRunAndInplace" }, std::pair{ bop::andnot_op, "ArrayRunAndNot" } } ) {
+            band d;
+            d.op = op;
+            d.op_name = name;
+            d.shape = shape;
+            d.a = array;
+            d.b = runs;
+            d.b_run_shaped = true;
+            d.repeat = 200;
+            d.ops_per_run = 200;
+            d.inner_reps = 20;
+            d.description = std::string( name ) + ": " + what;
+            register_band( d );
+        }
+    };
+    static constexpr run_list lists[]{
+        { "1kruns", 100, 20, 60, 1000 },
+        { "10kruns", 2, 3, 6, 10000 },
+    };
+    for ( auto const & list : lists ) {
+        auto const runs = share( runs_of( list ) );
+        for ( std::uint32_t const keys : { 1U, 4U, 16U, 64U } ) {
+            values32 array;
+            for ( std::uint32_t i = 0; i < keys; ++i ) {
+                auto const run_index = static_cast<std::uint32_t>( ( static_cast<std::uint64_t>( i ) * list.count ) / keys );
+                auto const start = list.first + run_index * list.stride;
+                array.push_back( ( 3U << 16 ) + start + ( i % 2 == 0 ? list.length / 2 : list.length + 1 ) );
+            }
+            register_ops( std::string( list.name ) + "/keys=" + std::to_string( keys ), share( std::move( array ) ), runs,
+                          std::to_string( keys ) + " array keys against a run chunk of " + std::to_string( list.count ) + " runs of " + std::to_string( list.length ) + " values." );
+        }
+    }
+    {
+        std::mt19937_64 rng{ 0xA1A1 };
+        values32 array;
+        for ( auto const low : random_lows( rng, 4000 ) ) { array.push_back( ( 3U << 16 ) + low ); }
+        std::ranges::sort( array );
+        values32 runs;
+        for ( auto const [first, last] : { std::pair{ 1000U, 1999U }, std::pair{ 30000U, 30000U }, std::pair{ 50000U, 65535U } } ) {
+            for ( auto v = first; v <= last; ++v ) { runs.push_back( ( 3U << 16 ) + v ); }
+        }
+        register_ops( "3runs/keys=4000", share( std::move( array ) ), share( std::move( runs ) ), "4000 array keys against a run chunk of 3 long runs." );
+    }
+}
+
 static void register_benchmarks() {
     register_run_shaped_listed();
+    register_array_run();
     register_back_front();
     register_small_array_export();
     register_bitset_and_to_array();

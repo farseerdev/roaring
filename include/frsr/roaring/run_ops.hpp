@@ -41,7 +41,7 @@ template <typename Run>
 [[nodiscard]] [[gnu::always_inline]] inline std::size_t next_run_reaching( Run const * const runs, std::size_t const index, std::size_t const size, std::size_t const limit ) noexcept {
     return gallop_forward<false>(
         runs, index + 1U, size, limit,
-        []( Run const & run ) noexcept { return std::size_t{ run.end }; }
+        run_end_key<std::size_t>{}
     );
 }
 

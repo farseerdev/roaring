@@ -547,11 +547,12 @@ template <typename Layout, typename CowPolicy = cow_value_semantics>
             auto const & runs  { [ & ]() -> auto const & { if constexpr ( left_run   ) { return left.runs  ; } else { return right.runs  ; } }() };
             auto const * const keys{ values.data() };
             auto const card{ static_cast<std::size_t>( values.size() ) };
-            auto run_it { runs.begin() };
-            auto run_end{ runs.end  () };
+            auto const * const run_list{ runs.data() };
+            auto const         run_end { static_cast<std::size_t>( runs.size() ) };
+            std::size_t        run_ix  { 0 };
             std::size_t count{ 0 };
             std::size_t ap{ 0 };
-            if ( run_it == run_end ) { return 0; }
+            if ( run_end == 0 ) { return 0; }
             if ( runs.size() * 16U <= card ) {
                 // few runs over many values: two gallops per run count the values it covers
                 for ( auto const & run : runs ) {
@@ -566,14 +567,13 @@ template <typename Layout, typename CowPolicy = cow_value_semantics>
             // the array-driven walk of filter_array_run_into, counting instead of storing
             while ( ap < card ) {
                 auto const value{ keys[ ap ] };
-                while ( static_cast<low_type>( run_it->end ) < value ) {
-                    if ( ++run_it == run_end ) { return count; }
-                }
-                if ( value >= static_cast<low_type>( run_it->begin ) ) {
+                run_ix = run_reaching( run_list, run_ix, run_end, value );
+                if ( run_ix == run_end ) { return count; }
+                if ( value >= static_cast<low_type>( run_list[ run_ix ].begin ) ) {
                     ++count;
                     ++ap;
                 } else {
-                    ap = gallop_forward<false>( keys, ap, card, static_cast<low_type>( run_it->begin ) );
+                    ap = gallop_forward<false>( keys, ap, card, static_cast<low_type>( run_list[ run_ix ].begin ) );
                 }
             }
             return count;

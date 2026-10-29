@@ -1536,6 +1536,13 @@ struct identity_key {
     [[nodiscard]] constexpr T const & operator()( T const & value ) const noexcept { return value; }
 };
 
+// The key of a run in a sorted run list: its inclusive end, as `Key`.
+template <typename Key>
+struct run_end_key {
+    template <typename Run>
+    [[nodiscard]] constexpr Key operator()( Run const & run ) const noexcept { return static_cast<Key>( run.end ); }
+};
+
 template <bool Greater, typename Element, typename Key, typename KeyOf = identity_key>
 [[nodiscard]] [[gnu::always_inline]] inline std::size_t gallop_forward(
     Element const * const keys, std::size_t lo, std::size_t const hi, Key const limit, KeyOf const key_of = {}
@@ -1570,6 +1577,32 @@ template <bool Greater, typename Element, typename Key, typename KeyOf = identit
     return static_cast<std::size_t>( found - keys );
 }
 
+// The first run at or after `index` (< `size`) whose end is not below `value` (`size` if none). The run the
+// previous value landed in usually still reaches this one: one compare. A value a few runs ahead is reached by
+// predictable linear steps (a gallop over such a skip mispredicts more than it saves); a value further ahead
+// pays the gallop, kept out of line so it does not weigh on the loops that call this per array value.
+inline constexpr std::size_t linear_run_steps{ 16 };
+
+template <typename Run, typename Value>
+[[gnu::noinline]] inline std::size_t gallop_to_run_reaching( Run const * const runs, std::size_t const index, std::size_t const size, Value const value ) noexcept {
+    return gallop_forward<false>( runs, index, size, value, run_end_key<Value>{} );
+}
+
+template <typename Run, typename Value>
+[[nodiscard]] [[gnu::always_inline]] inline std::size_t run_reaching( Run const * const runs, std::size_t index, std::size_t const size, Value const value ) noexcept {
+    assert( index < size );
+    std::size_t steps{ 0 };
+    while ( static_cast<Value>( runs[ index ].end ) < value ) {
+        if ( ++index == size ) {
+            return size;
+        }
+        if ( ++steps == linear_run_steps ) {
+            return gallop_to_run_reaching( runs, index, size, value );
+        }
+    }
+    return index;
+}
+
 template <typename Layout, typename OutVector, typename CowPolicy = cow_value_semantics, typename Keep = std::true_type>
 [[ gnu::hot ]] inline void filter_array_run_into(
     array_cref<Layout, CowPolicy> const lhs,
@@ -1599,8 +1632,12 @@ template <typename Layout, typename OutVector, typename CowPolicy = cow_value_se
     // so that stretch is bounded by a gallop and moved in one copy.
     // [croaring-ref] deps/croaring/src/containers/mixed_intersection.c:array_run_container_intersection
     // [croaring-ref] deps/croaring/src/containers/mixed_andnot.c:array_run_container_andnot
-    auto       run_it { rhs.runs.begin() };
-    auto const run_end{ rhs.runs.end  () };
+    // The run cursor moves by a gallop on the run ends: one compare when the current run still reaches
+    // the value (the adjacent-run shape), and a few array values against thousands of short runs cost
+    // O(values * log runs) instead of O(runs).
+    auto const * const runs   { rhs.runs.data() };
+    auto const         run_end{ static_cast<std::size_t>( rhs.runs.size() ) };
+    std::size_t        run_ix { 0 };
     auto const finish{ [ & ] {
         if constexpr ( !keep_matches ) {
             // past the last run: every remaining value misses
@@ -1609,30 +1646,30 @@ template <typename Layout, typename OutVector, typename CowPolicy = cow_value_se
         }
         resize_uninitialized( result, static_cast<std::uint32_t>( written ) );
     } };
-    if ( run_it == run_end ) {
+    if ( run_end == 0 ) {
         // a run chunk emptied by removals and kept as a lazily erased slot holds no runs
         finish();
         return;
     }
     while ( ap < card ) {
         auto const value{ keys[ ap ] };
-        while ( static_cast<low_type>( run_it->end ) < value ) {
-            if ( ++run_it == run_end ) {
-                finish();
-                return;
-            }
+        run_ix = run_reaching( runs, run_ix, run_end, value );
+        if ( run_ix == run_end ) {
+            finish();
+            return;
         }
-        if ( value >= static_cast<low_type>( run_it->begin ) ) {
+        auto const & run{ runs[ run_ix ] };
+        if ( value >= static_cast<low_type>( run.begin ) ) {
             if constexpr ( keep_matches ) {
                 out[ written++ ] = value;
                 ++ap;
             } else {
-                ap = gallop_forward<true>( keys, ap, card, static_cast<low_type>( run_it->end ) );
+                ap = gallop_forward<true>( keys, ap, card, static_cast<low_type>( run.end ) );
             }
         } else if constexpr ( keep_matches ) {
-            ap = gallop_forward<false>( keys, ap, card, static_cast<low_type>( run_it->begin ) );
+            ap = gallop_forward<false>( keys, ap, card, static_cast<low_type>( run.begin ) );
         } else {
-            auto const stretch_end{ gallop_forward<false>( keys, ap, card, static_cast<low_type>( run_it->begin ) ) };
+            auto const stretch_end{ gallop_forward<false>( keys, ap, card, static_cast<low_type>( run.begin ) ) };
             std::copy_n( keys + ap, stretch_end - ap, out + written );
             written += stretch_end - ap;
             ap = stretch_end;
@@ -1845,29 +1882,30 @@ template <typename Layout, typename CowPolicy = cow_value_semantics>
         }
         arr.values.resize_uninitialized( static_cast<std::uint32_t>( out ) );
     } };
-    auto       run_it { rhs.runs.begin() };
-    auto const run_end{ rhs.runs.end  () };
-    if ( run_it == run_end ) {
+    auto const * const runs   { rhs.runs.data() };
+    auto const         run_end{ static_cast<std::size_t>( rhs.runs.size() ) };
+    std::size_t        run_ix { 0 };
+    if ( run_end == 0 ) {
         // a run chunk emptied by removals and kept as a lazily erased slot holds no runs
         finish();
         return;
     }
     while ( in < card ) {
         auto const value{ base[ in ] };
-        while ( static_cast<low_type>( run_it->end ) < value ) {
-            if ( ++run_it == run_end ) {
-                finish();
-                return;
-            }
+        run_ix = run_reaching( runs, run_ix, run_end, value );
+        if ( run_ix == run_end ) {
+            finish();
+            return;
         }
-        bool const in_run{ value >= static_cast<low_type>( run_it->begin ) };
+        auto const & run{ runs[ run_ix ] };
+        bool const in_run{ value >= static_cast<low_type>( run.begin ) };
         if ( in_run == keep_matches ) {
             base[ out++ ] = value;
             ++in;
         } else if ( in_run ) {
-            in = gallop_forward<true >( base, in, card, static_cast<low_type>( run_it->end ) );
+            in = gallop_forward<true >( base, in, card, static_cast<low_type>( run.end ) );
         } else {
-            in = gallop_forward<false>( base, in, card, static_cast<low_type>( run_it->begin ) );
+            in = gallop_forward<false>( base, in, card, static_cast<low_type>( run.begin ) );
         }
     }
     finish();

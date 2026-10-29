@@ -549,4 +549,139 @@ TEST( KernelCrosscheck, RunListsOfDifferentLengthsIntersectLikeCRoaring ) {
     }
 }
 
+// ---- an array chunk against a run chunk of very many short runs -----------------------------------------
+//
+// The run list is crossed by a gallop on the run ends, so a handful of array keys against thousands of runs
+// reach the right run from far away: keys before the first run, on a run's first and last value, inside it,
+// in the gap between runs, past the last run, and a run ending on the chunk's last value. Every operation that
+// pairs the two forms is compared with CRoaring: and (both operand orders), the cardinality, the difference
+// both ways, and the in-place forms.
+struct run_shape {
+    char const * name;
+    std::uint32_t first;     // first value of the first run
+    std::uint32_t length;    // values per run
+    std::uint32_t stride;    // distance between run starts
+    std::uint32_t count;     // runs
+};
+
+constexpr std::uint32_t run_chunk_base{ 3U << 16 };
+
+// The operand held as one run chunk by this library (run-encoded whatever the size: optimize() would turn
+// thousands of short runs into a bitset) and as the reference holds the same values.
+struct run_operand {
+    explicit run_operand( Values32 values_ ) : values{ std::move( values_ ) }, theirs{ values } {
+        ours.add_many( values );
+        ours.optimize_run_shaped( 1 );
+        roaring_bitmap_run_optimize( theirs.r );
+    }
+
+    Values32 values;
+    Bitmap32 ours;
+    croaring theirs;
+};
+
+[[nodiscard]] run_operand make_run_operand( std::vector<std::pair<std::uint32_t, std::uint32_t>> const & ranges ) {
+    Values32 values;
+    for ( auto const [first, last] : ranges ) {
+        for ( auto v{ first }; v <= last; ++v ) { values.push_back( run_chunk_base + v ); }
+    }
+    return run_operand{ std::move( values ) };
+}
+
+[[nodiscard]] run_operand make_run_operand( run_shape const & s ) {
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> ranges;
+    for ( std::uint32_t r{ 0 }; r < s.count; ++r ) {
+        auto const first{ s.first + r * s.stride };
+        ranges.emplace_back( first, std::min( first + s.length - 1U, 65535U ) );
+    }
+    return make_run_operand( ranges );
+}
+
+// Every operation on the pair (array side, run side), against CRoaring.
+void check_array_run_pair( Values32 const & array_values, run_operand const & run, char const * const trace, bool const expect_array = true ) {
+    SCOPED_TRACE( ::testing::Message() << trace << ": " << array_values.size() << " array values" );
+    auto const array{ make_ours( array_values, false ) };
+    auto const theirs_array{ make_theirs( array_values, false ) };
+    if ( expect_array ) {
+        ASSERT_EQ( array.statistics().array_containers, array.statistics().container_count() ) << "the array side must stay an array";
+    }
+    croaring const and_expected{ roaring_bitmap_and( theirs_array.r, run.theirs.r ) };
+    croaring const array_minus_run{ roaring_bitmap_andnot( theirs_array.r, run.theirs.r ) };
+    croaring const run_minus_array{ roaring_bitmap_andnot( run.theirs.r, theirs_array.r ) };
+    EXPECT_TRUE( same_contents( array & run.ours, and_expected ) ) << "array & run";
+    EXPECT_TRUE( same_contents( run.ours & array, and_expected ) ) << "run & array";
+    EXPECT_EQ( array.and_cardinality( run.ours ), roaring_bitmap_and_cardinality( theirs_array.r, run.theirs.r ) );
+    EXPECT_EQ( run.ours.and_cardinality( array ), roaring_bitmap_and_cardinality( theirs_array.r, run.theirs.r ) );
+    EXPECT_EQ( array.intersects( run.ours ), roaring_bitmap_intersect( theirs_array.r, run.theirs.r ) );
+    EXPECT_TRUE( same_contents( array - run.ours, array_minus_run ) ) << "array - run";
+    EXPECT_TRUE( same_contents( run.ours - array, run_minus_array ) ) << "run - array";
+    { auto t{ array }; t &= run.ours; EXPECT_TRUE( same_contents( t, and_expected ) ) << "array &= run"; }
+    { auto t{ array }; t -= run.ours; EXPECT_TRUE( same_contents( t, array_minus_run ) ) << "array -= run"; }
+    { auto t{ run.ours }; t &= array; EXPECT_TRUE( same_contents( t, and_expected ) ) << "run &= array"; }
+    { auto t{ run.ours }; t -= array; EXPECT_TRUE( same_contents( t, run_minus_array ) ) << "run -= array"; }
+}
+
+TEST( KernelCrosscheck, ArrayKeysAgainstManyShortRunsLikeCRoaring ) {
+    std::mt19937_64 rng{ 0xA77A };
+    static constexpr run_shape shapes[]{
+        { "1k runs of 20",              100, 20, 60, 1000 },
+        { "1k runs of 20, to the end",  15, 20, 65, 1008 },
+        { "10k runs of 3",              2,   3,  6, 10000 },
+        { "2k runs of 1",               0,   1, 32, 2048 },
+        { "3 long runs",                1000, 5000, 20000, 3 },
+        { "one run",                    40000, 100, 1, 1 },
+    };
+    for ( auto const & shape : shapes ) {
+        auto const run{ make_run_operand( shape ) };
+        ASSERT_EQ( run.ours.statistics().run_containers, 1U ) << shape.name;
+        for ( std::size_t const keys : { 1, 4, 16, 64 } ) {
+            // keys before, inside, between and after the runs, at the run edges and beyond the last run
+            for ( int trial{ 0 }; trial < 40; ++trial ) {
+                std::set<std::uint32_t> lows;
+                while ( lows.size() < keys ) {
+                    auto const pick{ rng() % 8 };
+                    auto const r{ static_cast<std::uint32_t>( rng() % shape.count ) };
+                    auto const start{ shape.first + r * shape.stride };
+                    switch ( pick ) {
+                        case 0: lows.insert( static_cast<std::uint32_t>( rng() % std::max( shape.first, 1U ) ) ); break;         // before the first run
+                        case 1: lows.insert( start ); break;                                                                      // a run's first value
+                        case 2: lows.insert( start + shape.length - 1U ); break;                                                  // its last
+                        case 3: lows.insert( start + static_cast<std::uint32_t>( rng() % shape.length ) ); break;                 // inside
+                        case 4: lows.insert( start + shape.length + static_cast<std::uint32_t>( rng() % std::max( shape.stride - shape.length, 1U ) ) ); break;   // the gap after it
+                        case 5: lows.insert( 65535U - static_cast<std::uint32_t>( rng() % 64 ) ); break;                          // the chunk's last values
+                        case 6: lows.insert( shape.first + shape.count * shape.stride + static_cast<std::uint32_t>( rng() % 100 ) ); break;   // past the last run
+                        default: lows.insert( static_cast<std::uint32_t>( rng() % 65536 ) ); break;
+                    }
+                    for ( auto it{ lows.begin() }; it != lows.end(); ) { it = *it > 65535U ? lows.erase( it ) : std::next( it ); }
+                }
+                Values32 array_values;
+                for ( auto const low : lows ) { array_values.push_back( run_chunk_base + low ); }
+                check_array_run_pair( array_values, run, shape.name );
+            }
+        }
+    }
+}
+
+TEST( KernelCrosscheck, LongArrayAgainstFewRunsLikeCRoaring ) {
+    std::mt19937_64 rng{ 0xB16A };
+    auto const run{ make_run_operand( { { 1000, 1999 }, { 30000, 30000 }, { 50000, 65535 } } ) };
+    ASSERT_EQ( run.ours.statistics().run_containers, 1U );
+    for ( std::size_t const count : { 100, 1000, 2000, 4000 } ) {
+        for ( int trial{ 0 }; trial < 20; ++trial ) {
+            std::set<std::uint32_t> lows;
+            while ( lows.size() < count ) { lows.insert( static_cast<std::uint32_t>( rng() % 65536 ) ); }
+            Values32 array_values;
+            for ( auto const low : lows ) { array_values.push_back( run_chunk_base + low ); }
+            check_array_run_pair( array_values, run, "long array, few runs" );
+        }
+    }
+    // consecutive keys across the run edges
+    Values32 edge;
+    for ( std::uint32_t low{ 990 }; low < 1010; ++low ) { edge.push_back( run_chunk_base + low ); }
+    for ( std::uint32_t low{ 1990 }; low < 2010; ++low ) { edge.push_back( run_chunk_base + low ); }
+    for ( std::uint32_t low{ 29995 }; low < 30005; ++low ) { edge.push_back( run_chunk_base + low ); }
+    for ( std::uint32_t low{ 49990 }; low < 50010; ++low ) { edge.push_back( run_chunk_base + low ); }
+    check_array_run_pair( edge, run, "run edges", false );   // consecutive values: the receiver may hold them as runs
+}
+
 } // namespace
