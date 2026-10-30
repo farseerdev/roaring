@@ -40,7 +40,7 @@ TYPED_TEST_SUITE( ChunkTreeTyped, tree_types );
 handle make( std::uint16_t const tag ) {
     return handle::make_array_from_sorted( std::span<std::uint16_t const>{ &tag, 1 } );
 }
-std::uint16_t tag_of( handle const & h ) { return *detail::container_first( h ); }
+std::uint16_t tag_of( handle const & h ) { return detail::container_first( h ); }
 std::uint16_t tag_for( std::uint64_t const key ) { return static_cast<std::uint16_t>( key * 40503U >> 3 ); }
 
 using model = std::map<std::uint64_t, std::uint16_t>;
@@ -370,7 +370,7 @@ TEST(ChunkTree, SharedPayloadsSurviveCopiesRewritesAndErases) {
     ASSERT_EQ( original.size(), 200U );
     for ( auto const & slot : original.slots() ) {
         ASSERT_EQ( slot.cardinality(), values.size() );
-        ASSERT_EQ( *detail::container_first( slot ), 0 );
+        ASSERT_EQ( detail::container_first( slot ), 0 );
     }
 }
 

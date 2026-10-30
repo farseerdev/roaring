@@ -381,19 +381,14 @@ public:
         void finish() noexcept {
             owner_ = nullptr;
             chunk_ = chunk_cursor{};
-            current_low_.reset();
+            current_low_ = {};
             current_value_ = {};
         }
 
         void seek_first() noexcept {
-            for ( chunk_ = owner_->chunks_.begin(); chunk_ != owner_->chunks_.end(); ++chunk_ ) {
-                if ( auto const low{ detail::container_first( owner_->chunks_.slot( chunk_ ) ) } ) {
-                    current_low_ = low;
-                    current_value_ = layout_type::compose( owner_->chunks_.key( chunk_ ), *low );
-                    return;
-                }
-            }
-            finish();
+            chunk_ = owner_->chunks_.begin();
+            current_low_ = detail::container_first( owner_->chunks_.slot( chunk_ ) );
+            current_value_ = layout_type::compose( owner_->chunks_.key( chunk_ ), current_low_ );
         }
 
         void advance() noexcept {
@@ -401,18 +396,17 @@ public:
                 return;
             }
 
-            if ( auto const next_low{ detail::container_next_after( owner_->chunks_.slot( chunk_ ), *current_low_ ) } ) {
-                current_low_ = next_low;
+            if ( auto const next_low{ detail::container_next_after( owner_->chunks_.slot( chunk_ ), current_low_ ) } ) {
+                current_low_ = *next_low;
                 current_value_ = layout_type::compose( owner_->chunks_.key( chunk_ ), *next_low );
                 return;
             }
 
-            for ( ++chunk_; chunk_ != owner_->chunks_.end(); ++chunk_ ) {
-                if ( auto const low{ detail::container_first( owner_->chunks_.slot( chunk_ ) ) } ) {
-                    current_low_ = low;
-                    current_value_ = layout_type::compose( owner_->chunks_.key( chunk_ ), *low );
-                    return;
-                }
+            ++chunk_;
+            if ( chunk_ != owner_->chunks_.end() ) {
+                current_low_ = detail::container_first( owner_->chunks_.slot( chunk_ ) );
+                current_value_ = layout_type::compose( owner_->chunks_.key( chunk_ ), current_low_ );
+                return;
             }
 
             finish();
@@ -420,7 +414,7 @@ public:
 
         bitmap const * owner_{};
         chunk_cursor chunk_{};
-        std::optional<low_type> current_low_{};
+        low_type current_low_{};
         value_type current_value_{};
     };
 

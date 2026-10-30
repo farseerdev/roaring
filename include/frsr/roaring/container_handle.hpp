@@ -1124,17 +1124,13 @@ public:
 
     [[nodiscard]] std::size_t size() const noexcept { return values.size(); }
 
-    [[nodiscard]] std::optional<low_type> first() const noexcept {
-        if ( values.empty() ) {
-            return std::nullopt;
-        }
+    [[nodiscard]] low_type first() const noexcept {
+        assert( !values.empty() );
         return values.front();
     }
 
-    [[nodiscard]] std::optional<low_type> last() const noexcept {
-        if ( values.empty() ) {
-            return std::nullopt;
-        }
+    [[nodiscard]] low_type last() const noexcept {
+        assert( !values.empty() );
         return values.back();
     }
 
@@ -1341,10 +1337,8 @@ public:
 
     [[nodiscard]] std::size_t size() const noexcept { return values.size(); }
 
-    [[nodiscard]] std::optional<low_type> first() const noexcept {
-        if ( values.empty() ) {
-            return std::nullopt;
-        }
+    [[nodiscard]] low_type first() const noexcept {
+        assert( !values.empty() );
         return values.front();
     }
 
@@ -1412,17 +1406,13 @@ public:
 
     [[nodiscard]] std::size_t size() const noexcept { return handle_->cardinality(); }
 
-    [[nodiscard]] std::optional<low_type> first() const noexcept {
-        if ( runs.empty() ) {
-            return std::nullopt;
-        }
+    [[nodiscard]] low_type first() const noexcept {
+        assert( !runs.empty() );
         return runs.front().begin;
     }
 
-    [[nodiscard]] std::optional<low_type> last() const noexcept {
-        if ( runs.empty() ) {
-            return std::nullopt;
-        }
+    [[nodiscard]] low_type last() const noexcept {
+        assert( !runs.empty() );
         return runs.back().end;
     }
 
@@ -1730,7 +1720,7 @@ public:
 
     [[nodiscard]] std::size_t size() const noexcept { return handle_->cardinality(); }
 
-    [[nodiscard]] std::optional<low_type> first() const noexcept { return cref{ *handle_ }.first(); }
+    [[nodiscard]] low_type first() const noexcept { return cref{ *handle_ }.first(); }
 
     [[nodiscard]] std::optional<low_type> next_after( low_type const value ) const noexcept {
         return cref{ *handle_ }.next_after( value );
@@ -1860,25 +1850,25 @@ public:
 
     [[nodiscard]] std::size_t size() const noexcept { return handle_->cardinality(); }
 
-    [[nodiscard]] std::optional<low_type> first() const noexcept {
+    [[nodiscard]] low_type first() const noexcept {
         for ( std::size_t index{ 0 }; index < words.size(); ++index ) {
             auto const word{ words[ index ] };
             if ( word != 0 ) {
                 return static_cast<low_type>( ( index << 6U ) + static_cast<std::size_t>( std::countr_zero( word ) ) );
             }
         }
-        return std::nullopt;
+        std::unreachable();
     }
 
     // The top-down word scan reads word 0 as well: a bitset whose values all lie in its first word has its last one there.
-    [[nodiscard]] std::optional<low_type> last() const noexcept {
+    [[nodiscard]] low_type last() const noexcept {
         for ( std::size_t index{ words.size() }; index-- != 0; ) {
             auto const word{ words[ index ] };
             if ( word != 0 ) {
                 return static_cast<low_type>( ( index << 6U ) + ( 63U - static_cast<unsigned>( std::countl_zero( word ) ) ) );
             }
         }
-        return std::nullopt;
+        std::unreachable();
     }
 
     [[nodiscard]] std::optional<low_type> next_after( low_type const value ) const noexcept {
@@ -2034,7 +2024,7 @@ public:
 
     [[nodiscard]] std::size_t size() const noexcept { return handle_->cardinality(); }
 
-    [[nodiscard]] std::optional<low_type> first() const noexcept { return cref{ *handle_ }.first(); }
+    [[nodiscard]] low_type first() const noexcept { return cref{ *handle_ }.first(); }
 
     [[nodiscard]] std::optional<low_type> next_after( low_type const value ) const noexcept {
         return cref{ *handle_ }.next_after( value );

@@ -139,15 +139,11 @@ FRSR_ROARING_DEFINITION_INLINE auto FRSR_ROARING_BITMAP::statistics() const noex
 
 FRSR_ROARING_BITMAP_TEMPLATE
 FRSR_ROARING_DEFINITION_INLINE auto FRSR_ROARING_BITMAP::back() const noexcept -> key_type {
-    auto at{ chunks_.end() };
-    while ( at != chunks_.begin() ) {
-        at = chunks_.prev( at );
-        auto const & container{ chunks_.slot( at ) };
-        if ( auto const last{ detail::container_last( container ) } ) {
-            return layout_type::compose( chunks_.key( at ), *last );
-        }
+    if ( empty() ) {
+        return {};
     }
-    return {};
+    auto const last{ chunks_.prev( chunks_.end() ) };
+    return layout_type::compose( chunks_.key( last ), detail::container_last( chunks_.slot( last ) ) );
 }
 
 FRSR_ROARING_BITMAP_TEMPLATE

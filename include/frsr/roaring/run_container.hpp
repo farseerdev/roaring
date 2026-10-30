@@ -149,10 +149,8 @@ struct run_container {
 
     [[nodiscard]] std::size_t size() const noexcept { return static_cast<std::size_t>( cardinality ); }
 
-    [[nodiscard]] std::optional<low_type> first() const noexcept {
-        if ( runs.empty() ) {
-            return std::nullopt;
-        }
+    [[nodiscard]] low_type first() const noexcept {
+        assert( !runs.empty() );
         return runs.front().begin;
     }
 

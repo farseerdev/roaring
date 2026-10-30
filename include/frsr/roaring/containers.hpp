@@ -175,15 +175,18 @@ template <typename Layout, typename CowPolicy>
     std::unreachable();
 }
 
+// The smallest and largest value of a container. A chunk never holds an empty container, so both exist; they are returned
+// bare, because a value-or-nothing pair of this width is passed through the stack, where its parts are stored separately
+// and read back whole.
 template <typename Layout, typename CowPolicy>
-[[nodiscard]] inline std::optional<typename Layout::low_type> container_first(
+[[nodiscard]] inline typename Layout::low_type container_first(
     container_handle<Layout, CowPolicy> const & container
 ) noexcept {
     return container.visit( []( auto const & current ) noexcept { return current.first(); } );
 }
 
 template <typename Layout, typename CowPolicy>
-[[nodiscard]] inline std::optional<typename Layout::low_type> container_last(
+[[nodiscard]] inline typename Layout::low_type container_last(
     container_handle<Layout, CowPolicy> const & container
 ) noexcept {
     return container.visit( []( auto const & current ) noexcept { return current.last(); } );
