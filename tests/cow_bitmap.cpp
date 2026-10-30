@@ -14,6 +14,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <vector>
 
 namespace {
@@ -119,6 +120,70 @@ TEST( CowBitmap, MixedOpsMatchValueSemanticsBitwiseIdentically ) {
     // The shared copy taken before the in-place ops above must be unaffected.
     CowBitmap const original_lhs{ lhs_values };
     EXPECT_EQ( shared_copy.to_vector(), original_lhs.to_vector() );
+}
+
+// A sorted batch added to a copy: the copy's run containers take it (a batch inside the runs changes nothing, a batch
+// outside them is merged into a payload of the copy's own) and the original keeps what it had. Every copy-on-write
+// policy with either run policy.
+template <typename Bitmap>
+class CowBitmapBatch : public ::testing::Test {};
+
+template <typename CowPolicy, typename RunPolicy>
+using batch_bitmap = frsr::roaring::bitmap<std::uint32_t, frsr::roaring::default_container_set<std::uint32_t>, CowPolicy, RunPolicy>;
+using frsr::roaring::detail::cow_atomic_refcount;
+using frsr::roaring::detail::cow_unsynchronized_refcount;
+using frsr::roaring::detail::cow_value_semantics;
+using frsr::roaring::detail::run_selection_eager;
+using frsr::roaring::detail::run_selection_lazy;
+
+using batch_bitmaps = ::testing::Types<
+    batch_bitmap<cow_value_semantics        , run_selection_eager>,
+    batch_bitmap<cow_value_semantics        , run_selection_lazy >,
+    batch_bitmap<cow_atomic_refcount        , run_selection_eager>,
+    batch_bitmap<cow_atomic_refcount        , run_selection_lazy >,
+    batch_bitmap<cow_unsynchronized_refcount, run_selection_eager>,
+    batch_bitmap<cow_unsynchronized_refcount, run_selection_lazy >
+>;
+TYPED_TEST_SUITE( CowBitmapBatch, batch_bitmaps );
+
+TYPED_TEST( CowBitmapBatch, SortedBatchIntoCopyLeavesOriginalIntact ) {
+    TypeParam original;
+    for ( std::uint32_t i{ 0 }; i < 60U; ++i ) {
+        original.add_closed_range( 100U + i * 50U, 120U + i * 50U );            // chunk 0: sixty runs
+        original.add_closed_range( 65'536U + i * 50U, 65'536U + i * 50U + 9U ); // chunk 1: sixty runs
+    }
+    original.optimize();
+    auto const original_snapshot{ original.to_vector() };
+
+    auto copy{ original };
+    auto expected{ original_snapshot };
+
+    // Wholly inside existing runs: nothing is added.
+    std::vector<std::uint32_t> const inside{ 105U, 110U, 155U, 65'541U };
+    copy.add_many_sorted( { inside.data(), inside.size() } );
+    EXPECT_EQ( copy.to_vector(), expected );
+    EXPECT_EQ( copy.size(), original.size() );
+
+    // Outside them, in both chunks, and in chunks the copy did not have.
+    std::vector<std::uint32_t> const outside{ 30U, 125U, 126U, 127U, 3'000U, 65'600U, 65'601U, 70'000U, 1'000'000U };
+    expected.insert( expected.end(), outside.begin(), outside.end() );
+    std::ranges::sort( expected );
+    expected.erase( std::ranges::unique( expected ).begin(), expected.end() );
+    copy.add_many_sorted( { outside.data(), outside.size() } );
+    EXPECT_EQ( copy.to_vector(), expected );
+    EXPECT_EQ( copy.size(), expected.size() );
+    EXPECT_EQ( original.to_vector(), original_snapshot );
+    EXPECT_EQ( original.size(), original_snapshot.size() );
+
+    // A copy of the changed one, and a batch that fills a new chunk past the array threshold.
+    auto const grand{ copy };
+    std::vector<std::uint32_t> dense;
+    for ( std::uint32_t value{ 2U * 65'536U }; value < 2U * 65'536U + 5'000U; ++value ) {
+        dense.push_back( value );
+    }
+    copy.add_many_sorted( { dense.data(), dense.size() } );
+    EXPECT_EQ( copy.size(), expected.size() + dense.size() );
+    EXPECT_EQ( grand.to_vector(), expected );
 }
 
 } // namespace

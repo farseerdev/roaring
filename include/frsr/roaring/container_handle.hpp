@@ -552,11 +552,23 @@ public:
         return { static_cast<E *>( allocate_payload( std::size_t{ grown } * sizeof( E ) ) ), grown };
     }
 
-    // Makes the block the payload and returns the previous one to the allocator. count() is the caller's to set.
+    // A block of `capacity` elements for a caller that rewrites the payload into a block of its own - the
+    // copy-on-write clone and the rewrite in one, where the barrier's clone would be copied over at once.
+    template <typename E>
+    [[using gnu: cold]] grown_payload<E> allocate_replacement_payload( std::uint32_t const capacity ) {
+#if FRSR_ROARING_PAYLOAD_ALLOC_STATS
+        payload_alloc_stats().cow_clone.fetch_add( 1, std::memory_order_relaxed );
+#endif
+        return { static_cast<E *>( allocate_payload( std::size_t{ capacity } * sizeof( E ) ) ), capacity };
+    }
+
+    // Makes the block the payload and lets go of the previous one: freed when this handle was its only owner, else
+    // (shared with a copy, or borrowed from a mapping) only this handle's claim on it is dropped. count() is the
+    // caller's to set.
     template <typename E>
     [[gnu::always_inline]] void adopt_grown_payload( grown_payload<E> const grown ) noexcept {
         if ( spilled() ) {
-            free_payload( spill().data, std::size_t{ spill().capacity } * sizeof( E ) );
+            release_payload_of( std::size_t{ spill().capacity } * sizeof( E ) );
         }
         spill_to( grown.data, grown.capacity );
     }
@@ -613,6 +625,8 @@ private:
             // of the source handle. Invariant under a refcounted policy:
             // owner == shared ⟺ spilled.
             owner_ = storage_ownership::shared;
+        } else {
+            owner_ = storage_ownership::unique;
         }
     }
 
@@ -720,19 +734,25 @@ private:
     }
 
     void release_payload() noexcept {
-        if ( !spilled() ) {
-            return;
+        if ( spilled() ) {
+            release_payload_of( std::size_t{ spill().capacity } * element_size() );
         }
+    }
+
+    // Drops this handle's claim on its payload, which was allocated with `bytes`: freed when this handle was its
+    // only owner; left to the other holders when shared; untouched when borrowed.
+    void release_payload_of( std::size_t const bytes ) noexcept {
+        assert( spilled() );
         if constexpr ( CowPolicy::refcounted ) {
             if ( owner_ == storage_ownership::shared ) {
                 if ( CowPolicy::rc_decrement_is_last( rc_slot_of( spill().data ) ) ) {
-                    free_payload( spill().data );
+                    free_payload( spill().data, bytes );
                 }
                 return;
             }
         }
         if ( owner_ == storage_ownership::unique ) {
-            free_payload( spill().data );
+            free_payload( spill().data, bytes );
         }
     }
 
@@ -806,9 +826,6 @@ private:
             auto * const fresh{ allocate_payload( bytes ) };
             std::memcpy( fresh, source, bytes );
             spill_to( fresh, count_ );
-            if constexpr ( !CowPolicy::refcounted ) {
-                owner_ = storage_ownership::unique;
-            }
         }
     }
 
@@ -1502,8 +1519,9 @@ public:
     // number of runs the batch can open, and the merge then writes from the front of that gap while it
     // reads behind the write position, so the payload grows at most once per batch (and not at all when
     // its capacity already holds the result). Adjacent and overlapping runs coalesce as they are written.
-    // The caller owns the write barrier and any kind change the result calls for. Returns how many
-    // values were new.
+    // The caller owns any kind change the result calls for. The payload need not be private (see
+    // as_run_for_merge): one shared with a copy, or borrowed, is only read, its result is written into a
+    // block of its own, and it stays as it was when nothing is added. Returns how many values were new.
     // Precondition: sorted_values is strictly ascending (sorted and duplicate-free).
     std::size_t add_sorted( std::span<low_type const> const sorted_values ) {
         assert( std::ranges::adjacent_find( sorted_values, std::greater_equal<>{} ) == sorted_values.end() );
@@ -1567,13 +1585,16 @@ public:
         auto grown{ typename container_handle<Layout, CowPolicy>::template grown_payload<run_type>{} };
         run_type * data;
         run_type const * source;
-        auto const in_place{ run_count + opened <= capacity };
+        auto const fits    { run_count + opened <= capacity };
+        auto const in_place{ fits && handle_->payload_is_unshared() };
         if ( in_place ) {
             data = runs.data();
             std::memmove( data + first_touched + opened, data + first_touched, std::size_t{ suffix_count } * sizeof( run_type ) );
             source = data + opened;
         } else {
-            grown  = handle_->template allocate_grown_payload<run_type>( run_count + ( opened > stop_after ? groups : opened ) );
+            grown  = fits
+                ? handle_->template allocate_replacement_payload<run_type>( capacity )
+                : handle_->template allocate_grown_payload<run_type>( run_count + ( opened > stop_after ? groups : opened ) );
             data   = grown.data;
             source = runs.data();
             std::memcpy( data, source, std::size_t{ first_touched } * sizeof( run_type ) );
@@ -2087,6 +2108,14 @@ template <typename Layout, typename CowPolicy>
 template <typename Layout, typename CowPolicy>
 [[nodiscard]] bitset_ref<Layout, CowPolicy> as_bitset_already_private( container_handle<Layout, CowPolicy> & handle ) noexcept {
     return bitset_ref<Layout, CowPolicy>{ handle };
+}
+
+// A mutable run view that does not make the payload private, for run_ref::add_sorted alone: it reads a payload
+// shared with a copy (or borrowed from a mapping) and writes its result into a block of its own, so the barrier's
+// clone would be a copy made only to be copied over - and leaves a shared payload untouched when nothing is added.
+template <typename Layout, typename CowPolicy>
+[[nodiscard]] run_ref<Layout, CowPolicy> as_run_for_merge( container_handle<Layout, CowPolicy> & handle ) noexcept {
+    return run_ref<Layout, CowPolicy>{ handle };
 }
 
 template <typename Layout, typename CowPolicy>

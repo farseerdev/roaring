@@ -19,6 +19,7 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <atomic>
 #include <cstdlib>
 #include <new>
@@ -110,6 +111,17 @@ template <typename CowPolicy>
     return handle_t<CowPolicy>::make_array_from_sorted( { values.data(), values.size() } );
 }
 
+// A run container of `runs` two-value runs spaced four apart.
+template <typename CowPolicy>
+[[nodiscard]] handle_t<CowPolicy> make_spilled_run( std::uint32_t const runs = 40 ) {
+    auto handle{ handle_t<CowPolicy>::make_run() };
+    auto run{ handle.as_run() };
+    for ( std::uint32_t i{ 0 }; i < runs; ++i ) {
+        run.add_closed_range( static_cast<low_type>( i * 4U ), static_cast<low_type>( i * 4U + 1U ) );
+    }
+    return handle;
+}
+
 [[nodiscard]] void const * payload_of( auto const & handle ) noexcept { return handle.payload_data_raw(); }
 
 template <typename CowPolicy>
@@ -148,6 +160,33 @@ TYPED_TEST( RefcountedCow, WriteBarrierClonesSharedPayload ) {
     EXPECT_FALSE( std::as_const( original ).as_array().contains( low_type{ 1 } ) );
     EXPECT_EQ( original.cardinality(), 64U );
     EXPECT_EQ( copy    .cardinality(), 65U );
+}
+
+// A batch merged into a run payload shared with a copy is written into one new block - the shared payload is not
+// cloned first and then replaced - and the other holder keeps its payload and contents.
+TYPED_TEST( RefcountedCow, MergeIntoSharedRunAllocatesOnce ) {
+    auto const live_before{ g_live_allocations.load() };
+    {
+        auto original{ make_spilled_run<TypeParam>() };
+        auto copy{ original };
+        ASSERT_EQ( payload_of( copy ), payload_of( original ) );
+
+        // 3, 7, 11, ... fill the gaps between the runs, which are full to capacity, so the payload must grow.
+        std::vector<low_type> batch;
+        for ( std::uint32_t i{ 0 }; i < 40; ++i ) {
+            batch.push_back( static_cast<low_type>( i * 4U + 3U ) );
+        }
+        auto const allocations_before{ g_total_allocations.load() };
+        EXPECT_EQ( as_run_for_merge( copy ).add_sorted( { batch.data(), batch.size() } ), batch.size() );
+        FRSR_EXPECT_ALLOC_EQ( g_total_allocations.load(), allocations_before + 1 );
+
+        EXPECT_NE( payload_of( copy ), payload_of( original ) );
+        EXPECT_EQ( original.cardinality(), 80U );
+        EXPECT_EQ( copy    .cardinality(), 120U );
+        EXPECT_FALSE( std::as_const( original ).as_run().contains( low_type{ 3 } ) );
+        EXPECT_TRUE ( std::as_const( copy     ).as_run().contains( low_type{ 3 } ) );
+    }
+    FRSR_EXPECT_ALLOC_EQ( g_live_allocations.load(), live_before );
 }
 
 TYPED_TEST( RefcountedCow, SoleReferentMutatesInPlace ) {
@@ -404,6 +443,36 @@ TEST( AtomicCowThreaded, CopyMutateDestroyRace ) {
 
         EXPECT_EQ( original.cardinality(), 64U );
         EXPECT_FALSE( std::as_const( original ).as_array().contains( low_type{ 1 } ) );
+    }
+    FRSR_EXPECT_ALLOC_EQ( g_live_allocations.load(), live_before );
+}
+
+// Copies of one run payload merged into and dropped concurrently: the merge reads the shared payload and releases its
+// claim on it, so the original must come out unchanged and every block freed.
+TEST( AtomicCowThreaded, CopyMergeDestroyRace ) {
+    auto const live_before{ g_live_allocations.load() };
+    {
+        auto const original{ make_spilled_run<cow_atomic_refcount>() };
+
+        constexpr unsigned thread_count{ 8 };
+        constexpr unsigned iterations  { 2000 };
+        std::vector<std::thread> threads;
+        threads.reserve( thread_count );
+        for ( unsigned t{ 0 }; t < thread_count; ++t ) {
+            threads.emplace_back( [&original, t] {
+                std::array<low_type, 2> const batch{ static_cast<low_type>( 2 + 4 * t ), static_cast<low_type>( 3 + 4 * t ) };
+                for ( unsigned i{ 0 }; i < iterations; ++i ) {
+                    auto copy{ original };
+                    std::ignore = as_run_for_merge( copy ).add_sorted( { batch.data(), batch.size() } );
+                }
+            } );
+        }
+        for ( auto & thread : threads ) {
+            thread.join();
+        }
+
+        EXPECT_EQ( original.cardinality(), 80U );
+        EXPECT_FALSE( std::as_const( original ).as_run().contains( low_type{ 2 } ) );
     }
     FRSR_EXPECT_ALLOC_EQ( g_live_allocations.load(), live_before );
 }

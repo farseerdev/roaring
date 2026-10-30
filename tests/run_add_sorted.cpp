@@ -220,4 +220,59 @@ TYPED_TEST( RunAddSorted, MatchesTheOracleOnRandomBatches ) {
     }
 }
 
+// A batch merged through as_run_for_merge() into a handle that shares its payload with a copy (or borrows it) is
+// written into a block of the handle's own: the other holder keeps what it had, and a batch that adds nothing
+// leaves the sharing as it was.
+TYPED_TEST( RunAddSorted, MergingIntoASharedPayloadLeavesTheOtherHolderAlone ) {
+    ranges_t ranges;
+    for ( low_type begin{ 100 }; ranges.size() < 40; begin += 50 ) {
+        ranges.emplace_back( begin, static_cast<low_type>( begin + 20 ) );
+    }
+    auto const master{ TestFixture::make( ranges ) };
+    auto const before{ TestFixture::contents_of( master ) };
+
+    auto copy{ master };
+    EXPECT_EQ( as_run_for_merge( copy ).add_sorted( {} ), 0U );
+    if constexpr ( TypeParam::refcounted ) {
+        EXPECT_TRUE( copy.shares_payload_with( master ) );
+    }
+    values_t const present{ 105, 110, 155 };
+    EXPECT_EQ( as_run_for_merge( copy ).add_sorted( { present.data(), present.size() } ), 0U );
+    if constexpr ( TypeParam::refcounted ) {
+        EXPECT_TRUE( copy.shares_payload_with( master ) );
+        EXPECT_EQ( master.payload_refcount(), 2U );
+    }
+
+    values_t const batch{ 30, 125, 126, 127, 140, 141, 1'000, 1'001, 60'000 };
+    auto oracle{ before };
+    oracle.insert( batch.begin(), batch.end() );
+    EXPECT_EQ( as_run_for_merge( copy ).add_sorted( { batch.data(), batch.size() } ), oracle.size() - before.size() );
+    TestFixture::check( copy, oracle );
+    TestFixture::check( master, before );
+    EXPECT_FALSE( copy.shares_payload_with( master ) );
+    if constexpr ( TypeParam::refcounted ) {
+        EXPECT_EQ( master.payload_refcount(), 1U );
+        EXPECT_EQ( copy.payload_refcount(), 1U );
+    }
+}
+
+TYPED_TEST( RunAddSorted, MergingIntoABorrowedPayloadLeavesTheMasterAlone ) {
+    ranges_t ranges;
+    for ( low_type begin{ 100 }; ranges.size() < 40; begin += 50 ) {
+        ranges.emplace_back( begin, static_cast<low_type>( begin + 20 ) );
+    }
+    auto const master{ TestFixture::make( ranges ) };
+    auto const before{ TestFixture::contents_of( master ) };
+
+    auto alias{ TestFixture::handle_t::make_borrowed_alias( master ) };
+    values_t const batch{ 30, 125, 126, 127, 1'000 };
+    auto oracle{ before };
+    oracle.insert( batch.begin(), batch.end() );
+    EXPECT_EQ( as_run_for_merge( alias ).add_sorted( { batch.data(), batch.size() } ), oracle.size() - before.size() );
+    TestFixture::check( alias, oracle );
+    TestFixture::check( master, before );
+    EXPECT_FALSE( alias.shares_payload_with( master ) );
+}
+
+
 } // namespace

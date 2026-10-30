@@ -156,7 +156,7 @@ template <typename Layout, typename CowPolicy>
 ) {
     switch ( container.kind() ) {
         case container_kind::array : return container.as_array ().add_sorted( sorted_values );
-        case container_kind::run   : return container.as_run   ().add_sorted( sorted_values );
+        case container_kind::run   : return as_run_for_merge( container ).add_sorted( sorted_values );
         case container_kind::bitset: return container.as_bitset().add_sorted( sorted_values );
     }
     std::unreachable();
