@@ -48,6 +48,8 @@ known_above = {
     'RunAndNot/run_bitset/residue=one_stretch': 1.17,
     'RunAndNot/run_run/one_cut': 1.19,
     'RunAndNotInplace/run_bitset/residue=dense': 1.3,
+    # A 0.25 to 0.28 us band: the same kernel as the not-in-place band above (ceiling 1.17), measured at 0.9x to 1.09x.
+    'RunAndNotInplace/run_bitset/residue=one_stretch': 1.2,
     'RunAndNotInplace/run_run/one_cut': 1.25,
 }
 # The same, against the CRoaring arm that runs run_optimize after each deletion.

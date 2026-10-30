@@ -1607,9 +1607,10 @@ template <typename Run, typename Value>
     return index;
 }
 
-// With a few array values to a run the kept values come one by one, and the loop that moves the stretch of values
-// a run keeps at once only adds an exit test to each (a mispredicted one when the stretches vary): the stretch
-// loop is the instantiation for lists with at least values_per_run_for_stretch_copy values to a run.
+// With a few array values to a run the kept values come one by one (for the difference, the values in the gap before
+// a run), and the loop or copy that moves the stretch of values at once only adds an exit test or a call to each (a
+// mispredicted one when the stretches vary): the stretch form is the instantiation for lists with at least
+// values_per_run_for_stretch_copy values to a run. The in-place filter below is built the same way.
 template <typename Layout, typename OutVector, typename CowPolicy, typename Keep, bool LongStretches>
 [[ gnu::hot, gnu::noinline ]] inline void filter_array_run_into_with(
     array_cref<Layout, CowPolicy> const lhs,
@@ -1682,11 +1683,14 @@ template <typename Layout, typename OutVector, typename CowPolicy, typename Keep
             }
         } else if constexpr ( keep_matches ) {
             ap = gallop_forward<false>( keys, ap, card, static_cast<low_type>( run.begin ) );
-        } else {
+        } else if constexpr ( LongStretches ) {
             auto const stretch_end{ gallop_forward<false>( keys, ap, card, static_cast<low_type>( run.begin ) ) };
             std::copy_n( keys + ap, stretch_end - ap, out + written );
             written += stretch_end - ap;
             ap = stretch_end;
+        } else {
+            out[ written++ ] = value;
+            ++ap;
         }
     }
     resize_uninitialized( result, static_cast<std::uint32_t>( written ) );

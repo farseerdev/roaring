@@ -9400,6 +9400,22 @@ static void register_array_run() {
         }
         register_ops( "3runs/keys=4000", share( std::move( array ) ), share( std::move( runs ) ), nullptr, "4000 array keys against a run chunk of 3 long runs." );
     }
+    // The array values to a run are 4 on average here (a short-list kernel), but they are not spread out: all of them
+    // lie in one stretch, either the gap before the first of a thousand short runs or inside one long run among them.
+    {
+        values32 before;
+        for ( std::uint32_t v = 1000; v < 5000; ++v ) { before.push_back( ( 3U << 16 ) + v ); }
+        values32 inside;
+        for ( std::uint32_t v = 12000; v < 16000; ++v ) { inside.push_back( ( 3U << 16 ) + v ); }
+        values32 runs;
+        for ( std::uint32_t v = 10000; v < 20000; ++v ) { runs.push_back( ( 3U << 16 ) + v ); }
+        for ( std::uint32_t i = 0; i < 999; ++i ) {
+            for ( std::uint32_t k = 0; k < 20; ++k ) { runs.push_back( ( 3U << 16 ) + 30000 + i * 30 + k ); }
+        }
+        auto const shared_runs = share( std::move( runs ) );
+        register_ops( "clustered/before", share( std::move( before ) ), shared_runs, nullptr, "4000 consecutive array keys in the gap before the first of 1000 runs." );
+        register_ops( "clustered/inside", share( std::move( inside ) ), shared_runs, nullptr, "4000 consecutive array keys inside the first of 1000 runs." );
+    }
 }
 
 // ---- B11: how many array values a run holds, and how many runs one list has against the other ----------------

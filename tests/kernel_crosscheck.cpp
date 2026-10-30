@@ -662,6 +662,42 @@ TEST( KernelCrosscheck, ArrayKeysAgainstManyShortRunsLikeCRoaring ) {
     }
 }
 
+// The kernels treat a list with fewer than 16 array values to a run (value by value) and one with 16 or more (stretch
+// by stretch) differently: random arrays on both sides of that line against half-covered run lists of 16 to 1024
+// runs, and arrays that lie in one stretch (a gap, one run) of a list of a thousand runs, where the mean says
+// "few" but the values sit together.
+TEST( KernelCrosscheck, ArrayAgainstRunsAroundTheStretchBoundaryLikeCRoaring ) {
+    std::mt19937_64 rng{ 0xC1D2 };
+    for ( std::uint32_t const runs : { 16U, 64U, 256U, 1024U } ) {
+        auto const period{ 65536U / runs };
+        std::vector<std::pair<std::uint32_t, std::uint32_t>> ranges;
+        for ( std::uint32_t r{ 0 }; r < runs; ++r ) { ranges.emplace_back( r * period, r * period + period / 2 - 1U ); }
+        auto const run{ make_run_operand( ranges ) };
+        ASSERT_EQ( run.ours.statistics().run_containers, 1U ) << runs;
+        for ( std::uint32_t const per_run : { 1U, 4U, 8U, 15U, 16U, 17U, 24U, 64U } ) {
+            auto const keys{ std::min( per_run * runs, 4000U ) };
+            for ( int trial{ 0 }; trial < 6; ++trial ) {
+                std::set<std::uint32_t> lows;
+                while ( lows.size() < keys ) { lows.insert( static_cast<std::uint32_t>( rng() % 65536 ) ); }
+                Values32 array_values;
+                for ( auto const low : lows ) { array_values.push_back( run_chunk_base + low ); }
+                check_array_run_pair( array_values, run, "random keys around the stretch boundary" );
+            }
+        }
+    }
+    // consecutive keys in one stretch of a list of a thousand runs: in the gap before the first run, inside a long run
+    // among them, and straddling the end of that run
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> ranges{ { 10000, 19999 } };
+    for ( std::uint32_t i{ 0 }; i < 999; ++i ) { ranges.emplace_back( 30000 + i * 30, 30000 + i * 30 + 19 ); }
+    auto const run{ make_run_operand( ranges ) };
+    ASSERT_EQ( run.ours.statistics().run_containers, 1U );
+    for ( auto const [first, last] : { std::pair{ 1000U, 4999U }, std::pair{ 12000U, 15999U }, std::pair{ 18000U, 21999U }, std::pair{ 9000U, 12999U }, std::pair{ 29990U, 33989U } } ) {
+        Values32 array_values;
+        for ( auto low{ first }; low <= last; ++low ) { array_values.push_back( run_chunk_base + low ); }
+        check_array_run_pair( array_values, run, "consecutive keys in one stretch", false );
+    }
+}
+
 TEST( KernelCrosscheck, LongArrayAgainstFewRunsLikeCRoaring ) {
     std::mt19937_64 rng{ 0xB16A };
     auto const run{ make_run_operand( { { 1000, 1999 }, { 30000, 30000 }, { 50000, 65535 } } ) };
