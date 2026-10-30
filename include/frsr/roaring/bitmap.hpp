@@ -1721,6 +1721,48 @@ public:
     // kernels than it saves in bytes, so the caller sets the bar.
     void optimize_run_shaped( std::size_t const min_mean_run_length ) noexcept( detail::allocation_failure_terminates );
 
+    // The chunks a write may have changed, as a set the caller only fills and hands back: what a chunk key is (its
+    // width differs between key types) never shows. Kept as ascending distinct chunk keys; every add appends and
+    // merges only when its keys do not all land above the last one, so the common ascending sequence of adds costs
+    // one append per new chunk.
+    class touched_chunks {
+    public:
+        // The chunks of `sorted_values` (non-descending).
+        void add_values( std::span<key_type const> sorted_values ) noexcept( detail::allocation_failure_terminates );
+        // The chunks of the values [first, last], both included. Costs a step per chunk spanned.
+        void add_range( key_type first, key_type last ) noexcept( detail::allocation_failure_terminates );
+        // The chunks `other` holds.
+        void add_chunks_of( bitmap const & other ) noexcept( detail::allocation_failure_terminates );
+
+        [[nodiscard]] bool empty() const noexcept { return chunks_.empty(); }
+
+        [[nodiscard]] friend bool operator==( touched_chunks const & lhs, touched_chunks const & rhs ) noexcept {
+            return lhs.chunks_ == rhs.chunks_;
+        }
+
+    private:
+        friend class bitmap;
+
+        // Appends `chunk` unless it is the last one held.
+        void push( chunk_type chunk ) noexcept( detail::allocation_failure_terminates );
+        // Merges the keys appended after the first `old_size` into the set.
+        void merge( std::size_t old_size ) noexcept;
+
+        std::vector<chunk_type> chunks_; // ascending, distinct
+    };
+
+    // The maintenance pass of a bitmap a write has degraded: optimize_run_shaped( min_mean_run_length ) restricted to
+    // the `touched` chunks, the others keep the shape they have. One galloping walk of the chunk table visits the
+    // touched chunks that exist (the others are skipped); a chunk costs a read-only run count and, only when it
+    // qualifies, the conversion: a shared payload is peeked, never cloned, and the converted chunk replaces just its
+    // own handle, so a copy of this bitmap keeps the payload it shares. An empty `touched` is no work.
+    //
+    // Const because it changes no value and no observable state of the bitmap, so that a caller holding the
+    // published, shared bitmap by const reference can call it. It does write the chunk table, though: it is a
+    // mutation for the purpose of concurrency (no other thread may use THIS object meanwhile, copies sharing its
+    // payloads are unaffected), and the bitmap object must not have been defined const.
+    void optimize_run_shaped( std::size_t min_mean_run_length, touched_chunks const & touched ) const noexcept( detail::allocation_failure_terminates );
+
     void optimize_for_storage() noexcept( detail::allocation_failure_terminates ) { optimize(); }
     void optimize_for_speed( std::uint16_t const threshold = static_cast<std::uint16_t>( array_to_bitset_threshold ) ) noexcept( detail::allocation_failure_terminates );
     [[nodiscard]] inverse_proxy operator!() const noexcept { return inverse_proxy{ *this }; }
@@ -1847,6 +1889,13 @@ public:
     }
 
 private:
+    // Whether the chunk is not a run container yet but would be one under the bar: its mean run length
+    // (cardinality / runs) is at least `min_mean_run_length`. Read-only: an array is scanned in place, a bitset is
+    // counted from its words, the count capped at the first value that already fails.
+    [[nodiscard]] static bool is_run_shaped( handle_type const & chunk, std::size_t min_mean_run_length ) noexcept;
+    // The one chunk step of both run-shaped passes.
+    static void run_encode_if_run_shaped( handle_type & chunk, std::size_t min_mean_run_length ) noexcept( detail::allocation_failure_terminates );
+
     static constexpr bool uses_default_container_set{ std::same_as<container_set_type, default_container_set_type> };
     static constexpr bool supports_run_container{
         detail::variant_contains_v<container_set_type, run_container_type>

@@ -9055,7 +9055,87 @@ static void register_back_front() {
     }
 }
 
+// ---- B9: the run-shaped maintenance pass over the chunks a write touched, against the pass over every chunk -----
+// Steady state: every chunk holds an array that fails the bar (every other value), so neither pass converts anything
+// and a call is repeatable on one bitmap; the cost is the walk and the read-only run counts. The arm "frsr-full"
+// is the whole-bitmap pass (optimize_run_shaped( bar )), the baseline the listed pass is measured against; the
+// reference library has no listed pass. The "empty" bands list nothing at all.
+static void register_run_shaped_listed() {
+    using Bitmap = arms::FrsrShipped::bitmap;
+    constexpr std::size_t bar = 64;
+    struct state {
+        Bitmap a;
+        Bitmap::touched_chunks touched;
+    };
+    for ( std::size_t const chunks : { std::size_t{ 1000 }, std::size_t{ 10000 } } ) {
+        for ( std::size_t const touched_count : { std::size_t{ 0 }, std::size_t{ 1 }, std::size_t{ 16 }, chunks } ) {
+            auto const make_state = [ chunks, touched_count ]() -> void * {
+                auto * const st = new state;
+                std::vector<std::uint32_t> values;
+                values.reserve( chunks * 600 );
+                for ( std::uint32_t c = 0; c < chunks; ++c ) {
+                    for ( std::uint32_t k = 0; k < 600; ++k ) { values.push_back( ( c << 16 ) + 2 * k ); }
+                }
+                st->a.add_many( values );
+                if ( touched_count == chunks ) {
+                    st->touched.add_chunks_of( st->a );
+                } else if ( touched_count != 0 ) {
+                    std::vector<std::uint32_t> firsts;
+                    for ( std::size_t i = 0; i < touched_count; ++i ) {
+                        firsts.push_back( static_cast<std::uint32_t>( ( chunks / 2 + i * ( chunks / touched_count ) ) % chunks ) << 16 );
+                    }
+                    std::ranges::sort( firsts );
+                    st->touched.add_values( firsts );
+                }
+                return st;
+            };
+            auto const shape = std::string( touched_count == 0 ? "empty" : std::to_string( touched_count ) + "touched" ) + "_of_" + std::to_string( chunks ) + "chunks";
+            auto const listed_repeat = std::clamp<std::size_t>( 400000 / std::max<std::size_t>( touched_count, 1 ), 1, 1000000 );
+            auto const full_repeat = std::max<std::size_t>( 400000 / chunks, 1 );
+            {
+                Entry e;
+                e.name = "kernel/" + std::string( arms::FrsrShipped::label() ) + "RunShaped/" + shape;
+                e.description = "bitmap::optimize_run_shaped( bar, touched ): " + shape + "; cost per call.";
+                e.setup = make_state;
+                e.run = [ listed_repeat ]( void * sv ) -> int64_t {
+                    auto * const st = static_cast<state *>( sv );
+                    for ( std::size_t i = 0; i < listed_repeat; ++i ) {
+                        asm volatile( "" ::: "memory" );
+                        std::as_const( st->a ).optimize_run_shaped( bar, st->touched );
+                    }
+                    return static_cast<std::int64_t>( st->a.size() );
+                };
+                e.teardown = []( void * sv ) { delete static_cast<state *>( sv ); };
+                e.ops_per_run = static_cast<int64_t>( listed_repeat );
+                e.inner_reps = 20;
+                e.reusable_state = true;
+                g_benchmarks.push_back( std::move( e ) );
+            }
+            if ( touched_count != 0 ) {
+                Entry e;
+                e.name = "kernel/frsr-fullRunShaped/" + shape;
+                e.description = "bitmap::optimize_run_shaped( bar ), every chunk: " + shape + "; cost per call.";
+                e.setup = make_state;
+                e.run = [ full_repeat ]( void * sv ) -> int64_t {
+                    auto * const st = static_cast<state *>( sv );
+                    for ( std::size_t i = 0; i < full_repeat; ++i ) {
+                        asm volatile( "" ::: "memory" );
+                        st->a.optimize_run_shaped( bar );
+                    }
+                    return static_cast<std::int64_t>( st->a.size() );
+                };
+                e.teardown = []( void * sv ) { delete static_cast<state *>( sv ); };
+                e.ops_per_run = static_cast<int64_t>( full_repeat );
+                e.inner_reps = 20;
+                e.reusable_state = true;
+                g_benchmarks.push_back( std::move( e ) );
+            }
+        }
+    }
+}
+
 static void register_benchmarks() {
+    register_run_shaped_listed();
     register_back_front();
     register_small_array_export();
     register_bitset_and_to_array();

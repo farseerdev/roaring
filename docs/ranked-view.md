@@ -67,6 +67,15 @@ than the last nanoseconds, let `optimize_run_shaped( 4096 )` turn chunks with a 
 16 runs per chunk) into runs. Lower bars (64, 1024) still pick runs for tables with a range / entries of 1.001 to 1.01
 and are 5 to 10 times slower there.
 
+A table that is edited after it is built degrades only the chunks the edits fall into. Fill a `touched_chunks` with
+what was written (`add_values( sorted_values )`, `add_range( first, last )`, `add_chunks_of( other )`, in any order
+and any number of times; the set keeps distinct ascending chunks and what a chunk key is stays hidden) and call
+`optimize_run_shaped( bar, touched )`: one galloping walk of the chunk table visits just those chunks, each costing the
+same read-only run count as the whole pass, and an empty set costs nothing. It is a `const` member for a caller that holds
+the published table by const reference: it changes no value, but it does replace the handle of a converted chunk, so no
+other thread may use that same object meanwhile (copies that share its payloads are unaffected, and a shared payload that
+is not converted is never cloned).
+
 Measured with `bench/rank_bench.cpp` on one pinned core of a Zen 4 machine, clang 23 and g++ 16 (glibc), `index_of` of
 present ids, independent probes, a table of 10^6 ids, nanoseconds per lookup, the fastest of 9 rounds (clang; g++ is
 within 15% of it except for the sorted array, which is up to 2x slower, and CRoaring on the dense tables):

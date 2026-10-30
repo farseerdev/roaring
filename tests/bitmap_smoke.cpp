@@ -1,13 +1,17 @@
 #include <frsr/roaring/bitmap.hpp>
 #include <frsr/roaring/run_container.hpp>
 
+#include "allocation_fault.hpp"
+
 #include <gtest/gtest.h>
 #include <cstring>
 
 #include <algorithm>
 #include <array>
 #include <algorithm>
+#include <initializer_list>
 #include <iterator>
+#include <limits>
 #include <random>
 #include <set>
 #include <string>
@@ -1276,6 +1280,452 @@ TEST(FrsrRoaringSmoke, OptimizeRunShapedOnACopyLeavesTheSharedSourceUntouched) {
     EXPECT_EQ( source.statistics().run_containers,    0U );
     EXPECT_EQ( copy  .to_vector(), values );
     EXPECT_EQ( source.to_vector(), values );
+}
+
+// The listed pass: optimize_run_shaped( bar, touched_chunks ) over every key width and copy-on-write policy.
+template <typename Bitmap>
+class TouchedChunksTyped : public ::testing::Test {};
+
+namespace detail_test = frsr::roaring::detail;
+
+template <typename Key, typename Cow>
+using LazyOf = frsr::roaring::bitmap<
+    Key,
+    frsr::roaring::default_container_set<Key>,
+    Cow,
+    detail_test::run_selection_lazy
+>;
+
+using TouchedChunksBitmaps = ::testing::Types<
+    LazyOf<std::uint32_t, detail_test::cow_value_semantics>,
+    LazyOf<std::uint32_t, detail_test::cow_atomic_refcount>,
+    LazyOf<std::uint32_t, detail_test::cow_unsynchronized_refcount>,
+    LazyOf<std::uint64_t, detail_test::cow_value_semantics>,
+    LazyOf<std::uint64_t, detail_test::cow_atomic_refcount>,
+    LazyOf<std::uint64_t, detail_test::cow_unsynchronized_refcount>
+>;
+TYPED_TEST_SUITE( TouchedChunksTyped, TouchedChunksBitmaps );
+
+constexpr std::size_t listed_bar{ 64U };
+
+enum class chunk_shape : std::uint8_t {
+    run_array,         // one run of 600 values: an array that qualifies
+    run_bitset,        // one run of 6000 values: a bitset that qualifies
+    scattered_array,   // every other value, 600 of them: stays an array
+    scattered_bitset,  // every other value, 6000 of them: stays a bitset
+    short_run_array,   // one run of 100 values (cheap to build in bulk)
+    short_scattered,   // every other value, 100 of them
+};
+
+template <typename Bitmap>
+void add_chunk( std::vector<typename Bitmap::key_type> & values, std::uint64_t const chunk, chunk_shape const shape ) {
+    std::vector<std::uint32_t> lows;
+    switch ( shape ) {
+        case chunk_shape::run_array:        lows = run_shaped_values( 0U,   1U,   600U, 0U ); break;
+        case chunk_shape::run_bitset:       lows = run_shaped_values( 0U,   1U, 6'000U, 0U ); break;
+        case chunk_shape::scattered_array:  lows = run_shaped_values( 0U, 600U,     1U, 1U ); break;
+        case chunk_shape::scattered_bitset: lows = run_shaped_values( 0U, 6'000U,   1U, 1U ); break;
+        case chunk_shape::short_run_array:  lows = run_shaped_values( 0U,   1U,   100U, 0U ); break;
+        case chunk_shape::short_scattered:  lows = run_shaped_values( 0U, 100U,     1U, 1U ); break;
+    }
+    for ( auto const low : lows ) {
+        values.push_back( static_cast<typename Bitmap::key_type>( ( chunk << 16 ) + low ) );
+    }
+}
+
+// The first value of each of the chunks (distinct, ascending or not).
+template <typename Bitmap>
+[[nodiscard]] std::vector<typename Bitmap::key_type> first_values_of( std::initializer_list<std::uint64_t> const chunks ) {
+    std::vector<typename Bitmap::key_type> values;
+    for ( auto const chunk : chunks ) {
+        values.push_back( static_cast<typename Bitmap::key_type>( chunk << 16 ) );
+    }
+    return values;
+}
+
+template <typename Bitmap>
+[[nodiscard]] typename Bitmap::touched_chunks touched_of( std::initializer_list<std::uint64_t> const chunks ) {
+    auto values{ first_values_of<Bitmap>( chunks ) };
+    std::ranges::sort( values );
+    typename Bitmap::touched_chunks touched;
+    touched.add_values( values );
+    return touched;
+}
+
+// The allocations the calling thread makes while `f` runs (the test binary's operator new counts them while a
+// thread is armed; without it, the answer is always 0 and the checks that use it are void).
+template <typename F>
+[[nodiscard]] std::uint32_t allocations_during( F && f ) {
+    namespace fault = frsr::roaring::kernel_test::alloc_fault;
+    fault::armed const armed{ 0x7fff'ffffU };
+    auto const before{ fault::counter };
+    f();
+    return fault::counter - before;
+}
+
+// chunk 0: run array, 1: run bitset, 2: scattered array, 3: short-run array (runs of 64), 4: scattered bitset,
+// 5: run array
+template <typename Bitmap>
+[[nodiscard]] std::vector<typename Bitmap::key_type> mixed_chunks() {
+    std::vector<typename Bitmap::key_type> values;
+    add_chunk<Bitmap>( values, 0, chunk_shape::run_array );
+    add_chunk<Bitmap>( values, 1, chunk_shape::run_bitset );
+    add_chunk<Bitmap>( values, 2, chunk_shape::scattered_array );
+    {
+        auto const lows{ run_shaped_values( 0U, 50U, 64U, 1U ) };
+        for ( auto const low : lows ) {
+            values.push_back( static_cast<typename Bitmap::key_type>( ( std::uint64_t{ 3 } << 16 ) + low ) );
+        }
+    }
+    add_chunk<Bitmap>( values, 4, chunk_shape::scattered_bitset );
+    add_chunk<Bitmap>( values, 5, chunk_shape::run_array );
+    return values;
+}
+
+TYPED_TEST( TouchedChunksTyped, OnlyTheListedChunksAreConsidered ) {
+    using Bitmap = TypeParam;
+    auto const values{ mixed_chunks<Bitmap>() };
+    Bitmap bitmap{ values };
+    auto const before{ bitmap.statistics() };
+    ASSERT_EQ( before.run_containers,    0U );
+    ASSERT_EQ( before.array_containers,  4U );
+    ASSERT_EQ( before.bitset_containers, 2U );
+
+    // 1 and 3 qualify, 4 does not; 0 and 5 qualify but are not listed
+    std::as_const( bitmap ).optimize_run_shaped( listed_bar, touched_of<Bitmap>( { 1, 3, 4 } ) );
+    {
+        auto const after{ bitmap.statistics() };
+        EXPECT_EQ( after.run_containers,    2U );
+        EXPECT_EQ( after.array_containers,  3U );
+        EXPECT_EQ( after.bitset_containers, 1U );
+        EXPECT_EQ( bitmap.to_vector(), values );
+    }
+
+    // listing everything makes it the whole pass
+    typename Bitmap::touched_chunks all;
+    all.add_chunks_of( bitmap );
+    std::as_const( bitmap ).optimize_run_shaped( listed_bar, all );
+    {
+        auto const after{ bitmap.statistics() };
+        EXPECT_EQ( after.run_containers,    4U );
+        EXPECT_EQ( after.array_containers,  1U );
+        EXPECT_EQ( after.bitset_containers, 1U );
+        EXPECT_EQ( bitmap.to_vector(), values );
+    }
+
+    Bitmap whole{ values };
+    whole.optimize_run_shaped( listed_bar );
+    EXPECT_EQ( whole.statistics().run_containers, bitmap.statistics().run_containers );
+}
+
+TYPED_TEST( TouchedChunksTyped, AnEmptySetDoesNothingAndAllocatesNothing ) {
+    using Bitmap = TypeParam;
+    auto const values{ mixed_chunks<Bitmap>() };
+    Bitmap const bitmap{ values };
+    typename Bitmap::touched_chunks const none;
+    EXPECT_TRUE( none.empty() );
+    auto const allocations{ allocations_during( [ & ] { bitmap.optimize_run_shaped( listed_bar, none ); } ) };
+    if ( FRSR_TESTS_COUNT_ALLOCATIONS ) {
+        EXPECT_EQ( allocations, 0U );
+    }
+    EXPECT_EQ( bitmap.statistics().run_containers, 0U );
+    EXPECT_EQ( bitmap.to_vector(), values );
+
+    // and an empty bitmap with a listed chunk
+    Bitmap const nothing;
+    nothing.optimize_run_shaped( listed_bar, touched_of<Bitmap>( { 0, 7 } ) );
+    EXPECT_TRUE( nothing.empty() );
+}
+
+TYPED_TEST( TouchedChunksTyped, ListedChunksThatDoNotExistAreSkipped ) {
+    using Bitmap = TypeParam;
+    // chunks 2, 4 and 6 only
+    std::vector<typename Bitmap::key_type> values;
+    add_chunk<Bitmap>( values, 2, chunk_shape::run_array );
+    add_chunk<Bitmap>( values, 4, chunk_shape::run_array );
+    add_chunk<Bitmap>( values, 6, chunk_shape::run_array );
+    Bitmap bitmap{ values };
+
+    // below the first, between two, and above the last chunk: nothing there, and the walk goes on after each
+    std::as_const( bitmap ).optimize_run_shaped( listed_bar, touched_of<Bitmap>( { 0, 1, 3, 5, 9, 100 } ) );
+    EXPECT_EQ( bitmap.statistics().run_containers, 0U );
+
+    // the missing ones around the existing 4: only that one converts
+    std::as_const( bitmap ).optimize_run_shaped( listed_bar, touched_of<Bitmap>( { 1, 3, 4, 5, 100 } ) );
+    EXPECT_EQ( bitmap.statistics().run_containers, 1U );
+
+    // the first and the last, the walk past the end stops
+    std::as_const( bitmap ).optimize_run_shaped( listed_bar, touched_of<Bitmap>( { 2, 6, 7, 8 } ) );
+    EXPECT_EQ( bitmap.statistics().run_containers, 3U );
+    EXPECT_EQ( bitmap.to_vector(), values );
+}
+
+TYPED_TEST( TouchedChunksTyped, ARunContainerAndARepeatedPassAreLeftAlone ) {
+    using Bitmap = TypeParam;
+    auto const values{ mixed_chunks<Bitmap>() };
+    Bitmap bitmap{ values };
+    auto const touched{ touched_of<Bitmap>( { 0, 1, 2, 3, 4, 5 } ) };
+    std::as_const( bitmap ).optimize_run_shaped( listed_bar, touched );
+    auto const once{ bitmap.statistics() };
+    auto const allocations{ allocations_during( [ & ] { std::as_const( bitmap ).optimize_run_shaped( listed_bar, touched ); } ) };
+    if ( FRSR_TESTS_COUNT_ALLOCATIONS ) {
+        EXPECT_EQ( allocations, 0U );
+    }
+    auto const twice{ bitmap.statistics() };
+    EXPECT_EQ( twice.run_containers,    once.run_containers );
+    EXPECT_EQ( twice.array_containers,  once.array_containers );
+    EXPECT_EQ( twice.bitset_containers, once.bitset_containers );
+    EXPECT_EQ( bitmap.to_vector(), values );
+}
+
+// A chunk that is not converted is not cloned even when its payload is shared; one that is converted is replaced
+// in this bitmap only.
+TYPED_TEST( TouchedChunksTyped, ASharedPayloadIsNotClonedUnlessConverted ) {
+    using Bitmap = TypeParam;
+    // 0: scattered bitset and 1: scattered array (neither qualifies), 2: array of 50 runs, 3: run bitset
+    std::vector<typename Bitmap::key_type> values;
+    add_chunk<Bitmap>( values, 0, chunk_shape::scattered_bitset );
+    add_chunk<Bitmap>( values, 1, chunk_shape::scattered_array );
+    for ( auto const low : run_shaped_values( 0U, 50U, 64U, 1U ) ) {   // 50 runs: a run payload that spills
+        values.push_back( static_cast<typename Bitmap::key_type>( ( std::uint64_t{ 2 } << 16 ) + low ) );
+    }
+    add_chunk<Bitmap>( values, 3, chunk_shape::run_bitset );
+    Bitmap const source{ values };
+    Bitmap copy{ source };
+
+    auto const failing{ touched_of<Bitmap>( { 0, 1 } ) };
+    auto const allocations{ allocations_during( [ & ] { std::as_const( copy ).optimize_run_shaped( listed_bar, failing ); } ) };
+    if ( FRSR_TESTS_COUNT_ALLOCATIONS ) {
+        EXPECT_EQ( allocations, 0U );
+    }
+    EXPECT_EQ( copy.statistics().run_containers, 0U );
+
+    auto const converting{ touched_of<Bitmap>( { 0, 1, 2, 3 } ) };
+    auto const conversion_allocations{ allocations_during( [ & ] { std::as_const( copy ).optimize_run_shaped( listed_bar, converting ); } ) };
+    if ( FRSR_TESTS_COUNT_ALLOCATIONS ) {
+        EXPECT_GT( conversion_allocations, 0U );   // (the counter is live)
+    }
+    EXPECT_EQ( copy  .statistics().run_containers, 2U );
+    EXPECT_EQ( source.statistics().run_containers, 0U );
+    EXPECT_EQ( copy  .to_vector(), values );
+    EXPECT_EQ( source.to_vector(), values );
+    EXPECT_EQ( copy.size(), source.size() );
+}
+
+// The chunk table of a wide key is a tree or, for many evenly spread keys, a flat directory
+// (see chunk_tree.cpp for what makes which): the walk is the same on both.
+TEST( TouchedChunks, WideKeysOnADirectoryAndOnATree ) {
+    using Wide = LazyOf<std::uint64_t, detail_test::cow_atomic_refcount>;
+    struct layout {
+        char const * name;
+        std::vector<std::uint64_t> chunks; // ascending
+    };
+    std::vector<layout> layouts;
+    {
+        // evenly spread: the directory
+        layout even{ "even", {} };
+        for ( std::uint64_t k{ 0 }; k < 20'000; ++k ) {
+            even.chunks.push_back( 4096 * k );
+        }
+        layouts.push_back( std::move( even ) );
+    }
+    {
+        // dense clusters far apart: the tree
+        layout clusters{ "clusters", {} };
+        for ( std::uint64_t const base : { std::uint64_t{ 0 }, std::uint64_t{ 1 } << 34, std::uint64_t{ 1 } << 40, ( std::uint64_t{ 1 } << 44 ) + 12'345 } ) {
+            for ( std::uint64_t k{ 0 }; k < 3'000; ++k ) {
+                clusters.chunks.push_back( base + 2 * k );
+            }
+        }
+        layouts.push_back( std::move( clusters ) );
+    }
+    for ( auto const & table : layouts ) {
+        SCOPED_TRACE( table.name );
+        // every even-numbered chunk qualifies (one run of 100), every odd one does not
+        std::vector<std::uint64_t> values;
+        std::size_t qualifying{ 0 };
+        for ( std::size_t i{ 0 }; i < table.chunks.size(); ++i ) {
+            auto const shape{ ( i % 2 == 0 ) ? chunk_shape::short_run_array : chunk_shape::short_scattered };
+            qualifying += ( i % 2 == 0 );
+            add_chunk<Wide>( values, table.chunks[ i ], shape );
+        }
+        Wide const pristine{ values };
+        ASSERT_EQ( pristine.statistics().container_count(), table.chunks.size() );
+
+        auto const touch_indices{ [ & ]( std::vector<std::size_t> const & indices ) {
+            std::vector<Wide::key_type> firsts;
+            for ( auto const i : indices ) {
+                firsts.push_back( table.chunks[ i ] << 16 );
+            }
+            Wide::touched_chunks touched;
+            touched.add_values( firsts );
+            return touched;
+        } };
+        auto const converted_after{ [ & ]( Wide::touched_chunks const & touched ) {
+            Wide bitmap{ pristine };
+            std::as_const( bitmap ).optimize_run_shaped( listed_bar, touched );
+            EXPECT_EQ( bitmap.to_vector(), values );
+            return bitmap.statistics().run_containers;
+        } };
+
+        // one chunk, qualifying and not
+        EXPECT_EQ( converted_after( touch_indices( { 100 } ) ), 1U );
+        EXPECT_EQ( converted_after( touch_indices( { 101 } ) ), 0U );
+        // the first and the last
+        EXPECT_EQ( converted_after( touch_indices( { 0, table.chunks.size() - 2 } ) ), 2U );
+        // sixteen spread out (every 251st, even and odd alike)
+        std::vector<std::size_t> sixteen;
+        for ( std::size_t i{ 0 }; i < 16; ++i ) {
+            sixteen.push_back( 17 + i * 251 );
+        }
+        auto const expected{ static_cast<std::size_t>( std::ranges::count_if( sixteen, []( std::size_t const i ) { return i % 2 == 0; } ) ) };
+        EXPECT_EQ( converted_after( touch_indices( sixteen ) ), expected );
+        // all of them: the full pass
+        Wide::touched_chunks all;
+        all.add_chunks_of( pristine );
+        EXPECT_EQ( converted_after( all ), qualifying );
+    }
+}
+
+// The set itself: ascending distinct chunks however the adds arrive.
+using TouchedBitmap = LazyOf<std::uint32_t, detail_test::cow_atomic_refcount>;
+using WideTouchedBitmap = LazyOf<std::uint64_t, detail_test::cow_atomic_refcount>;
+
+template <typename Bitmap>
+[[nodiscard]] typename Bitmap::touched_chunks touched_in_steps( std::initializer_list<std::initializer_list<std::uint64_t>> const steps ) {
+    typename Bitmap::touched_chunks touched;
+    for ( auto const step : steps ) {
+        auto values{ first_values_of<Bitmap>( step ) };
+        std::ranges::sort( values );
+        touched.add_values( values );
+    }
+    return touched;
+}
+
+TEST( TouchedChunks, AddsMergeWhereverTheirChunksLand ) {
+    using Touched = TouchedBitmap::touched_chunks;
+    Touched const empty;
+    EXPECT_TRUE( empty.empty() );
+    EXPECT_EQ( empty, Touched{} );
+
+    auto const expect = []( auto const & steps, std::initializer_list<std::uint64_t> const whole ) {
+        EXPECT_EQ( touched_in_steps<TouchedBitmap>( steps ), touched_of<TouchedBitmap>( whole ) );
+        EXPECT_EQ( touched_in_steps<WideTouchedBitmap>( steps ), touched_of<WideTouchedBitmap>( whole ) );
+    };
+    // after, below, inside, between, spanning, the same again
+    expect( std::initializer_list<std::initializer_list<std::uint64_t>>{ { 1, 2 }, { 5, 9 } },                           { 1, 2, 5, 9 } );
+    expect( std::initializer_list<std::initializer_list<std::uint64_t>>{ { 5, 9 }, { 1, 2 } },                           { 1, 2, 5, 9 } );
+    expect( std::initializer_list<std::initializer_list<std::uint64_t>>{ { 1, 9 }, { 3, 5 } },                           { 1, 3, 5, 9 } );
+    expect( std::initializer_list<std::initializer_list<std::uint64_t>>{ { 2, 4 }, { 1, 3, 5 } },                        { 1, 2, 3, 4, 5 } );
+    expect( std::initializer_list<std::initializer_list<std::uint64_t>>{ { 3, 4 }, { 1, 2, 5, 6 } },                     { 1, 2, 3, 4, 5, 6 } );
+    // duplicates inside a step, equal to the last, equal to the first and to the last at once, wholly equal
+    expect( std::initializer_list<std::initializer_list<std::uint64_t>>{ { 1, 1, 2, 2 } },                               { 1, 2 } );
+    expect( std::initializer_list<std::initializer_list<std::uint64_t>>{ { 1, 2 }, { 2 } },                              { 1, 2 } );
+    expect( std::initializer_list<std::initializer_list<std::uint64_t>>{ { 1, 2 }, { 2, 3 } },                           { 1, 2, 3 } );
+    expect( std::initializer_list<std::initializer_list<std::uint64_t>>{ { 1, 4 }, { 1, 4 } },                           { 1, 4 } );
+    expect( std::initializer_list<std::initializer_list<std::uint64_t>>{ { 1, 4 }, { 0, 1, 4, 5 }, { 3, 4 } },           { 0, 1, 3, 4, 5 } );
+    expect( std::initializer_list<std::initializer_list<std::uint64_t>>{ { 7 }, { 7 }, { 3 }, { 3 }, { 7 } },            { 3, 7 } );
+}
+
+TEST( TouchedChunks, ManyValuesInOneChunkAreOneEntry ) {
+    std::vector<std::uint32_t> values;
+    for ( std::uint32_t v{ 5U }; v < 3'000U; v += 7U ) {
+        values.push_back( v );
+        values.push_back( v + 65'536U );
+        values.push_back( v + 3U * 65'536U );
+    }
+    std::ranges::sort( values );
+    TouchedBitmap::touched_chunks touched;
+    touched.add_values( values );
+    EXPECT_EQ( touched, touched_of<TouchedBitmap>( { 0, 1, 3 } ) );
+    touched.add_values( {} );
+    EXPECT_EQ( touched, touched_of<TouchedBitmap>( { 0, 1, 3 } ) );
+}
+
+TEST( TouchedChunks, RangesCoverEveryChunkTheySpanAndMergeLikeValues ) {
+    using Touched = TouchedBitmap::touched_chunks;
+    {
+        Touched touched;
+        touched.add_range( 70'000U, 70'000U );
+        EXPECT_EQ( touched, touched_of<TouchedBitmap>( { 1 } ) );
+        touched.add_range( 3U, 65'535U );   // chunk 0 only, below the 1 held
+        EXPECT_EQ( touched, touched_of<TouchedBitmap>( { 0, 1 } ) );
+        touched.add_range( 65'536U * 2U + 7U, 65'536U * 5U );   // 2..5, past it
+        EXPECT_EQ( touched, touched_of<TouchedBitmap>( { 0, 1, 2, 3, 4, 5 } ) );
+        touched.add_range( 65'536U * 3U, 65'536U * 8U + 1U );   // 3..8, overlapping the end
+        EXPECT_EQ( touched, touched_of<TouchedBitmap>( { 0, 1, 2, 3, 4, 5, 6, 7, 8 } ) );
+    }
+    {
+        // a range ending in the last chunk of the key domain does not wrap
+        Touched touched;
+        touched.add_range( 0xFFFE'0000U, 0xFFFF'FFFFU );
+        EXPECT_EQ( touched, touched_of<TouchedBitmap>( { 0xFFFE, 0xFFFF } ) );
+        using WideTouched = WideTouchedBitmap::touched_chunks;
+        WideTouched wide;
+        auto constexpr max{ std::numeric_limits<std::uint64_t>::max() };
+        wide.add_range( max - 70'000U, max );
+        auto const last_chunk{ max >> 16 };
+        WideTouched expected;
+        std::vector<std::uint64_t> firsts{ ( last_chunk - 1 ) << 16, last_chunk << 16 };
+        expected.add_values( firsts );
+        EXPECT_EQ( wide, expected );
+    }
+    {
+        // at the very start of the domain
+        Touched touched;
+        touched.add_range( 0U, 0U );
+        EXPECT_EQ( touched, touched_of<TouchedBitmap>( { 0 } ) );
+    }
+}
+
+TEST( TouchedChunks, ChunksOfABitmapMergeWithWhatIsHeld ) {
+    using Bitmap = TouchedBitmap;
+    std::vector<std::uint32_t> values;
+    add_chunk<Bitmap>( values, 2, chunk_shape::short_run_array );
+    add_chunk<Bitmap>( values, 4, chunk_shape::short_run_array );
+    add_chunk<Bitmap>( values, 9, chunk_shape::short_run_array );
+    Bitmap const bitmap{ values };
+
+    Bitmap::touched_chunks touched;
+    touched.add_chunks_of( Bitmap{} );
+    EXPECT_TRUE( touched.empty() );
+    touched.add_chunks_of( bitmap );
+    EXPECT_EQ( touched, touched_of<Bitmap>( { 2, 4, 9 } ) );
+    touched.add_chunks_of( bitmap );
+    EXPECT_EQ( touched, touched_of<Bitmap>( { 2, 4, 9 } ) );
+
+    Bitmap::touched_chunks mixed{ touched_of<Bitmap>( { 0, 4, 11 } ) };
+    mixed.add_chunks_of( bitmap );
+    EXPECT_EQ( mixed, touched_of<Bitmap>( { 0, 2, 4, 9, 11 } ) );
+
+    // the chunks of a 64-bit bitmap
+    WideTouchedBitmap wide;
+    (void)wide.add( 5ULL << 40 );
+    (void)wide.add( 9ULL << 50 );
+    WideTouchedBitmap::touched_chunks wide_touched;
+    wide_touched.add_chunks_of( wide );
+    EXPECT_EQ( wide_touched, touched_of<WideTouchedBitmap>( { 5ULL << 24, 9ULL << 34 } ) );
+}
+
+// A 16-bit key has a single chunk.
+TEST( TouchedChunks, ASixteenBitKeyHasOneChunk ) {
+    using Small = LazyOf<std::uint16_t, detail_test::cow_atomic_refcount>;
+    std::vector<std::uint16_t> values;
+    for ( std::uint16_t v{ 100U }; v < 700U; ++v ) {
+        values.push_back( v );
+    }
+    Small bitmap{ values };
+    ASSERT_EQ( bitmap.statistics().array_containers, 1U );
+    Small::touched_chunks touched;
+    touched.add_values( std::span<std::uint16_t const>{ values } );
+    touched.add_range( 3U, 0xFFFFU );
+    Small::touched_chunks expected;
+    std::array<std::uint16_t, 1> const one{ 7U };
+    expected.add_values( one );
+    EXPECT_EQ( touched, expected );
+    std::as_const( bitmap ).optimize_run_shaped( listed_bar, touched );
+    EXPECT_EQ( bitmap.statistics().run_containers, 1U );
+    EXPECT_EQ( bitmap.to_vector(), values );
 }
 
 TEST(FrsrRoaringSmoke, ShrinkToFitReturnsPayloadSlackAndKeepsContents) {
