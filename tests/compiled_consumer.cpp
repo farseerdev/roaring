@@ -14,6 +14,7 @@
 #include <random>
 #include <set>
 #include <span>
+#include <utility>
 #include <vector>
 
 #ifdef FRSR_ROARING_WITH_DEFINITIONS
@@ -153,6 +154,53 @@ void exercise() {
     std::array<Bitmap const *, 3> const many{ &lhs, &rhs, &mutated };
     EXPECT_EQ( Bitmap::and_many_cardinality( many ), ( lhs & rhs & mutated ).size() );
     EXPECT_EQ( Bitmap::xor_many( many ).size(), ( lhs ^ rhs ^ mutated ).size() );
+}
+
+// The set of touched chunks and the run-shaped pass over it, through the compiled instantiations only.
+template <typename Bitmap>
+void exercise_touched_chunks( bool const lazy_runs ) {
+    using key_type = typename Bitmap::key_type;
+    constexpr std::size_t chunks{ sizeof( key_type ) > 2 ? 4 : 1 };   // a 16-bit key has one chunk
+    std::vector<key_type> values;
+    for ( std::size_t chunk{ 0 }; chunk < chunks; ++chunk ) {
+        for ( std::uint32_t low{ 0 }; low < 600; ++low ) {
+            values.push_back( static_cast<key_type>( ( static_cast<std::uint64_t>( chunk ) << ( sizeof( key_type ) > 2 ? 16 : 0 ) ) + low ) );
+        }
+    }
+    Bitmap bitmap{ values };
+
+    typename Bitmap::touched_chunks none;
+    EXPECT_TRUE( none.empty() );
+    auto const before{ bitmap.statistics().run_containers };
+    std::as_const( bitmap ).optimize_run_shaped( 64, none );
+    EXPECT_EQ( bitmap.statistics().run_containers, before );
+
+    typename Bitmap::touched_chunks by_values;
+    by_values.add_values( values );
+    typename Bitmap::touched_chunks by_range;
+    by_range.add_range( values.front(), values.back() );
+    typename Bitmap::touched_chunks by_bitmap;
+    by_bitmap.add_chunks_of( bitmap );
+    EXPECT_FALSE( by_values.empty() );
+    EXPECT_TRUE( by_values == by_range );
+    EXPECT_TRUE( by_values == by_bitmap );
+    EXPECT_FALSE( by_values == none );
+
+    std::as_const( bitmap ).optimize_run_shaped( 64, by_values );
+    EXPECT_EQ( keys_of( bitmap ), values );
+    if ( lazy_runs ) {
+        EXPECT_EQ( bitmap.statistics().run_containers, chunks );
+    }
+}
+
+TEST( CompiledConsumer, TouchedChunks ) {
+    using namespace frsr::roaring;
+    using lazy_cow = detail::cow_atomic_refcount;
+    exercise_touched_chunks<bitmap<std::uint32_t>>( false );
+    exercise_touched_chunks<bitmap<std::uint64_t>>( false );
+    exercise_touched_chunks<bitmap<std::uint16_t>>( false );
+    exercise_touched_chunks<bitmap<std::uint32_t, default_container_set<std::uint32_t>, lazy_cow, detail::run_selection_lazy>>( true );
+    exercise_touched_chunks<bitmap<std::uint64_t, default_container_set<std::uint64_t>, lazy_cow, detail::run_selection_lazy>>( true );
 }
 
 TEST( CompiledConsumer, DefaultBitmap32 ) { exercise<frsr::roaring::bitmap<std::uint32_t>>(); }

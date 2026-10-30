@@ -1724,7 +1724,7 @@ public:
     // The chunks a write may have changed, as a set the caller only fills and hands back: what a chunk key is (its
     // width differs between key types) never shows. Kept as ascending distinct chunk keys; every add appends and
     // merges only when its keys do not all land above the last one, so the common ascending sequence of adds costs
-    // one append per new chunk.
+    // one append per new chunk. An add that runs out of memory leaves the set as it was.
     class touched_chunks {
     public:
         // The chunks of `sorted_values` (non-descending).
@@ -1747,6 +1747,9 @@ public:
         void push( chunk_type chunk ) noexcept( detail::allocation_failure_terminates );
         // Merges the keys appended after the first `old_size` into the set.
         void merge( std::size_t old_size ) noexcept;
+        // Runs `append` (which pushes) and merges what it pushed; when it throws, the set is what it was before.
+        template <typename Append>
+        void append_and_merge( Append const & append ) noexcept( detail::allocation_failure_terminates );
 
         std::vector<chunk_type> chunks_; // ascending, distinct
     };

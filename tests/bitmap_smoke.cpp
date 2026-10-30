@@ -1421,10 +1421,10 @@ TYPED_TEST( TouchedChunksTyped, OnlyTheListedChunksAreConsidered ) {
 TYPED_TEST( TouchedChunksTyped, AnEmptySetDoesNothingAndAllocatesNothing ) {
     using Bitmap = TypeParam;
     auto const values{ mixed_chunks<Bitmap>() };
-    Bitmap const bitmap{ values };
+    Bitmap bitmap{ values };
     typename Bitmap::touched_chunks const none;
     EXPECT_TRUE( none.empty() );
-    auto const allocations{ allocations_during( [ & ] { bitmap.optimize_run_shaped( listed_bar, none ); } ) };
+    auto const allocations{ allocations_during( [ & ] { std::as_const( bitmap ).optimize_run_shaped( listed_bar, none ); } ) };
     if ( FRSR_TESTS_COUNT_ALLOCATIONS ) {
         EXPECT_EQ( allocations, 0U );
     }
@@ -1432,8 +1432,8 @@ TYPED_TEST( TouchedChunksTyped, AnEmptySetDoesNothingAndAllocatesNothing ) {
     EXPECT_EQ( bitmap.to_vector(), values );
 
     // and an empty bitmap with a listed chunk
-    Bitmap const nothing;
-    nothing.optimize_run_shaped( listed_bar, touched_of<Bitmap>( { 0, 7 } ) );
+    Bitmap nothing;
+    std::as_const( nothing ).optimize_run_shaped( listed_bar, touched_of<Bitmap>( { 0, 7 } ) );
     EXPECT_TRUE( nothing.empty() );
 }
 
@@ -1513,7 +1513,7 @@ TYPED_TEST( TouchedChunksTyped, ASharedPayloadIsNotClonedUnlessConverted ) {
 }
 
 // The chunk table of a wide key is a tree or, for many evenly spread keys, a flat directory
-// (see chunk_tree.cpp for what makes which): the walk is the same on both.
+// (the key shapes below are the ones chunk_tree.cpp pins as the one and the other): the walk is the same on both.
 TEST( TouchedChunks, WideKeysOnADirectoryAndOnATree ) {
     using Wide = LazyOf<std::uint64_t, detail_test::cow_atomic_refcount>;
     struct layout {
@@ -1726,6 +1726,65 @@ TEST( TouchedChunks, ASixteenBitKeyHasOneChunk ) {
     std::as_const( bitmap ).optimize_run_shaped( listed_bar, touched );
     EXPECT_EQ( bitmap.statistics().run_containers, 1U );
     EXPECT_EQ( bitmap.to_vector(), values );
+}
+
+// An allocation failure inside an add leaves the set as it was, and inside the pass leaves the bitmap valid and equal.
+TEST( TouchedChunks, AllocationFailuresLeaveTheSetAndTheBitmapIntact ) {
+    if constexpr ( detail_test::allocation_failure_terminates ) {
+        GTEST_SKIP() << "an allocation failure terminates in this build";
+    }
+#if FRSR_ROARING_HAS_MIMALLOC || !FRSR_TESTS_COUNT_ALLOCATIONS
+    GTEST_SKIP() << "allocations cannot be made to fail in this build";
+#else
+    namespace fault = frsr::roaring::kernel_test::alloc_fault;
+    using Bitmap = TouchedBitmap;
+    std::uint32_t failed{ 0 };
+    // adds that land below what is held, after some of their chunks were already appended
+    for ( std::uint32_t const period : { 1U, 2U, 3U, 5U } ) {
+        auto touched{ touched_in_steps<Bitmap>( { { 100, 200, 300, 400, 500 } } ) };
+        auto const before{ touched_in_steps<Bitmap>( { { 100, 200, 300, 400, 500 } } ) };
+        std::vector<std::uint32_t> values;
+        for ( std::uint32_t chunk{ 0 }; chunk < 60; ++chunk ) {
+            values.push_back( chunk << 16 );
+        }
+        try {
+            fault::armed const armed{ period };
+            touched.add_values( values );
+        } catch ( std::bad_alloc const & ) {
+            ++failed;
+            EXPECT_EQ( touched, before );
+        }
+        try {
+            fault::armed const armed{ period };
+            touched.add_range( 0U, 60U << 16 );
+        } catch ( std::bad_alloc const & ) {
+            ++failed;
+        }
+        // whatever happened, the set is ascending and distinct: a later add and the pass behave
+        touched.add_range( 0U, 600U << 16 );
+        Bitmap::touched_chunks expected;
+        expected.add_range( 0U, 600U << 16 );
+        EXPECT_EQ( touched, expected );
+    }
+    EXPECT_GT( failed, 0U );
+
+    auto const values{ mixed_chunks<Bitmap>() };
+    auto const all{ touched_of<Bitmap>( { 0, 1, 2, 3, 4, 5 } ) };
+    failed = 0;
+    for ( std::uint32_t const period : { 1U, 2U, 3U, 5U, 11U, 23U } ) {
+        Bitmap bitmap{ values };
+        try {
+            fault::armed const armed{ period };
+            std::as_const( bitmap ).optimize_run_shaped( listed_bar, all );
+        } catch ( std::bad_alloc const & ) {
+            ++failed;
+        }
+        EXPECT_EQ( bitmap.validate(), nullptr );
+        EXPECT_EQ( bitmap.to_vector(), values );
+        EXPECT_EQ( bitmap.statistics().container_count(), 6U );
+    }
+    EXPECT_GT( failed, 0U );
+#endif
 }
 
 TEST(FrsrRoaringSmoke, ShrinkToFitReturnsPayloadSlackAndKeepsContents) {

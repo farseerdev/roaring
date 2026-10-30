@@ -2050,42 +2050,56 @@ FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::touched_chunks::merge( 
 }
 
 FRSR_ROARING_BITMAP_TEMPLATE
-FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::touched_chunks::add_values( std::span<key_type const> const sorted_values ) noexcept( detail::allocation_failure_terminates ) {
-    assert( std::ranges::is_sorted( sorted_values ) );
+template <typename Append>
+FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::touched_chunks::append_and_merge( Append const & append ) noexcept( detail::allocation_failure_terminates ) {
     auto const old_size{ chunks_.size() };
-    auto const n{ sorted_values.size() };
-    auto const chunk_of{ []( key_type const value ) noexcept { return layout_type::chunk_key( value ); } };
-    // One gallop per chunk, to the first value past it.
-    for ( std::size_t at{ 0 }; at < n; ) {
-        auto const chunk{ chunk_of( sorted_values[ at ] ) };
-        push( chunk );
-        at = detail::gallop_forward<true>( sorted_values.data(), at, n, chunk, chunk_of );
+    try {
+        append();
+    } catch ( ... ) {
+        // Shrinking never allocates: the set is what it was before the add.
+        chunks_.resize( old_size );
+        throw;
     }
     merge( old_size );
+}
+
+FRSR_ROARING_BITMAP_TEMPLATE
+FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::touched_chunks::add_values( std::span<key_type const> const sorted_values ) noexcept( detail::allocation_failure_terminates ) {
+    assert( std::ranges::is_sorted( sorted_values ) );
+    append_and_merge( [ & ] {
+        auto const n{ sorted_values.size() };
+        auto const chunk_of{ []( key_type const value ) noexcept { return layout_type::chunk_key( value ); } };
+        // One gallop per chunk, to the first value past it.
+        for ( std::size_t at{ 0 }; at < n; ) {
+            auto const chunk{ chunk_of( sorted_values[ at ] ) };
+            push( chunk );
+            at = detail::gallop_forward<true>( sorted_values.data(), at, n, chunk, chunk_of );
+        }
+    } );
 }
 
 FRSR_ROARING_BITMAP_TEMPLATE
 FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::touched_chunks::add_range( key_type const first, key_type const last ) noexcept( detail::allocation_failure_terminates ) {
     assert( first <= last );
-    auto const old_size{ chunks_.size() };
-    auto const last_chunk{ layout_type::chunk_key( last ) };
-    // Stops at the last chunk before incrementing: a range ending in the final chunk of the key domain must not wrap.
-    for ( auto chunk{ layout_type::chunk_key( first ) };; ++chunk ) {
-        push( chunk );
-        if ( chunk == last_chunk ) {
-            break;
+    append_and_merge( [ & ] {
+        auto const last_chunk{ layout_type::chunk_key( last ) };
+        // Stops at the last chunk before incrementing: a range ending in the final chunk of the key domain must not wrap.
+        for ( auto chunk{ layout_type::chunk_key( first ) };; ++chunk ) {
+            push( chunk );
+            if ( chunk == last_chunk ) {
+                break;
+            }
         }
-    }
-    merge( old_size );
+    } );
 }
 
 FRSR_ROARING_BITMAP_TEMPLATE
 FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::touched_chunks::add_chunks_of( bitmap const & other ) noexcept( detail::allocation_failure_terminates ) {
-    auto const old_size{ chunks_.size() };
-    for ( auto at{ other.chunks_.begin() }; at != other.chunks_.end(); ++at ) {
-        push( other.chunks_.key( at ) );
-    }
-    merge( old_size );
+    append_and_merge( [ & ] {
+        for ( auto at{ other.chunks_.begin() }; at != other.chunks_.end(); ++at ) {
+            push( other.chunks_.key( at ) );
+        }
+    } );
 }
 
 FRSR_ROARING_BITMAP_TEMPLATE
