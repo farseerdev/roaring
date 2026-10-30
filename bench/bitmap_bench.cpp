@@ -8121,6 +8121,8 @@ struct band {
     shared_values32 c;                           // the *_after_andnot operations: the operand of the timed intersection
     shared_values32 fill;                        // frsr only: built from these values, then reduced to a by removals, which leaves a bitset holding few values
     bool b_run_shaped{};                         // frsr only: b is run-encoded whatever its size (optimize() keeps a run list only when it is smaller than a bitset, which a list of thousands of runs is not); the reference holds it by its size rule
+    shared_values32 b_holes;                     // b is one closed range (d.b holds its first and last value) cut by removing these values one at a time, in both arms, with no optimize pass: a run list that a single removal may split past the size at which an optimize would turn it into a bitset
+    bool b_optimize{};                           // b goes through optimize() as a run_optimize'd reference operand does: a run list when that is the smallest form
     bool run_encode_a{};                         // a is fully run-optimized (a bitset a stays a run when that is smaller)
     std::uint32_t range_first{}, range_last{};   // flip
     std::uint32_t spare_value{};                 // or_inplace_spare
@@ -8156,13 +8158,23 @@ struct frsr_band_registrar {
             } else {
                 s->a.add_many( *d.a );
             }
-            if ( d.b ) { s->b.add_many( *d.b ); }
+            if ( d.b_holes ) {
+                s->b.add_closed_range( d.b->front(), d.b->back() );
+                s->b.optimize();   // a range is added as words; this is the run it is
+                for ( auto const hole : *d.b_holes ) { std::ignore = s->b.remove( hole ); }
+            } else if ( d.b ) {
+                s->b.add_many( *d.b );
+            }
             if ( d.run_encode_a ) {
                 s->a.optimize();
             } else {
                 s->a.optimize_keep_bitsets();
             }
-            if ( d.b_run_shaped ) {
+            if ( d.b_holes ) {
+                // built as it would be: nothing re-decides after a removal
+            } else if ( d.b_optimize ) {
+                s->b.optimize();
+            } else if ( d.b_run_shaped ) {
                 s->b.optimize_run_shaped( 1 );
             } else {
                 s->b.optimize_keep_bitsets();
@@ -8233,9 +8245,16 @@ struct cpp_band_registrar {
             s->a.r = Arm::create();
             s->b.r = Arm::create();
             roaring_bitmap_add_many( s->a.r, d.a->size(), d.a->data() );
-            if ( d.b ) { roaring_bitmap_add_many( s->b.r, d.b->size(), d.b->data() ); }
+            if ( d.b_holes ) {
+                roaring_bitmap_add_range_closed( s->b.r, d.b->front(), d.b->back() );
+                for ( auto const hole : *d.b_holes ) { roaring_bitmap_remove( s->b.r, hole ); }
+            } else if ( d.b ) {
+                roaring_bitmap_add_many( s->b.r, d.b->size(), d.b->data() );
+            }
             roaring_bitmap_run_optimize( s->a.r );
-            roaring_bitmap_run_optimize( s->b.r );
+            if ( !d.b_holes ) {
+                roaring_bitmap_run_optimize( s->b.r );
+            }
             if ( d.op == bop::and_after_andnot || d.op == bop::and_inplace_after_andnot ) {
                 roaring_bitmap_andnot_inplace( s->a.r, s->b.r );
                 roaring_bitmap_free( s->b.r );
@@ -9292,13 +9311,27 @@ static void register_run_shaped_listed() {
 // ---- B10: a sparse array chunk against a run chunk -----------------------------------------------------------
 // A few array keys against thousands of short runs (the run list is crossed by a gallop, not stepped), and, as
 // the guard, a long array against a few long runs (the array side is the one that gallops). Half of the keys lie
-// inside a run, half in the gap after one, spread evenly over the runs. This library holds the run list as runs
-// (optimize() would turn thousands of short runs into a bitset); the reference's run_optimize keeps a list only
-// when it is smaller than the alternative, so it may hold the 10k-run chunk as a bitset.
+// inside a run, half in the gap after one, spread evenly over the runs.
+//
+// How the run list comes to be matters, because the size rule decides it. Every operation that settles its
+// result (optimize, `-=`, the set operations) keeps a run list only when its serialized size, 4 * runs + 2 bytes,
+// is the smallest form, which is never the case above 2047 runs (a bitset is 8192 bytes; below the bitset
+// threshold an array of the values is smaller). The lists here are therefore built three ways:
+//  - 1kruns, 2kruns: the operand as `optimize` leaves it (frsr) and `run_optimize` leaves it (the reference), a run
+//    list in both. 2kruns is the longest list the rule keeps (8002 bytes against 8192).
+//  - 10kruns: a closed range (run-encoded: the reference adds a range as a run, this library as words that
+//    optimize() then turns into one run) cut by single removals, which no library settles, so both arms hold a
+//    10000-run list (40 KB, larger than the L1 data cache). Removing values one at a time from a run chunk is how a
+//    run chunk comes to hold more runs than the rule keeps; the list is crossed by a gallop here and, in the
+//    reference, by a walk over the runs.
+//  - 10kruns-optimized: the same values through each library's own optimize, which makes a bitset in both arms (the
+//    band is then array against bitset). Forcing run form on one arm only (optimize_run_shaped( 1 )) compared a
+//    list the reference never holds with the bitset it does: a harness artefact, not a gap.
 static void register_array_run() {
     struct run_list {
         char const * name;
         std::uint32_t first, length, stride, count;
+        bool by_removal;   // the operand is a closed range cut by single removals (see above)
     };
     auto const runs_of = [](run_list const & r) {
         values32 out;
@@ -9307,7 +9340,7 @@ static void register_array_run() {
         }
         return out;
     };
-    auto const register_ops = [](std::string const & shape, shared_values32 const & array, shared_values32 const & runs, std::string const & what) {
+    auto const register_ops = [](std::string const & shape, shared_values32 const & array, shared_values32 const & runs, shared_values32 const & holes, std::string const & what) {
         for ( auto const [op, name] : { std::pair{ bop::and_op, "ArrayRunAnd" }, std::pair{ bop::and_inplace, "ArrayRunAndInplace" }, std::pair{ bop::andnot_op, "ArrayRunAndNot" } } ) {
             band d;
             d.op = op;
@@ -9315,7 +9348,8 @@ static void register_array_run() {
             d.shape = shape;
             d.a = array;
             d.b = runs;
-            d.b_run_shaped = true;
+            d.b_holes = holes;
+            d.b_optimize = true;
             d.repeat = 200;
             d.ops_per_run = 200;
             d.inner_reps = 20;
@@ -9324,11 +9358,26 @@ static void register_array_run() {
         }
     };
     static constexpr run_list lists[]{
-        { "1kruns", 100, 20, 60, 1000 },
-        { "10kruns", 2, 3, 6, 10000 },
+        { "1kruns", 100, 20, 60, 1000, false },
+        { "2kruns", 2, 3, 6, 2000, false },
+        { "10kruns", 2, 3, 6, 10000, true },
+        { "10kruns-optimized", 2, 3, 6, 10000, false },
     };
     for ( auto const & list : lists ) {
-        auto const runs = share( runs_of( list ) );
+        auto const values = runs_of( list );
+        shared_values32 runs;
+        shared_values32 holes;
+        if ( list.by_removal ) {
+            // the closed range from the first value to the last, and what it loses
+            runs = share( values32{ values.front(), values.back() } );
+            values32 gaps;
+            for ( auto v = values.front(); v <= values.back(); ++v ) {
+                if ( !std::ranges::binary_search( values, v ) ) { gaps.push_back( v ); }
+            }
+            holes = share( std::move( gaps ) );
+        } else {
+            runs = share( values32{ values } );
+        }
         for ( std::uint32_t const keys : { 1U, 4U, 16U, 64U } ) {
             values32 array;
             for ( std::uint32_t i = 0; i < keys; ++i ) {
@@ -9336,7 +9385,7 @@ static void register_array_run() {
                 auto const start = list.first + run_index * list.stride;
                 array.push_back( ( 3U << 16 ) + start + ( i % 2 == 0 ? list.length / 2 : list.length + 1 ) );
             }
-            register_ops( std::string( list.name ) + "/keys=" + std::to_string( keys ), share( std::move( array ) ), runs,
+            register_ops( std::string( list.name ) + "/keys=" + std::to_string( keys ), share( std::move( array ) ), runs, holes,
                           std::to_string( keys ) + " array keys against a run chunk of " + std::to_string( list.count ) + " runs of " + std::to_string( list.length ) + " values." );
         }
     }
@@ -9349,7 +9398,7 @@ static void register_array_run() {
         for ( auto const [first, last] : { std::pair{ 1000U, 1999U }, std::pair{ 30000U, 30000U }, std::pair{ 50000U, 65535U } } ) {
             for ( auto v = first; v <= last; ++v ) { runs.push_back( ( 3U << 16 ) + v ); }
         }
-        register_ops( "3runs/keys=4000", share( std::move( array ) ), share( std::move( runs ) ), "4000 array keys against a run chunk of 3 long runs." );
+        register_ops( "3runs/keys=4000", share( std::move( array ) ), share( std::move( runs ) ), nullptr, "4000 array keys against a run chunk of 3 long runs." );
     }
 }
 
