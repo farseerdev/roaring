@@ -37,6 +37,53 @@ TEST(FrsrRoaringSmoke, RangeConstructionAndOperatorsPreserveSortedValues) {
     EXPECT_EQ( ( lhs & !rhs ).to_vector(), ( std::vector<std::uint32_t>{ 1U, 65'538U } ) );
 }
 
+// An add decides between the last chunk, a chunk above it (an append), and a search for anything else.
+// Every kind of position is exercised in turn, on the flat 32-bit table and the wide 64-bit one, and the
+// bitmap is compared with a model after each phase.
+template <typename Bitmap>
+void adds_around_the_last_chunk_case() {
+    using key_type = typename Bitmap::key_type;
+    constexpr key_type stride{ ( key_type{ 1 } << 16 ) * ( sizeof( key_type ) == 4 ? 1U : 1'000'003U ) };
+    Bitmap bitmap;
+    std::set<key_type> model;
+    auto const add{ [&]( key_type const chunk, key_type const low ) {
+        auto const value{ chunk * stride + low };
+        EXPECT_EQ( bitmap.add( value ), model.insert( value ).second ) << value;
+    } };
+    auto const verify{ [&] {
+        EXPECT_EQ( bitmap.size(), model.size() );
+        EXPECT_EQ( bitmap.to_vector(), ( std::vector<key_type>( model.begin(), model.end() ) ) );
+    } };
+    add( 5, 1 );    // into an empty table
+    add( 5, 2 );    // the last chunk
+    add( 5, 2 );    // already there
+    add( 7, 0 );    // above the last chunk
+    add( 7, 1 );
+    add( 3, 9 );    // below every chunk
+    add( 6, 4 );    // between two
+    add( 7, 1 );    // the last chunk again, already there
+    add( 3, 9 );    // the first chunk again, already there
+    add( 6, 4 );
+    verify();
+    std::mt19937 random{ 5 };
+    for ( unsigned i{ 0 }; i != 6000; ++i ) {
+        add( random() % 64, random() % 3000 );
+    }
+    verify();
+    for ( key_type chunk{ 70 }; chunk != 400; ++chunk ) {   // a long ascending run of new chunks, two values each
+        add( chunk, 7 );
+        add( chunk, 8 );
+    }
+    verify();
+    for ( key_type chunk{ 69 }; chunk != 0; --chunk ) {     // and a descending one
+        add( chunk, 100 );
+    }
+    verify();
+}
+
+TEST(FrsrRoaringSmoke, AddsAroundTheLastChunkAgreeWithAModel32) { adds_around_the_last_chunk_case<frsr::roaring::bitmap<std::uint32_t>>(); }
+TEST(FrsrRoaringSmoke, AddsAroundTheLastChunkAgreeWithAModel64) { adds_around_the_last_chunk_case<frsr::roaring::bitmap<std::uint64_t>>(); }
+
 TEST(FrsrRoaringSmoke, BulkContextAcceleratesSequentialChunkReuse) {
     TestBitmap bitmap;
     TestBitmap::bulk_context ctx;

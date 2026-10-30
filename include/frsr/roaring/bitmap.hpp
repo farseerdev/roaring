@@ -2438,10 +2438,31 @@ private:
         auto const chunk{ layout_type::chunk_key( value ) };
         auto const low{ layout_type::low_key( value ) };
 
-        // CRoaring-style: O(log n) binary search + sorted insert.
-        auto at{ chunks_.lower_bound( chunk ) };
-        if ( at == chunks_.end() || chunks_.key( at ) != chunk ) {
-            at = chunks_.insert( at, chunk, handle_type{} );
+        // One comparison with the last chunk decides the three cases that need no search (the reference's
+        // ra_get_index probes the same key first): the chunk of an ascending run of adds is the last one, and a
+        // chunk above it is an append.
+        // [croaring-ref] deps/croaring/src/roaring_array.c:ra_get_index
+        auto const append{ [ & ] {
+            chunks_.push_back( chunk, handle_type{} );
+            return chunks_.last();
+        } };
+        auto at{ chunks_.end() };
+        if ( chunks_.empty() ) {
+            at = append();
+        } else {
+            auto const last{ chunks_.last() };
+            auto const last_chunk{ chunks_.key( last ) };
+            if ( chunk == last_chunk ) {
+                at = last;
+            } else if ( chunk > last_chunk ) {
+                at = append();
+            } else {
+                at = chunks_.lower_bound( chunk );
+                assert( at != chunks_.end() );   // the last chunk is above this one
+                if ( chunks_.key( at ) != chunk ) {
+                    at = chunks_.insert( at, chunk, handle_type{} );
+                }
+            }
         }
 
         if ( ctx != nullptr ) {
