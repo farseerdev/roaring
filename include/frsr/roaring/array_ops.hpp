@@ -1583,6 +1583,10 @@ template <bool Greater, typename Element, typename Key, typename KeyOf = identit
 // pays the gallop, kept out of line so it does not weigh on the loops that call this per array value.
 inline constexpr std::size_t linear_run_steps{ 16 };
 
+// The array values per run from which the values that follow a kept one in its run are moved by one copy loop
+// (see filter_array_run_into) instead of being tested one by one.
+inline constexpr std::size_t values_per_run_for_stretch_copy{ 16 };
+
 template <typename Run, typename Value>
 [[gnu::noinline]] inline std::size_t gallop_to_run_reaching( Run const * const runs, std::size_t const index, std::size_t const size, Value const value ) noexcept {
     return gallop_forward<false>( runs, index, size, value, run_end_key<Value>{} );
@@ -1603,12 +1607,14 @@ template <typename Run, typename Value>
     return index;
 }
 
-template <typename Layout, typename OutVector, typename CowPolicy = cow_value_semantics, typename Keep = std::true_type>
-[[ gnu::hot ]] inline void filter_array_run_into(
+// With a few array values to a run the kept values come one by one, and the loop that moves the stretch of values
+// a run keeps at once only adds an exit test to each (a mispredicted one when the stretches vary): the stretch
+// loop is the instantiation for lists with at least values_per_run_for_stretch_copy values to a run.
+template <typename Layout, typename OutVector, typename CowPolicy, typename Keep, bool LongStretches>
+[[ gnu::hot, gnu::noinline ]] inline void filter_array_run_into_with(
     array_cref<Layout, CowPolicy> const lhs,
     run_cref<Layout, CowPolicy> const rhs,
-    OutVector & result,
-    Keep = {}
+    OutVector & result
 ) {
     using low_type = typename Layout::low_type;
     // true_type: the intersection, false_type: the difference.
@@ -1661,11 +1667,16 @@ template <typename Layout, typename OutVector, typename CowPolicy = cow_value_se
         auto const & run{ runs[ run_ix ] };
         if ( value >= static_cast<low_type>( run.begin ) ) {
             if constexpr ( keep_matches ) {
-                // the values up to the end of the run
-                auto const stretch_end{ static_cast<std::size_t>( run.end ) + 1U };
-                do {
-                    out[ written++ ] = keys[ ap++ ];
-                } while ( ap < card && keys[ ap ] < stretch_end );
+                if constexpr ( LongStretches ) {
+                    // the values up to the end of the run
+                    auto const stretch_end{ static_cast<std::size_t>( run.end ) + 1U };
+                    do {
+                        out[ written++ ] = keys[ ap++ ];
+                    } while ( ap < card && keys[ ap ] < stretch_end );
+                } else {
+                    out[ written++ ] = value;
+                    ++ap;
+                }
             } else {
                 ap = gallop_forward<true>( keys, ap, card, static_cast<low_type>( run.end ) );
             }
@@ -1679,6 +1690,20 @@ template <typename Layout, typename OutVector, typename CowPolicy = cow_value_se
         }
     }
     resize_uninitialized( result, static_cast<std::uint32_t>( written ) );
+}
+
+template <typename Layout, typename OutVector, typename CowPolicy = cow_value_semantics, typename Keep = std::true_type>
+[[ gnu::hot ]] inline void filter_array_run_into(
+    array_cref<Layout, CowPolicy> const lhs,
+    run_cref<Layout, CowPolicy> const rhs,
+    OutVector & result,
+    Keep = {}
+) {
+    if ( lhs.values.size() >= rhs.runs.size() * values_per_run_for_stretch_copy ) {
+        filter_array_run_into_with<Layout, OutVector, CowPolicy, Keep, true>( lhs, rhs, result );
+    } else {
+        filter_array_run_into_with<Layout, OutVector, CowPolicy, Keep, false>( lhs, rhs, result );
+    }
 }
 
 template <typename Layout, typename CowPolicy = cow_value_semantics>
@@ -1866,11 +1891,11 @@ template <typename Layout, typename CowPolicy = cow_value_semantics>
 // scratch.
 // [croaring-ref] deps/croaring/src/containers/mixed_intersection.c:array_run_container_intersection
 // [croaring-ref] deps/croaring/src/containers/mixed_andnot.c:array_run_container_andnot
-template <typename Layout, typename CowPolicy = cow_value_semantics>
-[[ gnu::hot ]] inline void filter_array_run_inplace(
+template <typename Layout, typename CowPolicy, bool LongStretches>
+[[ gnu::hot, gnu::noinline ]] inline void filter_array_run_inplace_with(
     array_ref<Layout, CowPolicy> arr,
     run_cref<Layout, CowPolicy> const rhs,
-    bool const keep_matches = true
+    bool const keep_matches
 ) {
     using low_type = typename Layout::low_type;
     auto * const base{ arr.values.data() };
@@ -1904,10 +1929,15 @@ template <typename Layout, typename CowPolicy = cow_value_semantics>
         bool const in_run{ value >= static_cast<low_type>( run.begin ) };
         if ( in_run == keep_matches ) {
             // the kept stretch: the values up to the end of the run (intersection) or to the start of the next run (difference)
-            auto const stretch_end{ keep_matches ? static_cast<std::size_t>( run.end ) + 1U : static_cast<std::size_t>( run.begin ) };
-            do {
-                base[ out++ ] = base[ in++ ];
-            } while ( in < card && base[ in ] < stretch_end );
+            if constexpr ( LongStretches ) {
+                auto const stretch_end{ keep_matches ? static_cast<std::size_t>( run.end ) + 1U : static_cast<std::size_t>( run.begin ) };
+                do {
+                    base[ out++ ] = base[ in++ ];
+                } while ( in < card && base[ in ] < stretch_end );
+            } else {
+                base[ out++ ] = value;
+                ++in;
+            }
         } else if ( in_run ) {
             in = gallop_forward<true >( base, in, card, static_cast<low_type>( run.end ) );
         } else {
@@ -1915,6 +1945,19 @@ template <typename Layout, typename CowPolicy = cow_value_semantics>
         }
     }
     finish();
+}
+
+template <typename Layout, typename CowPolicy = cow_value_semantics>
+[[ gnu::hot ]] inline void filter_array_run_inplace(
+    array_ref<Layout, CowPolicy> arr,
+    run_cref<Layout, CowPolicy> const rhs,
+    bool const keep_matches = true
+) {
+    if ( arr.values.size() >= rhs.runs.size() * values_per_run_for_stretch_copy ) {
+        filter_array_run_inplace_with<Layout, CowPolicy, true>( arr, rhs, keep_matches );
+    } else {
+        filter_array_run_inplace_with<Layout, CowPolicy, false>( arr, rhs, keep_matches );
+    }
 }
 
 template <typename Layout, typename CowPolicy = cow_value_semantics>

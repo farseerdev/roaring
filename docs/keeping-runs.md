@@ -118,11 +118,14 @@ one pass, and is 0.19x to 0.39x the time of CRoaring's `roaring_bitmap_remove_ma
   past the stretch a run covers and copies the stretch it keeps (the sub-ranges rows were 1.8x to 2.5x and 1.1x to
   1.3x before).
 * `KeepRunsRemoveAnd` with singles and mixed doomed sets: the deletion above, plus the intersection with the filter.
-* `KeepRunsRemoveAndMany` (the intersection of the bitmap with four run-heavy filters): 1.2x to 2.4x plain CRoaring's
-  chained `and`, and on ranges 1.4x to 1.7x the arm that re-optimizes, whose containers are the same forms and the same
-  bytes. That gap is the intersection, not the deletion: on ranges, 44% of the time is `array & runs` and 27% is
-  `run & bitset`, both of them kernels shared with `&=`; the array-with-runs and run-run intersections are not
-  changed here.
+* `KeepRunsRemoveAndMany` (the intersection of the bitmap with four run-heavy filters): level with or faster than
+  CRoaring's chained `and` on `ranges`, `mixed` and `dense chunks` (0.5x to 1.0x), and 1.2x to 1.7x on `singles`,
+  where the bitmap that reaches the intersection holds its holed chunks as run lists of up to a thousand runs
+  (the smaller form; CRoaring holds them as bitsets). `KeepRunsAndMany` times the same intersection alone, on the
+  bitmap the four rounds of deletion leave. What made the intersection fast: a chunk whose smallest container is a
+  run container keeps its accumulator in run form while the operands met are run containers, and only becomes an
+  array or a bitset when it meets one (it used to be expanded to one of them at once and then pay a word-wise pass
+  per operand), and an array against a run list moves the values a run keeps in one loop.
 * Under 0.1 us per operation, `RunAndNot*` of a run minus a run (`run_run/one_cut`) and a few single-chunk bitset
   residues sit at 1.0x to 1.3x; at that size a few nanoseconds of timer and loop overhead move the ratio.
 

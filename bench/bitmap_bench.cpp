@@ -9353,9 +9353,74 @@ static void register_array_run() {
     }
 }
 
+// ---- B11: how many array values a run holds, and how many runs one list has against the other ----------------
+// A random array of `keys` values against a run chunk of `runs` runs that cover half of every period, so the
+// array values per run run from far below one to hundreds; and, for the run lists, a few long runs against a list
+// of many short ones inside them, both ways round (the first list has `runs * ratio` runs, run-optimized, the
+// second `runs`, held as runs).
+static void register_run_density_sweeps() {
+    auto const half_covered = [](std::uint32_t const runs) {
+        values32 out;
+        auto const period = 65'536U / runs;
+        for ( std::uint32_t r = 0; r < runs; ++r ) {
+            for ( std::uint32_t k = 0; k < period / 2; ++k ) { out.push_back( ( 3U << 16 ) + r * period + k ); }
+        }
+        return out;
+    };
+    for ( std::uint32_t const runs : { 16U, 64U, 256U, 1024U } ) {
+        auto const shared_runs = share( half_covered( runs ) );
+        for ( std::uint32_t const keys : { 64U, 256U, 1024U, 4000U } ) {
+            std::mt19937_64 rng{ 0xD00D + runs + keys };
+            values32 array;
+            for ( auto const low : random_lows( rng, keys ) ) { array.push_back( ( 3U << 16 ) + low ); }
+            std::ranges::sort( array );
+            array.erase( std::unique( array.begin(), array.end() ), array.end() );
+            for ( auto const [op, name] : { std::pair{ bop::and_op, "ArrayRunDensityAnd" }, std::pair{ bop::and_inplace, "ArrayRunDensityAndInplace" }, std::pair{ bop::andnot_op, "ArrayRunDensityAndNot" } } ) {
+                band d;
+                d.op = op;
+                d.op_name = name;
+                d.shape = "runs=" + std::to_string( runs ) + "/keys=" + std::to_string( keys );
+                d.a = share( values32{ array } );
+                d.b = shared_runs;
+                d.b_run_shaped = true;
+                d.repeat = 200;
+                d.ops_per_run = 200;
+                d.inner_reps = 20;
+                d.description = std::string( name ) + ": " + std::to_string( array.size() ) + " random array keys against a run chunk of " + std::to_string( runs ) + " runs covering half of every period.";
+                register_band( d );
+            }
+        }
+    }
+    for ( std::uint32_t const runs : { 8U, 16U, 32U } ) {
+        auto const few = share( half_covered( runs ) );
+        for ( std::uint32_t const ratio : { 1U, 2U, 4U, 8U, 16U, 64U } ) {
+            if ( runs * ratio > 1'500U ) {
+                continue;   // a list this long is a bitset once optimized
+            }
+            auto const many = share( half_covered( runs * ratio ) );
+            for ( bool const many_first : { true, false } ) {
+                band d;
+                d.op = bop::and_op;
+                d.op_name = "RunRunAnd";
+                d.shape = std::string( many_first ? "many_first" : "few_first" ) + "/runs=" + std::to_string( runs ) + "/ratio=" + std::to_string( ratio );
+                d.a = many_first ? many : few;
+                d.b = many_first ? few : many;
+                d.run_encode_a = true;
+                d.b_run_shaped = true;
+                d.repeat = 200;
+                d.ops_per_run = 200;
+                d.inner_reps = 20;
+                d.description = "RunRunAnd: a run chunk of " + std::to_string( runs ) + " runs against one of " + std::to_string( runs * ratio ) + ", " + ( many_first ? "the longer list first." : "the shorter list first." );
+                register_band( d );
+            }
+        }
+    }
+}
+
 static void register_benchmarks() {
     register_run_shaped_listed();
     register_array_run();
+    register_run_density_sweeps();
     register_back_front();
     register_small_array_export();
     register_bitset_and_to_array();

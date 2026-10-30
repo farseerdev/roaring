@@ -46,10 +46,12 @@ template <typename Run>
     );
 }
 
-// Run∩run merge into `out`, which MUST hold lhs.size + rhs.size runs (the most an intersection can
-// produce, one more than it does). Returns the run count and the cardinality they cover.
-// [croaring-ref] deps/croaring/src/containers/run.c:run_container_intersection
 struct run_intersection { std::size_t runs; std::size_t cardinality; };
+
+// A run list this many times longer than the other is crossed by gallops and copied in pieces (see
+// copy_runs_inside); against lists of comparable length the plain merge is faster, the pieces being too short
+// to pay for the gallop and the copy call.
+inline constexpr std::size_t skewed_run_lists_ratio{ 16 };
 
 // The runs from `index` on that lie wholly inside the run of the other list that ends at `limit` (exclusive):
 // they are the intersection's runs unchanged, so they are found by one gallop and copied in one piece instead
@@ -71,8 +73,8 @@ template <typename Layout>
     return stop;
 }
 
-template <typename Layout>
-[[ gnu::hot ]] inline run_intersection intersect_runs(
+template <typename Layout, bool SkewedLists>
+[[ gnu::hot ]] inline run_intersection intersect_runs_merge(
     run<typename Layout::low_type> const * const lhs_runs, std::size_t const lhs_size,
     run<typename Layout::low_type> const * const rhs_runs, std::size_t const rhs_size,
     run<typename Layout::low_type> * const out
@@ -124,8 +126,10 @@ template <typename Layout>
             ++li;
             out[ result.runs++ ] = run<low_type>{ static_cast<low_type>( begin ), static_cast<low_type>( earliest_end - 1U ) };
             result.cardinality += earliest_end - begin;
-            if ( li < lhs_size && static_cast<std::size_t>( lhs_runs[ li ].end ) < xend ) {
-                li = copy_runs_inside<Layout>( lhs_runs, li, lhs_size, xend, out, result );
+            if constexpr ( SkewedLists ) {
+                if ( li < lhs_size && static_cast<std::size_t>( lhs_runs[ li ].end ) < xend ) {
+                    li = copy_runs_inside<Layout>( lhs_runs, li, lhs_size, xend, out, result );
+                }
             }
             if ( li < lhs_size ) {
                 start = static_cast<std::size_t>( lhs_runs[ li ].begin );
@@ -137,8 +141,10 @@ template <typename Layout>
             ++ri;
             out[ result.runs++ ] = run<low_type>{ static_cast<low_type>( begin ), static_cast<low_type>( earliest_end - 1U ) };
             result.cardinality += earliest_end - begin;
-            if ( ri < rhs_size && static_cast<std::size_t>( rhs_runs[ ri ].end ) < end ) {
-                ri = copy_runs_inside<Layout>( rhs_runs, ri, rhs_size, end, out, result );
+            if constexpr ( SkewedLists ) {
+                if ( ri < rhs_size && static_cast<std::size_t>( rhs_runs[ ri ].end ) < end ) {
+                    ri = copy_runs_inside<Layout>( rhs_runs, ri, rhs_size, end, out, result );
+                }
             }
             if ( ri < rhs_size ) {
                 xstart = static_cast<std::size_t>( rhs_runs[ ri ].begin );
@@ -151,6 +157,21 @@ template <typename Layout>
         result.cardinality += earliest_end - begin;
     }
     return result;
+}
+
+// Run∩run merge into `out`, which MUST hold lhs.size + rhs.size runs (the most an intersection can
+// produce, one more than it does). Returns the run count and the cardinality they cover.
+// [croaring-ref] deps/croaring/src/containers/run.c:run_container_intersection
+template <typename Layout>
+[[ gnu::hot ]] inline run_intersection intersect_runs(
+    run<typename Layout::low_type> const * const lhs_runs, std::size_t const lhs_size,
+    run<typename Layout::low_type> const * const rhs_runs, std::size_t const rhs_size,
+    run<typename Layout::low_type> * const out
+) noexcept {
+    if ( lhs_size >= skewed_run_lists_ratio * rhs_size || rhs_size >= skewed_run_lists_ratio * lhs_size ) {
+        return intersect_runs_merge<Layout, true>( lhs_runs, lhs_size, rhs_runs, rhs_size, out );
+    }
+    return intersect_runs_merge<Layout, false>( lhs_runs, lhs_size, rhs_runs, rhs_size, out );
 }
 
 // How many values two run lists have in common: the merge of intersect_runs with the stores dropped.
