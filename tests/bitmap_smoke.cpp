@@ -826,6 +826,85 @@ TEST(FrsrRoaringSmoke, AndManyOfNothingAndOfOneOperand) {
     EXPECT_FALSE( Bitmap::and_many_intersects( with_empty ) );
 }
 
+// An intersection whose smallest container is a run container stays in run form through the run containers it
+// meets and ends in the smallest of runs, array and bitset, as the pairwise intersection does.
+TEST(FrsrRoaringSmoke, AndManyOfRunOperandsEndsInTheSmallestForm) {
+    using Bitmap = frsr::roaring::bitmap<std::uint32_t>;
+    auto const periodic{ []( std::uint32_t const base, std::uint32_t const first, std::uint32_t const period, std::uint32_t const length ) {
+        Bitmap bitmap;
+        for ( auto start{ first }; start + length <= 65'536U; start += period ) {
+            bitmap.add_closed_range( base + start, base + start + length - 1 );
+        }
+        bitmap.optimize();
+        return bitmap;
+    } };
+    auto const intersection_of{ []( std::vector<Bitmap const *> const & operands ) {
+        auto const first{ operands.front()->to_vector() };
+        std::vector<std::uint32_t> common( first.begin(), first.end() );
+        for ( auto const * operand : operands ) {
+            auto const values{ operand->to_vector() };
+            std::vector<std::uint32_t> other( values.begin(), values.end() );
+            std::vector<std::uint32_t> next;
+            std::ranges::set_intersection( common, other, std::back_inserter( next ) );
+            common = std::move( next );
+        }
+        return common;
+    } };
+    auto const check{ [ & ]( std::vector<Bitmap const *> const & operands, char const * what ) {
+        auto const combined{ Bitmap::and_many( operands ) };
+        auto const want{ intersection_of( operands ) };
+        auto const got{ combined.to_vector() };
+        EXPECT_EQ( std::vector<std::uint32_t>( got.begin(), got.end() ), want ) << what;
+        EXPECT_EQ( combined.validate( true ), nullptr ) << what;
+        EXPECT_EQ( Bitmap::and_many_cardinality( operands ), want.size() ) << what;
+        EXPECT_EQ( Bitmap::and_many_intersects( operands ), !want.empty() ) << what;
+        return combined;
+    } };
+
+    // run chunks only: a few runs from a few runs is a run container
+    auto const a{ periodic( 0, 0, 7'000, 6'000 ) };
+    auto const b{ periodic( 0, 1'300, 9'000, 7'900 ) };
+    auto const c{ periodic( 0, 2'600, 11'000, 9'700 ) };
+    ASSERT_EQ( a.statistics().run_containers, 1U );
+    ASSERT_EQ( c.statistics().run_containers, 1U );
+    auto const runs_only{ check( { &a, &b, &c }, "runs only" ) };
+    EXPECT_EQ( runs_only.statistics().run_containers, 1U );
+
+    // runs that overlap in one value each: the runs of the result are not its smallest form
+    auto const left { periodic( 0, 0, 200, 101 ) };
+    auto const right{ periodic( 0, 100, 200, 101 ) };
+    auto const single_values{ check( { &left, &right }, "single values" ) };
+    EXPECT_EQ( single_values.statistics().run_containers, 0U );
+    EXPECT_EQ( single_values.statistics().array_containers, 1U );
+
+    // runs that do not meet
+    auto const gap_left { periodic( 0, 0, 1'000, 400 ) };
+    auto const gap_right{ periodic( 0, 500, 1'000, 400 ) };
+    EXPECT_TRUE( check( { &gap_left, &gap_right, &a }, "disjoint runs" ).empty() );
+
+    // a run seed meeting an array, then a bitset, then runs again: cardinalities order the operands
+    Bitmap small_run;
+    small_run.add_closed_range( 100U, 3'000U );
+    std::mt19937 rng{ 20261030 };
+    Bitmap array;
+    for ( int i{ 0 }; i < 3'800; ++i ) { std::ignore = array.add( rng() % 65'536U ); }
+    Bitmap bitset;
+    for ( int i{ 0 }; i < 60'000; ++i ) { std::ignore = bitset.add( rng() % 65'536U ); }
+    ASSERT_EQ( array.statistics().array_containers, 1U );
+    ASSERT_EQ( bitset.statistics().bitset_containers, 1U );
+    check( { &small_run, &array, &bitset, &a }, "run, array, bitset, run" );
+    check( { &small_run, &bitset, &a, &b }, "run, bitset, runs" );
+    check( { &small_run, &a, &array }, "run, run, array" );
+    check( { &a, &b, &bitset }, "runs, bitset" );
+    check( { &c, &a, &bitset, &array }, "runs, bitset, array" );
+
+    // two chunks, the second without a meeting run
+    auto two{ periodic( 0, 0, 7'000, 6'000 ) };
+    two.add_closed_range( 65'536U + 10U, 65'536U + 20U );
+    auto const other_two{ periodic( 0, 1'000, 9'000, 6'000 ) };
+    EXPECT_EQ( check( { &two, &other_two }, "second chunk absent" ).statistics().run_containers, 1U );
+}
+
 // Run-heavy operands in every kind pairing and both orders, through each binary operator and its in-place
 // form: the values must match an ordered set and the result must be a legal bitmap - above all, no array
 // may hold more values than the array limit, since the portable format tells an array from a bitset by

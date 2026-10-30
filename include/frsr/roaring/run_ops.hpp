@@ -9,6 +9,7 @@
 #include <bit>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <tuple>
 #include <utility>
@@ -49,6 +50,26 @@ template <typename Run>
 // produce, one more than it does). Returns the run count and the cardinality they cover.
 // [croaring-ref] deps/croaring/src/containers/run.c:run_container_intersection
 struct run_intersection { std::size_t runs; std::size_t cardinality; };
+
+// The runs from `index` on that lie wholly inside the run of the other list that ends at `limit` (exclusive):
+// they are the intersection's runs unchanged, so they are found by one gallop and copied in one piece instead
+// of being merged one by one - a list of many short runs against a list of a few long ones costs the few.
+// Returns the index of the first run that is not inside; `index` must be inside.
+template <typename Layout>
+[[ gnu::always_inline ]] inline std::size_t copy_runs_inside(
+    run<typename Layout::low_type> const * const runs, std::size_t const index, std::size_t const size, std::size_t const limit,
+    run<typename Layout::low_type> * const out, run_intersection & result
+) noexcept {
+    auto const stop{ gallop_forward<false>( runs, index + 1U, size, limit, run_end_key<std::size_t>{} ) };
+    std::memcpy( out + result.runs, runs + index, ( stop - index ) * sizeof( *runs ) );
+    result.runs += stop - index;
+    std::size_t covered{ 0 };
+    for ( auto at{ index }; at != stop; ++at ) {
+        covered += static_cast<std::size_t>( runs[ at ].end ) - runs[ at ].begin + 1U;
+    }
+    result.cardinality += covered;
+    return stop;
+}
 
 template <typename Layout>
 [[ gnu::hot ]] inline run_intersection intersect_runs(
@@ -101,17 +122,29 @@ template <typename Layout>
             }
         } else if ( end < xend ) {
             ++li;
+            out[ result.runs++ ] = run<low_type>{ static_cast<low_type>( begin ), static_cast<low_type>( earliest_end - 1U ) };
+            result.cardinality += earliest_end - begin;
+            if ( li < lhs_size && static_cast<std::size_t>( lhs_runs[ li ].end ) < xend ) {
+                li = copy_runs_inside<Layout>( lhs_runs, li, lhs_size, xend, out, result );
+            }
             if ( li < lhs_size ) {
                 start = static_cast<std::size_t>( lhs_runs[ li ].begin );
                 end = static_cast<std::size_t>( lhs_runs[ li ].end ) + 1U;
             }
+            continue;
         } else {
             earliest_end = xend;
             ++ri;
+            out[ result.runs++ ] = run<low_type>{ static_cast<low_type>( begin ), static_cast<low_type>( earliest_end - 1U ) };
+            result.cardinality += earliest_end - begin;
+            if ( ri < rhs_size && static_cast<std::size_t>( rhs_runs[ ri ].end ) < end ) {
+                ri = copy_runs_inside<Layout>( rhs_runs, ri, rhs_size, end, out, result );
+            }
             if ( ri < rhs_size ) {
                 xstart = static_cast<std::size_t>( rhs_runs[ ri ].begin );
                 xend = static_cast<std::size_t>( rhs_runs[ ri ].end ) + 1U;
             }
+            continue;
         }
 
         out[ result.runs++ ] = run<low_type>{ static_cast<low_type>( begin ), static_cast<low_type>( earliest_end - 1U ) };

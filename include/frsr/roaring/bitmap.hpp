@@ -1377,6 +1377,8 @@ public:
         handle_type array_alt;
         handle_type bitset_acc;
         handle_type bitset_alt;
+        handle_type run_acc;
+        handle_type run_alt;
     };
 
     // The values common to every operand, ascending, handed over in blocks. A block is a run of
@@ -1577,6 +1579,16 @@ private:
     }
 
     static void and_many_seed_bitset( and_many_scratch & scratch, handle_type const & source );
+
+    // The accumulator of a chunk whose smallest container is a run container stays a run container
+    // while the operands met are run containers (the intersection of two run lists is a run list, a few
+    // runs for a few runs); an array or a bitset operand turns it into that kind, as the pairwise
+    // intersection does. and_many_run_step is one such step, out of place into a scratch handle.
+    [[nodiscard]] static handle_type * and_many_run_step( handle_type const & run, handle_type const & other, and_many_scratch & scratch );
+    // The run accumulator as the smallest of runs, array and bitset (the choice of the pairwise
+    // intersection): itself when the runs are smallest, else its values in the array or bitset scratch.
+    [[nodiscard]] static handle_type * and_many_settle_run( handle_type * acc, and_many_scratch & scratch );
+    [[nodiscard]] static handle_type * and_many_expand_run( handle_type const & run, and_many_scratch & scratch );
 
     // The AND of the containers of one chunk, ascending by cardinality, as a handle: a view of the only
     // container when there is just one operand, otherwise one of the scratch handles (owned = true).

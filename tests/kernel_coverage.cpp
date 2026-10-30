@@ -719,6 +719,62 @@ TEST( KernelCoverage, RunIntersectionCardinalityMatchesNaive ) {
     }
 }
 
+// The run-list intersection against a per-value oracle, over lists that mix many short runs with a few long
+// ones in both orientations: the short runs inside a long one are copied across in one piece, and the runs
+// around them, the run that ends together with the long one and the runs past it must come out unchanged.
+TEST( KernelCoverage, RunIntersectionMatchesNaive ) {
+    using layout = detail::default_layout<std::uint32_t>;
+    using run_type = run<std::uint16_t>;
+    std::mt19937_64 rng{ 0x3B3B };
+    auto const random_runs{ [ & ]( std::size_t const count, std::uint32_t const short_length, std::uint32_t const long_length ) {
+        std::vector<run_type> runs;
+        std::uint32_t at{ static_cast<std::uint32_t>( rng() % 50 ) };
+        for ( std::size_t i{ 0 }; i < count && at < 64000; ++i ) {
+            auto const is_long{ rng() % 5 == 0 };
+            auto const length{ static_cast<std::uint32_t>( rng() % ( 1 + ( is_long ? long_length : short_length ) ) ) };
+            runs.push_back( { static_cast<std::uint16_t>( at ), static_cast<std::uint16_t>( at + length ) } );
+            at += length + 2 + static_cast<std::uint32_t>( rng() % ( is_long ? 200 : 6 ) );
+        }
+        return runs;
+    } };
+    auto const values_of{ []( std::span<run_type const> const runs ) {
+        std::vector<bool> present( 65536 );
+        for ( auto const & r : runs ) { for ( std::uint32_t k{ r.begin }; k <= r.end; ++k ) { present[ k ] = true; } }
+        return present;
+    } };
+    for ( int trial{ 0 }; trial < 3000; ++trial ) {
+        auto const dense{ trial % 2 == 0 };
+        auto const left { random_runs( 1 + rng() % ( dense ? 400 : 30 ), dense ? 4 : 400, 3000 ) };
+        auto const right{ random_runs( 1 + rng() % ( dense ? 12 : 400 ), dense ? 3000 : 4, 3000 ) };
+        for ( auto const swap : { false, true } ) {
+            auto const & lhs{ swap ? right : left };
+            auto const & rhs{ swap ? left : right };
+            std::vector<run_type> out( lhs.size() + rhs.size() );
+            auto const result{ detail::intersect_runs<layout>( lhs.data(), lhs.size(), rhs.data(), rhs.size(), out.data() ) };
+            ASSERT_LE( result.runs, out.size() );
+            auto const in_lhs{ values_of( lhs ) };
+            auto const in_rhs{ values_of( rhs ) };
+            std::vector<bool> got( 65536 );
+            std::size_t covered{ 0 };
+            std::int64_t previous_end{ -1 };
+            for ( std::size_t i{ 0 }; i < result.runs; ++i ) {
+                ASSERT_LE( out[ i ].begin, out[ i ].end ) << "trial " << trial;
+                ASSERT_GT( static_cast<std::int64_t>( out[ i ].begin ), previous_end ) << "runs out of order, trial " << trial;
+                previous_end = out[ i ].end;
+                for ( std::uint32_t k{ out[ i ].begin }; k <= out[ i ].end; ++k ) { got[ k ] = true; }
+                covered += out[ i ].end - out[ i ].begin + 1U;
+            }
+            std::size_t expected{ 0 };
+            for ( std::uint32_t k{ 0 }; k < 65536; ++k ) {
+                ASSERT_EQ( got[ k ], in_lhs[ k ] && in_rhs[ k ] ) << "value " << k << ", trial " << trial << ( swap ? " swapped" : "" );
+                expected += in_lhs[ k ] && in_rhs[ k ];
+            }
+            ASSERT_EQ( result.cardinality, expected ) << "trial " << trial;
+            ASSERT_EQ( covered, expected ) << "trial " << trial;
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 
 template <typename Bitmap>

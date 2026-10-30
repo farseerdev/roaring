@@ -8585,6 +8585,7 @@ enum class mode : std::uint8_t {
     remove_many,         // remove_many_sorted / roaring_bitmap_remove_many per round
     remove_and,          // -= then &= a filter, per round
     remove_and_many,     // -= then the intersection of the bitmap with all the filters, per round
+    and_many_only,       // the intersection of the bitmap the rounds of -= leave (built before the timing) with all the filters
 };
 
 struct data {
@@ -8713,12 +8714,24 @@ struct frsr_registrar {
     using Bitmap = typename Arm::bitmap;
     struct state {
         Bitmap base;
+        Bitmap after;                            // base after every round of -=
         std::vector<Bitmap> doomed;
         std::vector<Bitmap> filters;
     };
 
     static std::int64_t pipeline( state const & s, band const & b, std::size_t * const bytes ) {
         std::int64_t checksum = 0;
+        if ( b.m == mode::and_many_only ) {
+            std::vector<Bitmap const *> operands{ &s.after };
+            for ( auto const & f : s.filters ) {
+                operands.push_back( &f );
+            }
+            Bitmap const m{ Bitmap::and_many( std::span<Bitmap const * const>{ operands } ) };
+            if ( bytes != nullptr ) {
+                *bytes = m.portable_size_in_bytes();
+            }
+            return static_cast<std::int64_t>( m.size() );
+        }
         Bitmap cur{ s.base };
         for ( std::size_t r = 0; r < rounds; ++r ) {
             if ( b.m == mode::remove_many ) {
@@ -8768,6 +8781,10 @@ struct frsr_registrar {
                 f.optimize();
                 s->filters.push_back( std::move( f ) );
             }
+            s->after = s->base;
+            for ( auto const & d : s->doomed ) {
+                s->after -= d;
+            }
             std::size_t bytes = 0;
             auto const checksum = pipeline( *s, b, &bytes );
             printf( "#bytes\t%s\t%zu\tchecksum=%lld\n", name.c_str(), bytes, static_cast<long long>( checksum ) );
@@ -8785,6 +8802,7 @@ template <class Arm>
 struct cpp_registrar {
     struct state {
         croaring_handle base;
+        croaring_handle after;                   // base after every round of the deletion
         std::vector<std::unique_ptr<croaring_handle>> doomed;
         std::vector<std::unique_ptr<croaring_handle>> filters;
     };
@@ -8792,6 +8810,16 @@ struct cpp_registrar {
     template <bool Optimize>
     static std::int64_t pipeline( state const & s, band const & b, std::size_t * const bytes ) {
         std::int64_t checksum = 0;
+        if ( b.m == mode::and_many_only ) {
+            croaring_handle const m{ roaring_bitmap_and( s.after.r, s.filters[ 0 ]->r ) };
+            for ( std::size_t k = 1; k < s.filters.size(); ++k ) {
+                roaring_bitmap_and_inplace( m.r, s.filters[ k ]->r );
+            }
+            if ( bytes != nullptr ) {
+                *bytes = roaring_bitmap_portable_size_in_bytes( m.r );
+            }
+            return static_cast<std::int64_t>( roaring_bitmap_get_cardinality( m.r ) );
+        }
         croaring_handle const cur{ Arm::copy( s.base.r ) };
         for ( std::size_t r = 0; r < rounds; ++r ) {
             if ( b.m == mode::remove_many ) {
@@ -8845,6 +8873,13 @@ struct cpp_registrar {
                 roaring_bitmap_run_optimize( f->r );
                 s->filters.push_back( std::move( f ) );
             }
+            s->after.r = Arm::copy( s->base.r );
+            for ( auto const & d : s->doomed ) {
+                roaring_bitmap_andnot_inplace( s->after.r, d->r );
+                if constexpr ( Optimize ) {
+                    roaring_bitmap_run_optimize( s->after.r );
+                }
+            }
             std::size_t bytes = 0;
             auto const checksum = pipeline<Optimize>( *s, b, &bytes );
             printf( "#bytes\t%s\t%zu\tchecksum=%lld\n", name.c_str(), bytes, static_cast<long long>( checksum ) );
@@ -8871,7 +8906,8 @@ static void register_keep_runs_rounds() {
         for ( auto const & [op, m, what] : { mode_entry{ "KeepRunsRemove", mode::remove, "batch deletion (-=)" },
                                               mode_entry{ "KeepRunsRemoveMany", mode::remove_many, "batch deletion (remove_many of the sorted doomed ids)" },
                                               mode_entry{ "KeepRunsRemoveAnd", mode::remove_and, "batch deletion, then &= a run-heavy filter" },
-                                              mode_entry{ "KeepRunsRemoveAndMany", mode::remove_and_many, "batch deletion, then the intersection with four run-heavy filters" } } ) {
+                                              mode_entry{ "KeepRunsRemoveAndMany", mode::remove_and_many, "batch deletion, then the intersection with four run-heavy filters" },
+                                              mode_entry{ "KeepRunsAndMany", mode::and_many_only, "the intersection with four run-heavy filters of the bitmap four rounds of batch deletion leave (built before the timing, in each arm's own container forms)" } } ) {
             band b;
             b.op_name = op;
             b.shape = name;

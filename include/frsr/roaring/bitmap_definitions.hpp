@@ -1841,38 +1841,18 @@ FRSR_ROARING_DEFINITION_INLINE auto FRSR_ROARING_BITMAP::and_chunk( std::span<ha
             and_many_seed_bitset( scratch, seed );
             acc = &scratch.bitset_acc;
             break;
-        case detail::container_kind::run: {
-            auto const runs{ seed.as_run() };
-            if ( seed.cardinality() <= array_to_bitset_threshold ) {
-                auto target{ scratch.array_acc.as_array() };
-                detail::resize_uninitialized( target.values, seed.cardinality() );
-                auto * out{ target.values.data() };
-                for ( auto const & run : runs.runs ) {
-                    for ( auto value{ static_cast<std::uint32_t>( run.begin ) }; value <= run.end; ++value ) {
-                        *out++ = static_cast<low_type>( value );
-                    }
-                }
-                target.sync_header();
-                acc = &scratch.array_acc;
-            } else {
-                auto & bits{ scratch.bitset_acc };
-                if ( !bits.holds_bitset() ) { bits = handle_type::make_bitset_uninitialized(); }
-                auto words{ bits.as_bitset() };
-                std::memset( words.words.as_array().data(), 0, layout_type::word_count * sizeof( std::uint64_t ) );
-                for ( auto const & run : runs.runs ) {
-                    detail::apply_range_to_words<layout_type>( words.words.as_array(), run.begin, run.end, detail::range_operation::add );
-                }
-                words.cardinality = static_cast<std::uint32_t>( seed.cardinality() );
-                words.mark_endpoints_stale();
-                acc = &scratch.bitset_acc;
-            }
+        case detail::container_kind::run:
+            // read in place: the first step writes to a scratch handle
             break;
-        }
     }
 
+    auto const * run_seed{ seed.holds_run() ? &seed : nullptr };
     for ( std::size_t i{ 1 }; i < ordered.size(); ++i ) {
         auto const & other{ *ordered[ i ] };
-        if ( acc->holds_array() ) {
+        if ( run_seed != nullptr || acc->holds_run() ) {
+            acc      = and_many_run_step( run_seed != nullptr ? *run_seed : std::as_const( *acc ), other, scratch );
+            run_seed = nullptr;
+        } else if ( acc->holds_array() ) {
             auto array{ acc->as_array() };
             switch ( other.kind() ) {
                 case detail::container_kind::array : detail::intersect_array_array_inplace<layout_type>( array, other.as_array() ); break;
@@ -1904,7 +1884,79 @@ FRSR_ROARING_DEFINITION_INLINE auto FRSR_ROARING_BITMAP::and_chunk( std::span<ha
             return nullptr;
         }
     }
-    return acc;
+    return acc->holds_run() ? and_many_settle_run( acc, scratch ) : acc;
+}
+
+FRSR_ROARING_BITMAP_TEMPLATE
+FRSR_ROARING_DEFINITION_INLINE auto FRSR_ROARING_BITMAP::and_many_run_step( handle_type const & run, handle_type const & other, and_many_scratch & scratch ) -> handle_type * {
+    switch ( other.kind() ) {
+        case detail::container_kind::run: {
+            auto & alt{ scratch.run_alt };
+            if ( !alt.holds_run() ) {
+                alt = handle_type::make_run();
+            }
+            auto target{ alt.as_run() };
+            auto const cardinality{ detail::intersect_run_run_into<layout_type>( run.as_run(), other.as_run(), target.runs ) };
+            alt.set_cardinality( static_cast<std::uint32_t>( cardinality ) );
+            if ( cardinality != 0 ) {
+                alt.set_endpoints( target.runs.front().begin, target.runs.back().end );
+            }
+            std::swap( scratch.run_acc, alt );
+            return &scratch.run_acc;
+        }
+        case detail::container_kind::array: {
+            auto target{ scratch.array_acc.as_array() };
+            detail::filter_array_run_into<layout_type>( other.as_array(), run.as_run(), target.values );
+            target.sync_header();
+            return &scratch.array_acc;
+        }
+        case detail::container_kind::bitset:
+            scratch.bitset_alt = detail::intersect_run_bitset<layout_type, CowPolicy>( run.as_run(), other.as_bitset(), std::move( scratch.bitset_alt ) );
+            std::swap( scratch.bitset_acc, scratch.bitset_alt );
+            return &scratch.bitset_acc;
+    }
+    std::unreachable();
+}
+
+FRSR_ROARING_BITMAP_TEMPLATE
+FRSR_ROARING_DEFINITION_INLINE auto FRSR_ROARING_BITMAP::and_many_settle_run( handle_type * const acc, and_many_scratch & scratch ) -> handle_type * {
+    auto const cardinality{ static_cast<std::size_t>( acc->cardinality() ) };
+    auto const run_bytes  { acc->as_run().runs.size() * sizeof( typename detail::run_container<layout_type>::run ) };
+    auto const array_bytes{ cardinality * sizeof( low_type ) };
+    constexpr auto bitset_bytes{ layout_type::word_count * sizeof( std::uint64_t ) };
+    if ( run_bytes <= array_bytes && !( cardinality >= array_to_bitset_threshold && bitset_bytes <= run_bytes ) ) {
+        return acc;
+    }
+    return and_many_expand_run( *acc, scratch );
+}
+
+FRSR_ROARING_BITMAP_TEMPLATE
+FRSR_ROARING_DEFINITION_INLINE auto FRSR_ROARING_BITMAP::and_many_expand_run( handle_type const & run, and_many_scratch & scratch ) -> handle_type * {
+    auto const runs{ run.as_run() };
+    if ( run.cardinality() <= array_to_bitset_threshold ) {
+        auto target{ scratch.array_acc.as_array() };
+        detail::resize_uninitialized( target.values, run.cardinality() );
+        auto * out{ target.values.data() };
+        for ( auto const & each : runs.runs ) {
+            for ( auto value{ static_cast<std::uint32_t>( each.begin ) }; value <= each.end; ++value ) {
+                *out++ = static_cast<low_type>( value );
+            }
+        }
+        target.sync_header();
+        return &scratch.array_acc;
+    }
+    auto & bits{ scratch.bitset_acc };
+    if ( !bits.holds_bitset() ) {
+        bits = handle_type::make_bitset_uninitialized();
+    }
+    auto words{ bits.as_bitset() };
+    std::memset( words.words.as_array().data(), 0, layout_type::word_count * sizeof( std::uint64_t ) );
+    for ( auto const & each : runs.runs ) {
+        detail::apply_range_to_words<layout_type>( words.words.as_array(), each.begin, each.end, detail::range_operation::add );
+    }
+    words.cardinality = static_cast<std::uint32_t>( run.cardinality() );
+    words.mark_endpoints_stale();
+    return &scratch.bitset_acc;
 }
 
 FRSR_ROARING_BITMAP_TEMPLATE
