@@ -6450,6 +6450,109 @@ struct register_cpp_to_array_registrar {
 };
 #endif
 
+// ---- Iterate / ForEach: visit every value of a whole bitmap -------------------
+// Value-by-value traversal, per container kind (`array`, `bitset`, `runs`) and `mixed` (the three
+// kinds in alternating chunks). Iterate drives the iterator (CRoaring: roaring_uint32_iterator_t),
+// ForEach the callback walk (CRoaring: roaring_iterate). The checksum is the sum of the values,
+// which keeps the traversal observable and equal across the arms.
+static constexpr std::size_t kIterateChunks = 16;
+static constexpr char const * kIterateShapes[]{ "array", "bitset", "runs", "mixed" };
+
+static std::vector<std::uint32_t> iterate_values(std::string_view const shape) {
+    std::vector<std::uint32_t> values;
+    for (std::size_t c = 0; c < kIterateChunks; ++c) {
+        auto const & kind = shape == "mixed" ? kToArrayShapes[c % std::size(kToArrayShapes)] : *std::ranges::find_if(kToArrayShapes, [&](ToArrayShape const & candidate) { return shape == candidate.label; });
+        for (std::uint32_t i = 0; i < kind.per_chunk; ++i) {
+            values.push_back(static_cast<std::uint32_t>(c) * 65'536U + i * kind.stride);
+        }
+    }
+    return values;
+}
+
+template <class Arm>
+struct register_frsr_iterate_registrar {
+    using TestBitmap32 = typename Arm::bitmap;
+    static void run(char const * const shape, bool const callback_walk) {
+        Entry e;
+        char buf[128];
+        snprintf(buf, sizeof(buf), "set_ops/%s%s/shape=%s", Arm::label(), callback_walk ? "ForEach" : "Iterate", shape);
+        e.name        = buf;
+        e.description = callback_walk
+            ? "frsr::roaring::bitmap<uint32_t> for_each() over a whole bitmap; checksum = sum of the values."
+            : "frsr::roaring::bitmap<uint32_t> const_iterator walk over a whole bitmap; checksum = sum of the values.";
+        e.setup = [shape]() -> void * {
+            auto * const bm = new TestBitmap32;
+            for (auto const value : iterate_values(shape)) { std::ignore = bm->add(value); }
+            if (std::string_view{shape} == "runs" || std::string_view{shape} == "mixed") { bm->optimize(); }
+            return bm;
+        };
+        if (callback_walk) {
+            e.run = [](void * const sv) -> int64_t {
+                std::uint64_t sum{};
+                static_cast<TestBitmap32 const *>(sv)->for_each([&sum](std::uint32_t const value) { sum += value; });
+                return static_cast<int64_t>(sum);
+            };
+        } else {
+            e.run = [](void * const sv) -> int64_t {
+                std::uint64_t sum{};
+                for (auto const value : *static_cast<TestBitmap32 const *>(sv)) { sum += value; }
+                return static_cast<int64_t>(sum);
+            };
+        }
+        e.teardown       = [](void * const sv) { delete static_cast<TestBitmap32 *>(sv); };
+        e.ops_per_run    = 1;
+        e.inner_reps     = kBinaryInnerReps;
+        e.reusable_state = true;
+        g_benchmarks.push_back(std::move(e));
+    }
+};
+
+#if FRSR_ROARING_HAS_CROARING
+template <class Arm>
+struct register_cpp_iterate_registrar {
+    struct S { roaring_bitmap_t * bm{}; ~S() { if (bm) roaring_bitmap_free(bm); } };
+    static void run(char const * const shape, bool const callback_walk) {
+        Entry e;
+        char buf[128];
+        snprintf(buf, sizeof(buf), "set_ops/%s%s/shape=%s", Arm::label(), callback_walk ? "ForEach" : "Iterate", shape);
+        e.name        = buf;
+        e.description = callback_walk
+            ? "CRoaring roaring_iterate() over a whole bitmap; checksum = sum of the values. [croaring-ref] deps/croaring/src/roaring.c:roaring_iterate"
+            : "CRoaring roaring_uint32_iterator_t walk over a whole bitmap; checksum = sum of the values. [croaring-ref] deps/croaring/src/roaring.c:roaring_uint32_iterator_advance";
+        e.setup = [shape]() -> void * {
+            auto * const s = new S;
+            s->bm = Arm::create();
+            for (auto const value : iterate_values(shape)) { roaring_bitmap_add(s->bm, value); }
+            if (std::string_view{shape} == "runs" || std::string_view{shape} == "mixed") { roaring_bitmap_run_optimize(s->bm); }
+            return s;
+        };
+        if (callback_walk) {
+            e.run = [](void * const sv) -> int64_t {
+                std::uint64_t sum{};
+                roaring_iterate(static_cast<S *>(sv)->bm, [](std::uint32_t const value, void * const param) noexcept { *static_cast<std::uint64_t *>(param) += value; return true; }, &sum);
+                return static_cast<int64_t>(sum);
+            };
+        } else {
+            e.run = [](void * const sv) -> int64_t {
+                std::uint64_t sum{};
+                roaring_uint32_iterator_t it;
+                roaring_iterator_init(static_cast<S *>(sv)->bm, &it);
+                while (it.has_value) {
+                    sum += it.current_value;
+                    roaring_uint32_iterator_advance(&it);
+                }
+                return static_cast<int64_t>(sum);
+            };
+        }
+        e.teardown       = [](void * const sv) { delete static_cast<S *>(sv); };
+        e.ops_per_run    = 1;
+        e.inner_reps     = kBinaryInnerReps;
+        e.reusable_state = true;
+        g_benchmarks.push_back(std::move(e));
+    }
+};
+#endif
+
 // ---- BulkAddRows: the row-insert shape of a bitmap INDEX ----------------------
 // A dimension's bitmap index holds one bitmap per value; inserting a batch of table
 // rows walks the rows in order and adds each row id to its value's bitmap through a
@@ -6941,6 +7044,14 @@ void register_benchmarks() {
             register_set_binary(count, offset, ov.label);
         }
         if (count >= 100'000) {
+            for (auto const shape : kIterateShapes) {
+                for (bool const callback_walk : { false, true }) {
+                    arms::for_each_frsr<register_frsr_iterate_registrar>(shape, callback_walk);
+    #if FRSR_ROARING_HAS_CROARING
+                    arms::for_each_croaring<register_cpp_iterate_registrar>(shape, callback_walk);
+    #endif
+                }
+            }
             for (auto const &shape : kCopyShapes) {
                 arms::for_each_frsr<register_frsr_copy_registrar>(shape);
 #if FRSR_ROARING_HAS_CROARING
