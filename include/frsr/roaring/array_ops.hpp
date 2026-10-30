@@ -1661,8 +1661,11 @@ template <typename Layout, typename OutVector, typename CowPolicy = cow_value_se
         auto const & run{ runs[ run_ix ] };
         if ( value >= static_cast<low_type>( run.begin ) ) {
             if constexpr ( keep_matches ) {
-                out[ written++ ] = value;
-                ++ap;
+                // the values up to the end of the run
+                auto const stretch_end{ static_cast<std::size_t>( run.end ) + 1U };
+                do {
+                    out[ written++ ] = keys[ ap++ ];
+                } while ( ap < card && keys[ ap ] < stretch_end );
             } else {
                 ap = gallop_forward<true>( keys, ap, card, static_cast<low_type>( run.end ) );
             }
@@ -1900,8 +1903,11 @@ template <typename Layout, typename CowPolicy = cow_value_semantics>
         auto const & run{ runs[ run_ix ] };
         bool const in_run{ value >= static_cast<low_type>( run.begin ) };
         if ( in_run == keep_matches ) {
-            base[ out++ ] = value;
-            ++in;
+            // the kept stretch: the values up to the end of the run (intersection) or to the start of the next run (difference)
+            auto const stretch_end{ keep_matches ? static_cast<std::size_t>( run.end ) + 1U : static_cast<std::size_t>( run.begin ) };
+            do {
+                base[ out++ ] = base[ in++ ];
+            } while ( in < card && base[ in ] < stretch_end );
         } else if ( in_run ) {
             in = gallop_forward<true >( base, in, card, static_cast<low_type>( run.end ) );
         } else {
