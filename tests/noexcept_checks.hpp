@@ -120,6 +120,14 @@ struct checks {
     static_assert( noexcept( std::declval<Bitmap &>().optimize_for_storage() ) == terminates );
     static_assert( noexcept( std::declval<Bitmap &>().optimize_for_speed() ) == terminates );
     static_assert( noexcept( std::declval<Bitmap &>().shrink_to_fit() ) == terminates );
+
+    // the touched chunks and the pass over them
+    using touched = typename Bitmap::touched_chunks;
+    static_assert( noexcept( std::declval<touched &>().add_values( std::declval<std::span<typename Bitmap::key_type const>>() ) ) == terminates );
+    static_assert( noexcept( std::declval<touched &>().add_range( typename Bitmap::key_type{}, typename Bitmap::key_type{} ) ) == terminates );
+    static_assert( noexcept( std::declval<touched &>().add_chunks_of( std::declval<Bitmap const &>() ) ) == terminates );
+    static_assert( noexcept( std::declval<touched const &>().empty() ) );
+    static_assert( noexcept( std::declval<Bitmap const &>().optimize_run_shaped( std::size_t{}, std::declval<touched const &>() ) ) == terminates );
     static_assert( noexcept( std::declval<Bitmap &>().bulk_or_finish() ) == terminates );
 };
 
