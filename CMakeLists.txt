@@ -298,6 +298,7 @@ if(FRSR_ROARING_BUILD_TESTS)
         tests/noexcept_policy.cpp
         tests/ranked_view.cpp
         tests/bitmap_bounds.cpp
+        tests/bitmap_iteration.cpp
     )
     target_link_libraries(frsr_roaring_tests
         PRIVATE

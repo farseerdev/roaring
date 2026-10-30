@@ -382,12 +382,14 @@ public:
             owner_ = nullptr;
             chunk_ = chunk_cursor{};
             current_low_ = {};
+            position_ = 0;
             current_value_ = {};
         }
 
         void seek_first() noexcept {
             chunk_ = owner_->chunks_.begin();
             current_low_ = detail::container_first( owner_->chunks_.slot( chunk_ ) );
+            position_ = 0;
             current_value_ = layout_type::compose( owner_->chunks_.key( chunk_ ), current_low_ );
         }
 
@@ -396,15 +398,16 @@ public:
                 return;
             }
 
-            if ( auto const next_low{ detail::container_next_after( owner_->chunks_.slot( chunk_ ), current_low_ ) } ) {
-                current_low_ = *next_low;
-                current_value_ = layout_type::compose( owner_->chunks_.key( chunk_ ), *next_low );
+            if ( auto const next_low{ detail::container_next_after( owner_->chunks_.slot( chunk_ ), current_low_, position_ ) }; next_low != layout_type::no_next ) {
+                current_low_ = static_cast<low_type>( next_low );
+                current_value_ = layout_type::compose( owner_->chunks_.key( chunk_ ), current_low_ );
                 return;
             }
 
             ++chunk_;
             if ( chunk_ != owner_->chunks_.end() ) {
                 current_low_ = detail::container_first( owner_->chunks_.slot( chunk_ ) );
+                position_ = 0;
                 current_value_ = layout_type::compose( owner_->chunks_.key( chunk_ ), current_low_ );
                 return;
             }
@@ -415,6 +418,7 @@ public:
         bitmap const * owner_{};
         chunk_cursor chunk_{};
         low_type current_low_{};
+        std::uint32_t position_{};  // where current_low_ sits in its container (see container_next_after)
         value_type current_value_{};
     };
 

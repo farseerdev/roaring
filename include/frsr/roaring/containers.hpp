@@ -193,11 +193,12 @@ template <typename Layout, typename CowPolicy>
 }
 
 template <typename Layout, typename CowPolicy>
-[[nodiscard]] inline std::optional<typename Layout::low_type> container_next_after(
+[[nodiscard]] inline typename Layout::next_type container_next_after(
     container_handle<Layout, CowPolicy> const & container,
-    typename Layout::low_type const value
+    typename Layout::low_type const value,
+    std::uint32_t & position
 ) noexcept {
-    return container.visit( [value]( auto const & current ) noexcept { return current.next_after( value ); } );
+    return container.visit( [ value, &position ]( auto const & current ) noexcept { return current.next_after( value, position ); } );
 }
 
 template <typename Layout, typename CowPolicy, typename F>

@@ -1134,12 +1134,18 @@ public:
         return values.back();
     }
 
-    [[nodiscard]] std::optional<low_type> next_after( low_type const value ) const noexcept {
-        auto const pos{ std::upper_bound( values.begin(), values.end(), value ) };
-        if ( pos == values.end() ) {
-            return std::nullopt;
+    // The value after `value`, or Layout::no_next. `position` is the cursor of a walk: where
+    // `value` sits in the container (0 for first()), left at the position of the value returned.
+    // A walk keeps its cursor, so a step costs no search; the container must not change between
+    // the steps of a walk.
+    [[nodiscard]] typename Layout::next_type next_after( [[maybe_unused]] low_type const value, std::uint32_t & position ) const noexcept {
+        assert( position < values.size() && values[ position ] == value );
+        auto const next{ position + 1U };
+        if ( next == values.size() ) {
+            return Layout::no_next;
         }
-        return *pos;
+        position = next;
+        return values[ next ];
     }
 
     template <typename F>
@@ -1342,12 +1348,8 @@ public:
         return values.front();
     }
 
-    [[nodiscard]] std::optional<low_type> next_after( low_type const value ) const noexcept {
-        auto const pos{ std::upper_bound( values.begin(), values.end(), value ) };
-        if ( pos == values.end() ) {
-            return std::nullopt;
-        }
-        return *pos;
+    [[nodiscard]] typename Layout::next_type next_after( low_type const value, std::uint32_t & position ) const noexcept {
+        return array_cref<Layout, CowPolicy>{ *handle_ }.next_after( value, position );
     }
 
     template <typename F>
@@ -1416,25 +1418,21 @@ public:
         return runs.back().end;
     }
 
-    [[nodiscard]] std::optional<low_type> next_after( low_type const value ) const noexcept {
-        auto const it{ std::lower_bound(
-            runs.begin(), runs.end(), value,
-            []( run_type const & current, low_type const v ) noexcept { return current.end < v; }
-        ) };
-        if ( it == runs.end() ) {
-            return std::nullopt;
-        }
-        if ( value < it->begin ) {
-            return it->begin;
-        }
-        if ( value < it->end && value != std::numeric_limits<low_type>::max() ) {
+    // The value after `value`, or Layout::no_next. `position` is the cursor of a walk: where
+    // `value` sits in the container (0 for first()), left at the position of the value returned.
+    // A walk keeps its cursor, so a step costs no search; the container must not change between
+    // the steps of a walk.
+    [[nodiscard]] typename Layout::next_type next_after( low_type const value, std::uint32_t & position ) const noexcept {
+        assert( position < runs.size() && runs[ position ].begin <= value && value <= runs[ position ].end );
+        if ( value < runs[ position ].end ) {
             return static_cast<low_type>( value + 1U );
         }
-        auto next{ it + 1 };
-        if ( next == runs.end() ) {
-            return std::nullopt;
+        auto const next{ position + 1U };
+        if ( next == runs.size() ) {
+            return Layout::no_next;
         }
-        return next->begin;
+        position = next;
+        return runs[ next ].begin;
     }
 
     template <typename F>
@@ -1722,8 +1720,8 @@ public:
 
     [[nodiscard]] low_type first() const noexcept { return cref{ *handle_ }.first(); }
 
-    [[nodiscard]] std::optional<low_type> next_after( low_type const value ) const noexcept {
-        return cref{ *handle_ }.next_after( value );
+    [[nodiscard]] typename Layout::next_type next_after( low_type const value, std::uint32_t & position ) const noexcept {
+        return cref{ *handle_ }.next_after( value, position );
     }
 
     template <typename F>
@@ -1871,10 +1869,11 @@ public:
         std::unreachable();
     }
 
-    [[nodiscard]] std::optional<low_type> next_after( low_type const value ) const noexcept {
+    // The scan restarts from the word of `value`, which is its own position: `position` is not used.
+    [[nodiscard]] typename Layout::next_type next_after( low_type const value, std::uint32_t & ) const noexcept {
         auto word_index{ static_cast<std::size_t>( value ) >> 6U };
         if ( word_index >= words.size() ) {
-            return std::nullopt;
+            return Layout::no_next;
         }
 
         auto bit_index{ static_cast<unsigned>( value ) & 63U };
@@ -1886,16 +1885,16 @@ public:
         };
         word &= ~consumed_mask;
         if ( word != 0 ) {
-            return static_cast<low_type>( ( word_index << 6U ) + static_cast<std::size_t>( std::countr_zero( word ) ) );
+            return static_cast<typename Layout::next_type>( ( word_index << 6U ) + static_cast<std::size_t>( std::countr_zero( word ) ) );
         }
 
         for ( ++word_index; word_index < words.size(); ++word_index ) {
             word = words[ word_index ];
             if ( word != 0 ) {
-                return static_cast<low_type>( ( word_index << 6U ) + static_cast<std::size_t>( std::countr_zero( word ) ) );
+                return static_cast<typename Layout::next_type>( ( word_index << 6U ) + static_cast<std::size_t>( std::countr_zero( word ) ) );
             }
         }
-        return std::nullopt;
+        return Layout::no_next;
     }
 
     template <typename F>
@@ -2026,8 +2025,8 @@ public:
 
     [[nodiscard]] low_type first() const noexcept { return cref{ *handle_ }.first(); }
 
-    [[nodiscard]] std::optional<low_type> next_after( low_type const value ) const noexcept {
-        return cref{ *handle_ }.next_after( value );
+    [[nodiscard]] typename Layout::next_type next_after( low_type const value, std::uint32_t & position ) const noexcept {
+        return cref{ *handle_ }.next_after( value, position );
     }
 
     template <typename F>

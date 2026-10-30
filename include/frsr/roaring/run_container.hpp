@@ -154,20 +154,21 @@ struct run_container {
         return runs.front().begin;
     }
 
-    [[nodiscard]] std::optional<low_type> next_after( low_type const value ) const noexcept {
+    // The value after `value`, or layout_type::no_next.
+    [[nodiscard]] typename layout_type::next_type next_after( low_type const value ) const noexcept {
         auto const it{ std::ranges::lower_bound( runs, value, {}, &run_type::end ) };
         if ( it == runs.end() ) {
-            return std::nullopt;
+            return layout_type::no_next;
         }
         if ( value < it->begin ) {
             return it->begin;
         }
-        if ( value < it->end && value != std::numeric_limits<low_type>::max() ) {
+        if ( value < it->end ) {
             return static_cast<low_type>( value + 1U );
         }
         auto next{ it + 1 };
         if ( next == runs.end() ) {
-            return std::nullopt;
+            return layout_type::no_next;
         }
         return next->begin;
     }

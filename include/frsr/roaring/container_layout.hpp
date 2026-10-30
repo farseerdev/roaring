@@ -26,6 +26,12 @@ struct default_layout {
     using chunk_type = std::conditional_t<( key_bits <= 32 ), std::uint16_t, Key>;
     using low_type = std::conditional_t<( low_bits <= 8 ), std::uint8_t, std::uint16_t>;
 
+    // What a container's next_after() returns: the next value widened past low_type, so that "no
+    // further value" is a value of its own (no_next) and not a std::optional, which some ABIs
+    // pass through memory (a store-forwarding stall on every call).
+    using next_type = std::uint32_t;
+    static constexpr next_type no_next{ std::numeric_limits<next_type>::max() };
+
     static constexpr chunk_type chunk_key( key_type const value ) noexcept {
         if constexpr ( key_bits == low_bits ) {
             return static_cast<chunk_type>( 0 );
