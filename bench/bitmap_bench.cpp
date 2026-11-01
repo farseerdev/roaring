@@ -6789,6 +6789,146 @@ struct register_cpp_copy_registrar {
 };
 #endif
 
+// ---- CopyThenFirstWrite / CopyThenNoOpMutate: a copy, then a call on it ------
+// The two sides of a copy whose chunk table is shared with its source until it
+// changes (see bitmap::is_unique). FirstWrite: the copy takes one value into a
+// chunk it already holds and is dropped, so the band is what a copy that is then
+// written costs whole. NoOpMutate: the copy is subtracted a value it lacks and
+// run-encoded with a bar no chunk meets, neither of which changes it, and is
+// dropped: it must cost what CopyAndDrop does. Same fixture and repeat count as
+// CopyAndDrop. Checksum = cardinality sum.
+enum class CopyThen { first_write, no_op_mutate };
+
+[[nodiscard]] inline char const * copy_then_label( CopyThen const kind ) {
+    return kind == CopyThen::first_write ? "CopyThenFirstWrite" : "CopyThenNoOpMutate";
+}
+
+// Not a member of the fixture (every value is a multiple of 7), in its first chunk.
+static constexpr std::uint32_t kCopyAbsentValue{ 1 };
+
+template <class Arm>
+struct register_frsr_copy_then_registrar {
+    using TestBitmap32 = typename Arm::bitmap;
+    struct S { TestBitmap32 src; TestBitmap32 absent; };
+    static void run(CopyShape const &shape, CopyThen const kind) {
+        Entry e;
+        char buf[160];
+        snprintf(buf, sizeof(buf), "set_ops/%s%s/shape=%s", Arm::label(), copy_then_label(kind), shape.label);
+        e.name        = buf;
+        e.description = kind == CopyThen::first_write
+            ? "frsr::roaring::bitmap<uint32_t> copy + add() of one absent value into an existing chunk + destroy, 64 times."
+            : "frsr::roaring::bitmap<uint32_t> copy + -= of a bitmap the copy does not intersect + optimize_run_shaped() "
+              "with a bar no chunk meets + destroy, 64 times.";
+        e.setup = [shape]() -> void * {
+            auto *s = new S;
+            for (std::size_t c = 0; c < shape.chunks; ++c) {
+                auto const base = static_cast<std::uint32_t>(c * 65536u);
+                for (std::size_t i = 0; i < shape.per_chunk; ++i) {
+                    std::ignore = s->src.add(base + static_cast<std::uint32_t>(i * 7u));
+                }
+            }
+            std::ignore = s->absent.add(kCopyAbsentValue);
+            return s;
+        };
+        if (kind == CopyThen::first_write) {
+            e.run = [](void *sv) -> int64_t {
+                auto *s = static_cast<S *>(sv);
+                std::int64_t sum = 0;
+                for (std::size_t i = 0; i < kCopyReps; ++i) {
+                    TestBitmap32 copy{ s->src };
+                    std::ignore = copy.add(kCopyAbsentValue);
+                    sum += static_cast<std::int64_t>(copy.size());
+                }
+                return sum;
+            };
+        } else {
+            e.run = [](void *sv) -> int64_t {
+                auto *s = static_cast<S *>(sv);
+                std::int64_t sum = 0;
+                for (std::size_t i = 0; i < kCopyReps; ++i) {
+                    TestBitmap32 copy{ s->src };
+                    copy -= s->absent;
+                    copy.optimize_run_shaped(65536u);
+                    sum += static_cast<std::int64_t>(copy.size());
+                }
+                return sum;
+            };
+        }
+        e.teardown       = [](void *sv) { delete static_cast<S *>(sv); };
+        e.ops_per_run    = 1;
+        e.inner_reps     = kBinaryInnerReps;
+        e.reusable_state = true;
+        g_benchmarks.push_back(std::move(e));
+    }
+};
+
+#if FRSR_ROARING_HAS_CROARING
+template <class Arm>
+struct register_cpp_copy_then_registrar {
+    struct S {
+        roaring_bitmap_t *src{};
+        roaring_bitmap_t *absent{};
+        ~S() {
+            if (src) roaring_bitmap_free(src);
+            if (absent) roaring_bitmap_free(absent);
+        }
+    };
+    static void run(CopyShape const &shape, CopyThen const kind) {
+        Entry e;
+        char buf[160];
+        snprintf(buf, sizeof(buf), "set_ops/%s%s/shape=%s", Arm::label(), copy_then_label(kind), shape.label);
+        e.name        = buf;
+        e.description = kind == CopyThen::first_write
+            ? "CRoaring roaring_bitmap_copy() + roaring_bitmap_add() of one absent value into an existing container + free, 64 times."
+            : "CRoaring roaring_bitmap_copy() + roaring_bitmap_andnot_inplace() of a bitmap the copy does not intersect "
+              "+ free, 64 times (no run-shaped pass to mirror).";
+        e.setup = [shape]() -> void * {
+            auto *s = new S;
+            s->src = Arm::create();
+            for (std::size_t c = 0; c < shape.chunks; ++c) {
+                auto const base = static_cast<std::uint32_t>(c * 65536u);
+                for (std::size_t i = 0; i < shape.per_chunk; ++i) {
+                    roaring_bitmap_add(s->src, base + static_cast<std::uint32_t>(i * 7u));
+                }
+            }
+            s->absent = Arm::create();
+            roaring_bitmap_add(s->absent, kCopyAbsentValue);
+            return s;
+        };
+        if (kind == CopyThen::first_write) {
+            e.run = [](void *sv) -> int64_t {
+                auto *s = static_cast<S *>(sv);
+                std::int64_t sum = 0;
+                for (std::size_t i = 0; i < kCopyReps; ++i) {
+                    roaring_bitmap_t *copy = roaring_bitmap_copy(s->src);
+                    roaring_bitmap_add(copy, kCopyAbsentValue);
+                    sum += static_cast<std::int64_t>(roaring_bitmap_get_cardinality(copy));
+                    roaring_bitmap_free(copy);
+                }
+                return sum;
+            };
+        } else {
+            e.run = [](void *sv) -> int64_t {
+                auto *s = static_cast<S *>(sv);
+                std::int64_t sum = 0;
+                for (std::size_t i = 0; i < kCopyReps; ++i) {
+                    roaring_bitmap_t *copy = roaring_bitmap_copy(s->src);
+                    roaring_bitmap_andnot_inplace(copy, s->absent);
+                    sum += static_cast<std::int64_t>(roaring_bitmap_get_cardinality(copy));
+                    roaring_bitmap_free(copy);
+                }
+                return sum;
+            };
+        }
+        e.teardown       = [](void *sv) { delete static_cast<S *>(sv); };
+        e.ops_per_run    = 1;
+        e.inner_reps     = kBinaryInnerReps;
+        e.reusable_state = true;
+        g_benchmarks.push_back(std::move(e));
+    }
+};
+#endif
+
 // ---- BulkAddRowsGrouped: the same insert, handed over in per-value groups -----
 // A bitmap index's insert batch is already grouped by indexed value with the rows
 // ascending inside a group, so the row ids of one group can be handed over as one
@@ -7568,6 +7708,12 @@ void register_benchmarks() {
 #if FRSR_ROARING_HAS_CROARING
                 arms::for_each_croaring<register_cpp_copy_registrar>(shape);
 #endif
+                for (auto const kind : { CopyThen::first_write, CopyThen::no_op_mutate }) {
+                    arms::for_each_frsr<register_frsr_copy_then_registrar>(shape, kind);
+#if FRSR_ROARING_HAS_CROARING
+                    arms::for_each_croaring<register_cpp_copy_then_registrar>(shape, kind);
+#endif
+                }
             }
             for (auto const &shape : kRunBatchShapes) {
                 arms::for_each_frsr<register_frsr_run_batch_registrar>(shape);
