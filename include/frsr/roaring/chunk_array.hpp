@@ -40,15 +40,29 @@ namespace frsr::roaring::detail {
 //
 // The same table, with the same interface, is the flat pool of parked payloads that every chunk
 // store keeps for scratch reuse.
+//
+// Under a refcounted copy-on-write policy the block starts with a prefix one handle wide whose last
+// word counts the tables that hold the block, as a spilled payload carries its own count in front of
+// it: copies of a bitmap then share one table (share_from), and the first change of a copy gives it a
+// block of its own (detach). A block that is shared is never written. The prefix is one handle wide so
+// that the handles stay on the 32-byte grid of the block and none of them straddles a cache line.
+// Under value semantics there is no prefix and the block is what it was.
 template <typename ChunkType, typename Handle>
 class chunk_array {
 public:
     using chunk_type  = ChunkType;
     using handle_type = Handle;
     using index_type  = std::uint32_t;
+    using cow_policy  = typename handle_type::cow_policy;
 
     static_assert( sizeof( handle_type ) % alignof( chunk_type ) == 0 );
     static_assert( handle_type::is_trivially_moveable ); // relocation below is a memcpy
+
+    // Whether a block can be held by more than one table: a refcounted policy.
+    static constexpr bool shareable{ handle_type::rc_prefix_bytes != 0 };
+    static constexpr std::size_t table_prefix_bytes{ shareable ? sizeof( handle_type ) : 0 };
+    static_assert( table_prefix_bytes % sizeof( handle_type ) == 0, "the prefix keeps the handles on their grid" );
+    static_assert( table_prefix_bytes >= handle_type::rc_prefix_bytes );
 
     // A position in key order; end() is the position past the last entry. It stays valid until
     // the table is restructured.
@@ -174,7 +188,71 @@ public:
     [[nodiscard]] handle_type const * data() const noexcept { return slots_; }
 
     // Bytes held, spare capacity included (not the spilled payloads).
-    [[nodiscard]] std::size_t node_bytes() const noexcept { return bytes_for( capacity_ ); }
+    [[nodiscard]] std::size_t node_bytes() const noexcept {
+        if constexpr ( shareable ) {
+            return capacity_ != 0 ? table_prefix_bytes + bytes_for( capacity_ ) : 0;
+        } else {
+            return bytes_for( capacity_ );
+        }
+    }
+
+    // Whether another table holds this block too: then nothing in it may be written. A pure read.
+    [[nodiscard]] bool shared() const noexcept {
+        if constexpr ( shareable ) {
+            return slots_ != nullptr && cow_policy::rc_load( rc_slot() ) != 1;
+        } else {
+            return false;
+        }
+    }
+
+    // Whether this table and `other` hold the same block.
+    [[nodiscard]] bool shares_block_with( chunk_array const & other ) const noexcept {
+        return slots_ != nullptr && slots_ == other.slots_;
+    }
+
+    // Makes this a table that holds `other`'s block, which is not copied: one count is taken on it. The
+    // block of an empty table is never shared, so a copy of a table emptied with its capacity kept holds
+    // nothing.
+    void share_from( chunk_array const & other ) noexcept requires( shareable ) {
+        release();
+        if ( other.size_ == 0 ) {
+            return;
+        }
+        slots_    = other.slots_;
+        keys_     = other.keys_;
+        size_     = other.size_;
+        capacity_ = other.capacity_;
+        cow_policy::rc_increment( rc_slot() );
+    }
+
+    // Gives this table a block of its own with room for `min_capacity` entries (never fewer than it
+    // holds): the keys are copied and every handle is copy-constructed, so each payload is shared with
+    // the block left behind, which this table lets go of. Positions stay where they were. On failure
+    // nothing has changed.
+    [[using gnu: cold, noinline]] void detach( index_type const min_capacity ) requires( shareable ) {
+        auto const capacity{ std::max( size_, min_capacity ) };
+        auto * const fresh_slots{ allocate_table( capacity ) };
+        auto * const fresh_keys { keys_of( fresh_slots, capacity ) };
+        index_type built{ 0 };
+        try {
+            for ( ; built < size_; ++built ) {
+                new ( fresh_slots + built ) handle_type{ slots_[ built ] };
+            }
+        } catch ( ... ) {
+            while ( built != 0 ) {
+                fresh_slots[ --built ].~handle_type();
+            }
+            free_table( fresh_slots );
+            throw;
+        }
+        if ( size_ != 0 ) {
+            std::memcpy( fresh_keys, keys_, std::size_t{ size_ } * sizeof( chunk_type ) );
+        }
+        drop_block();
+        slots_    = fresh_slots;
+        keys_     = fresh_keys;
+        capacity_ = capacity;
+    }
 
     // Inserts before `at` and returns the position of the new entry.
     template <typename H>
@@ -203,6 +281,7 @@ public:
         auto const total{ size_ + count };
         // A table that has to grow is rebuilt in its new block, each run of entries going straight
         // to its final place, instead of being relocated first and moved again within the block.
+        assert( !shared() );
         bool const relocating{ total > capacity_ };
         std::byte * fresh{ nullptr };
         auto new_capacity{ capacity_ };
@@ -210,9 +289,12 @@ public:
         auto * dst_keys { keys_ };
         if ( relocating ) {
             auto const capacity{ std::max( { total, capacity_ < 1024 ? capacity_ * 2 : capacity_ + capacity_ / 4, index_type{ 4 } } ) };
-            fresh     = allocate_block( bytes_for( capacity ) );
-            dst_slots = reinterpret_cast<handle_type *>( fresh );
-            dst_keys  = reinterpret_cast<chunk_type  *>( fresh + keys_offset( capacity ) );
+            fresh     = allocate_block( table_prefix_bytes + bytes_for( capacity ) );
+            if constexpr ( shareable ) {
+                count_from_one( fresh );
+            }
+            dst_slots = reinterpret_cast<handle_type *>( fresh + table_prefix_bytes );
+            dst_keys  = reinterpret_cast<chunk_type  *>( fresh + table_prefix_bytes + keys_offset( capacity ) );
             new_capacity = capacity;
         }
         auto end{ size_ };                              // [ 0, end ) is still in place
@@ -251,7 +333,7 @@ public:
                 std::memcpy( static_cast<void *>( dst_slots ), static_cast<void const *>( slots_ ), std::size_t{ end } * sizeof( handle_type ) );
                 std::memcpy( dst_keys, keys_, std::size_t{ end } * sizeof( chunk_type ) );
             }
-            if ( slots_ ) { free_block( reinterpret_cast<std::byte *>( slots_ ) ); }
+            if ( slots_ ) { free_block( reinterpret_cast<std::byte *>( slots_ ) - table_prefix_bytes ); }
             slots_    = dst_slots;
             keys_     = dst_keys;
             capacity_ = new_capacity;
@@ -309,21 +391,33 @@ public:
         }
     }
 
-    // Destroys every entry; the capacity stays.
+    // Destroys every entry; the capacity stays. The block must not be shared.
     void destroy_all() noexcept {
+        assert( !shared() );
         for ( index_type i{ 0 }; i < size_; ++i ) {
             slots_[ i ].~handle_type();
         }
         size_ = 0;
     }
 
+    // Lets go of the block: the last table that holds it destroys the entries and frees it.
     void release() noexcept {
-        destroy_all();
-        if ( slots_ ) {
-            free_block( reinterpret_cast<std::byte *>( slots_ ) );
-            slots_    = nullptr;
-            keys_     = nullptr;
-            capacity_ = 0;
+        if constexpr ( shareable ) {
+            if ( slots_ != nullptr ) {
+                drop_block();
+                slots_    = nullptr;
+                keys_     = nullptr;
+                capacity_ = 0;
+            }
+            size_ = 0;
+        } else {
+            destroy_all();
+            if ( slots_ ) {
+                free_block( reinterpret_cast<std::byte *>( slots_ ) );
+                slots_    = nullptr;
+                keys_     = nullptr;
+                capacity_ = 0;
+            }
         }
     }
 
@@ -336,7 +430,7 @@ public:
         std::swap( capacity_, other.capacity_ );
     }
 
-    // Makes this a copy of `other`.
+    // Makes this a copy of `other`, with entries of its own.
     void copy_from( chunk_array const & other ) {
         destroy_all();
         if ( other.size_ == 0 ) { return; }
@@ -494,21 +588,58 @@ private:
     }
 
     // Both arrays move to a fresh block of `capacity` entries (never below size_): handles by
-    // memcpy (trivially moveable), keys likewise.
+    // memcpy (trivially moveable), keys likewise. The block must not be shared.
     void relocate( index_type const capacity ) {
-        auto * const fresh{ allocate_block( bytes_for( capacity ) ) };
-        auto * const fresh_slots{ reinterpret_cast<handle_type *>( fresh ) };
-        auto * const fresh_keys { reinterpret_cast<chunk_type  *>( fresh + keys_offset( capacity ) ) };
+        assert( !shared() );
+        auto * const fresh{ allocate_block( table_prefix_bytes + bytes_for( capacity ) ) };
+        if constexpr ( shareable ) {
+            count_from_one( fresh );
+        }
+        auto * const fresh_slots{ reinterpret_cast<handle_type *>( fresh + table_prefix_bytes ) };
+        auto * const fresh_keys { reinterpret_cast<chunk_type  *>( fresh + table_prefix_bytes + keys_offset( capacity ) ) };
         if ( size_ != 0 ) {
             std::memcpy( static_cast<void *>( fresh_slots ), static_cast<void const *>( slots_ ), std::size_t{ size_ } * sizeof( handle_type ) );
             std::memcpy( fresh_keys , keys_ , std::size_t{ size_ } * sizeof( chunk_type  ) );
         }
         if ( slots_ ) {
-            free_block( reinterpret_cast<std::byte *>( slots_ ) );
+            free_block( reinterpret_cast<std::byte *>( slots_ ) - table_prefix_bytes );
         }
         slots_    = fresh_slots;
         keys_     = fresh_keys;
         capacity_ = capacity;
+    }
+
+    // The count of a fresh block (the handles start table_prefix_bytes into it): this table alone holds it.
+    static void count_from_one( std::byte * const block ) noexcept requires( shareable ) {
+        cow_policy::rc_construct( block + table_prefix_bytes - handle_type::rc_prefix_bytes );
+    }
+    // A block of `capacity` entries, held by this table alone; the handles start where the result points.
+    [[nodiscard]] static handle_type * allocate_table( index_type const capacity ) requires( shareable ) {
+        auto * const block{ allocate_block( table_prefix_bytes + bytes_for( capacity ) ) };
+        count_from_one( block );
+        return reinterpret_cast<handle_type *>( block + table_prefix_bytes );
+    }
+    static void free_table( handle_type * const slots ) noexcept requires( shareable ) {
+        free_block( reinterpret_cast<std::byte *>( slots ) - table_prefix_bytes );
+    }
+    [[nodiscard]] static chunk_type * keys_of( handle_type * const slots, index_type const capacity ) noexcept requires( shareable ) {
+        return reinterpret_cast<chunk_type *>( reinterpret_cast<std::byte *>( slots ) + keys_offset( capacity ) );
+    }
+
+    // The count of the tables that hold the block, the word right before the first handle.
+    [[nodiscard]] std::byte * rc_slot() const noexcept {
+        return reinterpret_cast<std::byte *>( slots_ ) - handle_type::rc_prefix_bytes;
+    }
+
+    // Gives up this table's count on its block (which it holds); the last holder destroys the entries and
+    // frees the block. The fields are left as they are.
+    void drop_block() noexcept requires( shareable ) {
+        if ( cow_policy::rc_decrement_is_last( rc_slot() ) ) {
+            for ( index_type i{ 0 }; i < size_; ++i ) {
+                slots_[ i ].~handle_type();
+            }
+            free_table( slots_ );
+        }
     }
 
     [[nodiscard]] static std::byte * allocate_block( std::size_t const bytes ) {
