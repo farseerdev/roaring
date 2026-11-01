@@ -95,6 +95,26 @@ side with the operation applied to part of it: a union still holds every key it 
 holds no key it did not hold. An in-place `^=`, `xor_with` or `xor_many_in_place` leaves its left side valid with
 unspecified contents.
 
+## Copies
+
+Under a refcounted copy-on-write policy (`cow_atomic_refcount`, `cow_unsynchronized_refcount`) a copy of a bitmap whose
+keys are up to 32 bits wide shares the whole chunk table with the bitmap it was copied from: it takes one count on the
+table and touches nothing else, and dropping it gives the count back. The first call that changes either bitmap gives
+that bitmap a table of its own, which costs what copying the table cost before (one allocation, and one count on each
+payload, which stays shared until it is written); a call that would change nothing (`remove` of an absent key, `&=` with
+a superset, `-=` of a disjoint operand, an `optimize` that converts nothing, ...) finds that out on the shared table and
+leaves it shared. A `|=` with a bitmap is the exception: it makes the table its own whatever it adds (a `|=` with a
+view, keys or a range still asks first). `is_unique()` tells whether another bitmap holds the table and
+`shares_storage_with( other )` whether two bitmaps hold the same one. A copy of a bitmap of 64-bit keys copies the chunk
+table and shares the payloads, and under value semantics a copy copies everything.
+
+A call that changes nothing on a shared table leaves its containers as they are, where on a table of its own some such
+calls re-encode a container they rewrite (an `&=` with a superset may turn a run into an array, for instance): the keys
+are the same either way. `byte_size()` counts a shared table in full for each bitmap that holds it.
+
+Copying a bitmap is a read of it: under the atomic policy any number of threads may copy a bitmap that others read, and
+each copy is its holder's own to change.
+
 ## Compiled library and header-only mode
 
 `bitmap` is split in two. The headers a program includes (`<frsr/roaring/bitmap.hpp>`) declare the class and

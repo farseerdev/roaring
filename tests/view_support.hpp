@@ -15,6 +15,9 @@ template <typename Bitmap>
 struct bitmap_test_access {
     using handle_type = typename Bitmap::handle_type;
 
+    // The structure generation of the chunk table (chunk_store::generation).
+    [[nodiscard]] static std::uint32_t generation( Bitmap const & bitmap ) noexcept { return bitmap.chunks_.generation(); }
+
     // Everything an operation could write into a published container, as bytes taken before and after it:
     // the 32-byte handle, the count of the payload, and the payload itself.
     struct container_state {

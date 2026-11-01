@@ -253,9 +253,10 @@ inline combine_stats_t & combine_stats() noexcept { static combine_stats_t s; re
 // the set operations that read this bitmap as an operand (the result is a new
 // bitmap owned by the caller). Copying a const bitmap is such a read, and so is a
 // set operation whose result shares chunk payloads with its operands, for the
-// value-semantics and the atomic-refcount CowPolicy; the unsynchronized-refcount
-// policy updates a plain shared count on both, so there those need one thread at
-// a time. Anything that can modify the bitmap - every non-const member - needs
+// value-semantics and the atomic-refcount CowPolicy (a copy takes an atomic count
+// on the shared chunk table); the unsynchronized-refcount policy updates a plain
+// shared count on both, so there those need one thread at a time. Anything that
+// can modify the bitmap - every non-const member - needs
 // exclusive access, and a bulk_context is the caller's own state: it is not shared
 // between threads.
 // The chunk table is therefore always kept sorted and is searched, never cached or
@@ -288,6 +289,23 @@ private:
     using chunk_store_type = detail::chunk_store<layout_type, CowPolicy>;
     using chunk_cursor     = typename chunk_store_type::cursor;
 
+    // Whether a copy shares the chunk table (see is_unique).
+    static constexpr bool table_sharing{ chunk_store_type::table_sharing };
+
+    // Whether add_bulk may write through the slot a context holds, where a copy shares the chunk table: only a context
+    // add_impl filled may (add_impl made the table this bitmap's own, and no copy is taken while a context is alive); a
+    // context contains_bulk filled (payload_private is false) takes the add_impl path once. The build that tests the
+    // sharing counts every table as shared at the start of every call, which a context cannot know. (A template, so that
+    // the compiled instantiations of value semantics hold no code for it.)
+    template <typename Context>
+    [[nodiscard]] [[gnu::always_inline]] bool context_writes( Context const & ctx ) noexcept {
+#if FRSR_ROARING_TEST_SHARE_EVERY_TABLE
+        return ctx.payload_private && !chunks_.must_unshare();
+#else
+        return ctx.payload_private;
+#endif
+    }
+
 public:
 
     static constexpr size_type array_to_bitset_threshold{
@@ -315,7 +333,8 @@ public:
     // its cached container directly, having unshared it once on the miss path).
     //
     // Precondition, shared with that reference: no copy of the bitmap may be
-    // taken while a context on it is alive. A copy is what re-shares a payload,
+    // taken while a context on it is alive. A copy is what re-shares a payload
+    // (and, under a refcounted policy, the chunk table the context points into),
     // and a writer that has already made one private would then mutate the
     // copy's data. Callers already have to guarantee this - a copy taken during
     // any in-place write sequence would observe a half-applied one anyway - and
@@ -454,6 +473,19 @@ public:
     }
 
     [[nodiscard]] bool empty() const noexcept { return size_ == 0; }
+
+    // Under a refcounted CowPolicy a copy of a bitmap whose chunk keys are 16 bits wide (a key of up to 32 bits) shares
+    // the chunk table with the bitmap it was copied from instead of copying it: a copy costs one count on the table.
+    // The first call that changes either of them gives it a table of its own (copying the table then, as a copy did
+    // before), and a call that would change nothing leaves the table shared. Whether no other bitmap holds this
+    // bitmap's table:
+    // (Templates, so that the library's compiled instantiations hold no code for them.)
+    template <typename Self>
+    [[nodiscard]] bool is_unique( this Self const & self ) noexcept { return !self.chunks_.shared(); }
+    // Whether this bitmap and `other` hold the same chunk table (they are then equal).
+    template <typename Self>
+    [[nodiscard]] bool shares_storage_with( this Self const & self, bitmap const & other ) noexcept { return self.chunks_.shares_storage_with( other.chunks_ ); }
+
     [[nodiscard]] bool test( key_type const value ) const noexcept { return contains( value ); }
     // Not meaningful while the bitmap is in the middle of a lazy fold (see bulk_or_intermediate).
     [[nodiscard]] size_type size() const noexcept { assert( !counts_deferred() ); return size_; }
@@ -550,6 +582,7 @@ public:
     }
 
     [[nodiscard]] bool add( key_type const value ) noexcept( detail::allocation_failure_terminates ) {
+        FRSR_ROARING_WRITE_SCOPE;
         return add_impl( value, nullptr );
     }
 
@@ -559,8 +592,10 @@ public:
     // chunk) is the shared add_impl.
     // [croaring-ref] deps/croaring/src/roaring.c:add_bulk_impl
     [[nodiscard]] bool add_bulk( bulk_context & ctx, key_type const value ) noexcept( detail::allocation_failure_terminates ) {
+        FRSR_ROARING_WRITE_SCOPE;
         auto const chunk{ layout_type::chunk_key( value ) };
-        if ( ctx.slot != nullptr && ctx.generation == chunks_.generation() && ctx.chunk == chunk ) [[likely]] {
+        if ( ctx.slot != nullptr && ctx.generation == chunks_.generation() && ctx.chunk == chunk && ( !table_sharing || context_writes( ctx ) ) ) [[likely]] {
+            assert( !chunks_.must_unshare() && "a copy was taken while a context on the bitmap was alive" );
             // The context was filled from this (non-const) bitmap, whose slots are not const.
             auto       & slot{ const_cast<handle_type &>( *ctx.slot ) };
             auto const   low { layout_type::low_key( value ) };
@@ -588,6 +623,12 @@ public:
     }
 
     [[nodiscard]] bool remove( key_type const value ) noexcept( detail::allocation_failure_terminates ) {
+        FRSR_ROARING_WRITE_SCOPE;
+        if constexpr ( table_sharing ) {
+            if ( unchanged_while_shared( [ this, value ] { return !contains( value ); } ) ) {
+                return false;
+            }
+        }
         auto const chunk{ layout_type::chunk_key( value ) };
         auto const low{ layout_type::low_key( value ) };
         auto const at{ chunks_.lower_bound( chunk ) };
@@ -1122,6 +1163,7 @@ public:
     // Defined here, not with the other large members: it is a thin forwarder to the out-of-line merge walk, and a
     // caller that hands it a fresh scratch bitmap lets the compiler drop the clearing of that scratch.
     [[ gnu::hot ]] void intersect_into( bitmap const & other, bitmap & scratch ) const noexcept( detail::allocation_failure_terminates ) {
+        FRSR_ROARING_WRITE_SCOPE;
         if ( this == &other ) {
             scratch = *this;
             return;
@@ -1181,7 +1223,8 @@ public:
     // saturated 8 KB bitset (CRoaring's repair is cheap on the same shape because
     // TO_FULL converted those to runs — we keep bitsets but skip the redundant
     // popcount when the header is already live).
-    void repair_cardinality() noexcept;
+    // Where a copy shares the chunk table, a table a copy holds is made this bitmap's own first, which allocates.
+    void repair_cardinality() noexcept( !table_sharing || detail::allocation_failure_terminates );
 
     // The state a lazy fold leaves: size_ and the counts of the bitsets it dirtied are not known. size_ then
     // holds a value no size can reach (the top bit; the half below it absorbs what operations subtract), so that an operation which adds to it or subtracts from it keeps it
@@ -1189,7 +1232,7 @@ public:
     static constexpr size_type size_deferred{ size_type{ 1 } << ( std::numeric_limits<size_type>::digits - 1 ) };
     [[nodiscard]] bool counts_deferred() const noexcept { return size_ >= size_deferred / 2; }
     // The entry of an in-place operation that reads container counts: ends a deferred state first.
-    void settle_counts() noexcept { if ( counts_deferred() ) [[unlikely]] { repair_cardinality(); } }
+    void settle_counts() noexcept( !table_sharing || detail::allocation_failure_terminates ) { if ( counts_deferred() ) [[unlikely]] { repair_cardinality(); } }
 
     // The shared in-place merge-walk spine behind operator&= (op == bit_and) and
     // operator-= (op == bit_andnot) — ONE copy of the forward-compacting chunk walk
@@ -1903,6 +1946,25 @@ private:
     // The one chunk step of both run-shaped passes.
     static void run_encode_if_run_shaped( handle_type & chunk, std::size_t min_mean_run_length ) noexcept( detail::allocation_failure_terminates );
 
+    // An optimizing pass (`pass` applied to a bitmap) on a shared table: the pass runs on a copy with a table of its own,
+    // which replaces this bitmap only when the pass changed the kind of a container; otherwise the table stays shared
+    // (the pass changed nothing). The copy costs what making the table this bitmap's own would. Whether it ran.
+    template <typename Pass>
+    [[nodiscard]] bool ran_aside_while_shared( Pass const & pass ) {
+        if ( !chunks_.must_unshare() ) [[likely]] {
+            return false;
+        }
+        bitmap aside{ *this };
+        aside.chunks_.make_unique();
+        pass( aside );
+        auto const before{ std::as_const( chunks_ ).slots() };
+        auto const after { std::as_const( aside.chunks_ ).slots() };
+        if ( !std::ranges::equal( before, after, {}, &handle_type::kind, &handle_type::kind ) ) {
+            swap( aside );
+        }
+        return true;
+    }
+
     static constexpr bool uses_default_container_set{ std::same_as<container_set_type, default_container_set_type> };
     static constexpr bool supports_run_container{
         detail::variant_contains_v<container_set_type, run_container_type>
@@ -2453,6 +2515,19 @@ private:
     }
 
     [[nodiscard]] bool add_impl( key_type const value, bulk_context * const ctx ) {
+        // A detach makes room for the chunk the add may insert, so the insertion does not reallocate the table again.
+        if constexpr ( table_sharing ) {
+            // A context that add_impl filled for this table, still current, says the table is this bitmap's own: no
+            // copy is taken while a context is alive. The build that tests the sharing checks every call.
+#if FRSR_ROARING_TEST_SHARE_EVERY_TABLE
+            bool const known_own{ false };
+#else
+            bool const known_own{ ctx != nullptr && ctx->slot != nullptr && ctx->payload_private && ctx->generation == chunks_.generation() };
+#endif
+            if ( !known_own && unchanged_while_shared( [ this, value ] { return contains( value ); }, chunks_.size() + 1 ) ) {
+                return false;
+            }
+        }
         auto const chunk{ layout_type::chunk_key( value ) };
         auto const low{ layout_type::low_key( value ) };
 
@@ -2512,6 +2587,71 @@ private:
         ++size_;
         promote_if_needed( chunks_.slot( at ) );
         return true;
+    }
+
+    // The first thing a call that may change the bitmap does, after opening its write_scope: when the chunk table is
+    // shared, the call asks `unchanged` (a read of this bitmap and the operands only) whether it would change
+    // anything, and returns at once when it would not (true); otherwise the table is made this bitmap's own, with room
+    // for `min_capacity` entries, and the call goes on as for a table of its own (false). Under value semantics, and
+    // for a table of its own, it is nothing at all.
+    template <typename Unchanged>
+    [[nodiscard]] [[gnu::always_inline]] bool unchanged_while_shared( Unchanged const & unchanged, std::size_t const min_capacity = 0 ) {
+        if constexpr ( table_sharing ) {
+            if ( chunks_.must_unshare() ) [[unlikely]] {
+                return unchanged_or_unshared( unchanged, min_capacity );
+            }
+        } else {
+            (void)unchanged;
+            (void)min_capacity;
+        }
+        return false;
+    }
+    // The shared arm of unchanged_while_shared, out of the line of the call it guards.
+    template <typename Unchanged>
+    [[nodiscard]] [[gnu::cold, gnu::noinline]] bool unchanged_or_unshared( Unchanged const & unchanged, std::size_t const min_capacity ) requires( table_sharing ) {
+        if ( unchanged() ) {
+            return true;
+        }
+        chunks_.make_unique( min_capacity );
+        return false;
+    }
+
+    // `this &= other` or `this -= other` on a shared table: the result is built as the materializing operators build it,
+    // into a table of its own, which takes the place of the shared one only when it holds a different number of keys
+    // (both operations can only remove keys, so the same number is the same keys). The shared table is never copied, and
+    // is left shared when the call changes nothing.
+    template <detail::set_operation Op>
+    [[gnu::cold, gnu::noinline]] bitmap & combine_while_shared( bitmap const & other ) requires( table_sharing ) {
+        static_assert( Op == detail::set_operation::bit_and || Op == detail::set_operation::bit_andnot );
+        bitmap result;
+        if constexpr ( Op == detail::set_operation::bit_and ) {
+            intersect_into( other, result );
+        } else {
+            difference_into( other, result );
+        }
+        if ( result.size_ != size_ ) {
+            chunks_.swap_tables_with( result.chunks_ );
+            size_ = result.size_;
+        }
+        return *this;
+    }
+
+    // Whether every key of `values` is held, and whether any is: the questions a batch of keys asks of a shared table, which
+    // stop at the first key that answers them.
+    [[nodiscard]] bool holds_all( std::span<key_type const> const values ) const noexcept requires( table_sharing ) {
+        return std::ranges::all_of( values, [ this ]( key_type const value ) { return contains( value ); } );
+    }
+    [[nodiscard]] bool holds_any( std::span<key_type const> const values ) const noexcept requires( table_sharing ) {
+        return std::ranges::any_of( values, [ this ]( key_type const value ) { return contains( value ); } );
+    }
+
+    // For a call that changes the bitmap whatever it is given: the chunk table is made this bitmap's own.
+    [[gnu::always_inline]] void unshare() requires( table_sharing ) {
+        if constexpr ( table_sharing ) {
+            if ( chunks_.must_unshare() ) [[unlikely]] {
+                chunks_.make_unique();
+            }
+        }
     }
 
     // The threshold test is the inline part (two loads on the handle line the
@@ -2582,19 +2722,51 @@ private:
         return std::min( operand.last, static_cast<std::uint64_t>( std::numeric_limits<key_type>::max() ) ) - operand.first;
     }
 
+    // Whether the interop operation `Op` would leave `self` as it is (asked of a shared table only). An operand that can
+    // be read only once is not read ahead of the operation.
+    template <detail::interop_op Op, typename Operand>
+    [[nodiscard]] static bool interop_leaves_unchanged( bitmap const & self, Operand const & operand ) {
+        if constexpr ( detail::key_sequence<Operand> && !std::ranges::forward_range<Operand const> ) {
+            return false;
+        } else if constexpr ( Op == detail::interop_op::and_with ) {
+            return self.is_subset_of( operand );
+        } else if constexpr ( Op == detail::interop_op::or_with ) {
+            return self.is_superset_of( operand );
+        } else if constexpr ( Op == detail::interop_op::andnot_with ) {
+            return !self.intersects( operand );
+        } else {
+            return false;   // an exclusive-or changes the bitmap unless the operand is empty, which it is rarely
+        }
+    }
+
     template <detail::interop_op Op, typename Self, typename Operand>
     static decltype( auto ) interop_dispatch( Self & self, Operand const & operand ) {
         constexpr bool mutating{ Op == detail::interop_op::and_with || Op == detail::interop_op::or_with
                               || Op == detail::interop_op::andnot_with || Op == detail::interop_op::xor_with };
+        FRSR_ROARING_WRITE_SCOPE;
         if constexpr ( mutating ) {
             self.settle_counts();
         }
         if constexpr ( detail::is_typed_view_v<Operand> ) {
             static_assert( std::same_as<typename Operand::bitmap_type, bitmap>, "a view is an operand of bitmaps of its own instantiation" );
             if constexpr ( mutating ) {
-                // the table that is read is the table that is rewritten: the answer is known without reading it
+                // the table that is read is the table that is rewritten (or a table holding the same keys): the answer is
+                // known without reading it
+                if constexpr ( table_sharing ) {
+                    if ( self.shares_storage_with( operand.get() ) ) {
+                        if constexpr ( Op == detail::interop_op::andnot_with || Op == detail::interop_op::xor_with ) { self.clear(); }
+                        return;
+                    }
+                }
                 if ( &operand.get() == &self ) {
                     if constexpr ( Op == detail::interop_op::andnot_with || Op == detail::interop_op::xor_with ) { self.clear(); }
+                    return;
+                }
+            }
+        }
+        if constexpr ( mutating ) {
+            if constexpr ( table_sharing ) {
+                if ( self.unchanged_while_shared( [ &self, &operand ] { return interop_leaves_unchanged<Op>( self, operand ); } ) ) {
                     return;
                 }
             }

@@ -5,12 +5,50 @@
 #include <frsr/roaring/container_handle.hpp>
 #include <frsr/roaring/containers.hpp>
 
+#include <atomic>
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <new>
 #include <utility>
+
+namespace frsr::roaring::detail {
+
+// A test build that checks every mutating call against a shared chunk table (FRSR_ROARING_TEST_SHARE_EVERY_TABLE):
+// a store whose table holds entries counts as shared from the start of each outermost mutating call on the thread
+// (a write_scope) until that call has given it a table of its own (chunk_store::make_unique), which then really
+// copies the table. A write that comes before it trips the assertion of the accessor it uses. In any other build
+// a write_scope is an empty object.
+#if FRSR_ROARING_TEST_SHARE_EVERY_TABLE
+namespace share_every_table {
+    inline std::atomic<std::uint64_t> next_call{ 1 };
+    inline thread_local std::uint64_t call { 0 };
+    inline thread_local std::uint32_t depth{ 0 };
+} // namespace share_every_table
+
+class write_scope {
+public:
+    write_scope() noexcept {
+        if ( share_every_table::depth++ == 0 ) {
+            share_every_table::call = share_every_table::next_call.fetch_add( 1, std::memory_order_relaxed );
+        }
+    }
+    ~write_scope() noexcept { --share_every_table::depth; }
+    write_scope( write_scope const & ) = delete;
+    write_scope & operator=( write_scope const & ) = delete;
+};
+#else
+struct write_scope {};
+#endif
+} // namespace frsr::roaring::detail
+
+// Opens the write_scope of a mutating call: an object in the build that tests the sharing, nothing at all in any other.
+#if FRSR_ROARING_TEST_SHARE_EVERY_TABLE
+#   define FRSR_ROARING_WRITE_SCOPE [[maybe_unused]] ::frsr::roaring::detail::write_scope const frsr_roaring_write_scope
+#else
+#   define FRSR_ROARING_WRITE_SCOPE static_assert( true )
+#endif
 
 namespace frsr::roaring::detail {
 
@@ -45,8 +83,71 @@ private:
 public:
     using cursor = typename live_table::cursor;
 
+    // Whether a copy of the store shares its chunk table instead of copying it: a refcounted policy and a flat
+    // table. A copy then costs one count on the table, and the first change of either store gives it a table of
+    // its own (make_unique). A wide-key table is copied entry by entry.
+    static constexpr bool table_sharing{ !wide && flat_table::shareable };
+
     [[nodiscard]] std::size_t size () const noexcept { return live_.size();  }
     [[nodiscard]] bool        empty() const noexcept { return live_.empty(); }
+
+    // Whether another store holds this store's chunk table too. A pure read.
+    [[nodiscard]] bool shared() const noexcept {
+        if constexpr ( table_sharing ) {
+            return live_.shared();
+        } else {
+            return false;
+        }
+    }
+
+    // Whether this store and `other` hold the same chunk table.
+    [[nodiscard]] bool shares_storage_with( chunk_store const & other ) const noexcept {
+        if constexpr ( table_sharing ) {
+            return live_.shares_block_with( other.live_ );
+        } else {
+            return false;
+        }
+    }
+
+    // Whether the table must be made this store's own (make_unique) before anything in it is written: it is
+    // shared, or, in a build that tests the sharing (write_scope), it holds entries and has not been made unique
+    // in the current mutating call.
+    [[nodiscard]] bool must_unshare() const noexcept {
+        if constexpr ( table_sharing ) {
+#if FRSR_ROARING_TEST_SHARE_EVERY_TABLE
+            if ( live_.size() != 0 && unique_call_ != share_every_table::call ) {
+                return true;
+            }
+#endif
+            return live_.shared();
+        } else {
+            return false;
+        }
+    }
+
+    // Gives the store a chunk table of its own, with room for `min_capacity` entries, when it must_unshare(). The
+    // entries keep their positions, so cursors stay valid; slot pointers do not (the generation advances).
+    void make_unique( std::size_t const min_capacity = 0 ) {
+        if constexpr ( table_sharing ) {
+            if ( must_unshare() ) {
+                live_.detach( static_cast<std::uint32_t>( min_capacity ) );
+                ++generation_;
+#if FRSR_ROARING_TEST_SHARE_EVERY_TABLE
+                unique_call_ = share_every_table::call;
+#endif
+            }
+        } else {
+            (void)min_capacity;
+        }
+    }
+
+    // The entry at `at` for writing, which the table must allow (make_unique).
+    [[nodiscard]] handle_type & writable_slot( cursor const at ) noexcept {
+        if constexpr ( table_sharing ) {
+            note_write();
+        }
+        return live_.slot( at );
+    }
 
     // Structure generation: advances whenever a live slot may have moved or
     // died (relocation, insert, erase, compaction, swap, clear), so a
@@ -63,7 +164,13 @@ public:
 
     // The entry at `at`, which must not be end().
     [[nodiscard]] chunk_type key( cursor const at ) const noexcept { return static_cast<chunk_type>( live_.key( at ) ); }
-    [[nodiscard]] handle_type       & slot( cursor const at )       noexcept { return live_.slot( at ); }
+    // The non-const forms are for writing: the table must allow it (make_unique).
+    [[nodiscard]] handle_type       & slot( cursor const at )       noexcept {
+        if constexpr ( table_sharing ) {
+            note_write();
+        }
+        return live_.slot( at );
+    }
     [[nodiscard]] handle_type const & slot( cursor const at ) const noexcept { return live_.slot( at ); }
 
     // The first entry whose key is not below `key` (end() if there is none). A pure read.
@@ -77,7 +184,12 @@ public:
     [[nodiscard]] cursor lower_bound( chunk_type const key, cursor const from ) const noexcept { return live_.lower_bound( key, from ); }
 
     // The handles in key order.
-    [[nodiscard]] auto slots()       noexcept { return live_.slots(); }
+    [[nodiscard]] auto slots()       noexcept {
+        if constexpr ( table_sharing ) {
+            note_write();
+        }
+        return live_.slots();
+    }
     [[nodiscard]] auto slots() const noexcept { return std::as_const( live_ ).slots(); }
 
     // Whether the table is held by a directory instead of a tree (a wide chunk key only).
@@ -92,8 +204,11 @@ public:
     // Compaction (bitmap::shrink_to_fit): releases the parked scratch payloads
     // and the chunk table's spare capacity. Scratch reuse repopulates on the
     // next combine, so this is a footprint/throughput trade the CALLER asked for
-    // — never call it from a set operation.
+    // — never call it from a set operation. The table must allow writing (make_unique).
     void shrink_to_fit() {
+        if constexpr ( table_sharing ) {
+            note_write();
+        }
         retired_.release();
         retired_array_next_ = retired_bitset_next_ = 0;
         live_.shrink_to_fit();
@@ -102,6 +217,9 @@ public:
 
     // Makes room for `capacity` entries ahead of an append run. A tree grows by node and has no use for it.
     void reserve( std::size_t const capacity ) {
+        if constexpr ( table_sharing ) {
+            note_write();
+        }
         if constexpr ( !wide ) {
             if ( live_.reserve( capacity ) ) { ++generation_; }
         } else {
@@ -110,13 +228,23 @@ public:
     }
 
     // Retired slots (scratch payload reuse) are deliberately per-instance
-    // transient state: copies start with none.
+    // transient state: copies start with none. A copy shares the chunk table where table_sharing holds.
     chunk_store() = default;
-    chunk_store( chunk_store const & other ) { live_.copy_from( other.live_ ); }
+    chunk_store( chunk_store const & other ) {
+        if constexpr ( table_sharing ) {
+            live_.share_from( other.live_ );
+        } else {
+            live_.copy_from( other.live_ );
+        }
+    }
     chunk_store( chunk_store && ) noexcept = default;
     chunk_store & operator=( chunk_store const & other ) {
         if ( this != &other ) [[likely]] {
-            live_.copy_from( other.live_ );
+            if constexpr ( table_sharing ) {
+                live_.share_from( other.live_ );
+            } else {
+                live_.copy_from( other.live_ );
+            }
             ++generation_;
         }
         return *this;
@@ -126,12 +254,24 @@ public:
         retired_             = std::move( other.retired_ );
         retired_array_next_  = other.retired_array_next_;
         retired_bitset_next_ = other.retired_bitset_next_;
+#if FRSR_ROARING_TEST_SHARE_EVERY_TABLE
+        unique_call_         = other.unique_call_;
+#endif
         ++generation_;
         return *this;
     }
 
+    // Empties the store. A shared table is let go of, not emptied.
     void clear() noexcept {
-        live_   .destroy_all();
+        if constexpr ( table_sharing ) {
+            if ( live_.shared() ) {
+                live_.release();
+            } else {
+                live_.destroy_all();
+            }
+        } else {
+            live_.destroy_all();
+        }
         retired_.destroy_all();
         retired_array_next_ = retired_bitset_next_ = 0;
         ++generation_;
@@ -143,7 +283,9 @@ public:
     // hand back to the next run's materializing sites. A flat table swaps with
     // the pool, which also recycles the previous generation's pool back as the
     // live table, so the chunk table itself keeps its capacity across runs too.
-    // A tree moves its handles into the pool and frees its nodes.
+    // A tree moves its handles into the pool and frees its nodes. A shared table
+    // parks nothing (its payloads are its co-owners' too): it is let go of, and
+    // the emptied pool becomes the live table.
     void clear_retiring_slots() noexcept {
         retired_.destroy_all();
         // An empty live table has nothing to park, and keeps its capacity: the
@@ -155,6 +297,11 @@ public:
                     retired_.push_back( chunk_type{}, std::move( slot ) );
                 }
                 live_.destroy_all();
+            } else if constexpr ( table_sharing ) {
+                if ( live_.shared() ) {
+                    live_.release();
+                }
+                live_.swap( retired_ );
             } else {
                 live_.swap( retired_ );
             }
@@ -217,6 +364,9 @@ public:
     // non-relocating push_back). The opened slot is not part of the table until committed: a caller
     // that abandons it must leave it owning no payload.
     [[nodiscard]] handle_type * open_back() {
+        if constexpr ( table_sharing ) {
+            note_write();
+        }
         bool moved;
         auto * const slot{ live_.open_back( moved ) };
         if ( moved ) [[unlikely]] { ++generation_; }
@@ -224,6 +374,9 @@ public:
     }
 
     void commit_back( chunk_type const key ) {
+        if constexpr ( table_sharing ) {
+            note_write();
+        }
         live_.commit_back( key );
     }
 
@@ -266,12 +419,25 @@ public:
         explicit rewriter( chunk_store & store ) : store_{ &store }, inner_{ store.live_, retire_into{ &store } } {}
 
         // The entry at `from`, which the walk has finished with, is kept.
-        void keep( cursor const from ) { inner_.keep( from ); }
+        void keep( cursor const from ) {
+            if constexpr ( table_sharing ) {
+                store_->note_write();
+            }
+            inner_.keep( from );
+        }
 
         // The walk's current entry is replaced by (key, container).
-        void put( chunk_type const key, handle_type && container ) { inner_.put( key, std::move( container ) ); }
+        void put( chunk_type const key, handle_type && container ) {
+            if constexpr ( table_sharing ) {
+                store_->note_write();
+            }
+            inner_.put( key, std::move( container ) );
+        }
 
         void finish() noexcept {
+            if constexpr ( table_sharing ) {
+                store_->note_write();
+            }
             inner_.finish();
             ++store_->generation_;
         }
@@ -286,23 +452,39 @@ public:
         typename live_table::template rewriter<retire_into>    inner_;
     };
 
+    // Exchanges the chunk tables only: each store keeps its pool of parked payloads.
+    void swap_tables_with( chunk_store & other ) noexcept {
+        live_.swap( other.live_ );
+        ++generation_;
+        ++other.generation_;
+    }
+
     void swap( chunk_store & other ) noexcept {
         live_   .swap( other.live_    );
         retired_.swap( other.retired_ );
         std::swap( retired_array_next_ , other.retired_array_next_  );
         std::swap( retired_bitset_next_, other.retired_bitset_next_ );
+#if FRSR_ROARING_TEST_SHARE_EVERY_TABLE
+        std::swap( unique_call_, other.unique_call_ );
+#endif
         ++generation_;
         ++other.generation_;
     }
 
     template <typename Handle>
     void push_back( chunk_type const key, Handle && handle ) {
+        if constexpr ( table_sharing ) {
+            note_write();
+        }
         if ( live_.push_back( key, std::forward<Handle>( handle ) ) ) [[unlikely]] { ++generation_; }   // this append relocated
     }
 
     // Inserts before `at` (the lower_bound of `key`) and returns the position of the new entry.
     template <typename Handle>
     cursor insert( cursor const at, chunk_type const key, Handle && handle ) {
+        if constexpr ( table_sharing ) {
+            note_write();
+        }
         auto const inserted{ live_.insert( at, key, std::forward<Handle>( handle ) ) };
         ++generation_;
         return inserted;
@@ -314,18 +496,38 @@ public:
     // inserts each.
     template <typename Wanted>
     void insert_absent_from( chunk_store const & other, std::size_t const count, Wanted const & wanted ) {
+        if constexpr ( table_sharing ) {
+            note_write();
+        }
         live_.insert_absent_from( other.live_, static_cast<std::uint32_t>( count ), wanted );
         ++generation_;
     }
 
     // Removes the entry at `at` and returns the position of the entry that followed it.
     cursor erase( cursor const at ) {
+        if constexpr ( table_sharing ) {
+            note_write();
+        }
         auto const following{ live_.erase( at ) };
         ++generation_;
         return following;
     }
 
 private:
+    // Every write into the live table comes here first: the table must not need make_unique. In the build that tests
+    // the sharing, a table that is empty when it is written is this call's own from then on.
+    void note_write() noexcept {
+#if FRSR_ROARING_TEST_SHARE_EVERY_TABLE
+        if constexpr ( table_sharing ) {
+            assert( share_every_table::depth != 0 && "a write outside a mutating call: it opens no write_scope" );
+            if ( live_.size() == 0 ) {
+                unique_call_ = share_every_table::call;
+            }
+        }
+#endif
+        assert( !must_unshare() && "the chunk table is shared: make_unique() first" );
+    }
+
     live_table live_;
     // Scratch payload reuse (clear_retiring_slots / retire / take_retired):
     // consumed slots offered for in-place rebuild; per-kind claim cursors. Only
@@ -334,6 +536,10 @@ private:
     std::uint32_t retired_array_next_ { 0 };
     std::uint32_t retired_bitset_next_{ 0 };
     std::uint32_t generation_         { 0 };
+#if FRSR_ROARING_TEST_SHARE_EVERY_TABLE
+    // The mutating call (write_scope) in which the table was last made this store's own.
+    std::uint64_t unique_call_        { 0 };
+#endif
 };
 
 } // namespace frsr::roaring::detail

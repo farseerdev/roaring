@@ -40,6 +40,9 @@ std::atomic<std::size_t> g_live_allocations { 0 };
 
 #if FRSR_TESTS_COUNT_ALLOCATIONS
 [[nodiscard]] void * counted_allocate( std::size_t const size ) {
+    if ( auto const hook{ frsr::roaring::kernel_test::alloc_fault::on_allocate } ) {
+        hook();
+    }
     if ( frsr::roaring::kernel_test::alloc_fault::should_fail() ) {
         throw std::bad_alloc{};
     }

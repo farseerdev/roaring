@@ -373,6 +373,7 @@ bool bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy>::frozen_view::cont
 template <std::unsigned_integral Key, typename ContainerSet, typename CowPolicy, typename RunSelectionPolicy>
     requires detail::valid_container_set<Key, ContainerSet>
 bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy> bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy>::frozen_view::materialize() const {
+    FRSR_ROARING_WRITE_SCOPE;
     bitmap result;
     if ( header_ == nullptr || header_->chunk_count == 0U ) {
         return result;
@@ -426,6 +427,7 @@ bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy> bitmap<Key, ContainerSe
 template <std::unsigned_integral Key, typename ContainerSet, typename CowPolicy, typename RunSelectionPolicy>
     requires detail::valid_container_set<Key, ContainerSet>
 void bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy>::frozen_view::borrow_into( bitmap & out ) const {
+    FRSR_ROARING_WRITE_SCOPE;
     out = bitmap{};
     if ( header_ == nullptr || header_->chunk_count == 0U ) {
         return;
@@ -1041,6 +1043,7 @@ bool bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy>::portable_read_32(
 template <std::unsigned_integral Key, typename ContainerSet, typename CowPolicy, typename RunSelectionPolicy>
     requires detail::valid_container_set<Key, ContainerSet>
 std::optional<bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy>> bitmap<Key, ContainerSet, CowPolicy, RunSelectionPolicy>::portable_deserialize( std::span<std::byte const> const in ) requires ( std::numeric_limits<Key>::digits >= 32 ) {
+    FRSR_ROARING_WRITE_SCOPE;
     static_assert( std::numeric_limits<key_type>::digits == 32 || std::numeric_limits<key_type>::digits == 64, "the portable format is defined for 32- and 64-bit keys" );
     bitmap result;
     std::size_t total{ 0 };

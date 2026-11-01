@@ -26,6 +26,8 @@ namespace frsr::roaring::kernel_test::alloc_fault {
 
 inline thread_local std::uint32_t period { 0 };
 inline thread_local std::uint32_t counter{ 0 };
+// Called by every allocation of the thread while set: lets a test pause a thread at an allocation.
+inline thread_local void ( *on_allocate )() { nullptr };
 
 [[nodiscard]] inline bool should_fail() noexcept { return period != 0 && ++counter % period == 0; }
 

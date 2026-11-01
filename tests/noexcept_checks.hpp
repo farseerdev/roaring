@@ -20,12 +20,13 @@ inline constexpr bool terminates{ detail::allocation_failure_terminates };
 template <typename Bitmap>
 struct checks {
     using key_type = typename Bitmap::key_type;
+    // Whether copies share the chunk table: a refcounted policy and a key of up to 32 bits.
+    static constexpr bool shares_tables{ Bitmap::cow_policy::refcounted && sizeof( key_type ) <= sizeof( std::uint32_t ) };
 
     // operations that never allocate
     static_assert( noexcept( std::declval<Bitmap &>().clear() ) );
     static_assert( noexcept( std::declval<Bitmap &>().clear_keep_capacity() ) );
     static_assert( noexcept( std::declval<Bitmap &>().swap( std::declval<Bitmap &>() ) ) );
-    static_assert( noexcept( std::declval<Bitmap &>().repair_cardinality() ) );
     static_assert( std::is_nothrow_move_constructible_v<Bitmap> );
     static_assert( std::is_nothrow_move_assignable_v<Bitmap> );
     static_assert( std::is_nothrow_destructible_v<Bitmap> );
@@ -34,6 +35,8 @@ struct checks {
     static_assert( noexcept( std::declval<Bitmap const &>().intersects( std::declval<Bitmap const &>() ) ) );
 
     // operations that may allocate: noexcept exactly when allocation failure terminates
+    // (the repair of a lazy fold allocates only to make a table a copy shares the bitmap's own)
+    static_assert( noexcept( std::declval<Bitmap &>().repair_cardinality() ) == ( terminates || !shares_tables ) );
     static_assert( std::is_nothrow_copy_constructible_v<Bitmap> == terminates );
     static_assert( std::is_nothrow_copy_assignable_v<Bitmap> == terminates );
     static_assert( noexcept( std::declval<Bitmap &>().add( std::declval<key_type>() ) ) == terminates );

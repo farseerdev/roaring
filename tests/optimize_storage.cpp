@@ -11,6 +11,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -96,6 +97,19 @@ template <typename F>
     return fault::counter - before;
 }
 
+// A pass that keeps every container allocates nothing on a chunk table of its own. A shared table (a copy's, with table
+// sharing on; every table, in the build that counts every table as shared) is made the bitmap's own, or the pass runs
+// on a copy of it, which allocates.
+template <typename Bitmap>
+[[nodiscard]] bool owns_table( Bitmap const & bitmap ) {
+#if FRSR_ROARING_TEST_SHARE_EVERY_TABLE
+    std::ignore = bitmap;
+    return false;
+#else
+    return bitmap.is_unique();
+#endif
+}
+
 // Both optimize calls, each on its own copy: the kind they leave and whether the chunk was left as it was.
 template <typename Bitmap>
 void expect_settles( values_t const & values, kind const before, kind const after ) {
@@ -103,6 +117,7 @@ void expect_settles( values_t const & values, kind const before, kind const afte
     ASSERT_EQ( only_kind( source ), before );
     for ( auto const keep_bitsets : { false, true } ) {
         auto copy{ source };
+        auto const owned{ owns_table( copy ) };
         auto const allocations{ allocations_during( [ & ] {
             if ( keep_bitsets ) {
                 copy.optimize_keep_bitsets();
@@ -115,7 +130,7 @@ void expect_settles( values_t const & values, kind const before, kind const afte
         EXPECT_EQ( contents( source ), values );
         EXPECT_EQ( only_kind( source ), before );
         EXPECT_EQ( copy.validate(), nullptr );
-        if ( before == after ) {
+        if ( before == after && owned ) {
             EXPECT_EQ( allocations, 0U ) << "keep_bitsets=" << keep_bitsets;
         }
     }
@@ -144,6 +159,7 @@ TYPED_TEST( OptimizeStorage, RunToSelf ) {
     ASSERT_EQ( only_kind( source ), kind::run );
     for ( auto const keep_bitsets : { false, true } ) {
         auto copy{ source };
+        auto const owned{ owns_table( copy ) };
         auto const allocations{ allocations_during( [ & ] {
             if ( keep_bitsets ) {
                 copy.optimize_keep_bitsets();
@@ -153,7 +169,9 @@ TYPED_TEST( OptimizeStorage, RunToSelf ) {
         } ) };
         EXPECT_EQ( only_kind( copy ), kind::run );
         EXPECT_EQ( contents( copy ), values );
-        EXPECT_EQ( allocations, 0U ) << "keep_bitsets=" << keep_bitsets;
+        if ( owned ) {
+            EXPECT_EQ( allocations, 0U ) << "keep_bitsets=" << keep_bitsets;
+        }
     }
 }
 
@@ -203,9 +221,12 @@ TYPED_TEST( OptimizeStorage, RunShapedPassThenOptimizeLeavesTheChunk ) {
     auto bitmap{ make<TypeParam>( values ) };
     bitmap.optimize_run_shaped( 32U );
     ASSERT_EQ( only_kind( bitmap ), kind::run );
+    auto const owned{ owns_table( bitmap ) };
     auto const allocations{ allocations_during( [ & ] { bitmap.optimize_keep_bitsets(); } ) };
     EXPECT_EQ( only_kind( bitmap ), kind::run );
-    EXPECT_EQ( allocations, 0U );
+    if ( owned ) {
+        EXPECT_EQ( allocations, 0U );
+    }
     EXPECT_EQ( contents( bitmap ), values );
 }
 
@@ -229,8 +250,11 @@ TYPED_TEST( OptimizeStorage, MixedChunksSettleOnceThenStay ) {
     EXPECT_EQ( contents( bitmap ), values );
 
     auto copy{ bitmap };
+    auto const owned{ owns_table( copy ) };
     auto const allocations{ allocations_during( [ & ] { copy.optimize_keep_bitsets(); } ) };
-    EXPECT_EQ( allocations, 0U );
+    if ( owned ) {
+        EXPECT_EQ( allocations, 0U );
+    }
     auto const twice{ copy.statistics() };
     EXPECT_EQ( twice.run_containers, once.run_containers );
     EXPECT_EQ( twice.array_containers, once.array_containers );

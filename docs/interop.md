@@ -177,7 +177,8 @@ whose size is known); `jaccard_index` of two empty sets is NaN, as in the refere
 
 `bitmap::borrowed_copy( view_of( b ) )` is a copy of the finished bitmap `b` whose spilled containers are borrowed
 aliases of those of `b` (the way a bitmap served from a mapped file borrows its payloads): making it writes nothing to
-`b`, where copying a bitmap under a counting policy writes one count per container, and it copies no payload. The first
+`b`, where copying a bitmap under a counting policy writes a count (one on the chunk table for keys of up to 32 bits,
+one per container for wider keys), and it copies no payload. The first
 update of a container of the copy clones that container into private storage, so the copy is as mutable as any bitmap
 and `b` is never changed through it.
 

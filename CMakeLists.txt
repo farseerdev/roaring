@@ -69,6 +69,14 @@ else()
 endif()
 add_library(frsr::roaring ALIAS frsr_roaring)
 
+# A test build: every chunk table that copies could share counts as shared at the start of every call that may
+# change the bitmap, so the call has to give it a table of its own before it writes anything (see write_scope in
+# chunk_store.hpp). Meant for a build with assertions on, running the whole test suite.
+option(FRSR_ROARING_TEST_SHARE_EVERY_TABLE "Count every chunk table as shared at the start of each mutating call (a test build)" OFF)
+if(FRSR_ROARING_TEST_SHARE_EVERY_TABLE)
+    target_compile_definitions(frsr_roaring ${_frsr_scope} FRSR_ROARING_TEST_SHARE_EVERY_TABLE=1)
+endif()
+
 target_include_directories(frsr_roaring
     ${_frsr_scope}
         ${PROJECT_SOURCE_DIR}/include
@@ -301,6 +309,7 @@ if(FRSR_ROARING_BUILD_TESTS)
         tests/bitmap_bounds.cpp
         tests/bitmap_iteration.cpp
         tests/in_place_allocation_failure.cpp
+        tests/table_sharing.cpp
     )
     target_link_libraries(frsr_roaring_tests
         PRIVATE

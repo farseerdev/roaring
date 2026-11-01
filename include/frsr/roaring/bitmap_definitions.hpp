@@ -171,7 +171,13 @@ FRSR_ROARING_DEFINITION_INLINE bool FRSR_ROARING_BITMAP::intersects( bitmap cons
 
 FRSR_ROARING_BITMAP_TEMPLATE
 FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::add_many_sorted( std::span<key_type const> const sorted_values ) noexcept( detail::allocation_failure_terminates ) {
+    FRSR_ROARING_WRITE_SCOPE;
     settle_counts();
+    if constexpr ( table_sharing ) {
+        if ( unchanged_while_shared( [ this, sorted_values ] { return holds_all( sorted_values ); } ) ) {
+            return;
+        }
+    }
     for_each_chunk_group( sorted_values, [ & ]( chunk_type const chunk, std::span<low_type const> const lows ) {
         auto const at{ chunks_.lower_bound( chunk ) };
         if ( at == chunks_.end() || chunks_.key( at ) != chunk ) {
@@ -187,7 +193,13 @@ FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::add_many_sorted( std::s
 FRSR_ROARING_BITMAP_TEMPLATE
 FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::remove_many_sorted( std::span<key_type const> const sorted_values ) noexcept( detail::allocation_failure_terminates ) {
     assert( std::ranges::is_sorted( sorted_values ) );
+    FRSR_ROARING_WRITE_SCOPE;
     settle_counts();
+    if constexpr ( table_sharing ) {
+        if ( unchanged_while_shared( [ this, sorted_values ] { return !holds_any( sorted_values ); } ) ) {
+            return;
+        }
+    }
     for_each_chunk_group( sorted_values, [ & ]( chunk_type const chunk, std::span<low_type const> const lows ) {
         auto const at{ chunks_.lower_bound( chunk ) };
         if ( at == chunks_.end() || chunks_.key( at ) != chunk ) {
@@ -206,6 +218,7 @@ FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::remove_many_sorted( std
 
 FRSR_ROARING_BITMAP_TEMPLATE
 FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::add_sorted_many( std::span<key_type const> const sorted_values, std::uint16_t const bitset_threshold ) {
+    FRSR_ROARING_WRITE_SCOPE;
     if ( sorted_values.empty() ) {
         return;
     }
@@ -218,6 +231,10 @@ FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::add_sorted_many( std::s
         return;
     }
 
+    // Appending writes the table: a shared one is made this bitmap's own first.
+    if constexpr ( table_sharing ) {
+        unshare();
+    }
     auto const end{ sorted_values.end() };
     auto group{ sorted_values.begin() };
     while ( group != end ) {
@@ -233,16 +250,19 @@ FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::add_sorted_many( std::s
 
 FRSR_ROARING_BITMAP_TEMPLATE
 FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::add_closed_range( key_type const begin_value, key_type const end_value ) noexcept( detail::allocation_failure_terminates ) {
+    FRSR_ROARING_WRITE_SCOPE;
     apply_closed_range_operation( begin_value, end_value, detail::range_operation::add );
 }
 
 FRSR_ROARING_BITMAP_TEMPLATE
 FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::remove_closed_range( key_type const begin_value, key_type const end_value ) noexcept( detail::allocation_failure_terminates ) {
+    FRSR_ROARING_WRITE_SCOPE;
     apply_closed_range_operation( begin_value, end_value, detail::range_operation::remove );
 }
 
 FRSR_ROARING_BITMAP_TEMPLATE
 FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::flip_closed_range( key_type const begin_value, key_type const end_value ) noexcept( detail::allocation_failure_terminates ) {
+    FRSR_ROARING_WRITE_SCOPE;
     apply_closed_range_operation( begin_value, end_value, detail::range_operation::flip );
 }
 
@@ -271,6 +291,7 @@ FRSR_ROARING_DEFINITION_INLINE auto FRSR_ROARING_BITMAP::to_vector() const -> de
 
 FRSR_ROARING_BITMAP_TEMPLATE
 FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::union_into( bitmap const & other, bitmap & scratch ) const noexcept( detail::allocation_failure_terminates ) {
+    FRSR_ROARING_WRITE_SCOPE;
     if ( this == &other ) {
         scratch = *this;
         return;
@@ -367,6 +388,7 @@ FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::union_into( bitmap cons
 
 FRSR_ROARING_BITMAP_TEMPLATE
 FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::difference_into( bitmap const & other, bitmap & scratch ) const noexcept( detail::allocation_failure_terminates ) {
+    FRSR_ROARING_WRITE_SCOPE;
     assert( &scratch != this && &scratch != &other );
     if ( this == &other ) {
         scratch.clear_keep_capacity();
@@ -552,6 +574,9 @@ void FRSR_ROARING_BITMAP::union_same_key( detail::chunk_store<layout_type, CowPo
 FRSR_ROARING_BITMAP_TEMPLATE
 template <bool Lazy>
 FRSR_ROARING_DEFINITION_INLINE auto FRSR_ROARING_BITMAP::union_few( bitmap const & other ) -> bitmap & {
+    if constexpr ( table_sharing ) {
+        unshare();
+    }
     constexpr bool lazy{ Lazy };
     detail::small_array_values<low_type> array_union_scratch;
     std::size_t added{ 0 };
@@ -595,6 +620,9 @@ FRSR_ROARING_DEFINITION_INLINE auto FRSR_ROARING_BITMAP::union_few( bitmap const
 FRSR_ROARING_BITMAP_TEMPLATE
 template <bool Lazy>
 FRSR_ROARING_DEFINITION_INLINE auto FRSR_ROARING_BITMAP::union_merge( bitmap const & other ) -> bitmap & {
+    if constexpr ( table_sharing ) {
+        unshare();
+    }
     constexpr bool lazy{ Lazy };
     // A key-by-key insertion costs a search of this table per key of the other (about log2 of its size, a tenth
     // of it or less); the single merge pass costs a move of every entry of this table. The searches win until the
@@ -723,7 +751,12 @@ FRSR_ROARING_DEFINITION_INLINE auto FRSR_ROARING_BITMAP::union_merge( bitmap con
 }
 
 FRSR_ROARING_BITMAP_TEMPLATE
-FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::repair_cardinality() noexcept {
+FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::repair_cardinality() noexcept( !table_sharing || detail::allocation_failure_terminates ) {
+    // Only a lazy fold leaves counts to repair; a copy taken in the middle of one shares the table, which the repair then
+    // makes this bitmap's own (that allocates, so this may fail as any change of the bitmap may).
+    if constexpr ( table_sharing ) {
+        unshare();
+    }
     size_ = 0;
     for ( auto & slot : chunks_.slots() ) {
         if ( slot.holds_bitset() && !slot.cardinality_valid() ) {
@@ -745,6 +778,9 @@ FRSR_ROARING_DEFINITION_INLINE auto FRSR_ROARING_BITMAP::combine( bitmap const &
     constexpr auto op      { Op };
     constexpr auto in_place{ InPlace };
     assert( in_place == ( out == nullptr ) );
+    if constexpr ( table_sharing && InPlace ) {
+        unshare();
+    }
     auto const keep_unmatched_left{ op == detail::set_operation::bit_andnot };
 #if FRSR_ROARING_COMBINE_STATS
     detail::combine_stats().record_call( chunks_.size(), other.chunks_.size() );
@@ -847,7 +883,9 @@ FRSR_ROARING_DEFINITION_INLINE auto FRSR_ROARING_BITMAP::combine( bitmap const &
                 continue;
             }
 
-            auto       & left_container { chunks_.slot( left ) };
+            // The materializing form reads this bitmap only (a const one, reached through intersect_into), whose table may
+            // be shared: it is read through the const table, and none of the arms that write it runs.
+            auto       & left_container { InPlace || !table_sharing ? chunks_.slot( left ) : const_cast<handle_type &>( std::as_const( chunks_ ).slot( left ) ) };
             auto const & right_container{ other.chunks_.slot( right ) };
     #if FRSR_ROARING_COMBINE_STATS
             detail::combine_stats().record_pair( left_container, right_container, op );
@@ -1248,6 +1286,13 @@ FRSR_ROARING_DEFINITION_INLINE auto FRSR_ROARING_BITMAP::combine( bitmap const &
 
 FRSR_ROARING_BITMAP_TEMPLATE
 FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::bulk_or_inplace( bitmap const & other ) noexcept( detail::allocation_failure_terminates ) {
+    FRSR_ROARING_WRITE_SCOPE;
+    // A fold that starts from a copy shares its table until a union adds something.
+    if constexpr ( table_sharing ) {
+        if ( shares_storage_with( other ) || unchanged_while_shared( [ this, &other ] { return !counts_deferred() && other.is_subset_of( *this ); } ) ) {
+            return;
+        }
+    }
     // Counts are not maintained by the fold.
     size_ = size_deferred;
     auto const & rhs{ other.chunks_ };
@@ -1350,6 +1395,13 @@ FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::bulk_or_inplace( bitmap
 
 FRSR_ROARING_BITMAP_TEMPLATE
 FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::bulk_or_finish() noexcept( detail::allocation_failure_terminates ) {
+    FRSR_ROARING_WRITE_SCOPE;
+    // A fold none of whose steps changed a shared table leaves it as it was: there is nothing to finish.
+    if constexpr ( table_sharing ) {
+        if ( unchanged_while_shared( [ this ] { return !counts_deferred(); } ) ) {
+            return;
+        }
+    }
     repair_cardinality();
     for ( auto & slot : chunks_.slots() ) {
         slot = optimize_container_for_policy( std::move( slot ) );
@@ -1358,6 +1410,13 @@ FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::bulk_or_finish() noexce
 
 FRSR_ROARING_BITMAP_TEMPLATE
 FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::bulk_or_finish_keep_bitsets() noexcept( detail::allocation_failure_terminates ) {
+    FRSR_ROARING_WRITE_SCOPE;
+    // A fold none of whose steps changed a shared table leaves it as it was: there is nothing to finish.
+    if constexpr ( table_sharing ) {
+        if ( unchanged_while_shared( [ this ] { return !counts_deferred(); } ) ) {
+            return;
+        }
+    }
     repair_cardinality();  // bulk_or_intermediate left bitset cardinalities stale
     for ( auto & slot : chunks_.slots() ) {
         slot = optimize_container_keep_bitsets_for_policy<detail::run_selection_eager>( std::move( slot ) );
@@ -1366,6 +1425,13 @@ FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::bulk_or_finish_keep_bit
 
 FRSR_ROARING_BITMAP_TEMPLATE
 FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::bulk_or_repair_after_lazy() noexcept( detail::allocation_failure_terminates ) {
+    FRSR_ROARING_WRITE_SCOPE;
+    // A fold none of whose steps changed a shared table leaves it as it was: there is nothing to finish.
+    if constexpr ( table_sharing ) {
+        if ( unchanged_while_shared( [ this ] { return !counts_deferred(); } ) ) {
+            return;
+        }
+    }
     repair_cardinality();
     for ( auto & slot : chunks_.slots() ) {
         if ( slot.holds_bitset() && slot.cardinality() <= array_to_bitset_threshold ) {
@@ -1383,6 +1449,7 @@ FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::bulk_or_repair_after_la
 
 FRSR_ROARING_BITMAP_TEMPLATE
 FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::or_many_in_place( std::span<bitmap const * const> const others ) noexcept( detail::allocation_failure_terminates ) {
+    FRSR_ROARING_WRITE_SCOPE;
     for ( auto const other : others ) {
         if ( other != nullptr ) {
             bulk_or_intermediate( *other );
@@ -1393,6 +1460,7 @@ FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::or_many_in_place( std::
 
 FRSR_ROARING_BITMAP_TEMPLATE
 FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::or_many_sorted_in_place( std::span<bitmap const *> others ) noexcept( detail::allocation_failure_terminates ) {
+    FRSR_ROARING_WRITE_SCOPE;
     std::ranges::sort( others, []( bitmap const * const lhs, bitmap const * const rhs ) {
         return lhs->data_byte_size() > rhs->data_byte_size();
     } );
@@ -1456,6 +1524,7 @@ void FRSR_ROARING_BITMAP::xor_same_key( detail::chunk_store<layout_type, CowPoli
 
 FRSR_ROARING_BITMAP_TEMPLATE
 FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::xor_into( bitmap const & other, bitmap & scratch ) const noexcept( detail::allocation_failure_terminates ) {
+    FRSR_ROARING_WRITE_SCOPE;
     scratch.clear_keep_capacity();
     if ( this == &other ) {
         return;
@@ -1498,7 +1567,14 @@ FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::xor_into( bitmap const 
 
 FRSR_ROARING_BITMAP_TEMPLATE
 FRSR_ROARING_DEFINITION_INLINE auto FRSR_ROARING_BITMAP::xor_merge( bitmap const & other ) -> bitmap & {
+    FRSR_ROARING_WRITE_SCOPE;
     settle_counts();
+    if constexpr ( table_sharing ) {
+        if ( shares_storage_with( other ) ) {
+            clear();
+            return *this;
+        }
+    }
     if ( this == &other ) {
         clear();
         return *this;
@@ -1508,6 +1584,9 @@ FRSR_ROARING_DEFINITION_INLINE auto FRSR_ROARING_BITMAP::xor_merge( bitmap const
     }
     if ( chunks_.empty() ) {
         return *this = other;
+    }
+    if constexpr ( table_sharing ) {
+        unshare();
     }
     auto left{ chunks_.begin() };
     auto right{ other.chunks_.begin() };
@@ -1589,6 +1668,16 @@ FRSR_ROARING_DEFINITION_INLINE auto FRSR_ROARING_BITMAP::xor_merge( bitmap const
 
 FRSR_ROARING_BITMAP_TEMPLATE
 FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::bulk_xor_intermediate( bitmap const & other ) noexcept( detail::allocation_failure_terminates ) {
+    FRSR_ROARING_WRITE_SCOPE;
+    if constexpr ( table_sharing ) {
+        if ( this == &other || shares_storage_with( other ) ) {
+            clear();
+            return;
+        }
+        if ( unchanged_while_shared( [ &other ] { return other.chunks_.empty(); } ) ) {
+            return;
+        }
+    }
     // Counts are not maintained by the fold.
     size_ = size_deferred;
     if ( this == &other ) {
@@ -1653,6 +1742,13 @@ FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::lazy_xor_same_key( deta
 
 FRSR_ROARING_BITMAP_TEMPLATE
 FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::bulk_xor_repair_after_lazy() noexcept( detail::allocation_failure_terminates ) {
+    FRSR_ROARING_WRITE_SCOPE;
+    // A fold none of whose steps changed a shared table leaves it as it was: there is nothing to finish.
+    if constexpr ( table_sharing ) {
+        if ( unchanged_while_shared( [ this ] { return !counts_deferred(); } ) ) {
+            return;
+        }
+    }
     repair_cardinality();
     bool any_empty{ false };
     for ( auto & slot : chunks_.slots() ) {
@@ -1670,6 +1766,7 @@ FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::bulk_xor_repair_after_l
 
 FRSR_ROARING_BITMAP_TEMPLATE
 FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::xor_many_in_place( std::span<bitmap const * const> const others ) noexcept( detail::allocation_failure_terminates ) {
+    FRSR_ROARING_WRITE_SCOPE;
     try {
         for ( auto const other : others ) {
             if ( other != nullptr ) {
@@ -1692,6 +1789,7 @@ FRSR_ROARING_DEFINITION_INLINE auto FRSR_ROARING_BITMAP::xor_many( std::span<bit
 
 FRSR_ROARING_BITMAP_TEMPLATE
 FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::and_many_sorted_in_place( std::span<bitmap const *> others ) noexcept( detail::allocation_failure_terminates ) {
+    FRSR_ROARING_WRITE_SCOPE;
     std::ranges::sort( others, []( bitmap const * const lhs, bitmap const * const rhs ) {
         return lhs->data_byte_size() < rhs->data_byte_size();
     } );
@@ -1759,6 +1857,7 @@ FRSR_ROARING_DEFINITION_INLINE bool FRSR_ROARING_BITMAP::and_many_intersects( st
 
 FRSR_ROARING_BITMAP_TEMPLATE
 FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::intersect_into( typed_view<bitmap> const view, bitmap & out ) const noexcept( detail::allocation_failure_terminates ) {
+    FRSR_ROARING_WRITE_SCOPE;
     assert( &out != this && &out != &view.get() );
     if ( &view.get() == this ) {
         // the view names this bitmap: the answer is this bitmap, copied (a counted copy would write the counts of a view's bitmap)
@@ -1772,6 +1871,7 @@ FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::intersect_into( typed_v
 
 FRSR_ROARING_BITMAP_TEMPLATE
 FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::difference_into( typed_view<bitmap> const view, bitmap & out ) const noexcept( detail::allocation_failure_terminates ) {
+    FRSR_ROARING_WRITE_SCOPE;
     assert( &out != this && &out != &view.get() );
     detail::store_source source{ view.get().chunks_ };
     detail::interop_engine<bitmap>::andnot_stream_into( *this, source, out );
@@ -1786,6 +1886,7 @@ FRSR_ROARING_DEFINITION_INLINE auto FRSR_ROARING_BITMAP::and_many( std::span<bit
 
 FRSR_ROARING_BITMAP_TEMPLATE
 FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::and_many_into( std::span<bitmap const * const> const operands, bitmap & result ) noexcept( detail::allocation_failure_terminates ) {
+    FRSR_ROARING_WRITE_SCOPE;
     assert( std::ranges::none_of( operands, [ &result ]( bitmap const * const operand ) { return operand == &result; } ) && "the result is none of the operands" );
     result.clear_keep_capacity();
     and_many_scratch scratch;
@@ -1816,6 +1917,7 @@ FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::and_many_into( std::spa
 
 FRSR_ROARING_BITMAP_TEMPLATE
 FRSR_ROARING_DEFINITION_INLINE auto FRSR_ROARING_BITMAP::borrowed_copy( typed_view<bitmap> const view ) noexcept( detail::allocation_failure_terminates ) -> bitmap {
+    FRSR_ROARING_WRITE_SCOPE;
     bitmap result;
     auto const & source{ view.get().chunks_ };
     result.chunks_.reserve( source.size() );
@@ -1993,6 +2095,13 @@ FRSR_ROARING_DEFINITION_INLINE auto FRSR_ROARING_BITMAP::and_many_expand_run( ha
 
 FRSR_ROARING_BITMAP_TEMPLATE
 FRSR_ROARING_DEFINITION_INLINE std::size_t FRSR_ROARING_BITMAP::shrink_to_fit() noexcept( detail::allocation_failure_terminates ) {
+    FRSR_ROARING_WRITE_SCOPE;
+    // A shared table frees nothing while a co-owner holds it: the call is skipped.
+    if constexpr ( table_sharing ) {
+        if ( unchanged_while_shared( [ this ] { return chunks_.shared(); } ) ) {
+            return 0;
+        }
+    }
     std::size_t freed{ 0 };
     for ( auto & slot : chunks_.slots() ) {
         freed += detail::container_shrink_to_fit( slot );
@@ -2003,6 +2112,14 @@ FRSR_ROARING_DEFINITION_INLINE std::size_t FRSR_ROARING_BITMAP::shrink_to_fit() 
 
 FRSR_ROARING_BITMAP_TEMPLATE
 FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::promote_large_arrays( std::uint16_t const threshold ) noexcept( detail::allocation_failure_terminates ) {
+    FRSR_ROARING_WRITE_SCOPE;
+    if constexpr ( table_sharing ) {
+        if ( unchanged_while_shared( [ this, threshold ] {
+            return std::ranges::none_of( std::as_const( chunks_ ).slots(), [ threshold ]( handle_type const & slot ) { return slot.holds_array() && slot.count() >= threshold; } );
+        } ) ) {
+            return;
+        }
+    }
     for ( auto & slot : chunks_.slots() ) {
         if ( slot.holds_array() && slot.count() >= threshold ) {
             if constexpr ( supports_bitset_container ) {
@@ -2019,7 +2136,13 @@ FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::promote_large_arrays( s
 
 FRSR_ROARING_BITMAP_TEMPLATE
 FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::optimize() noexcept( detail::allocation_failure_terminates ) {
+    FRSR_ROARING_WRITE_SCOPE;
     settle_counts();
+    if constexpr ( table_sharing ) {
+        if ( ran_aside_while_shared( []( bitmap & aside ) { aside.optimize(); } ) ) {
+            return;
+        }
+    }
     for ( auto & slot : chunks_.slots() ) {
         slot = optimize_container_for_policy<detail::run_selection_eager>( std::move( slot ) );
     }
@@ -2027,7 +2150,13 @@ FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::optimize() noexcept( de
 
 FRSR_ROARING_BITMAP_TEMPLATE
 FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::optimize_keep_bitsets() noexcept( detail::allocation_failure_terminates ) {
+    FRSR_ROARING_WRITE_SCOPE;
     settle_counts();
+    if constexpr ( table_sharing ) {
+        if ( ran_aside_while_shared( []( bitmap & aside ) { aside.optimize_keep_bitsets(); } ) ) {
+            return;
+        }
+    }
     for ( auto & slot : chunks_.slots() ) {
         if constexpr ( supports_bitset_container && uses_default_container_set ) {
             if ( slot.holds_bitset() ) {
@@ -2096,7 +2225,15 @@ FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::run_encode_if_run_shape
 
 FRSR_ROARING_BITMAP_TEMPLATE
 FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::optimize_run_shaped( std::size_t const min_mean_run_length ) noexcept( detail::allocation_failure_terminates ) {
+    FRSR_ROARING_WRITE_SCOPE;
     settle_counts();
+    if constexpr ( table_sharing ) {
+        if ( unchanged_while_shared( [ this, min_mean_run_length ] {
+            return std::ranges::none_of( std::as_const( chunks_ ).slots(), [ min_mean_run_length ]( handle_type const & slot ) { return run_shaped_run_count( slot, min_mean_run_length ) != 0; } );
+        } ) ) {
+            return;
+        }
+    }
     for ( auto & slot : chunks_.slots() ) {
         run_encode_if_run_shaped( slot, min_mean_run_length );
     }
@@ -2106,6 +2243,31 @@ FRSR_ROARING_BITMAP_TEMPLATE
 FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::optimize_run_shaped( std::size_t const min_mean_run_length, touched_chunks const & touched ) const noexcept( detail::allocation_failure_terminates ) {
     // A bitmap that is published is not in the middle of a lazy fold, and a const call cannot end one.
     assert( !counts_deferred() );
+    if constexpr ( table_sharing ) {
+        // The table may be shared with copies (a reader's snapshot): it is made this bitmap's own at the first chunk
+        // that is encoded, and the copies keep the table they hold. That writes this object's own table fields, under
+        // the contract above (the object is not defined const).
+        FRSR_ROARING_WRITE_SCOPE;
+        auto & store{ const_cast<chunk_store_type &>( chunks_ ) };
+        bool unique{ !store.must_unshare() };
+        auto at{ chunks_.begin() };
+        for ( auto const chunk : touched.chunks_ ) {
+            at = chunks_.lower_bound( chunk, at );
+            if ( at == chunks_.end() ) {
+                break;
+            }
+            if ( chunks_.key( at ) != chunk || run_shaped_run_count( chunks_.slot( at ), min_mean_run_length ) == 0 ) {
+                continue;
+            }
+            if ( !unique ) [[unlikely]] {
+                store.make_unique();
+                unique = true;
+            }
+            // Replacing the handle moves nothing in the table, nor does the detach: the cursor stays valid.
+            run_encode_if_run_shaped( store.writable_slot( at ), min_mean_run_length );
+        }
+        return;
+    }
     auto at{ chunks_.begin() };
     for ( auto const chunk : touched.chunks_ ) {
         at = chunks_.lower_bound( chunk, at );
@@ -2294,6 +2456,18 @@ FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::apply_closed_range_oper
     if ( begin_value > end_value ) {
         return;
     }
+    if constexpr ( table_sharing ) {
+        if ( unchanged_while_shared( [ this, begin_value, end_value, operation ] {
+            auto const range{ key_range::closed( begin_value, end_value ) };
+            switch ( operation ) {
+                case detail::range_operation::add:    return is_superset_of( range );
+                case detail::range_operation::remove: return !intersects( range );
+                default:                              return false;   // a flip of a non-empty range changes the bitmap
+            }
+        } ) ) {
+            return;
+        }
+    }
 
     auto current{ begin_value };
     while ( true ) {
@@ -2341,6 +2515,12 @@ FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::apply_chunk_range_opera
 
 FRSR_ROARING_BITMAP_TEMPLATE
 FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::add_many_unsorted( std::span<key_type const> const values ) noexcept( detail::allocation_failure_terminates ) {
+    FRSR_ROARING_WRITE_SCOPE;
+    if constexpr ( table_sharing ) {
+        if ( unchanged_while_shared( [ this, values ] { return holds_all( values ); } ) ) {
+            return;
+        }
+    }
     if ( try_add_many_single_chunk_dense( values ) ) {
         return;
     }
@@ -2359,6 +2539,12 @@ FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::add_many_unsorted( std:
 
 FRSR_ROARING_BITMAP_TEMPLATE
 FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::remove_many_unsorted( std::span<key_type const> const values ) noexcept( detail::allocation_failure_terminates ) {
+    FRSR_ROARING_WRITE_SCOPE;
+    if constexpr ( table_sharing ) {
+        if ( unchanged_while_shared( [ this, values ] { return !holds_any( values ); } ) ) {
+            return;
+        }
+    }
     detail::heap_vector<key_type> sorted_values;
     sorted_values.reserve( static_cast<std::uint32_t>( values.size() ) );
     for ( auto const value : values ) {
@@ -2370,19 +2556,47 @@ FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::remove_many_unsorted( s
 
 FRSR_ROARING_BITMAP_TEMPLATE
 FRSR_ROARING_DEFINITION_INLINE auto FRSR_ROARING_BITMAP::operator|=( bitmap const & other ) noexcept( detail::allocation_failure_terminates ) -> bitmap & {
+    FRSR_ROARING_WRITE_SCOPE;
     settle_counts();
+    if constexpr ( table_sharing ) {
+        // A bitmap that holds the chunk table of the other holds its keys.
+        if ( shares_storage_with( other ) ) {
+            return *this;
+        }
+        // Otherwise the union is made in place, on a table of its own (union_merge makes it), as a union with a copy
+        // always was: asking first whether it adds anything costs more than it saves.
+    }
     return union_merge<false>( other );
 }
 
 FRSR_ROARING_BITMAP_TEMPLATE
 FRSR_ROARING_DEFINITION_INLINE auto FRSR_ROARING_BITMAP::operator&=( bitmap const & other ) noexcept( detail::allocation_failure_terminates ) -> bitmap & {
+    FRSR_ROARING_WRITE_SCOPE;
     settle_counts();
+    if constexpr ( table_sharing ) {
+        if ( shares_storage_with( other ) ) {
+            return *this;
+        }
+        if ( chunks_.shared() ) [[unlikely]] {
+            return combine_while_shared<detail::set_operation::bit_and>( other );
+        }
+    }
     return combine<detail::set_operation::bit_and, true>( other, nullptr );
 }
 
 FRSR_ROARING_BITMAP_TEMPLATE
 FRSR_ROARING_DEFINITION_INLINE auto FRSR_ROARING_BITMAP::operator-=( bitmap const & other ) noexcept( detail::allocation_failure_terminates ) -> bitmap & {
+    FRSR_ROARING_WRITE_SCOPE;
     settle_counts();
+    if constexpr ( table_sharing ) {
+        if ( shares_storage_with( other ) ) {
+            clear();
+            return *this;
+        }
+        if ( chunks_.shared() ) [[unlikely]] {
+            return combine_while_shared<detail::set_operation::bit_andnot>( other );
+        }
+    }
     return combine<detail::set_operation::bit_andnot, true>( other, nullptr );
 }
 
