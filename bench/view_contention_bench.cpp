@@ -24,7 +24,10 @@
 // is reported (operations per second over all threads, and per thread). Threads are pinned one per CPU of --cpus
 // when given (distinct physical cores are the caller's to choose).
 //
-//   frsr_roaring_view_contention_bench [--filter text] [--rounds n] [--ms ms] [--threads 1,2,4,8] [--cpus 0,1,2,3] [--main-cpu n] [--chunks n] [--small-chunks n]
+//   bands "contains-<n>" / "contains-<n>+copier": readers probe one published bitmap of n chunks, alone and while a thread
+//     (on --copier-cpu) copies it and drops the copy in a loop
+//
+//   frsr_roaring_view_contention_bench [--filter text] [--rounds n] [--ms ms] [--threads 1,2,4,8] [--cpus 0,1,2,3] [--main-cpu n] [--copier-cpu n] [--chunks n] [--small-chunks n]
 //
 // (--main-cpu keeps the thread that starts and stops the workers off their CPUs.)
 
@@ -43,6 +46,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 #if defined( __linux__ )
@@ -69,6 +73,7 @@ struct options {
     std::vector<unsigned> threads{ 1, 2, 4, 8 };
     std::vector<int>      cpus;
     int                   main_cpu{ -1 };
+    int                   copier_cpu{ -1 };
     std::size_t           chunks{ 64 };
     std::size_t           small_chunks{ 4000 };
 };
@@ -189,8 +194,13 @@ double run_threads( unsigned const thread_count, options const & opts, std::func
 
 using body_factory = std::function<std::function<std::uint64_t()>( unsigned const )>;
 
+// Whether --filter selects a band of this name.
+bool wanted( std::string const & name, options const & opts ) {
+    return opts.filter.empty() || name.find( opts.filter ) != std::string::npos;
+}
+
 void run_band( std::string const & name, std::vector<std::pair<std::string, body_factory>> arms, options const & opts ) {
-    if ( !opts.filter.empty() && name.find( opts.filter ) == std::string::npos ) { return; }
+    if ( !wanted( name, opts ) ) { return; }
     for ( auto const threads : opts.threads ) {
         std::vector<double> best( arms.size(), 0.0 );
         for ( int round{ 0 }; round < opts.rounds; ++round ) {
@@ -250,6 +260,10 @@ roaring_set make_roaring_set( std::vector<counted_bitmap> const & published ) {
 #endif
 
 void and_bands( options const & opts, bool const small ) {
+    std::string const suffix{ small ? "-small" : "" };
+    if ( !wanted( "and3" + suffix, opts ) && !wanted( "and5" + suffix, opts ) ) {
+        return;
+    }
     auto const published{ std::make_shared<std::vector<counted_bitmap>>( small ? make_published_small<counted_bitmap>( 6, opts.small_chunks )
                                                                                : make_published<counted_bitmap>( 6, opts.chunks ) ) };
 #if FRSR_ROARING_HAS_CROARING
@@ -352,6 +366,9 @@ void and_bands( options const & opts, bool const small ) {
 // ---- the copy band ----------------------------------------------------------------------------------------------
 
 void copy_band( options const & opts ) {
+    if ( !wanted( "copy", opts ) && !wanted( "copy+update", opts ) ) {
+        return;
+    }
     auto const counted{ std::make_shared<counted_bitmap>( std::move( make_published<counted_bitmap>( 1, opts.chunks ).front() ) ) };
     auto const value{ std::make_shared<value_bitmap>( std::move( make_published<value_bitmap>( 1, opts.chunks ).front() ) ) };
     // the update of a copy: a few keys into 1% of the containers (at least one), which clones those containers
@@ -391,6 +408,66 @@ void copy_band( options const & opts ) {
     }
 }
 
+// ---- the contains bands -------------------------------------------------------------------------------------------
+
+// Readers probing a published bitmap while copies of it are taken and dropped on another thread: a copy writes the count
+// of the shared chunk table, so the readers' throughput tells whether that count shares a cache line with what a lookup
+// reads (the keys, the handles). Band "contains-<n>": the readers alone; "contains-<n>+copier": the same with a thread
+// (on --copier-cpu) that copies the bitmap and drops the copy in a loop. Tables of 12 and 64 chunks of small arrays.
+void contains_bands( options const & opts ) {
+    for ( std::size_t const chunks : { std::size_t{ 12 }, std::size_t{ 64 } } ) {
+        auto const name{ "contains-" + std::to_string( chunks ) };
+        if ( !wanted( name, opts ) && !wanted( name + "+copier", opts ) ) {
+            continue;
+        }
+        auto const published{ std::make_shared<counted_bitmap>() };
+        std::mt19937_64 rng{ 77 };
+        for ( std::size_t c{ 0 }; c < chunks; ++c ) {
+            auto const base{ static_cast<std::uint32_t>( ( 8 + c ) << 16 ) };
+            for ( int i{ 0 }; i != 200; ++i ) {
+                std::ignore = published->add( base + static_cast<std::uint32_t>( rng() & 0xFFFF ) );
+            }
+        }
+        auto const probe{ [ published, chunks ]( unsigned const t ) {
+            return [ published, chunks, state = std::uint64_t{ 0x9E3779B97F4A7C15ull * ( t + 1 ) } ]() mutable -> std::uint64_t {
+                std::uint64_t hits{ 0 };
+                for ( int i{ 0 }; i != 64; ++i ) {
+                    state = state * 6364136223846793005ull + 1442695040888963407ull;
+                    auto const chunk{ static_cast<std::uint32_t>( ( state >> 33 ) % chunks ) };
+                    auto const value{ static_cast<std::uint32_t>( ( 8 + chunk ) << 16 ) | static_cast<std::uint32_t>( ( state >> 17 ) & 0xFFFF ) };
+                    hits += published->contains( value );
+                }
+                return hits;
+            };
+        } };
+        for ( bool const copier : { false, true } ) {
+            std::atomic<bool> stop{ false };
+            std::atomic<std::uint64_t> copies{ 0 };
+            std::thread background;
+            if ( copier ) {
+                background = std::thread{ [ & ] {
+                    pin_to( opts.copier_cpu );
+                    std::uint64_t n{ 0 };
+                    while ( !stop.load( std::memory_order_relaxed ) ) {
+                        counted_bitmap const copy{ *published };
+                        g_sink.fetch_add( copy.container_count(), std::memory_order_relaxed );
+                        ++n;
+                    }
+                    copies.store( n );
+                } };
+            }
+            std::vector<std::pair<std::string, body_factory>> arms;
+            arms.emplace_back( "readers", probe );
+            run_band( name + ( copier ? "+copier" : "" ), std::move( arms ), opts );
+            if ( copier ) {
+                stop.store( true );
+                background.join();
+                std::printf( "# copier copies %llu\n", static_cast<unsigned long long>( copies.load() ) );
+            }
+        }
+    }
+}
+
 } // namespace
 
 int main( int argc, char ** argv ) {
@@ -405,12 +482,14 @@ int main( int argc, char ** argv ) {
         else if ( arg == "--threads" && i + 1 < argc ) { opts.threads.clear(); for ( auto const t : parse_list( argv[ ++i ] ) ) { opts.threads.push_back( static_cast<unsigned>( t ) ); } }
         else if ( arg == "--cpus" && i + 1 < argc ) { opts.cpus = parse_list( argv[ ++i ] ); }
         else if ( arg == "--main-cpu" && i + 1 < argc ) { opts.main_cpu = std::atoi( argv[ ++i ] ); }
+        else if ( arg == "--copier-cpu" && i + 1 < argc ) { opts.copier_cpu = std::atoi( argv[ ++i ] ); }
         else { std::fprintf( stderr, "unknown argument: %s\n", arg.c_str() ); return 2; }
     }
     pin_to( opts.main_cpu );
     and_bands( opts, false );
     and_bands( opts, true );
     copy_band( opts );
+    contains_bands( opts );
     std::fprintf( stderr, "# sink %llu\n", static_cast<unsigned long long>( g_sink.load() ) );
     return 0;
 }
