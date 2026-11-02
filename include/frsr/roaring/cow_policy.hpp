@@ -26,6 +26,19 @@
 #include <cstdint>
 #include <new>
 
+// ThreadSanitizer does not model a standalone fence, so under it the last release takes its acquire on the
+// decrement itself (the same synchronization, which TSan can see).
+#if defined( __SANITIZE_THREAD__ )
+#   define FRSR_ROARING_THREAD_SANITIZER 1
+#elif defined( __has_feature )
+#   if __has_feature( thread_sanitizer )
+#       define FRSR_ROARING_THREAD_SANITIZER 1
+#   endif
+#endif
+#ifndef FRSR_ROARING_THREAD_SANITIZER
+#   define FRSR_ROARING_THREAD_SANITIZER 0
+#endif
+
 namespace frsr::roaring::detail {
 
 // Model 1 — value semantics (the default; no refcount word, deep-clone on copy).
@@ -71,11 +84,15 @@ struct cow_atomic_refcount {
         if ( rc.load( std::memory_order_acquire ) == 1 ) {
             return true;
         }
+#if FRSR_ROARING_THREAD_SANITIZER
+        return rc.fetch_sub( 1, std::memory_order_acq_rel ) == 1;
+#else
         if ( rc.fetch_sub( 1, std::memory_order_release ) == 1 ) {
             std::atomic_thread_fence( std::memory_order_acquire );
             return true;
         }
         return false;
+#endif
     }
 };
 
