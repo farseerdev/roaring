@@ -314,23 +314,28 @@ template <typename Layout>
     std::span<typename Layout::low_type const> const sorted_values,
     std::size_t const cap = std::numeric_limits<std::size_t>::max()
 ) noexcept {
+    using low_type = typename Layout::low_type;
     if ( sorted_values.empty() ) {
         return 0;
     }
 
+    // A run starts at every value that is not its predecessor plus one (the predecessor plus one wraps to zero
+    // past the domain's last value, which no greater value can equal). Counted a block at a time with no branch
+    // inside a block, which the compiler turns into vector compares; the cap is checked between blocks. A value
+    // adds at most one run, so a block no longer than the runs still missing to the cap cannot overshoot it: the
+    // count stops at the same value a value-at-a-time scan would.
+    constexpr std::size_t max_block{ 256 };
+    auto const * const values{ sorted_values.data() };
+    auto const size{ sorted_values.size() };
     auto run_count{ std::size_t{ 1 } };
-    auto previous{ sorted_values.front() };
-    for ( auto index{ std::size_t{ 1 } }; index < sorted_values.size(); ++index ) {
-        auto const value{ sorted_values[ index ] };
-        if (
-            previous == std::numeric_limits<typename Layout::low_type>::max() ||
-            value != static_cast<typename Layout::low_type>( previous + 1U )
-        ) {
-            if ( ++run_count >= cap ) { return cap; }
+    for ( auto index{ std::size_t{ 1 } }; index < size && run_count < cap; ) {
+        auto const block{ std::min( cap - run_count, max_block ) };
+        auto const block_end{ std::min( index + block, size ) };
+        for ( ; index < block_end; ++index ) {
+            run_count += static_cast<std::size_t>( values[ index ] != static_cast<low_type>( values[ index - 1U ] + 1U ) );
         }
-        previous = value;
     }
-    return run_count;
+    return std::min( run_count, cap );
 }
 
 // Counts maximal runs directly from a bitset's words — a run starts at every set
@@ -564,116 +569,6 @@ template <typename Layout, typename CowPolicy = cow_value_semantics, typename Ru
         case container_kind::array : break;
     }
     return std::move( filled_array );
-}
-
-// Explicit, caller-requested compaction (bitmap::optimize()/optimize_for_storage(),
-// the CRoaring run_optimize() analog): callers that want the eager heuristic
-// unconditionally pass RunSelectionPolicy = run_selection_eager explicitly here
-// regardless of the bitmap's own ambient policy.
-template <typename Layout, typename CowPolicy = cow_value_semantics, typename RunSelectionPolicy = run_selection_eager>
-[[nodiscard]] inline container_handle<Layout, CowPolicy> optimize_container_for_storage(
-    container_handle<Layout, CowPolicy> container,
-    std::size_t const bitset_threshold
-) {
-    if ( container.holds_bitset() ) {
-        // A bitset's form decision needs only its cardinality (in the header) and its
-        // run count (countable from the words), so the by-far-common "stays a bitset"
-        // outcome costs a word scan and returns the very handle — where the generic
-        // path below materializes every value and re-scatters them into a freshly
-        // allocated, bit-identical bitset.
-        auto const cardinality{ static_cast<std::size_t>( container.cardinality() ) };
-        if ( cardinality == 0 ) { return container_handle<Layout, CowPolicy>{}; }
-        constexpr auto run_bytes_per_run{ sizeof( typename run_container<Layout>::run ) };
-        constexpr auto bitset_bytes     { Layout::word_count * sizeof( std::uint64_t ) };
-        auto const array_bytes{ cardinality * sizeof( typename Layout::low_type ) };
-        auto const can_consider_run{ RunSelectionPolicy::eager && cardinality >= 64U };
-        if ( array_bytes < bitset_bytes ) {
-            // Fewer values than the array limit: the bitset cannot stay one. The values are decoded from the words
-            // once, straight into the array's own payload, and a run encoding is considered from them (counting
-            // the runs of a few values is cheaper than a second pass over every word).
-            auto array{ array_from_bitset<Layout, CowPolicy>( std::as_const( container ).as_bitset(), static_cast<std::uint32_t>( cardinality ) ) };
-            if ( !can_consider_run ) { return array; }
-            auto const view{ std::as_const( array ).as_array().values };
-            std::span<typename Layout::low_type const> const values{ view.data(), view.size() };
-            if ( run_count_from_sorted_values<Layout>( values, array_bytes / run_bytes_per_run + 1U ) * run_bytes_per_run < array_bytes ) {
-                return run_handle_from_sorted_values<Layout, CowPolicy>( values );
-            }
-            return array;
-        }
-        auto const run_bytes{
-            can_consider_run
-                ? run_count_from_bitset_words<Layout>(
-                      std::span<std::uint64_t const>{ std::as_const( container ).as_bitset().words.as_array() },
-                      std::max( array_bytes, bitset_bytes ) / run_bytes_per_run + 1U
-                  ) * run_bytes_per_run
-                : std::numeric_limits<std::size_t>::max()
-        };
-        if ( cardinality >= bitset_threshold && bitset_bytes <= array_bytes && bitset_bytes <= run_bytes ) {
-            return container;  // identity — no extraction, no allocation
-        }
-        if ( can_consider_run && run_bytes < array_bytes ) {
-            auto values{ sorted_values_from_container<Layout>( container ) };
-            return run_handle_from_sorted_values<Layout, CowPolicy>( { values.data(), values.size() } );
-        }
-        // Decoded from the words straight into the array's own payload.
-        return array_from_bitset<Layout, CowPolicy>( std::as_const( container ).as_bitset(), static_cast<std::uint32_t>( cardinality ) );
-    }
-    if ( container.holds_array() ) {
-        // An array container IS its sorted-values span already: decide on it in
-        // place and keep the very handle when the decision is "stay an array" —
-        // the generic path below would extract a copy of the values and rebuild
-        // an identical array from them (two allocations and two copies per
-        // container for the by-far-common no-op outcome; CRoaring's
-        // repair_after_lazy/run_optimize likewise never rebuild an array that
-        // stays an array).
-        return make_container_from_filled_array<Layout, CowPolicy, RunSelectionPolicy>( std::move( container ), bitset_threshold );
-    }
-    auto values{ sorted_values_from_container<Layout>( container ) };
-    if ( values.empty() ) {
-        return container_handle<Layout, CowPolicy>{};
-    }
-    return make_container_from_sorted_values<Layout, CowPolicy, RunSelectionPolicy>( { values.data(), values.size() }, bitset_threshold );
-}
-
-// run_optimize()'s bitset arm: reconsider ONLY run encoding for a bitset container,
-// never the bitset→array down-conversion. Decided from the words (no value
-// materialization) and returns the very handle when the bitset stays — so the
-// caller needs no defensive copy of the container it is about to replace.
-template <typename Layout, typename CowPolicy = cow_value_semantics, typename RunSelectionPolicy = run_selection_eager>
-[[nodiscard]] inline container_handle<Layout, CowPolicy> optimize_bitset_run_only(
-    container_handle<Layout, CowPolicy> container,
-    std::size_t const bitset_threshold
-) {
-    auto const cardinality{ static_cast<std::size_t>( container.cardinality() ) };
-    auto const can_consider_run{ RunSelectionPolicy::eager && cardinality >= 64U };
-    if ( !can_consider_run ) { return container; }
-    constexpr auto run_bytes_per_run{ sizeof( typename run_container<Layout>::run ) };
-    constexpr auto bitset_bytes     { Layout::word_count * sizeof( std::uint64_t ) };
-    auto const array_bytes{ cardinality * sizeof( typename Layout::low_type ) };
-    auto const run_bytes{
-        run_count_from_bitset_words<Layout>(
-            std::span<std::uint64_t const>{ std::as_const( container ).as_bitset().words.as_array() },
-            std::max( array_bytes, bitset_bytes ) / run_bytes_per_run + 1U
-        ) * run_bytes_per_run
-    };
-    // choose_sorted_container_kind's decision, evaluated without materializing the
-    // values: a "bitset" outcome is the identity here and an "array" outcome is the
-    // one this call exists to suppress, so only a "run" outcome does any work.
-    auto const stays_bitset{ cardinality >= bitset_threshold && bitset_bytes <= array_bytes && bitset_bytes <= run_bytes };
-    if ( stays_bitset || run_bytes >= array_bytes ) { return container; }
-    auto values{ sorted_values_from_container<Layout>( container ) };
-    return run_handle_from_sorted_values<Layout, CowPolicy>( { values.data(), values.size() } );
-}
-
-template <typename Layout, typename CowPolicy = cow_value_semantics, typename RunSelectionPolicy = run_selection_eager>
-[[nodiscard]] inline container_handle<Layout, CowPolicy> optimize_container_keep_bitsets(
-    container_handle<Layout, CowPolicy> container,
-    std::size_t const bitset_threshold
-) {
-    if ( container.holds_bitset() ) {
-        return container;
-    }
-    return optimize_container_for_storage<Layout, CowPolicy, RunSelectionPolicy>( std::move( container ), bitset_threshold );
 }
 
 template <typename Layout>
@@ -1018,6 +913,16 @@ template <typename Layout, typename CowPolicy = cow_value_semantics>
     return result;
 }
 
+// A bitset handle holding the given runs, which are set range by range into the words.
+template <typename Layout, typename CowPolicy = cow_value_semantics>
+[[nodiscard]] inline container_handle<Layout, CowPolicy> bitset_handle_from_runs( std::span<::frsr::roaring::run<typename Layout::low_type> const> const runs ) {
+    word_array<Layout> words{};
+    for ( auto const & current : runs ) {
+        apply_range_to_words<Layout>( words, current.begin, current.end, range_operation::add );
+    }
+    return make_bitset_container_from_words<Layout, CowPolicy>( words );
+}
+
 // A freshly built run container (at least one run, header synced) in the smallest of its three forms: the
 // runs as they are, an array of the values, or a bitset.
 template <typename Layout, typename CowPolicy>
@@ -1031,11 +936,209 @@ template <typename Layout, typename CowPolicy>
         case container_kind::array: return array_handle_from_container<Layout, CowPolicy>( result );
         case container_kind::bitset: break;
     }
-    word_array<Layout> words{};
-    for ( auto const & current : runs ) {
-        apply_range_to_words<Layout>( words, current.begin, current.end, range_operation::add );
+    return bitset_handle_from_runs<Layout, CowPolicy>( { runs.data(), runs.size() } );
+}
+
+// Serialized size of `run_count` runs, as CRoaring counts it when it picks a container's form
+// (run_container_serialized_size_in_bytes): the two-byte run count plus four bytes per run. An array is two bytes
+// per value, a bitset its words.
+template <typename Layout>
+[[nodiscard]] constexpr std::size_t run_serialized_bytes( std::size_t const run_count ) noexcept {
+    return run_count * sizeof( ::frsr::roaring::run<typename Layout::low_type> ) + sizeof( typename Layout::low_type );
+}
+
+// A run count from which runs serialize to more than `bytes`, the largest size they are compared with: a count
+// capped here decides every comparison exactly as the true one would, so the counting may stop at it.
+template <typename Layout>
+[[nodiscard]] constexpr std::size_t run_count_cap( std::size_t const bytes ) noexcept {
+    return bytes / sizeof( ::frsr::roaring::run<typename Layout::low_type> ) + 1U;
+}
+
+// A run handle holding `sorted_values` (distinct, non-empty), which form exactly `run_count` maximal runs: the runs
+// are written straight into a payload of their final size.
+// [croaring-ref] deps/croaring/src/containers/convert.c:convert_run_optimize
+template <typename Layout, typename CowPolicy = cow_value_semantics>
+[[nodiscard]] inline container_handle<Layout, CowPolicy> run_handle_from_counted_values(
+    std::span<typename Layout::low_type const> const sorted_values,
+    std::size_t const run_count
+) {
+    using low_type = typename Layout::low_type;
+    assert( !sorted_values.empty() );
+    auto result{ container_handle<Layout, CowPolicy>::make_run() };
+    auto ref{ result.as_run() };
+    ref.runs.resize_uninitialized( static_cast<std::uint32_t>( run_count ) );
+    auto * const runs{ ref.runs.data() };
+    auto n{ std::size_t{ 0 } };
+    auto begin{ sorted_values.front() };
+    auto previous{ begin };
+    for ( auto const value : sorted_values.subspan( 1 ) ) {
+        // Distinct sorted values: `previous + 1` wraps only past the last value of the domain, which nothing follows.
+        if ( value != static_cast<low_type>( previous + 1U ) ) {
+            runs[ n ] = { begin, previous };
+            ++n;
+            begin = value;
+        }
+        previous = value;
     }
-    return make_bitset_container_from_words<Layout, CowPolicy>( words );
+    runs[ n ] = { begin, previous };
+    ++n;
+    assert( n == run_count );
+    result.set_cardinality( static_cast<std::uint32_t>( sorted_values.size() ) );
+    result.set_endpoints( sorted_values.front(), sorted_values.back() );
+    return result;
+}
+
+// A run handle holding the set bits of `words` (`cardinality` of them, at least one), which form exactly
+// `run_count` maximal runs: each run is found from its first set and its first clear bit, a word at a time.
+// [croaring-ref] deps/croaring/src/containers/convert.c:convert_run_optimize
+template <typename Layout, typename CowPolicy = cow_value_semantics>
+[[nodiscard]] inline container_handle<Layout, CowPolicy> run_handle_from_counted_words(
+    std::span<std::uint64_t const> const words,
+    std::size_t const run_count,
+    std::size_t const cardinality
+) {
+    using low_type = typename Layout::low_type;
+    constexpr auto all_ones{ ~std::uint64_t{ 0 } };
+    assert( run_count != 0 );
+    auto result{ container_handle<Layout, CowPolicy>::make_run() };
+    auto ref{ result.as_run() };
+    ref.runs.resize_uninitialized( static_cast<std::uint32_t>( run_count ) );
+    auto * const runs{ ref.runs.data() };
+    auto const last_word{ words.size() - 1U };
+    auto n{ std::size_t{ 0 } };
+    auto word_index{ std::size_t{ 0 } };
+    auto word{ words[ 0 ] };
+    for ( ;; ) {
+        while ( word == 0 && word_index < last_word ) {
+            word = words[ ++word_index ];
+        }
+        if ( word == 0 ) {
+            break;
+        }
+        auto const begin{ word_index * 64U + static_cast<std::size_t>( std::countr_zero( word ) ) };
+        // The bits below the run's start set too, so the run ends at the first clear bit of what follows.
+        auto filled{ word | ( word - 1U ) };
+        while ( filled == all_ones && word_index < last_word ) {
+            filled = words[ ++word_index ];
+        }
+        if ( filled == all_ones ) {
+            runs[ n ] = { static_cast<low_type>( begin ), std::numeric_limits<low_type>::max() };
+            ++n;
+            break;
+        }
+        auto const end{ word_index * 64U + static_cast<std::size_t>( std::countr_zero( ~filled ) ) };
+        runs[ n ] = { static_cast<low_type>( begin ), static_cast<low_type>( end - 1U ) };
+        ++n;
+        word = filled & ( filled + 1U );
+    }
+    assert( n == run_count );
+    result.set_cardinality( static_cast<std::uint32_t>( cardinality ) );
+    result.set_endpoints( runs[ 0 ].begin, runs[ n - 1U ].end );
+    return result;
+}
+
+// Explicit, caller-requested compaction (bitmap::optimize() and the finishes that settle containers in their
+// smallest form), the decision of CRoaring's run_optimize (convert_run_optimize) for every kind: the form is chosen
+// from the container's cardinality and its run count alone, by serialized size, and the kind it holds keeps a tie.
+// A container that keeps its kind is returned as the very handle; a conversion reads the held payload once, straight
+// into the new one (runs into an array or the words of a bitset, an array or a bitset into runs), with no copy of
+// the values in between.
+//
+// On top of run_optimize, which never changes an array into a bitset or back, the array/bitset choice is remade
+// here too: a bitset holds from bitset_threshold on and where it is not larger than the array, an array below.
+// RunSelectionPolicy = run_selection_lazy leaves runs out of the choice (a run container then becomes the array
+// or the bitset). Callers that want runs considered regardless of the bitmap's own policy pass run_selection_eager.
+template <typename Layout, typename CowPolicy = cow_value_semantics, typename RunSelectionPolicy = run_selection_eager>
+[[nodiscard]] inline container_handle<Layout, CowPolicy> optimize_container_for_storage(
+    container_handle<Layout, CowPolicy> container,
+    std::size_t const bitset_threshold
+) {
+    using handle_type = container_handle<Layout, CowPolicy>;
+    using low_type    = typename Layout::low_type;
+    constexpr auto bitset_bytes{ Layout::word_count * sizeof( std::uint64_t ) };
+    if ( container.holds_run() ) {
+        if ( container.cardinality() == 0 ) {
+            return handle_type{};
+        }
+        if constexpr ( RunSelectionPolicy::eager ) {
+            // [croaring-ref] deps/croaring/src/containers/convert.c:convert_run_to_efficient_container
+            return settle_run_result<Layout, CowPolicy>( std::move( container ), bitset_threshold );
+        } else {
+            if ( container.cardinality() >= bitset_threshold ) {
+                return bitset_handle_from_runs<Layout, CowPolicy>( std::as_const( container ).as_run().runs );
+            }
+            return array_handle_from_container<Layout, CowPolicy>( container );
+        }
+    }
+    if ( container.holds_array() ) {
+        auto const view{ std::as_const( container ).as_array().values };
+        std::span<low_type const> const values{ view.data(), view.size() };
+        if ( values.empty() ) {
+            return handle_type{};
+        }
+        auto const array_bytes   { values.size() * sizeof( low_type ) };
+        auto const bitset_allowed{ values.size() >= bitset_threshold };
+        auto const cap           { run_count_cap<Layout>( bitset_allowed ? std::max( array_bytes, bitset_bytes ) : array_bytes ) };
+        auto const run_count     { RunSelectionPolicy::eager ? run_count_from_sorted_values<Layout>( values, cap ) : cap };
+        auto const run_bytes     { run_serialized_bytes<Layout>( run_count ) };
+        if ( bitset_allowed && bitset_bytes <= run_bytes ) {
+            return bitset_handle_from_sorted_values<Layout, CowPolicy>( values );
+        }
+        if ( run_bytes < array_bytes ) {
+            return run_handle_from_counted_values<Layout, CowPolicy>( values, run_count );
+        }
+        return container;
+    }
+    auto const cardinality{ static_cast<std::size_t>( container.cardinality() ) };
+    if ( cardinality == 0 ) {
+        return handle_type{};
+    }
+    auto const bitset{ std::as_const( container ).as_bitset() };
+    std::span<std::uint64_t const> const words{ bitset.words.as_array() };
+    auto const array_bytes    { cardinality * sizeof( low_type ) };
+    auto const holds_as_bitset{ cardinality >= bitset_threshold && bitset_bytes <= array_bytes };
+    // Runs are compared with the bitset when it may stay one, and only with the array otherwise.
+    auto const cap            { run_count_cap<Layout>( holds_as_bitset ? bitset_bytes : array_bytes ) };
+    auto const run_count      { RunSelectionPolicy::eager ? run_count_from_bitset_words<Layout>( words, cap ) : cap };
+    auto const run_bytes      { run_serialized_bytes<Layout>( run_count ) };
+    if ( holds_as_bitset && bitset_bytes <= run_bytes ) {
+        return container;
+    }
+    if ( run_bytes < array_bytes ) {
+        return run_handle_from_counted_words<Layout, CowPolicy>( words, run_count, cardinality );
+    }
+    return array_from_bitset<Layout, CowPolicy>( bitset, static_cast<std::uint32_t>( cardinality ) );
+}
+
+// run_optimize()'s bitset arm: a bitset becomes runs when they are smaller, and is otherwise kept, never changed
+// into an array. A bitset held below the array limit (a lazy fold's promotion, which CRoaring demotes before
+// run_optimize sees it) becomes runs only when they are smaller than its array form too. Decided from the words
+// and the cardinality, and the very handle is returned when the bitset stays.
+// [croaring-ref] deps/croaring/src/containers/convert.c:convert_run_optimize
+template <typename Layout, typename CowPolicy = cow_value_semantics>
+[[nodiscard]] inline container_handle<Layout, CowPolicy> optimize_bitset_run_only( container_handle<Layout, CowPolicy> container ) {
+    constexpr auto bitset_bytes{ Layout::word_count * sizeof( std::uint64_t ) };
+    auto const cardinality{ static_cast<std::size_t>( container.cardinality() ) };
+    std::span<std::uint64_t const> const words{ std::as_const( container ).as_bitset().words.as_array() };
+    auto const array_bytes{ cardinality * sizeof( typename Layout::low_type ) };
+    auto const kept_bytes { std::min( bitset_bytes, array_bytes ) };
+    auto const run_count  { run_count_from_bitset_words<Layout>( words, run_count_cap<Layout>( kept_bytes ) ) };
+    auto const run_bytes  { run_serialized_bytes<Layout>( run_count ) };
+    if ( kept_bytes <= run_bytes ) {
+        return container;
+    }
+    return run_handle_from_counted_words<Layout, CowPolicy>( words, run_count, cardinality );
+}
+
+template <typename Layout, typename CowPolicy = cow_value_semantics, typename RunSelectionPolicy = run_selection_eager>
+[[nodiscard]] inline container_handle<Layout, CowPolicy> optimize_container_keep_bitsets(
+    container_handle<Layout, CowPolicy> container,
+    std::size_t const bitset_threshold
+) {
+    if ( container.holds_bitset() ) {
+        return container;
+    }
+    return optimize_container_for_storage<Layout, CowPolicy, RunSelectionPolicy>( std::move( container ), bitset_threshold );
 }
 
 // Flip of [begin, end] in a run container: the range joins the runs as one more

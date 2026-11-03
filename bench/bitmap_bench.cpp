@@ -8941,6 +8941,212 @@ static void register_keep_runs_rounds() {
 
 } // namespace keep_runs
 
+// ---- optimize: settling every chunk in its smallest form ---------------------------------------------------------
+// optimize_keep_bitsets() / optimize() against roaring_bitmap_run_optimize over 64 chunks of one shape. Both arms
+// load the same portable bytes, built by CRoaring through single adds, ranges and run_optimize, so every chunk
+// starts as the same kind in both. The bands:
+//   OptimizeStay/<shape>        the call on a bitmap it has already settled (runs, arrays, bitsets, or the three in
+//                               turn): every chunk keeps its kind
+//   OptimizeStayShrink/<shape>  the same followed by the footprint trim (shrink_to_fit), as CRoaring's own
+//                               microbenchmark finishes a bitmap
+//   OptimizeConvert/<shape>     the call on a freshly loaded bitmap whose every chunk changes kind (arrays and
+//                               bitsets of a few runs into runs, runs holding scattered values into an array or a
+//                               bitset); the load is outside the timing
+// The shipped call is optimize_keep_bitsets() (CRoaring's run_optimize analog, /call=keep_bitsets); optimize(),
+// which also remakes the array/bitset choice, is the /call=optimize cell. CRoaring has the one call for both cells.
+namespace optimize_bands {
+
+constexpr std::uint32_t chunk_count = 64;
+
+using bytes_t = std::vector<char>;
+
+enum class shape : std::uint8_t { runs, arrays, bitsets, mixed, array_to_run, bitset_to_run, run_to_array, run_to_bitset };
+
+[[nodiscard]] static char const * name_of( shape const s ) {
+    switch ( s ) {
+        case shape::runs         : return "runs";
+        case shape::arrays       : return "arrays";
+        case shape::bitsets      : return "bitsets";
+        case shape::mixed        : return "mixed";
+        case shape::array_to_run : return "array_to_run";
+        case shape::bitset_to_run: return "bitset_to_run";
+        case shape::run_to_array : return "run_to_array";
+        case shape::run_to_bitset: return "run_to_bitset";
+    }
+    return "";
+}
+
+// The ranges of one chunk of `s` at `base`, which become run chunks through run_optimize.
+static void add_ranges( roaring_bitmap_t * const r, std::mt19937_64 & rng, std::uint32_t const base, shape const s ) {
+    switch ( s ) {
+        case shape::runs:
+            // six runs of about two thousand ids
+            for ( std::uint32_t k = 0, start = 0; k < 6; ++k ) {
+                auto const length = 1500U + static_cast<std::uint32_t>( rng() % 1000 );
+                roaring_bitmap_add_range_closed( r, base + start, base + start + length - 1U );
+                start += length + 6000U + static_cast<std::uint32_t>( rng() % 3000 );
+            }
+            break;
+        case shape::run_to_array : roaring_bitmap_add_range_closed( r, base, base + 99U ); break;
+        case shape::run_to_bitset: roaring_bitmap_add_range_closed( r, base, base + 29999U ); break;
+        default: break;
+    }
+}
+
+// The single values of one chunk of `s` at `base`, added after run_optimize: a run chunk keeps its kind under them,
+// which is how the run_to_* chunks get more runs than they are worth.
+static void add_values( roaring_bitmap_t * const r, std::mt19937_64 & rng, std::uint32_t const base, shape const s ) {
+    auto const scatter = [ & ]( std::uint32_t const count, std::uint32_t const first, std::uint32_t const last ) {
+        for ( std::uint32_t k = 0; k < count; ++k ) {
+            roaring_bitmap_add( r, base + first + static_cast<std::uint32_t>( rng() % ( last - first + 1U ) ) );
+        }
+    };
+    auto const runs_of = [ & ]( std::uint32_t const runs, std::uint32_t const length, std::uint32_t const gap ) {
+        for ( std::uint32_t k = 0; k < runs; ++k ) {
+            for ( std::uint32_t i = 0; i < length; ++i ) {
+                roaring_bitmap_add( r, base + k * ( length + gap ) + i );
+            }
+        }
+    };
+    switch ( s ) {
+        case shape::arrays       : scatter( 1500, 0, 65535 ); break;
+        case shape::bitsets      : scatter( 30000, 0, 65535 ); break;
+        case shape::array_to_run : runs_of( 20, 50, 1000 ); break;
+        case shape::bitset_to_run: runs_of( 10, 3000, 3000 ); break;
+        case shape::run_to_array : scatter( 1500, 200, 65535 ); break;
+        case shape::run_to_bitset:
+            scatter( 5000, 30001, 65535 );
+            for ( std::uint32_t k = 0; k < 3000; ++k ) {
+                roaring_bitmap_remove( r, base + static_cast<std::uint32_t>( rng() % 30000 ) );
+            }
+            break;
+        default: break;
+    }
+}
+
+[[nodiscard]] static std::shared_ptr<bytes_t const> make_bytes( shape const s ) {
+    std::mt19937_64 rng{ 20261103U + static_cast<unsigned>( s ) };
+    croaring_handle const h{ roaring_bitmap_create() };
+    auto const of_chunk = [ s ]( std::uint32_t const c ) { return s != shape::mixed ? s : std::array{ shape::runs, shape::arrays, shape::bitsets }[ c % 3 ]; };
+    for ( std::uint32_t c = 0; c < chunk_count; ++c ) {
+        add_ranges( h.r, rng, c << 16, of_chunk( c ) );
+    }
+    roaring_bitmap_run_optimize( h.r );
+    for ( std::uint32_t c = 0; c < chunk_count; ++c ) {
+        add_values( h.r, rng, c << 16, of_chunk( c ) );
+    }
+    auto out = std::make_shared<bytes_t>( roaring_bitmap_portable_size_in_bytes( h.r ) );
+    roaring_bitmap_portable_serialize( h.r, out->data() );
+    return out;
+}
+
+enum class mode : std::uint8_t { stay, stay_shrink, convert };
+
+struct band {
+    char const * op_name;
+    mode m;
+    shape s;
+    std::shared_ptr<bytes_t const> bytes;
+};
+
+template <class Arm>
+struct frsr_registrar {
+    using Bitmap = typename Arm::bitmap;
+
+    [[nodiscard]] static Bitmap load( bytes_t const & bytes ) {
+        auto loaded = Bitmap::portable_deserialize( std::as_bytes( std::span{ bytes } ) );
+        return std::move( *loaded );
+    }
+
+    static void settle( Bitmap & bitmap, bool const keep_bitsets ) {
+        if ( keep_bitsets ) {
+            bitmap.optimize_keep_bitsets();
+        } else {
+            bitmap.optimize();
+        }
+    }
+
+    static void run( band const & b ) {
+        for ( bool const keep_bitsets : { true, false } ) {
+            Entry e;
+            e.name = "kernel/" + std::string( Arm::label() ) + b.op_name + "/" + name_of( b.s ) + ( keep_bitsets ? "/call=keep_bitsets" : "/call=optimize" );
+            e.description = std::string( "frsr::roaring::bitmap<uint32_t>: " ) + ( keep_bitsets ? "optimize_keep_bitsets()" : "optimize()" ) + " over 64 chunks of shape " + name_of( b.s ) + ".";
+            e.setup = [b, keep_bitsets]() -> void * {
+                auto * const s = new Bitmap( load( *b.bytes ) );
+                if ( b.m != mode::convert ) {
+                    settle( *s, keep_bitsets );
+                }
+                return s;
+            };
+            e.run = [b, keep_bitsets]( void * sv ) -> int64_t {
+                auto & bitmap = *static_cast<Bitmap *>( sv );
+                settle( bitmap, keep_bitsets );
+                if ( b.m == mode::stay_shrink ) {
+                    std::ignore = bitmap.shrink_to_fit();
+                }
+                return static_cast<int64_t>( bitmap.size() );
+            };
+            e.teardown = []( void * sv ) { delete static_cast<Bitmap *>( sv ); };
+            e.ops_per_run = chunk_count;
+            e.inner_reps = 10;
+            e.reusable_state = b.m != mode::convert;
+            g_benchmarks.push_back( std::move( e ) );
+        }
+    }
+};
+
+template <class Arm>
+struct cpp_registrar {
+    [[nodiscard]] static roaring_bitmap_t * load( bytes_t const & bytes ) {
+        auto * const r = roaring_bitmap_portable_deserialize_safe( bytes.data(), bytes.size() );
+        roaring_bitmap_set_copy_on_write( r, Arm::cow );
+        return r;
+    }
+
+    static void run( band const & b ) {
+        for ( bool const keep_bitsets : { true, false } ) {
+            Entry e;
+            e.name = "kernel/" + std::string( Arm::label() ) + b.op_name + "/" + name_of( b.s ) + ( keep_bitsets ? "/call=keep_bitsets" : "/call=optimize" );
+            e.description = std::string( "CRoaring roaring_bitmap_run_optimize over 64 chunks of shape " ) + name_of( b.s ) + ".";
+            e.setup = [b]() -> void * {
+                auto * const r = load( *b.bytes );
+                if ( b.m != mode::convert ) {
+                    roaring_bitmap_run_optimize( r );
+                }
+                return new croaring_handle( r );
+            };
+            e.run = [b]( void * sv ) -> int64_t {
+                auto * const r = static_cast<croaring_handle *>( sv )->r;
+                roaring_bitmap_run_optimize( r );
+                if ( b.m == mode::stay_shrink ) {
+                    std::ignore = roaring_bitmap_shrink_to_fit( r );
+                }
+                return static_cast<int64_t>( roaring_bitmap_get_cardinality( r ) );
+            };
+            e.teardown = []( void * sv ) { delete static_cast<croaring_handle *>( sv ); };
+            e.ops_per_run = chunk_count;
+            e.inner_reps = 10;
+            e.reusable_state = b.m != mode::convert;
+            g_benchmarks.push_back( std::move( e ) );
+        }
+    }
+};
+
+static void register_optimize_bands() {
+    struct mode_entry { char const * op; mode m; std::array<shape, 4> shapes; };
+    for ( auto const & [op, m, shapes] : { mode_entry{ "OptimizeStay", mode::stay, { shape::runs, shape::arrays, shape::bitsets, shape::mixed } },
+                                           mode_entry{ "OptimizeStayShrink", mode::stay_shrink, { shape::runs, shape::arrays, shape::bitsets, shape::mixed } },
+                                           mode_entry{ "OptimizeConvert", mode::convert, { shape::array_to_run, shape::bitset_to_run, shape::run_to_array, shape::run_to_bitset } } } ) {
+        for ( auto const s : shapes ) {
+            band const b{ op, m, s, make_bytes( s ) };
+            arms::for_each_frsr<frsr_registrar>( b );
+            arms::for_each_croaring<cpp_registrar>( b );
+        }
+    }
+}
+
+} // namespace optimize_bands
+
 // ---- random-order contains --------------------------------------------------------------------------
 struct probe_set {
     values64 stored;                  // sorted
@@ -9494,6 +9700,7 @@ static void register_benchmarks() {
     register_array_array();
     register_run_andnot();
     keep_runs::register_keep_runs_rounds();
+    optimize_bands::register_optimize_bands();
     register_random_contains_bands();
 }
 

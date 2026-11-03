@@ -1999,14 +1999,9 @@ FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::optimize_keep_bitsets()
     for ( auto & slot : chunks_.slots() ) {
         if constexpr ( supports_bitset_container && uses_default_container_set ) {
             if ( slot.holds_bitset() ) {
-                // Reconsider run encoding, but keep the bitset we already hold if
-                // the optimizer would down-convert to an array. Decided from the
-                // words: the previous formulation passed the slot BY VALUE so it
-                // could fall back to it, which cloned the whole 8 KB payload of
-                // every bitset in the bitmap on a call that usually changes nothing.
-                slot = detail::optimize_bitset_run_only<layout_type, CowPolicy, detail::run_selection_eager>(
-                    std::move( slot ), array_to_bitset_threshold
-                );
+                // Run encoding is reconsidered from the words, and a bitset that stays is the very handle: the
+                // slot is moved in, so a shared payload is never cloned on a call that usually changes nothing.
+                slot = detail::optimize_bitset_run_only<layout_type, CowPolicy>( std::move( slot ) );
                 continue;
             }
         } else if constexpr ( supports_bitset_container ) {
@@ -2023,14 +2018,14 @@ FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::optimize_keep_bitsets()
 }
 
 FRSR_ROARING_BITMAP_TEMPLATE
-FRSR_ROARING_DEFINITION_INLINE bool FRSR_ROARING_BITMAP::is_run_shaped( handle_type const & chunk, std::size_t const min_mean_run_length ) noexcept {
+FRSR_ROARING_DEFINITION_INLINE std::size_t FRSR_ROARING_BITMAP::run_shaped_run_count( handle_type const & chunk, std::size_t const min_mean_run_length ) noexcept {
     assert( min_mean_run_length != 0 );
     if ( chunk.holds_run() ) {
-        return false;
+        return 0;
     }
     auto const cardinality{ detail::container_size( chunk ) };
     if ( cardinality == 0 ) {
-        return false;
+        return 0;
     }
     // runs * min_mean_run_length <= cardinality  ⇔  runs <= cardinality / min_mean_run_length
     auto const max_runs{ cardinality / min_mean_run_length };
@@ -2045,16 +2040,26 @@ FRSR_ROARING_DEFINITION_INLINE bool FRSR_ROARING_BITMAP::is_run_shaped( handle_t
                   max_runs + 1U
               )
     };
-    return runs <= max_runs;
+    return runs <= max_runs ? runs : 0;
 }
 
 FRSR_ROARING_BITMAP_TEMPLATE
 FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::run_encode_if_run_shaped( handle_type & chunk, std::size_t const min_mean_run_length ) noexcept( detail::allocation_failure_terminates ) {
-    if ( !is_run_shaped( chunk, min_mean_run_length ) ) {
+    auto const run_count{ run_shaped_run_count( chunk, min_mean_run_length ) };
+    if ( run_count == 0 ) {
         return;
     }
-    auto const values{ detail::sorted_values_from_container<layout_type>( chunk ) };
-    chunk = detail::run_handle_from_sorted_values<layout_type, CowPolicy>( { values.data(), values.size() } );
+    auto const & source{ std::as_const( chunk ) };
+    if ( source.holds_array() ) {
+        auto const values{ source.as_array().values };
+        chunk = detail::run_handle_from_counted_values<layout_type, CowPolicy>( { values.data(), values.size() }, run_count );
+        return;
+    }
+    chunk = detail::run_handle_from_counted_words<layout_type, CowPolicy>(
+        std::span<std::uint64_t const>{ source.as_bitset().words.as_array() },
+        run_count,
+        detail::container_size( source )
+    );
 }
 
 FRSR_ROARING_BITMAP_TEMPLATE

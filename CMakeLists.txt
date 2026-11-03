@@ -286,6 +286,7 @@ if(FRSR_ROARING_BUILD_TESTS)
         tests/kernel_coverage.cpp
         tests/run_add_sorted.cpp
         tests/andnot_keeps_runs.cpp
+        tests/optimize_storage.cpp
         tests/remove_many_chunks.cpp
         tests/contains_states.cpp
         tests/lazy_fold_state.cpp
@@ -355,6 +356,7 @@ if(FRSR_ROARING_BUILD_TESTS)
             tests/symmetric_difference_crosscheck.cpp
             tests/ranked_view_crosscheck.cpp
             tests/andnot_runs_crosscheck.cpp
+            tests/optimize_crosscheck.cpp
         )
         target_link_libraries(frsr_roaring_croaring_crosscheck
             PRIVATE

@@ -1691,34 +1691,22 @@ public:
 
     void promote_large_arrays( std::uint16_t const threshold = static_cast<std::uint16_t>( array_to_bitset_threshold ) ) noexcept( detail::allocation_failure_terminates );
 
-    // Explicit, caller-requested compaction — the CRoaring run_optimize() analog.
-    // Always reconsiders run-encoding (forces run_selection_eager) regardless of
-    // the bitmap's ambient RunSelectionPolicy: under run_selection_lazy, ordinary
-    // insert/merge never auto-picks run encoding, but this call still can, on
-    // request, exactly like CRoaring never auto-run-encodes except via an
-    // explicit run_optimize() call.
+    // Explicit, caller-requested compaction: every chunk takes its smallest serialized
+    // form, decided as CRoaring's run_optimize() decides it — from the chunk's
+    // cardinality and run count (runs: 2 + 4 bytes per run, array: 2 per value,
+    // bitset: its words), the kind it already holds keeping a tie — and on top of
+    // that the array/bitset choice at array_to_bitset_threshold. A chunk that keeps
+    // its kind is left as it is: no allocation, and a payload shared with a copy
+    // stays shared. Always reconsiders run encoding (forces run_selection_eager)
+    // regardless of the bitmap's ambient RunSelectionPolicy, exactly like CRoaring
+    // never run-encodes except through an explicit run_optimize() call.
     void optimize() noexcept( detail::allocation_failure_terminates );
 
-    // Faithful analog of CRoaring's roaring_bitmap_run_optimize(): run encoding is
-    // reconsidered exactly as in optimize(), but an existing bitset is never
-    // down-converted to an array.
-    //
-    // This exists for API parity, because optimize() is NOT that analog despite its
-    // comment saying so. optimize() rebuilds each container from its sorted values at
-    // array_to_bitset_threshold, which can turn a bitset below that threshold into an
-    // array — the smaller stored form (an n-element array is 2n bytes against a
-    // bitset's fixed Layout::word_count * 8), which is what optimize() is for.
-    // CRoaring's run_optimize() reconsiders run encoding ONLY and has no array/bitset
-    // down-conversion, so callers porting from it want this call.
-    //
-    // Run selection is still evaluated for a bitset (run_optimize converts bitset→run
-    // when that is smaller); only the bitset→array step is suppressed.
-    //
-    // NOTE: no performance claim is attached to this call. On the workload it was
-    // written for, optimize() was measured never to down-convert a bitset at all, so
-    // the two are behaviourally identical there; the divergence from run_optimize() is
-    // real in principle but was not observed to matter. Do not cite this as a
-    // speed optimization without measuring it.
+    // CRoaring's roaring_bitmap_run_optimize(): run encoding is reconsidered exactly
+    // as in optimize(), but an existing bitset is never down-converted to an array.
+    // A bitset becomes runs only when they are smaller; one held below the array
+    // limit (a lazy fold's promotion, which CRoaring demotes before run_optimize sees
+    // it) only when they are smaller than its array form too.
     void optimize_keep_bitsets() noexcept( detail::allocation_failure_terminates );
 
     // Selective run-encoding: convert exactly the containers whose mean run length
@@ -1908,10 +1896,10 @@ public:
     }
 
 private:
-    // Whether the chunk is not a run container yet but would be one under the bar: its mean run length
-    // (cardinality / runs) is at least `min_mean_run_length`. Read-only: an array is scanned in place, a bitset is
-    // counted from its words, the count capped at the first value that already fails.
-    [[nodiscard]] static bool is_run_shaped( handle_type const & chunk, std::size_t min_mean_run_length ) noexcept;
+    // The run count of a chunk that is not a run container yet but would be one under the bar: its mean run length
+    // (cardinality / runs) is at least `min_mean_run_length`; zero for every other chunk. Read-only: an array is
+    // scanned in place, a bitset is counted from its words, the count capped at the first value that already fails.
+    [[nodiscard]] static std::size_t run_shaped_run_count( handle_type const & chunk, std::size_t min_mean_run_length ) noexcept;
     // The one chunk step of both run-shaped passes.
     static void run_encode_if_run_shaped( handle_type & chunk, std::size_t min_mean_run_length ) noexcept( detail::allocation_failure_terminates );
 
