@@ -8533,6 +8533,22 @@ static void register_run_andnot() {
         operands.push_back( { "run_array/holes=1000", share( std::move( v ) ) } );
     }
     {
+        // The receiver here is 500 runs of 60 values (a run chunk earlier removals have holed); the operand is 140
+        // values scattered over them, most runs losing none and none more than one.
+        values32 holed;
+        for ( std::uint32_t r = 0; r < 500; ++r ) {
+            for ( std::uint32_t i = 0; i < 60; ++i ) {
+                holed.push_back( base + r * 120U + i );
+            }
+        }
+        values32 v;
+        for ( std::uint32_t k = 0; k < 140; ++k ) {
+            v.push_back( base + ( k * 293U % 500U ) * 120U + k * 37U % 60U );
+        }
+        std::ranges::sort( v );
+        operands.push_back( { "run_array/runs=500/holes=140", share( std::move( v ) ), share( std::move( holed ) ) } );
+    }
+    {
         values32 v;
         for ( std::uint32_t i = 1000; i <= 2000; ++i ) { v.push_back( base + i ); }
         operands.push_back( { "run_run/one_cut", share( std::move( v ) ) } );

@@ -372,6 +372,51 @@ TYPED_TEST( AndnotKeepsRuns, remove_many_sorted ) {
     check( receiver_values_but( members_of( scattered_nine() ) ), shape::array, "all but 9 keys" );
 }
 
+// Rounds of scattered values taken out of a chunk of a few long runs, one of them reaching the chunk's last value: each
+// round cuts the runs the round before left (hundreds of them by the last round), and its values land on run edges,
+// inside runs, in stretches of consecutive values, in gaps an earlier round opened and past the last run. `-=` an
+// array of the round's values (on a receiver whose runs a copy shares) and `remove_many_sorted` of them (on a sole
+// holder) both keep the runs and match the membership table.
+TYPED_TEST( AndnotKeepsRuns, rounds_of_scattered_values_keep_the_runs ) {
+    members table( chunk_size );
+    for ( auto const [first, last] : { std::pair{ 0U, 1'999U }, std::pair{ 9'000U, 11'499U }, std::pair{ 20'000U, 21'000U }, std::pair{ 40'000U, 41'999U }, std::pair{ 63'000U, 65'535U } } ) {
+        for ( auto value{ first }; value <= last; ++value ) {
+            table[ value ] = true;
+        }
+    }
+    auto receiver{ TestFixture::from_members( table, true ) };
+    ASSERT_EQ( TestFixture::shape_of( receiver ), shape::run );
+    auto removed_many{ receiver };
+    std::mt19937_64 rng{ 0x5C47 };
+    for ( int round{ 0 }; round < 4; ++round ) {
+        members taken( chunk_size );
+        for ( int k{ 0 }; k < 300; ++k ) {
+            taken[ static_cast<std::uint32_t>( rng() % chunk_size ) ] = true;
+        }
+        for ( auto const value : { 0U, 1'999U, 9'000U, 20'000U, 21'000U, 63'000U, 65'535U } ) {
+            taken[ value ] = taken[ value ] || rng() % 2U == 0U;
+        }
+        // a stretch of consecutive values inside a run, and one reaching the chunk's last value
+        auto const stretch{ 9'100U + static_cast<std::uint32_t>( rng() % 2'000 ) };
+        for ( auto value{ stretch }; value < stretch + 9U + static_cast<std::uint32_t>( rng() % 40 ); ++value ) {
+            taken[ value ] = true;
+        }
+        for ( auto value{ 65'520U + static_cast<std::uint32_t>( rng() % 8 ) }; value < chunk_size; ++value ) {
+            taken[ value ] = true;
+        }
+        auto const keys{ values_of( taken ) };
+        table = without( std::move( table ), taken );
+        auto const operand{ TestFixture::from_members( taken ) };
+        ASSERT_EQ( TestFixture::shape_of( operand ), shape::array );
+        auto const shared{ receiver };
+        receiver -= operand;
+        TestFixture::expect_result( receiver, table, shape::run, "-= a round's values" );
+        EXPECT_EQ( TestFixture::shape_of( shared ), shape::run ) << "the other holder of the runs";
+        removed_many.remove_many_sorted( { keys.data(), keys.size() } );
+        TestFixture::expect_result( removed_many, table, shape::run, "remove_many_sorted of a round's values" );
+    }
+}
+
 // ---- the size boundary between runs and a bitset ---------------------------------------------------------------
 // A run container takes four bytes per run plus its two-byte count, so 2047 runs are smaller than the 8 KB bitset
 // and 2048 are not. Past 2048 runs the bitset difference stops counting and finishes in words.

@@ -430,56 +430,141 @@ template <typename Layout, typename CowPolicy = cow_value_semantics>
     return settle_run_result<Layout, CowPolicy>( std::move( result ), bitset_threshold );
 }
 
-// The runs minus a sorted, duplicate-free list of values: one merge pass over both, O(runs + values), written
-// straight into the result's run payload and settled to the smallest form. Used by the run-array difference and by
-// the batch removal of sorted values from a run chunk.
+// How many of the eight runs from `runs` (ascending) end below `value`.
+template <typename Run>
+[[nodiscard]] [[gnu::always_inline]] inline std::size_t runs_ending_below_in_block( Run const * const runs, std::uint32_t const value ) noexcept {
+#if defined( __AVX2__ )
+    if constexpr ( sizeof( Run ) == sizeof( std::uint32_t ) ) {
+        // A run is two 16-bit values, begin in the low half of its 32-bit lane and end in the high one.
+        static_assert( offsetof( Run, end ) == sizeof( Run ) / 2U && std::endian::native == std::endian::little );
+        auto const block{ _mm256_loadu_si256( reinterpret_cast<__m256i const *>( runs ) ) };
+        auto const ends { _mm256_srli_epi32( block, 16 ) };
+        auto const below{ _mm256_cmpgt_epi32( _mm256_set1_epi32( static_cast<int>( value ) ), ends ) };
+        return static_cast<std::size_t>( std::popcount( static_cast<unsigned>( _mm256_movemask_ps( _mm256_castsi256_ps( below ) ) ) ) );
+    }
+#endif
+    std::size_t count{ 0 };
+    for ( std::size_t i{ 0 }; i < 8; ++i ) {
+        count += static_cast<std::size_t>( runs[ i ].end < value );
+    }
+    return count;
+}
+
+// Writes the runs from `index` that end below `value` to `out` as they are (the run at `index` to out[ 0 ]) and returns
+// the index of the first run that does not (`size` if none). While eight runs remain they are compared and copied
+// eight at a time, so the copy may write up to eight runs past the ones it keeps: `out` needs that much room beyond.
+template <typename Run>
+[[nodiscard]] [[gnu::always_inline]] inline std::size_t copy_runs_ending_below(
+    Run const * const runs, std::size_t const index, std::size_t const size, std::uint32_t const value, Run * const out
+) noexcept {
+    constexpr std::size_t block{ 8 };
+    auto at{ index };
+    while ( size - at >= block ) {
+        auto const below{ runs_ending_below_in_block( runs + at, value ) };
+        std::memcpy( out + ( at - index ), runs + at, block * sizeof( Run ) );
+        at += below;
+        if ( below != block ) {
+            return at;
+        }
+    }
+    while ( at != size && runs[ at ].end < value ) {
+        out[ at - index ] = runs[ at ];
+        ++at;
+    }
+    return at;
+}
+
+// The runs minus a sorted, duplicate-free list of values, written straight into the result's run payload and settled
+// to the smallest form. Used by the run-array difference and by the batch removal of sorted values from a run chunk.
+// The walk goes value by value. A value past the run the one before it cut writes what is left of that run, then the
+// runs wholly below it, counted by their ends and copied eight at a time, and the run reaching it becomes current; a
+// value in the current run cuts it with no branch on where (on the run's first or last value or inside it). A merge
+// that chooses between the next run and the next value at every step mispredicts about once per value when the values
+// are scattered over many runs; this walk's one branch per value, whether the value has left the current run, goes
+// the same way for most values both when they are scattered and when many cut one run.
 template <typename Layout, typename CowPolicy = cow_value_semantics>
 [[nodiscard]] inline container_handle<Layout, CowPolicy> difference_run_values(
     run_cref<Layout, CowPolicy> const lhs,
     std::span<typename Layout::low_type const> const values,
     std::size_t const bitset_threshold
 ) {
+    using low_type = typename Layout::low_type;
+    using run_type = ::frsr::roaring::run<low_type>;
+    assert( !lhs.runs.empty() );
+    assert( !values.empty() );
     auto result{ container_handle<Layout, CowPolicy>::make_run() };
     auto ref{ result.as_run() };
     // Every value taken out splits at most one run in two, and disjoint runs that do not touch cannot be more than
-    // half the domain.
+    // half the domain; the block copy needs room for eight runs more.
     constexpr std::size_t most_runs{ Layout::low_domain_size / 2U };
-    ref.runs.resize_uninitialized( static_cast<std::uint32_t>( std::min<std::size_t>( lhs.runs.size() + values.size(), most_runs ) ) );
+    constexpr std::size_t copy_room{ 8 };
+    ref.runs.resize_uninitialized( static_cast<std::uint32_t>( std::min<std::size_t>( lhs.runs.size() + values.size(), most_runs ) + copy_room ) );
     auto * const out{ ref.runs.data() };
+    auto const * const runs{ lhs.runs.data() };
+    auto const run_count{ lhs.runs.size() };
     std::size_t n{ 0 };
-
-    auto value_it{ values.begin() };
-    for ( auto const & run : lhs.runs ) {
-        while ( value_it != values.end() && *value_it < run.begin ) {
-            ++value_it;
-        }
-
-        auto current_begin{ run.begin };
-        auto exhausted{ false };
-        auto scan{ value_it };
-        while ( scan != values.end() && *scan <= run.end ) {
-            if ( current_begin < *scan ) {
-                auto const end{ static_cast<typename Layout::low_type>( *scan - 1U ) };
-                out[ n++ ] = ::frsr::roaring::run<typename Layout::low_type>{ current_begin, end };
-            }
-            if ( *scan == std::numeric_limits<typename Layout::low_type>::max() ) {
-                exhausted = true;
+    // The part of the current run not written yet is [begin, end], empty once begin passes end (begin may be one past
+    // the domain); `next` is the run after it.
+    std::uint32_t begin{ runs[ 0 ].begin };
+    std::uint32_t end{ runs[ 0 ].end };
+    std::size_t next{ 1 };
+    auto const * at{ values.data() };
+    auto const * const stop{ at + values.size() };
+    // Values below the first run take nothing out.
+    while ( at != stop && *at < begin ) {
+        ++at;
+    }
+    // The values passed over in gaps: every other value the walk gets past is one the runs held, so the result's
+    // cardinality follows from where the walk stops, with no count kept per value.
+    auto in_gaps{ static_cast<std::size_t>( at - values.data() ) };
+    while ( at != stop ) {
+        std::uint32_t const value{ *at };
+        // Laid out off the straight line, whichever way the values go: leaving the run costs a block copy anyway,
+        // while a run cut by many values pays for no jump on each of them.
+        if ( value > end ) [[unlikely]] {
+            out[ n ].begin = static_cast<low_type>( begin );
+            out[ n ].end   = static_cast<low_type>( end );
+            n += static_cast<std::size_t>( begin <= end );
+            auto const below_from{ next };
+            next = copy_runs_ending_below( runs, next, run_count, value, out + n );
+            n += next - below_from;
+            if ( next == run_count ) {
+                // Past every run: nothing is left to cut.
+                begin = end + 1U;
                 break;
             }
-            current_begin = static_cast<typename Layout::low_type>( *scan + 1U );
-            ++scan;
+            begin = runs[ next ].begin;
+            end = runs[ next ].end;
+            ++next;
+            if ( value < begin ) {
+                // It and the values after it below the run lie in a gap: they take nothing out.
+                auto const * const gap_begin{ at };
+                do {
+                    ++at;
+                } while ( at != stop && *at < begin );
+                in_gaps += static_cast<std::size_t>( at - gap_begin );
+                continue;
+            }
         }
-
-        value_it = scan;
-        if ( !exhausted && current_begin <= run.end ) {
-            out[ n++ ] = ::frsr::roaring::run<typename Layout::low_type>{ current_begin, run.end };
-        }
+        // The value is in [begin, end]: the part below it is written, kept if not empty, and the rest begins after it.
+        // Field by field: g++ builds the run in memory and reads it back otherwise.
+        out[ n ].begin = static_cast<low_type>( begin );
+        out[ n ].end   = static_cast<low_type>( value - 1U );
+        n += static_cast<std::size_t>( value > begin );
+        begin = value + 1U;
+        ++at;
     }
+    auto const removed{ static_cast<std::size_t>( at - values.data() ) - in_gaps };
+    out[ n ] = run_type{ static_cast<low_type>( begin ), static_cast<low_type>( end ) };
+    n += static_cast<std::size_t>( begin <= end );
+    // The runs past the last value are kept whole, copied in one piece (as the reference copies them).
+    std::memcpy( out + n, runs + next, ( run_count - next ) * sizeof( run_type ) );
+    n += run_count - next;
     if ( n == 0 ) {
         return container_handle<Layout, CowPolicy>{};
     }
     ref.runs.resize_uninitialized( static_cast<std::uint32_t>( n ) );
-    ref.sync_header();
+    ref.sync_header( lhs.size() - removed );
     return settle_run_result<Layout, CowPolicy>( std::move( result ), bitset_threshold );
 }
 
