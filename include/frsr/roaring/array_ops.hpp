@@ -795,6 +795,61 @@ template <typename T>
     return k + ( sa - i );
 }
 
+// The values of `a` not in `b`, for a `b` much shorter than `a` (from kSkewedIntersectRatioThreshold times, where the
+// skewed intersection searches too): the values of `b` are found in `a` four at a time by the same interleaved binary
+// search, and each stretch of `a` between two of them is moved in one piece, so the values of `a` are not stepped
+// through one by one. `out` may be `a`: every value lands at or before where it was, and while nothing has been
+// dropped yet nothing is moved.
+// [croaring-ref] deps/croaring/src/array_util.c:intersect_skewed_uint16 (its search, applied to the difference)
+// Kept out of line: the callers test for the skew on every pair, mostly tiny ones that never take this path.
+template <typename T>
+[[ gnu::hot, gnu::noinline ]] inline std::size_t difference_sorted_skewed(
+    T const * const a, std::size_t const sa,
+    T const * const b, std::size_t const sb,
+    T * const out
+) noexcept {
+    std::size_t i{ 0 };   // the first value of `a` neither kept nor dropped yet
+    std::size_t k{ 0 };   // the values kept so far
+    // Keeps a[i, at) and drops a[at] when it is `value`.
+    auto const drop_at{ [ & ]( std::size_t const at, T const value ) noexcept {
+        if ( out + k != a + i ) {
+            move_tail( out + k, a + i, at - i );
+        }
+        k += at - i;
+        i = at + static_cast<std::size_t>( at < sa && a[ at ] == value );
+    } };
+    std::size_t j{ 0 };
+    while ( j + 4 <= sb && i < sa ) {
+        std::size_t r0, r1, r2, r3;
+        binary_search_4way( a + i, sa - i, b[ j ], b[ j + 1 ], b[ j + 2 ], b[ j + 3 ], r0, r1, r2, r3 );
+        auto const window{ i };
+        drop_at( window + r0, b[ j ] );
+        drop_at( window + r1, b[ j + 1 ] );
+        drop_at( window + r2, b[ j + 2 ] );
+        drop_at( window + r3, b[ j + 3 ] );
+        j += 4;
+    }
+    for ( ; j < sb && i < sa; ++j ) {
+        drop_at( static_cast<std::size_t>( std::lower_bound( a + i, a + sa, b[ j ] ) - a ), b[ j ] );
+    }
+    drop_at( sa, T{} );
+    return k;
+}
+
+// The difference of two sorted arrays into `out` (which may be `a`): the skewed form when `b` is much the shorter,
+// else the merge.
+template <typename T>
+[[ gnu::hot ]] inline std::size_t difference_sorted(
+    T const * const a, std::size_t const sa,
+    T const * const b, std::size_t const sb,
+    T * const out
+) noexcept {
+    if ( sb * kSkewedIntersectRatioThreshold < sa ) [[unlikely]] {
+        return difference_sorted_skewed( a, sa, b, sb, out );
+    }
+    return difference_sorted_scalar( a, sa, b, sb, out );
+}
+
 // OutVector: a small_array_values scratch or a handle's payload_vector (direct write).
 template <typename Layout, typename OutVector, typename CowPolicy = cow_value_semantics>
 [[ gnu::hot ]] inline void combine_array_array_into(
@@ -1230,7 +1285,7 @@ template <typename Layout, typename CowPolicy = cow_value_semantics>
 ) {
     auto * const a{ lhs.values.data() };
     lhs.values.resize_uninitialized( static_cast<std::uint32_t>(
-        difference_sorted_scalar( static_cast<typename Layout::low_type const *>( a ), lhs.values.size(), rhs.values.data(), rhs.values.size(), a )
+        difference_sorted( static_cast<typename Layout::low_type const *>( a ), lhs.values.size(), rhs.values.data(), rhs.values.size(), a )
     ) );
     lhs.sync_header();
 }
@@ -1241,6 +1296,13 @@ template <typename Layout, typename OutVector, typename CowPolicy = cow_value_se
     array_cref<Layout, CowPolicy> const rhs,
     OutVector & out
 ) {
+    if ( rhs.values.size() * kSkewedIntersectRatioThreshold < lhs.values.size() ) [[unlikely]] {
+        resize_uninitialized( out, lhs.values.size() );
+        out.resize( static_cast<std::uint32_t>( difference_sorted_skewed(
+            lhs.values.data(), lhs.values.size(), rhs.values.data(), rhs.values.size(), out.data()
+        ) ) );
+        return;
+    }
 #if defined( __SSE4_2__ )
     // Same over-allocate-by-one-vector contract as the intersection: the kernel's
     // stores write a full vector past the true count.

@@ -763,4 +763,47 @@ TEST( KernelCrosscheck, ManyRunsMinusFewRunsLikeCRoaring ) {
     }
 }
 
+// A long array minus a few values (the skewed difference: the few are searched for in the long one, which is moved in
+// stretches): values of the array, values between them, below its first and above its last, its first and last
+// values, on the receiver that is the sole holder of its array (in place), on a copy that shares it, and materialized.
+TEST( KernelCrosscheck, LongArrayMinusFewValuesLikeCRoaring ) {
+    std::mt19937_64 rng{ 0x5E3A };
+    for ( std::size_t const long_size : { 300, 1500, 4000 } ) {
+        std::set<std::uint32_t> long_lows;
+        while ( long_lows.size() < long_size ) {
+            long_lows.insert( 100U + static_cast<std::uint32_t>( rng() % 65000 ) );
+        }
+        Values32 const va( long_lows.begin(), long_lows.end() );
+        for ( std::size_t const few : { 1, 2, 3, 4, 5, 7, 8, 9, 17, 40 } ) {
+            for ( int trial{ 0 }; trial < 8; ++trial ) {
+                std::set<std::uint32_t> picks;
+                while ( picks.size() < few ) {
+                    switch ( rng() % 6 ) {
+                        case 0: picks.insert( va[ rng() % va.size() ] ); break;                                 // a value of the array
+                        case 1: picks.insert( static_cast<std::uint32_t>( rng() % 65536 ) ); break;             // anywhere
+                        case 2: picks.insert( static_cast<std::uint32_t>( rng() % 100 ) ); break;               // below its first
+                        case 3: picks.insert( 65200U + static_cast<std::uint32_t>( rng() % 336 ) ); break;      // above its last
+                        case 4: picks.insert( va.front() ); break;
+                        default: picks.insert( va.back() ); break;
+                    }
+                }
+                Values32 const vb( picks.begin(), picks.end() );
+                SCOPED_TRACE( ::testing::Message() << long_size << " values minus " << vb.size() );
+                auto const a{ make_ours( va, false ) };
+                auto const b{ make_ours( vb, false ) };
+                ASSERT_EQ( a.statistics().array_containers, 1U );
+                ASSERT_EQ( b.statistics().array_containers, 1U );
+                croaring const expected{ roaring_bitmap_andnot( make_theirs( va, false ).r, make_theirs( vb, false ).r ) };
+                EXPECT_TRUE( same_contents( a - b, expected ) ) << "a - b";
+                auto shared{ a };
+                shared -= b;
+                EXPECT_TRUE( same_contents( shared, expected ) ) << "-= on a copy that shares the array";
+                auto sole{ make_ours( va, false ) };
+                sole -= b;
+                EXPECT_TRUE( same_contents( sole, expected ) ) << "-= on the sole holder";
+            }
+        }
+    }
+}
+
 } // namespace
