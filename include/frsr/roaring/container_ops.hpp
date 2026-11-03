@@ -148,11 +148,14 @@ template <typename Layout, typename CowPolicy = cow_value_semantics, typename Ru
             return make_bitset_container_from_words<Layout, CowPolicy>( combine_run_bitset_words( left, right, op ) );
         } else if constexpr ( std::same_as<left_type, bitset_cref<Layout, CowPolicy>> && std::same_as<right_type, run_cref<Layout, CowPolicy>> ) {
             if ( op == set_operation::bit_andnot ) {
-                auto words{ left.words.as_array() };
-                for ( auto const & current : right.runs ) {
-                    apply_range_to_words<Layout>( words, current.begin, current.end, range_operation::remove );
+                // The words copied once into the result and the runs' bits cleared there, the cardinality kept by
+                // the bits that go rather than counted again.
+                auto result{ clone_bitset_words<Layout, CowPolicy>( left ) };
+                apply_runs_to_bitset_inplace<false, Layout, CowPolicy>( result.as_bitset(), right );
+                if ( result.cardinality() == 0 ) {
+                    return container_handle<Layout, CowPolicy>{};
                 }
-                return make_bitset_container_from_words<Layout, CowPolicy>( words );
+                return result;
             }
             return make_bitset_container_from_words<Layout, CowPolicy>( combine_run_bitset_words( right, left, op ) );
         } else if constexpr ( std::same_as<left_type, bitset_cref<Layout, CowPolicy>> && std::same_as<right_type, bitset_cref<Layout, CowPolicy>> ) {

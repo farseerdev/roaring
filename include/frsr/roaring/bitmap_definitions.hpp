@@ -1180,13 +1180,18 @@ FRSR_ROARING_DEFINITION_INLINE auto FRSR_ROARING_BITMAP::combine( bitmap const &
             continue;
         }
         if ( mutate_left && op == detail::set_operation::bit_andnot &&
-             left_container.holds_bitset() && right_container.holds_array() ) {
-            // In-place bitset\array: clear the array's bits from our own 8 KB
-            // block (exact cardinality bookkeeping, no allocation; the mutable
-            // as_bitset() write barrier clones once at rc > 1, as elsewhere).
+             left_container.holds_bitset() && !right_container.holds_bitset() ) {
+            // In-place bitset\array and bitset\run: clear the operand's bits from
+            // our own 8 KB block (exact cardinality bookkeeping, no allocation; the
+            // mutable as_bitset() write barrier clones once at rc > 1, as elsewhere).
+            // [croaring-ref] deps/croaring/src/containers/mixed_andnot.c:bitset_run_container_iandnot
             [ & ] [[ gnu::noinline ]] () {   // outlined: see the array∩run arm above
                 auto left_bitset{ left_container.as_bitset() };
-                detail::difference_bitset_array_inplace<layout_type>( left_bitset, right_container.as_array() );
+                if ( right_container.holds_array() ) {
+                    detail::difference_bitset_array_inplace<layout_type>( left_bitset, right_container.as_array() );
+                } else {
+                    detail::apply_runs_to_bitset_inplace<false, layout_type>( left_bitset, right_container.as_run() );
+                }
                 if ( left_bitset.size() != 0 ) {
                     size_ += left_bitset.size();
                     rewrite.keep( left );
