@@ -83,9 +83,10 @@ private:
 public:
     using cursor = typename live_table::cursor;
 
-    // Whether a copy of the store shares its chunk table instead of copying it: a refcounted policy and a flat
-    // table. A copy then costs one count on the table, and the first change of either store gives it a table of
-    // its own (make_unique). A wide-key table is copied entry by entry.
+    // Whether a copy of the store shares its chunk table instead of copying it: a refcounted policy, a flat
+    // table, and sharing on (table_sharing_policy). A copy then costs one count on the table, and the first change
+    // of either store gives it a table of its own (make_unique). A wide-key table, and a small one
+    // (table_sharing_policy::small_table_capacity), is copied entry by entry.
     static constexpr bool table_sharing{ !wide && flat_table::shareable };
 
     [[nodiscard]] std::size_t size () const noexcept { return live_.size();  }
@@ -232,23 +233,16 @@ public:
     chunk_store() = default;
     chunk_store( chunk_store const & other ) {
         if constexpr ( table_sharing ) {
-            live_.share_from( other.live_ );
-        } else {
-            live_.copy_from( other.live_ );
+            if ( other.live_.can_share() ) {
+                live_.share_from( other.live_ );
+                return;
+            }
         }
+        live_.copy_from( other.live_ );
     }
     chunk_store( chunk_store && ) noexcept = default;
-    chunk_store & operator=( chunk_store const & other ) {
-        if ( this != &other ) [[likely]] {
-            if constexpr ( table_sharing ) {
-                live_.share_from( other.live_ );
-            } else {
-                live_.copy_from( other.live_ );
-            }
-            ++generation_;
-        }
-        return *this;
-    }
+    // A bitmap assigns a copy by copying and swapping, which leaves it as it was when the copy fails.
+    chunk_store & operator=( chunk_store const & ) = delete;
     chunk_store & operator=( chunk_store && other ) noexcept {
         live_                = std::move( other.live_ );
         retired_             = std::move( other.retired_ );

@@ -21,7 +21,11 @@ template <typename Bitmap>
 struct checks {
     using key_type = typename Bitmap::key_type;
     // Whether copies share the chunk table: a refcounted policy and a key of up to 32 bits.
-    static constexpr bool shares_tables{ Bitmap::cow_policy::refcounted && sizeof( key_type ) <= sizeof( std::uint32_t ) };
+    static constexpr bool shares_tables{
+        Bitmap::cow_policy::refcounted &&
+        frsr::roaring::detail::table_sharing_policy::enabled &&
+        sizeof( key_type ) <= sizeof( std::uint32_t )
+    };
 
     // operations that never allocate
     static_assert( noexcept( std::declval<Bitmap &>().clear() ) );

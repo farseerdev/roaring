@@ -77,6 +77,22 @@ if(FRSR_ROARING_TEST_SHARE_EVERY_TABLE)
     target_compile_definitions(frsr_roaring ${_frsr_scope} FRSR_ROARING_TEST_SHARE_EVERY_TABLE=1)
 endif()
 
+# The knobs of chunk-table sharing (include/frsr/roaring/table_sharing_policy.hpp says what each trades). Empty keeps
+# the header's default. They change the compiled bitmaps, so they are a usage requirement of the library.
+foreach(_knob TABLE_SHARING TABLE_SHARING_SMALL_CAPACITY TABLE_SHARING_UNION_CHECKS_FIRST TABLE_SHARING_SUBTRACT_CHECKS_FIRST
+              TABLE_SHARING_KEY_LIST_CHECKS_FIRST TABLE_SHARING_OPTIMIZE_ASIDE TABLE_SHARING_PREFETCH_DISTANCE)
+    set(FRSR_ROARING_${_knob} "" CACHE STRING "FRSR_ROARING_${_knob} (table_sharing_policy.hpp; empty: the default)")
+    set(_knob_value "${FRSR_ROARING_${_knob}}")
+    if(_knob_value MATCHES "^([Oo][Nn]|[Tt][Rr][Uu][Ee]|[Yy][Ee][Ss])$")
+        set(_knob_value 1)
+    elseif(_knob_value MATCHES "^([Oo][Ff][Ff]|[Ff][Aa][Ll][Ss][Ee]|[Nn][Oo])$")
+        set(_knob_value 0)
+    endif()
+    if(NOT "${_knob_value}" STREQUAL "")
+        target_compile_definitions(frsr_roaring ${_frsr_scope} FRSR_ROARING_${_knob}=${_knob_value})
+    endif()
+endforeach()
+
 target_include_directories(frsr_roaring
     ${_frsr_scope}
         ${PROJECT_SOURCE_DIR}/include

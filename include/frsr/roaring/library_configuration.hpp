@@ -1,12 +1,13 @@
 #pragma once
 
 // The options that change the code of a bitmap member (the small-buffer containers, the combine statistics, the
-// allocation failure policy, psi::vm containers and file-mapped serialization) are visible to the library only
-// when it is compiled. A program that sets any of them differently from the library it links would run
-// instantiations laid out and behaving otherwise than it expects; the program therefore refers to a symbol
+// allocation failure policy, psi::vm containers, file-mapped serialization and the table sharing knobs) are visible
+// to the library only when it is compiled. A program that sets any of them differently from the library it links
+// would run instantiations laid out and behaving otherwise than it expects; the program therefore refers to a symbol
 // that only a library built with the same settings defines, and fails to link against any other.
 
 #include <frsr/roaring/allocation_policy.hpp>
+#include <frsr/roaring/table_sharing_policy.hpp>
 #include <frsr/roaring/tuning.hpp>
 
 #ifndef FRSR_ROARING_COMBINE_STATS
@@ -15,7 +16,7 @@
 
 namespace frsr::roaring::detail {
 
-template <bool SmallBuffers, bool CombineStats, bool AllocationFailureTerminates, bool PsiVm, bool VmSerialization>
+template <bool SmallBuffers, bool CombineStats, bool AllocationFailureTerminates, bool PsiVm, bool VmSerialization, std::uint64_t TableSharing>
 struct library_configuration {
     static int const witness;
 };
@@ -34,7 +35,8 @@ inline constexpr bool configured_vm_serialization{ false };
 
 #define FRSR_ROARING_LIBRARY_CONFIGURATION_ARGUMENTS \
     !FRSR_ROARING_NO_SBO, FRSR_ROARING_COMBINE_STATS != 0, ::frsr::roaring::detail::allocation_failure_terminates, \
-    ::frsr::roaring::detail::configured_psi_vm, ::frsr::roaring::detail::configured_vm_serialization
+    ::frsr::roaring::detail::configured_psi_vm, ::frsr::roaring::detail::configured_vm_serialization, \
+    ::frsr::roaring::detail::table_sharing_policy::signature
 
 using this_library_configuration = library_configuration<FRSR_ROARING_LIBRARY_CONFIGURATION_ARGUMENTS>;
 

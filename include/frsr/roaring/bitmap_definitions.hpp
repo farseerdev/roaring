@@ -2139,8 +2139,12 @@ FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::optimize() noexcept( de
     FRSR_ROARING_WRITE_SCOPE;
     settle_counts();
     if constexpr ( table_sharing ) {
-        if ( ran_aside_while_shared( []( bitmap & aside ) { aside.optimize(); } ) ) {
-            return;
+        if constexpr ( detail::table_sharing_policy::optimize_aside ) {
+            if ( ran_aside_while_shared( []( bitmap & aside ) { aside.optimize(); } ) ) {
+                return;
+            }
+        } else {
+            unshare();
         }
     }
     for ( auto & slot : chunks_.slots() ) {
@@ -2153,8 +2157,12 @@ FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::optimize_keep_bitsets()
     FRSR_ROARING_WRITE_SCOPE;
     settle_counts();
     if constexpr ( table_sharing ) {
-        if ( ran_aside_while_shared( []( bitmap & aside ) { aside.optimize_keep_bitsets(); } ) ) {
-            return;
+        if constexpr ( detail::table_sharing_policy::optimize_aside ) {
+            if ( ran_aside_while_shared( []( bitmap & aside ) { aside.optimize_keep_bitsets(); } ) ) {
+                return;
+            }
+        } else {
+            unshare();
         }
     }
     for ( auto & slot : chunks_.slots() ) {
@@ -2228,8 +2236,11 @@ FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::optimize_run_shaped( st
     FRSR_ROARING_WRITE_SCOPE;
     settle_counts();
     if constexpr ( table_sharing ) {
+        // A chunk of fewer keys than the bar has fewer than one run per bar: its handle answers without its payload.
         if ( unchanged_while_shared( [ this, min_mean_run_length ] {
-            return std::ranges::none_of( std::as_const( chunks_ ).slots(), [ min_mean_run_length ]( handle_type const & slot ) { return run_shaped_run_count( slot, min_mean_run_length ) != 0; } );
+            return std::ranges::none_of( std::as_const( chunks_ ).slots(), [ min_mean_run_length ]( handle_type const & slot ) {
+                return detail::container_size( slot ) >= min_mean_run_length && run_shaped_run_count( slot, min_mean_run_length ) != 0;
+            } );
         } ) ) {
             return;
         }
@@ -2564,7 +2575,12 @@ FRSR_ROARING_DEFINITION_INLINE auto FRSR_ROARING_BITMAP::operator|=( bitmap cons
             return *this;
         }
         // Otherwise the union is made in place, on a table of its own (union_merge makes it), as a union with a copy
-        // always was: asking first whether it adds anything costs more than it saves.
+        // always was, unless table_sharing_policy::union_checks_first asks first whether it adds anything.
+        if constexpr ( detail::table_sharing_policy::union_checks_first ) {
+            if ( unchanged_while_shared( [ this, &other ] { return other.is_subset_of( *this ); } ) ) {
+                return *this;
+            }
+        }
     }
     return union_merge<false>( other );
 }
@@ -2593,8 +2609,16 @@ FRSR_ROARING_DEFINITION_INLINE auto FRSR_ROARING_BITMAP::operator-=( bitmap cons
             clear();
             return *this;
         }
-        if ( chunks_.shared() ) [[unlikely]] {
-            return combine_while_shared<detail::set_operation::bit_andnot>( other );
+        // table_sharing_policy::subtract_checks_first: whether the two intersect is asked first, and the table is made
+        // this bitmap's own (combine) only when they do; otherwise the difference is built aside.
+        if constexpr ( detail::table_sharing_policy::subtract_checks_first ) {
+            if ( unchanged_while_shared( [ this, &other ] { return !intersects( other ); } ) ) {
+                return *this;
+            }
+        } else {
+            if ( chunks_.shared() ) [[unlikely]] {
+                return combine_while_shared<detail::set_operation::bit_andnot>( other );
+            }
         }
     }
     return combine<detail::set_operation::bit_andnot, true>( other, nullptr );

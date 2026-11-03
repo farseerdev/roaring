@@ -2766,8 +2766,14 @@ private:
         }
         if constexpr ( mutating ) {
             if constexpr ( table_sharing ) {
+                // table_sharing_policy::key_list_checks_first: whether the call would change the bitmap is asked first;
+                // otherwise the table is made the bitmap's own whatever the operand is.
+                if constexpr ( detail::table_sharing_policy::key_list_checks_first ) {
                 if ( self.unchanged_while_shared( [ &self, &operand ] { return interop_leaves_unchanged<Op>( self, operand ); } ) ) {
                     return;
+                }
+                } else {
+                    self.unshare();
                 }
             }
         }

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <frsr/roaring/container_handle.hpp>
+#include <frsr/roaring/table_sharing_policy.hpp>
 #include <frsr/roaring/tuning.hpp>
 
 #include <algorithm>
@@ -58,11 +59,13 @@ public:
     static_assert( sizeof( handle_type ) % alignof( chunk_type ) == 0 );
     static_assert( handle_type::is_trivially_moveable ); // relocation below is a memcpy
 
-    // Whether a block can be held by more than one table: a refcounted policy.
-    static constexpr bool shareable{ handle_type::rc_prefix_bytes != 0 };
+    // Whether a block can be held by more than one table: a refcounted policy, with sharing on (table_sharing_policy).
+    static constexpr bool shareable{ handle_type::rc_prefix_bytes != 0 && table_sharing_policy::enabled };
     static constexpr std::size_t table_prefix_bytes{ shareable ? sizeof( handle_type ) : 0 };
     static_assert( table_prefix_bytes % sizeof( handle_type ) == 0, "the prefix keeps the handles on their grid" );
-    static_assert( table_prefix_bytes >= handle_type::rc_prefix_bytes );
+    static_assert( table_prefix_bytes >= handle_type::rc_prefix_bytes || !shareable );
+    // A block of up to small_capacity entries has no prefix and no count: it is never shared, a copy copies it.
+    static constexpr index_type small_capacity{ shareable ? table_sharing_policy::small_table_capacity : 0 };
 
     // A position in key order; end() is the position past the last entry. It stays valid until
     // the table is restructured.
@@ -190,7 +193,7 @@ public:
     // Bytes held, spare capacity included (not the spilled payloads).
     [[nodiscard]] std::size_t node_bytes() const noexcept {
         if constexpr ( shareable ) {
-            return capacity_ != 0 ? table_prefix_bytes + bytes_for( capacity_ ) : 0;
+            return capacity_ != 0 ? prefix_bytes( capacity_ ) + bytes_for( capacity_ ) : 0;
         } else {
             return bytes_for( capacity_ );
         }
@@ -199,7 +202,7 @@ public:
     // Whether another table holds this block too: then nothing in it may be written. A pure read.
     [[nodiscard]] bool shared() const noexcept {
         if constexpr ( shareable ) {
-            return slots_ != nullptr && cow_policy::rc_load( rc_slot() ) != 1;
+            return counted( capacity_ ) && cow_policy::rc_load( rc_slot() ) != 1;
         } else {
             return false;
         }
@@ -210,10 +213,14 @@ public:
         return slots_ != nullptr && slots_ == other.slots_;
     }
 
-    // Makes this a table that holds `other`'s block, which is not copied: one count is taken on it. The
-    // block of an empty table is never shared, so a copy of a table emptied with its capacity kept holds
-    // nothing.
+    // Whether a copy may hold this table instead of copying it: it holds entries, in a block that counts its holders.
+    [[nodiscard]] bool can_share() const noexcept requires( shareable ) { return size_ != 0 && counted( capacity_ ); }
+
+    // Makes this a table that holds `other`'s block, which is not copied: one count is taken on it. Only a
+    // table that can_share() is shared: the block of an empty table never is (a copy of a table emptied with
+    // its capacity kept holds nothing), and a small block is copied instead (copy_from).
     void share_from( chunk_array const & other ) noexcept requires( shareable ) {
+        assert( other.can_share() || other.empty() );
         release();
         if ( other.size_ == 0 ) {
             return;
@@ -236,13 +243,14 @@ public:
         index_type built{ 0 };
         try {
             for ( ; built < size_; ++built ) {
+                prefetch_count_ahead( built );
                 new ( fresh_slots + built ) handle_type{ slots_[ built ] };
             }
         } catch ( ... ) {
             while ( built != 0 ) {
                 fresh_slots[ --built ].~handle_type();
             }
-            free_table( fresh_slots );
+            free_table( fresh_slots, capacity );
             throw;
         }
         if ( size_ != 0 ) {
@@ -289,12 +297,12 @@ public:
         auto * dst_keys { keys_ };
         if ( relocating ) {
             auto const capacity{ std::max( { total, capacity_ < 1024 ? capacity_ * 2 : capacity_ + capacity_ / 4, index_type{ 4 } } ) };
-            fresh     = allocate_block( table_prefix_bytes + bytes_for( capacity ) );
+            fresh     = allocate_block( prefix_bytes( capacity ) + bytes_for( capacity ) );
             if constexpr ( shareable ) {
-                count_from_one( fresh );
+                count_from_one( fresh, capacity );
             }
-            dst_slots = reinterpret_cast<handle_type *>( fresh + table_prefix_bytes );
-            dst_keys  = reinterpret_cast<chunk_type  *>( fresh + table_prefix_bytes + keys_offset( capacity ) );
+            dst_slots = reinterpret_cast<handle_type *>( fresh + prefix_bytes( capacity ) );
+            dst_keys  = reinterpret_cast<chunk_type  *>( fresh + prefix_bytes( capacity ) + keys_offset( capacity ) );
             new_capacity = capacity;
         }
         auto end{ size_ };                              // [ 0, end ) is still in place
@@ -333,7 +341,7 @@ public:
                 std::memcpy( static_cast<void *>( dst_slots ), static_cast<void const *>( slots_ ), std::size_t{ end } * sizeof( handle_type ) );
                 std::memcpy( dst_keys, keys_, std::size_t{ end } * sizeof( chunk_type ) );
             }
-            if ( slots_ ) { free_block( reinterpret_cast<std::byte *>( slots_ ) - table_prefix_bytes ); }
+            if ( slots_ ) { free_block( reinterpret_cast<std::byte *>( slots_ ) - prefix_bytes( capacity_ ) ); }
             slots_    = dst_slots;
             keys_     = dst_keys;
             capacity_ = new_capacity;
@@ -591,36 +599,60 @@ private:
     // memcpy (trivially moveable), keys likewise. The block must not be shared.
     void relocate( index_type const capacity ) {
         assert( !shared() );
-        auto * const fresh{ allocate_block( table_prefix_bytes + bytes_for( capacity ) ) };
+        auto * const fresh{ allocate_block( prefix_bytes( capacity ) + bytes_for( capacity ) ) };
         if constexpr ( shareable ) {
-            count_from_one( fresh );
+            count_from_one( fresh, capacity );
         }
-        auto * const fresh_slots{ reinterpret_cast<handle_type *>( fresh + table_prefix_bytes ) };
-        auto * const fresh_keys { reinterpret_cast<chunk_type  *>( fresh + table_prefix_bytes + keys_offset( capacity ) ) };
+        auto * const fresh_slots{ reinterpret_cast<handle_type *>( fresh + prefix_bytes( capacity ) ) };
+        auto * const fresh_keys { reinterpret_cast<chunk_type  *>( fresh + prefix_bytes( capacity ) + keys_offset( capacity ) ) };
         if ( size_ != 0 ) {
             std::memcpy( static_cast<void *>( fresh_slots ), static_cast<void const *>( slots_ ), std::size_t{ size_ } * sizeof( handle_type ) );
             std::memcpy( fresh_keys , keys_ , std::size_t{ size_ } * sizeof( chunk_type  ) );
         }
         if ( slots_ ) {
-            free_block( reinterpret_cast<std::byte *>( slots_ ) - table_prefix_bytes );
+            free_block( reinterpret_cast<std::byte *>( slots_ ) - prefix_bytes( capacity_ ) );
         }
         slots_    = fresh_slots;
         keys_     = fresh_keys;
         capacity_ = capacity;
     }
 
-    // The count of a fresh block (the handles start table_prefix_bytes into it): this table alone holds it.
-    static void count_from_one( std::byte * const block ) noexcept requires( shareable ) {
-        cow_policy::rc_construct( block + table_prefix_bytes - handle_type::rc_prefix_bytes );
+    // A walk at entry `at` that writes the payload counts fetches the one table_sharing_policy::prefetch_distance ahead.
+    [[gnu::always_inline]] void prefetch_count_ahead( index_type const at ) const noexcept requires( shareable ) {
+        if constexpr ( table_sharing_policy::prefetch_distance != 0 ) {
+            if ( at + table_sharing_policy::prefetch_distance < size_ ) {
+                slots_[ at + table_sharing_policy::prefetch_distance ].prefetch_payload_count();
+            }
+        }
+    }
+    // Whether a block of `capacity` entries counts the tables that hold it (only such a block is ever shared).
+    [[nodiscard]] static constexpr bool counted( index_type const capacity ) noexcept {
+        return shareable && capacity > small_capacity;
+    }
+    // The bytes in front of the handles of a block of `capacity` entries: the prefix that holds the count.
+    [[nodiscard]] static constexpr std::size_t prefix_bytes( index_type const capacity ) noexcept {
+        if constexpr ( small_capacity != 0 ) {
+            return counted( capacity ) ? table_prefix_bytes : 0;
+        } else {
+            (void)capacity;
+            return table_prefix_bytes;
+        }
+    }
+    // The count of a fresh block of `capacity` entries (the handles start prefix_bytes( capacity ) into it): this
+    // table alone holds it.
+    static void count_from_one( std::byte * const block, index_type const capacity ) noexcept requires( shareable ) {
+        if ( counted( capacity ) ) {
+            cow_policy::rc_construct( block + table_prefix_bytes - handle_type::rc_prefix_bytes );
+        }
     }
     // A block of `capacity` entries, held by this table alone; the handles start where the result points.
     [[nodiscard]] static handle_type * allocate_table( index_type const capacity ) requires( shareable ) {
-        auto * const block{ allocate_block( table_prefix_bytes + bytes_for( capacity ) ) };
-        count_from_one( block );
-        return reinterpret_cast<handle_type *>( block + table_prefix_bytes );
+        auto * const block{ allocate_block( prefix_bytes( capacity ) + bytes_for( capacity ) ) };
+        count_from_one( block, capacity );
+        return reinterpret_cast<handle_type *>( block + prefix_bytes( capacity ) );
     }
-    static void free_table( handle_type * const slots ) noexcept requires( shareable ) {
-        free_block( reinterpret_cast<std::byte *>( slots ) - table_prefix_bytes );
+    static void free_table( handle_type * const slots, index_type const capacity ) noexcept requires( shareable ) {
+        free_block( reinterpret_cast<std::byte *>( slots ) - prefix_bytes( capacity ) );
     }
     [[nodiscard]] static chunk_type * keys_of( handle_type * const slots, index_type const capacity ) noexcept requires( shareable ) {
         return reinterpret_cast<chunk_type *>( reinterpret_cast<std::byte *>( slots ) + keys_offset( capacity ) );
@@ -631,14 +663,15 @@ private:
         return reinterpret_cast<std::byte *>( slots_ ) - handle_type::rc_prefix_bytes;
     }
 
-    // Gives up this table's count on its block (which it holds); the last holder destroys the entries and
-    // frees the block. The fields are left as they are.
+    // Gives up this table's count on its block (which it holds); the last holder (the only one, of a block that
+    // counts none) destroys the entries and frees the block. The fields are left as they are.
     void drop_block() noexcept requires( shareable ) {
-        if ( cow_policy::rc_decrement_is_last( rc_slot() ) ) {
+        if ( !counted( capacity_ ) || cow_policy::rc_decrement_is_last( rc_slot() ) ) {
             for ( index_type i{ 0 }; i < size_; ++i ) {
+                prefetch_count_ahead( i );
                 slots_[ i ].~handle_type();
             }
-            free_table( slots_ );
+            free_table( slots_, capacity_ );
         }
     }
 

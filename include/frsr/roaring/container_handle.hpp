@@ -451,6 +451,16 @@ public:
         return spilled() && other.spilled() && spill().data == other.spill().data;
     }
 
+    // Starts fetching, for writing, the count of a counted payload, ahead of the copy or the release of this handle that
+    // writes it: a walk over many handles then overlaps the misses on their counts. Nothing for any other payload.
+    void prefetch_payload_count() const noexcept {
+        if constexpr ( CowPolicy::refcounted ) {
+            if ( spilled() && owner_ == storage_ownership::shared ) {
+                __builtin_prefetch( rc_slot_of( spill().data ), 1 );
+            }
+        }
+    }
+
     // The reference count of a spilled payload under a refcounted policy; 0 for an inline payload, for a
     // borrowed one, and under a policy without counts. A diagnostic for tests that pin down which operations
     // leave a published payload's count alone.

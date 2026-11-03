@@ -1,7 +1,8 @@
 // Copies of a bitmap whose chunk keys are 16 bits wide share the chunk table under a refcounted copy-on-write policy:
 // a copy takes one count on the table, the first call that changes either bitmap gives it a table of its own, and a
-// call that changes nothing leaves the table shared. Under value semantics a copy has a table of its own from the
-// start; the tests that do not depend on the sharing run there too.
+// call that changes nothing leaves the table shared. Under value semantics, with sharing off, and for a small table
+// (table_sharing_policy.hpp), a copy has a table of its own from the start; the tests that do not depend on the
+// sharing run there too.
 //
 // Mirrors the copy tests of the reference (tests/toplevel_unit.c: can_copy_empty, can_add_to_copies,
 // can_remove_from_copies, leaks_with_empty, test_stress_memory, test_example; tests/cpp_unit.cpp: test_example_cpp,
@@ -47,8 +48,21 @@ using fr::detail::run_selection_lazy;
 template <typename Key, typename Cow, typename Run = run_selection_eager>
 using bitmap_of = fr::bitmap<Key, fr::default_container_set<Key>, Cow, Run>;
 
+using sharing_policy = fr::detail::table_sharing_policy;
+
+// The chunks of a table that is not small: the bitmaps of 32-bit keys these tests share hold at least this many.
+inline constexpr std::uint32_t shared_chunks{ sharing_policy::small_table_capacity + 4 };
+
+// The room a table that grows from empty makes for its first chunks.
+inline constexpr std::uint32_t first_capacity{ 4 };
+
+// Whether a copy of the bitmaps these tests build shares their table: a refcounted policy with sharing on, and a table
+// that is not small. A bitmap of 16-bit keys has one chunk, in a table with room for first_capacity of them.
 template <typename Bitmap>
-inline constexpr bool shares_tables{ Bitmap::cow_policy::refcounted };
+inline constexpr bool shares_tables{
+    Bitmap::cow_policy::refcounted && sharing_policy::enabled &&
+    ( sizeof( typename Bitmap::key_type ) > sizeof( std::uint16_t ) || sharing_policy::small_table_capacity < first_capacity )
+};
 
 template <typename Bitmap>
 using access = fr::detail::bitmap_test_access<Bitmap>;
@@ -69,8 +83,8 @@ template <typename Bitmap>
     return { values.begin(), values.end() };
 }
 
-// A bitmap with an array, a bitset and a run container (in chunks 0, 1, 2 and 5 of a 32-bit key; a 16-bit key has one
-// chunk, which ends up a bitset).
+// A bitmap with an array, a bitset and a run container (in chunks 0, 1, 2 and 5 of a 32-bit key, and one value in each
+// of the chunks from 8 on that make the table more than small; a 16-bit key has one chunk, which ends up a bitset).
 template <typename Bitmap>
 [[nodiscard]] Bitmap make_mixed() {
     using key = typename Bitmap::key_type;
@@ -90,6 +104,9 @@ template <typename Bitmap>
         bitmap.optimize();
         for ( key i{ 0 }; i < 20; ++i ) {
             std::ignore = bitmap.add( 5 * 65'536 + i * 11 );
+        }
+        for ( key chunk{ 8 }; chunk < 8 + shared_chunks; ++chunk ) {
+            std::ignore = bitmap.add( chunk * 65'536 + 1 );
         }
     }
     return bitmap;
@@ -121,6 +138,7 @@ TYPED_TEST( TableSharing, CopySharesTheChunkTable ) {
     using bitmap = TypeParam;
     auto const source{ make_mixed<bitmap>() };
     auto const before{ access<bitmap>::snapshot( source ) };
+    auto const containers_before{ containers_of( source ) };
     EXPECT_TRUE( source.is_unique() );
     {
         bitmap const copy{ source };
@@ -128,7 +146,11 @@ TYPED_TEST( TableSharing, CopySharesTheChunkTable ) {
         EXPECT_EQ( source.shares_storage_with( copy ), shares_tables<bitmap> );
         EXPECT_EQ( source.is_unique(), !shares_tables<bitmap> );
         EXPECT_EQ( copy.is_unique(), !shares_tables<bitmap> );
-        EXPECT_EQ( access<bitmap>::snapshot( source ), before );
+        // a copy of a table that is not shared takes a count on each payload instead
+        if constexpr ( shares_tables<bitmap> ) {
+            EXPECT_EQ( access<bitmap>::snapshot( source ), before );
+        }
+        EXPECT_EQ( containers_of( source ), containers_before );
         EXPECT_EQ( values_of( copy ), values_of( source ) );
         EXPECT_EQ( copy.size(), source.size() );
         EXPECT_EQ( copy.validate(), nullptr );
@@ -237,10 +259,20 @@ TYPED_TEST( TableSharing, CallsThatChangeNothingLeaveTheTableShared ) {
             EXPECT_TRUE( !shares_tables<bitmap> || freed == 0U );
         } },
     };
+    // The calls a knob has make the table the bitmap's own whatever they would change.
+    auto const stays_shared{ [ & ]( std::string const & name ) {
+        bool const key_list{ name.starts_with( "and_with" ) ||
+                             name.starts_with( "or_with" ) ||
+                             name.starts_with( "andnot_with" ) };
+        bool const optimizing{ name.starts_with( "optimize( " ) };
+        return shares_tables<bitmap> &&
+               ( !key_list || sharing_policy::key_list_checks_first ) &&
+               ( !optimizing || sharing_policy::optimize_aside );
+    } };
     for ( auto const & [ name, call ] : calls ) {
         bitmap copy{ source };
         call( copy );
-        EXPECT_EQ( copy.shares_storage_with( source ), shares_tables<bitmap> ) << name;
+        EXPECT_EQ( copy.shares_storage_with( source ), stays_shared( name ) ) << name;
         EXPECT_EQ( values_of( copy ), expected ) << name;
         EXPECT_EQ( copy.size(), expected.size() ) << name;
         EXPECT_EQ( values_of( source ), expected ) << name;
@@ -317,16 +349,198 @@ TYPED_TEST( TableSharing, ACallThatChangesTheCopyLeavesTheSourceAsItWas ) {
             std::ignore = b.add( 1 );
         } },
     };
-    for ( auto const & [ name, call ] : calls ) {
-        bitmap copy{ source };
-        call( copy );
-        EXPECT_FALSE( copy.shares_storage_with( source ) ) << name;
-        EXPECT_TRUE( copy.is_unique() ) << name;
-        EXPECT_TRUE( source.is_unique() ) << name;
-        EXPECT_EQ( copy.validate(), nullptr ) << name;
-        EXPECT_EQ( containers_of( source ), before ) << name;
-        EXPECT_EQ( values_of( source ), expected ) << name;
+    // [croaring-ref] tests/toplevel_unit.c:check_unshares: each call on either holder of the table, from a source as
+    // built and from one run-optimized; the other holder keeps its containers and keys.
+    auto const optimized{ [] {
+        auto result{ make_mixed<bitmap>() };
+        result.optimize();
+        return result;
+    }() };
+    for ( auto const * const original : { &source, &optimized } ) {
+        auto const original_before{ containers_of( *original ) };
+        auto const original_keys{ values_of( *original ) };
+        for ( auto const & [ name, call ] : calls ) {
+            for ( bool const change_the_copy : { true, false } ) {
+                bitmap held{ *original };
+                bitmap copy{ held };
+                auto & changed{ change_the_copy ? copy : held };
+                auto const & unchanged{ change_the_copy ? held : copy };
+                auto const unchanged_before{ containers_of( unchanged ) };
+                call( changed );
+                EXPECT_FALSE( changed.shares_storage_with( unchanged ) ) << name;
+                EXPECT_TRUE( changed.is_unique() ) << name;
+                EXPECT_TRUE( unchanged.is_unique() || unchanged.shares_storage_with( *original ) ) << name;
+                EXPECT_EQ( changed.validate(), nullptr ) << name;
+                EXPECT_EQ( unchanged.validate(), nullptr ) << name;
+                EXPECT_EQ( containers_of( unchanged ), unchanged_before ) << name;
+                EXPECT_EQ( values_of( unchanged ), original_keys ) << name;
+            }
+        }
+        EXPECT_EQ( containers_of( *original ), original_before );
     }
+    EXPECT_TRUE( source.is_unique() );
+    EXPECT_EQ( containers_of( source ), before );
+    EXPECT_EQ( values_of( source ), expected );
+}
+
+// [croaring-ref] tests/toplevel_unit.c:test_remove_many_copy_on_write_many_copies: four copies of one table, each
+// changed in turn by a batch removal (one that empties a chunk, one inside a single chunk): every copy that has not
+// been changed yet keeps the keys of the source.
+TYPED_TEST( TableSharing, ManyCopiesChangedOneAfterAnother ) {
+    using bitmap = TypeParam;
+    using key = typename bitmap::key_type;
+    auto const source{ make_mixed<bitmap>() };
+    auto const expected{ values_of( source ) };
+    std::array<bitmap, 4> copies{ source, source, source, source };
+    std::vector<key> const one_chunk{ held_value<bitmap>, static_cast<key>( 2 * held_value<bitmap> ) };
+    auto const first_chunk{ [ & ] {
+        std::vector<key> keys;
+        for ( auto const value : expected ) {
+            if ( value >> 16 == expected.front() >> 16 ) {
+                keys.push_back( value );
+            }
+        }
+        return keys;
+    }() };
+    for ( std::size_t i{ 0 }; i < copies.size(); ++i ) {
+        if ( i % 2 == 0 ) {
+            copies[ i ].remove_many_sorted( first_chunk );
+            EXPECT_EQ( copies[ i ].size(), expected.size() - first_chunk.size() );
+        } else {
+            copies[ i ].remove_many( one_chunk );
+            EXPECT_EQ( copies[ i ].size(), expected.size() - one_chunk.size() );
+        }
+        EXPECT_EQ( copies[ i ].validate(), nullptr );
+        for ( std::size_t later{ i + 1 }; later < copies.size(); ++later ) {
+            EXPECT_EQ( values_of( copies[ later ] ), expected ) << i << " " << later;
+            EXPECT_EQ( copies[ later ].shares_storage_with( source ), shares_tables<bitmap> ) << i << " " << later;
+        }
+    }
+    EXPECT_EQ( values_of( source ), expected );
+    EXPECT_TRUE( source.is_unique() );
+}
+
+// [croaring-ref] tests/toplevel_unit.c:issue288 (roaring_bitmap_overwrite): a bitmap that holds a shared table is
+// assigned an empty bitmap, another table, itself and a copy of its own table; the other holders keep their keys.
+TYPED_TEST( TableSharing, AssignmentOverASharedTable ) {
+    using bitmap = TypeParam;
+    auto const source{ make_mixed<bitmap>() };
+    auto const expected{ values_of( source ) };
+    bitmap target{ source };
+    target = bitmap{};
+    EXPECT_TRUE( target.empty() );
+    EXPECT_TRUE( source.is_unique() );
+    EXPECT_EQ( values_of( source ), expected );
+
+    target = source;
+    EXPECT_EQ( target.shares_storage_with( source ), shares_tables<bitmap> );
+    auto const & same{ target };
+    target = same;
+    EXPECT_EQ( values_of( target ), expected );
+    bitmap other;
+    std::ignore = other.add( absent_value<bitmap> );
+    target = other;
+    EXPECT_EQ( values_of( target ), values_of( other ) );
+    EXPECT_TRUE( source.is_unique() );
+    EXPECT_EQ( values_of( source ), expected );
+    bitmap const third{ source };
+    target = third;
+    EXPECT_EQ( target.shares_storage_with( source ), shares_tables<bitmap> );
+    target = source;
+    EXPECT_EQ( values_of( target ), expected );
+    target = {};
+    EXPECT_EQ( values_of( third ), expected );
+}
+
+// A table that is small (table_sharing_policy::small_table_capacity) is copied, not shared: the copy has a table of its
+// own, which takes a count on every spilled payload instead, and either bitmap changes without copying a table.
+TYPED_TEST( TableSharing, ASmallTableIsCopied ) {
+    using bitmap = TypeParam;
+    using key = typename bitmap::key_type;
+    if constexpr ( !( bitmap::cow_policy::refcounted && sharing_policy::enabled && sharing_policy::small_table_capacity >= first_capacity ) ) {
+        GTEST_SKIP() << "no table is copied for being small";
+    } else {
+        bitmap source;
+        for ( std::uint32_t i{ 0 }; i < 3'000; ++i ) {
+            std::ignore = source.add( static_cast<key>( i * 3 ) );
+        }
+        ASSERT_LE( source.statistics().container_count(), sharing_policy::small_table_capacity );
+        auto const before{ access<bitmap>::snapshot( source ) };
+        bitmap copy{ source };
+        EXPECT_FALSE( copy.shares_storage_with( source ) );
+        EXPECT_TRUE( copy.is_unique() );
+        EXPECT_TRUE( source.is_unique() );
+        auto const after{ access<bitmap>::snapshot( source ) };
+        ASSERT_EQ( after.size(), before.size() );
+        for ( std::size_t i{ 0 }; i < after.size(); ++i ) {
+            EXPECT_EQ( after[ i ].refcount, before[ i ].refcount == 0 ? 0 : before[ i ].refcount + 1 );
+        }
+        std::ignore = copy.add( 1 );
+        EXPECT_FALSE( source.contains( 1 ) );
+        EXPECT_EQ( access<bitmap>::snapshot( source ), before );
+        bitmap assigned;
+        assigned = source;
+        EXPECT_FALSE( assigned.shares_storage_with( source ) );
+        EXPECT_EQ( values_of( assigned ), values_of( source ) );
+    }
+}
+
+// A copy, an assignment and the first change of a copy that fail at any of their allocations leave every bitmap they
+// involve as it was: the source, the target (which may hold a shared table of its own) and the copy.
+TYPED_TEST( TableSharing, AFailedCopyOrAssignmentChangesNothing ) {
+    using bitmap = TypeParam;
+    using key = typename bitmap::key_type;
+#if FRSR_ROARING_HAS_MIMALLOC || !FRSR_TESTS_COUNT_ALLOCATIONS
+    GTEST_SKIP() << "allocations cannot be made to fail in this build";
+#else
+    auto const large{ make_mixed<bitmap>() };
+    auto const small{ [] {
+        bitmap result;
+        for ( std::uint32_t i{ 0 }; i < 3'000; ++i ) {
+            std::ignore = result.add( static_cast<key>( i * 5 ) );
+        }
+        return result;
+    }() };
+    for ( auto const * const source : { &large, &small } ) {
+        auto const source_before{ containers_of( *source ) };
+        auto const source_keys{ values_of( *source ) };
+        auto const target_holder{ make_mixed<bitmap>() };
+        auto const target_keys{ values_of( target_holder ) };
+        bool failed_any{ false };
+        bool completed{ false };
+        for ( std::uint32_t fail_at{ 1 }; fail_at < 4'000 && !completed; ++fail_at ) {
+            bitmap target{ target_holder };
+            auto const target_before{ containers_of( target ) };
+            bool threw{ false };
+            alloc_fault::counter = 0;
+            try {
+                alloc_fault::armed const armed{ fail_at };
+                bitmap copy{ *source };
+                target = *source;
+                std::ignore = copy.add( absent_value<bitmap> );
+            } catch ( std::bad_alloc const & ) {
+                threw = true;
+            }
+            alloc_fault::counter = 0;
+            failed_any |= threw;
+            EXPECT_EQ( containers_of( *source ), source_before ) << fail_at;
+            EXPECT_EQ( values_of( *source ), source_keys ) << fail_at;
+            EXPECT_EQ( values_of( target_holder ), target_keys ) << fail_at;
+            EXPECT_EQ( target_holder.validate(), nullptr ) << fail_at;
+            EXPECT_EQ( target.validate(), nullptr ) << fail_at;
+            if ( threw && values_of( target ) != source_keys ) {
+                EXPECT_EQ( values_of( target ), target_keys ) << fail_at;
+                EXPECT_EQ( containers_of( target ), target_before ) << fail_at;
+            }
+            if ( !threw ) {
+                EXPECT_EQ( values_of( target ), source_keys ) << fail_at;
+                completed = true;
+            }
+        }
+        EXPECT_TRUE( failed_any );
+        EXPECT_TRUE( completed );
+    }
+#endif
 }
 
 // An iterator on the source is not disturbed by changes of a copy.
@@ -388,6 +602,11 @@ TYPED_TEST( TableSharing, OptimizeRunShapedOfTouchedChunksOnASharedTable ) {
         std::ignore = published.add( value );
     }
     std::ignore = published.add( static_cast<key>( 8'000 ) );
+    if constexpr ( sizeof( key ) > sizeof( std::uint16_t ) ) {
+        for ( key chunk{ 1 }; chunk <= shared_chunks; ++chunk ) {  // a table that is not small
+            std::ignore = published.add( chunk * 65'536 );
+        }
+    }
     ASSERT_EQ( published.statistics().bitset_containers, 1U );
     auto const expected{ values_of( published ) };
     auto const reader{ published };
@@ -838,6 +1057,31 @@ TYPED_TEST( ReferenceCopies, UnionIntoAnEmptyBitmapAndACopyOfIt ) {
     EXPECT_EQ( r1, r2 );
 }
 
+// [croaring-ref] tests/roaring64_unit.cpp: roaring64_bitmap_copy, roaring64_bitmap_overwrite (with keys, with an empty
+// bitmap and with itself): a bitmap of 64-bit keys, whose table every copy copies.
+TYPED_TEST( ReferenceCopies, CopiesAndOverwritesOfWideKeys ) {
+    using wide = bitmap_of<std::uint64_t, typename TypeParam::cow_policy>;
+    wide source;
+    for ( std::uint64_t i{ 0 }; i < 1'000; ++i ) {
+        std::ignore = source.add( i * 0x1'0000'0001ULL );
+    }
+    wide copy{ source };
+    EXPECT_EQ( copy, source );
+    std::ignore = copy.add( 3 );
+    EXPECT_FALSE( source.contains( 3 ) );
+    wide target;
+    std::ignore = target.add( 7 );
+    target = source;
+    EXPECT_EQ( target, source );
+    target = wide{};
+    EXPECT_TRUE( target.empty() );
+    EXPECT_EQ( source.size(), 1'000U );
+    copy = source;
+    auto const & same{ copy };
+    copy = same;
+    EXPECT_EQ( copy, source );
+}
+
 // ---- threads -------------------------------------------------------------------------------------------------------
 
 using atomic_bitmap = bitmap_of<std::uint32_t, cow_atomic_refcount>;
@@ -861,6 +1105,9 @@ TEST( TableSharingThreads, CopiesCombinedOnTwoThreads ) {
         if ( i % 2 == 0 ) {
             std::ignore = r1.add( i );
         }
+    }
+    for ( std::uint32_t chunk{ 8 }; chunk < 8 + shared_chunks; ++chunk ) {  // a table that is not small
+        std::ignore = r1.add( chunk * 65'536 );
     }
     r1.optimize();
     atomic_bitmap const r2{ std::vector<std::uint32_t>{ 10'010, 10'020, 10'030, 10'040, 10'050 } };
@@ -892,6 +1139,7 @@ TEST( TableSharingThreads, CopiesCombinedOnTwoThreads ) {
 // Threads copy one published bitmap, change their copies and read the published one meanwhile: the published bitmap
 // never changes, every copy ends with the published keys and its own change.
 TEST( TableSharingThreads, CopiesOfAPublishedBitmapChangedByManyThreads ) {
+    static_assert( sharing_policy::small_table_capacity < 64, "the published table is not small" );
     atomic_bitmap published;
     for ( std::uint32_t chunk{ 0 }; chunk < 64; ++chunk ) {
         for ( std::uint32_t i{ 0 }; i < 100; ++i ) {
@@ -937,7 +1185,7 @@ TEST( TableSharingThreads, CopiesOfAPublishedBitmapChangedByManyThreads ) {
 TEST( TableSharingThreads, TwoHoldersOfATableChangeItAtOnce ) {
     for ( int round{ 0 }; round < 200; ++round ) {
         auto source{ std::make_unique<atomic_bitmap>() };
-        for ( std::uint32_t chunk{ 0 }; chunk < 16; ++chunk ) {
+        for ( std::uint32_t chunk{ 0 }; chunk < shared_chunks; ++chunk ) {
             std::ignore = source->add( chunk * 65'536 );
         }
         atomic_bitmap left{ *source };
@@ -956,8 +1204,8 @@ TEST( TableSharingThreads, TwoHoldersOfATableChangeItAtOnce ) {
         b.join();
         ASSERT_TRUE( left.is_unique() );
         ASSERT_TRUE( right.is_unique() );
-        ASSERT_TRUE( left.contains( 7 ) && !left.contains( 9 ) && left.size() == 17 );
-        ASSERT_TRUE( right.contains( 9 ) && !right.contains( 7 ) && right.size() == 17 );
+        ASSERT_TRUE( left.contains( 7 ) && !left.contains( 9 ) && left.size() == shared_chunks + 1 );
+        ASSERT_TRUE( right.contains( 9 ) && !right.contains( 7 ) && right.size() == shared_chunks + 1 );
     }
 }
 
@@ -982,9 +1230,12 @@ TEST( TableSharingThreads, ADetachRacesTheReleaseOfTheOtherHolder ) {
 
     auto r1{ std::make_unique<atomic_bitmap>() };
     for ( std::uint32_t i{ 0 }; i < 10'000; ++i ) {
-        std::ignore = r1->add( 2 * i + 1 );
+        std::ignore = r1->add( 2 * i + 1 + ( i % shared_chunks ) * 65'536 );
     }
     auto r2{ std::make_unique<atomic_bitmap>( *r1 ) };
+    if ( !shares_tables<atomic_bitmap> ) {
+        GTEST_SKIP() << "a copy does not share the table";
+    }
     ASSERT_TRUE( r1->shares_storage_with( *r2 ) );
     bool intercepted{ false };
     std::thread modifier{ [ & ] {
