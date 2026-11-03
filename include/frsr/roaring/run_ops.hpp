@@ -368,46 +368,65 @@ template <typename Layout, typename CowPolicy = cow_value_semantics>
     run_cref<Layout, CowPolicy> const rhs,
     std::size_t const bitset_threshold
 ) {
+    using low_type = typename Layout::low_type;
+    using run_type = ::frsr::roaring::run<low_type>;
+    assert( !lhs.runs.empty() );
+    assert( !rhs.runs.empty() );
     auto result{ container_handle<Layout, CowPolicy>::make_run() };
     auto ref{ result.as_run() };
     // Cutting runs out of runs leaves at most one more run per run taken out.
     ref.runs.resize_uninitialized( static_cast<std::uint32_t>( lhs.runs.size() + rhs.runs.size() ) );
     auto * const out{ ref.runs.data() };
-    std::size_t n{ 0 };
+    auto const * const left{ lhs.runs.data() };
+    auto const left_size{ lhs.runs.size() };
+    auto const * const right{ rhs.runs.data() };
+    auto const right_size{ rhs.runs.size() };
 
-    auto ri{ rhs.runs.begin() };
-    for ( auto const & left : lhs.runs ) {
-        while ( ri != rhs.runs.end() && ri->end < left.begin ) {
+    // The left runs that end before the first right run are kept whole, copied in one piece.
+    auto li{ gallop_forward<false>( left, 0, left_size, right[ 0 ].begin, run_end_key<low_type>{} ) };
+    std::memcpy( out, left, li * sizeof( run_type ) );
+    auto n{ li };
+    // What the right runs take out of the left ones: the result's cardinality is the left one less this.
+    std::size_t removed{ 0 };
+    std::size_t ri{ 0 };
+    for ( ; li != left_size; ++li ) {
+        auto const current{ left[ li ] };
+        while ( ri != right_size && right[ ri ].end < current.begin ) {
             ++ri;
         }
+        if ( ri == right_size ) {
+            break;
+        }
 
-        auto current_begin{ left.begin };
+        auto current_begin{ current.begin };
         auto exhausted{ false };
-        auto scan{ ri };
-        while ( scan != rhs.runs.end() && scan->begin <= left.end ) {
-            if ( current_begin < scan->begin ) {
-                auto const end{ static_cast<typename Layout::low_type>( scan->begin - 1U ) };
-                out[ n++ ] = ::frsr::roaring::run<typename Layout::low_type>{ current_begin, end };
+        while ( ri != right_size && right[ ri ].begin <= current.end ) {
+            auto const cut_begin{ std::max( current_begin, right[ ri ].begin ) };
+            auto const cut_end  { std::min( current.end, right[ ri ].end ) };
+            removed += static_cast<std::size_t>( cut_end ) - cut_begin + 1U;
+            if ( current_begin < right[ ri ].begin ) {
+                out[ n++ ] = run_type{ current_begin, static_cast<low_type>( right[ ri ].begin - 1U ) };
             }
-
-            if ( scan->end == std::numeric_limits<typename Layout::low_type>::max() || scan->end >= left.end ) {
+            // A right run reaching past this left run may cut the next one too, so it stays current.
+            if ( right[ ri ].end >= current.end ) {
                 exhausted = true;
                 break;
             }
-
-            current_begin = static_cast<typename Layout::low_type>( scan->end + 1U );
-            ++scan;
+            current_begin = static_cast<low_type>( right[ ri ].end + 1U );
+            ++ri;
         }
-
-        if ( !exhausted && current_begin <= left.end ) {
-            out[ n++ ] = ::frsr::roaring::run<typename Layout::low_type>{ current_begin, left.end };
+        if ( !exhausted ) {
+            out[ n++ ] = run_type{ current_begin, current.end };
         }
     }
+    // The left runs past the last right run are kept whole, copied in one piece (as the reference copies them).
+    std::memcpy( out + n, left + li, ( left_size - li ) * sizeof( run_type ) );
+    n += left_size - li;
     if ( n == 0 ) {
         return container_handle<Layout, CowPolicy>{};
     }
     ref.runs.resize_uninitialized( static_cast<std::uint32_t>( n ) );
-    ref.sync_header();
+    ref.sync_header( lhs.size() - removed );
     return settle_run_result<Layout, CowPolicy>( std::move( result ), bitset_threshold );
 }
 

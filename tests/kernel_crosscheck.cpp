@@ -546,6 +546,13 @@ TEST( KernelCrosscheck, RunListsOfDifferentLengthsIntersectLikeCRoaring ) {
         auto copy{ left };
         copy &= right;
         EXPECT_TRUE( same_contents( copy, expected ) );
+        croaring const left_minus_right{ roaring_bitmap_andnot( theirs_left.r, theirs_right.r ) };
+        croaring const right_minus_left{ roaring_bitmap_andnot( theirs_right.r, theirs_left.r ) };
+        EXPECT_TRUE( same_contents( left - right, left_minus_right ) ) << "left - right";
+        EXPECT_TRUE( same_contents( right - left, right_minus_left ) ) << "right - left";
+        auto difference{ left };
+        difference -= right;
+        EXPECT_TRUE( same_contents( difference, left_minus_right ) ) << "left -= right";
     }
 }
 
@@ -718,6 +725,42 @@ TEST( KernelCrosscheck, LongArrayAgainstFewRunsLikeCRoaring ) {
     for ( std::uint32_t low{ 29995 }; low < 30005; ++low ) { edge.push_back( run_chunk_base + low ); }
     for ( std::uint32_t low{ 49990 }; low < 50010; ++low ) { edge.push_back( run_chunk_base + low ); }
     check_array_run_pair( edge, run, "run edges", false );   // consecutive values: the receiver may hold them as runs
+}
+
+// A long run list minus a short one: the runs below the first cut and above the last are kept whole, the runs between
+// are cut, and a cut may cover several runs, begin or end on a run's edge, or reach the chunk's last value.
+TEST( KernelCrosscheck, ManyRunsMinusFewRunsLikeCRoaring ) {
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> left_ranges;
+    for ( std::uint32_t i{ 0 }; i < 600; ++i ) {
+        left_ranges.emplace_back( 100U + i * 100U, 100U + i * 100U + 59U );
+    }
+    left_ranges.emplace_back( 65000U, 65535U );
+    auto const left{ make_run_operand( left_ranges ) };
+    ASSERT_EQ( left.ours.statistics().run_containers, 1U );
+    using cut_list = std::vector<std::pair<std::uint32_t, std::uint32_t>>;
+    cut_list const cut_sets[]{
+        { { 0, 50 } },                                  // below every run
+        { { 0, 100 } },                                 // reaching the first run's first value
+        { { 30010, 30020 } },                           // inside one run
+        { { 30000, 30059 } },                           // exactly one run
+        { { 30060, 30099 } },                           // a gap only
+        { { 29990, 30555 } },                           // across several runs, edges inside gaps
+        { { 30030, 30530 } },                           // across several runs, edges inside runs
+        { { 30030, 30530 }, { 30540, 30545 } },         // the next cut in the run the last one ended in
+        { { 200, 200 }, { 40000, 40100 }, { 64990, 65535 } },   // first run left whole, the last run to the chunk's end
+        { { 65535, 65535 } },                           // the chunk's last value
+        { { 0, 65535 } },                               // everything
+        { { 61000, 65534 } },                           // the runs above the last cut are none but the top one's last value
+    };
+    for ( auto const & cuts : cut_sets ) {
+        auto const right{ make_run_operand( cuts ) };
+        SCOPED_TRACE( ::testing::Message() << cuts.size() << " cuts from " << cuts.front().first );
+        croaring const expected{ roaring_bitmap_andnot( left.theirs.r, right.theirs.r ) };
+        EXPECT_TRUE( same_contents( left.ours - right.ours, expected ) ) << "left - right";
+        auto difference{ left.ours };
+        difference -= right.ours;
+        EXPECT_TRUE( same_contents( difference, expected ) ) << "left -= right";
+    }
 }
 
 } // namespace

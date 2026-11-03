@@ -1786,6 +1786,13 @@ public:
         }
     }
 
+    // The header of runs whose cardinality the writer already knows, without walking the runs to count it.
+    void sync_header( std::size_t const cardinality ) noexcept {
+        assert( !runs.empty() );
+        handle_->set_cardinality( static_cast<std::uint32_t>( cardinality ) );
+        handle_->set_endpoints( runs.front().begin, runs.back().end );
+    }
+
     payload_vector<Layout, run_type, CowPolicy> runs;
     header_cardinality_proxy<Layout, CowPolicy> cardinality;
 
