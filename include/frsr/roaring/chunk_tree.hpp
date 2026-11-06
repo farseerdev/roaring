@@ -247,7 +247,7 @@ public:
     template <typename H>
     cursor insert( cursor const at, key_type const key, H && handle ) {
         stage staged{ std::forward<H>( handle ) };
-        return insert_guarded( at, static_cast<key_t>( key ), staged );
+        return insert_guarded( at, static_cast<key_t>( key ), staged, moved_from<H>( handle ) );
     }
 
     // Inserts a copy of every entry of `other` whose key is not held here and for which `wanted`
@@ -344,7 +344,7 @@ public:
             }
         }
         stage staged{ std::forward<H>( handle ) };
-        return append_guarded( static_cast<key_t>( key ), staged );
+        return append_guarded( static_cast<key_t>( key ), staged, moved_from<H>( handle ) );
     }
 
     // Storage for the next appended entry, to be filled with a handle and then committed under its
@@ -502,6 +502,49 @@ public:
         }
     }
 
+    [[nodiscard]] static std::uint32_t chain_length( leaf_ptr const first ) noexcept {
+        std::uint32_t count{ 0 };
+        for ( auto leaf{ first }; leaf != nullptr; leaf = next_leaf( leaf ) ) { ++count; }
+        return count;
+    }
+
+    // What building the inner levels above a chain of up to `leaves` leaves takes from the allocator, taken
+    // beforehand: the nodes and the scratch the build sorts them with. The nodes it does not use are freed with it.
+    class level_reserve {
+    public:
+        explicit level_reserve( std::uint32_t const leaves ) {
+            if ( leaves <= 1 ) {
+                return;
+            }
+            std::uint32_t nodes{ 0 };
+            for ( auto level{ leaves }; level > 1; ) {
+                level  = ( level + inner_keys ) / ( inner_keys + 1 );
+                nodes += level;
+            }
+            pool_  = std::make_unique_for_overwrite<inner_node *[]>( nodes );
+            items_ = std::make_unique_for_overwrite<item[]>( leaves );
+            try {
+                for ( ; made_ != nodes; ++made_ ) { pool_[ made_ ] = make_inner(); }
+            } catch ( ... ) {
+                while ( made_ != 0 ) { free_inner( pool_[ --made_ ] ); }
+                throw;
+            }
+        }
+        level_reserve( level_reserve const & ) = delete;
+        ~level_reserve() {
+            while ( made_ != used_ ) { free_inner( pool_[ --made_ ] ); }
+        }
+
+    private:
+        friend class chunk_tree;
+        struct item { void * node; key_t lowest; };
+
+        std::unique_ptr<inner_node *[]> pool_;
+        std::unique_ptr<item[]>         items_;
+        std::uint32_t                   made_{ 0 };
+        std::uint32_t                   used_{ 0 };
+    };
+
     // The in-place rewrite of the table by the walk that is consuming it, in key order: an entry is
     // kept (moved down behind the walk), replaced, or left out. The rewritten entries are behind the
     // walk, so the leaves are compacted in place; finish() frees the leaves left empty and rebuilds
@@ -509,8 +552,11 @@ public:
     template <typename Retire>
     class rewriter {
     public:
-        rewriter( chunk_tree & tree, Retire retire ) noexcept
-            : tree_{ &tree }, retire_{ std::move( retire ) }, leaf_{ tree.root_ == nullptr ? nullptr : tree.leftmost_leaf() } {}
+        // Takes what finish() will need from the allocator (the only step that can fail), so a rewrite that has
+        // begun can always be finished.
+        rewriter( chunk_tree & tree, Retire retire )
+            : tree_{ &tree }, retire_{ std::move( retire ) }, leaf_{ tree.root_ == nullptr ? nullptr : tree.leftmost_leaf() },
+              reserve_{ leaf_ == nullptr ? 0U : chain_length( leaf_ ) } {}
 
         // The entry at `from`, which the walk has finished with, is kept.
         void keep( cursor const from ) {
@@ -530,7 +576,7 @@ public:
             advance();
         }
 
-        void finish() { tree_->finish_rewrite( leaf_, index_, last_complete_, kept_, retire_ ); }
+        void finish() noexcept { tree_->finish_rewrite( leaf_, index_, last_complete_, kept_, retire_, reserve_ ); }
 
     private:
         // The write position holds a consumed entry, whose payload is retired, unless the walk
@@ -560,6 +606,7 @@ public:
         leaf_ptr      last_complete_{ nullptr };
         unsigned      index_{ 0 };
         std::uint32_t kept_ { 0 };
+        level_reserve reserve_;
     };
 
     // The handles in key order.
@@ -612,23 +659,39 @@ private:
         alignas( Handle ) std::byte bytes[ sizeof( Handle ) ];
         template <typename H>
         explicit stage( H && handle ) { std::construct_at( reinterpret_cast<Handle *>( bytes ), std::forward<H>( handle ) ); }
-        // For an insertion that failed: the staged handle was not relocated into the tree.
-        void destroy() noexcept { std::destroy_at( reinterpret_cast<Handle *>( bytes ) ); }
+        // For an insertion that failed: the staged handle was not relocated into the tree. It goes back to the handle
+        // it was moved from, if any (`source`), so a failed insertion loses nothing.
+        void give_back( Handle * const source ) noexcept {
+            auto * const staged{ reinterpret_cast<Handle *>( bytes ) };
+            if ( source != nullptr ) {
+                *source = std::move( *staged );
+            }
+            std::destroy_at( staged );
+        }
     };
-    // The staged handle is destroyed if the insertion throws before relocating it into a leaf.
-    [[gnu::noinline]] bool append_guarded( key_t const key, stage & staged ) {
+    // The handle a stage built from `handle` moves from (nullptr: it copies).
+    template <typename H>
+    [[nodiscard]] static Handle * moved_from( H & handle ) noexcept {
+        if constexpr ( std::is_rvalue_reference_v<H &&> && std::is_same_v<std::remove_cvref_t<H>, Handle> && !std::is_const_v<H> ) {
+            return &handle;
+        } else {
+            return nullptr;
+        }
+    }
+    // The staged handle goes back to `source` if the insertion throws before relocating it into a leaf.
+    [[gnu::noinline]] bool append_guarded( key_t const key, stage & staged, Handle * const source ) {
         try {
             return append_staged( key, staged.bytes );
         } catch ( ... ) {
-            staged.destroy();
+            staged.give_back( source );
             throw;
         }
     }
-    cursor insert_guarded( cursor const at, key_t const key, stage & staged ) {
+    cursor insert_guarded( cursor const at, key_t const key, stage & staged, Handle * const source ) {
         try {
             return insert_staged( at, key, staged.bytes );
         } catch ( ... ) {
-            staged.destroy();
+            staged.give_back( source );
             throw;
         }
     }
@@ -1538,35 +1601,28 @@ private:
     // index in place of whichever one stands. The nodes are all allocated before anything is changed,
     // so an allocation failure leaves the table as it was.
     void rebuild_levels( leaf_ptr const first ) {
-        struct item { void * node; key_t lowest; };
-        std::uint32_t count{ 0 };
-        for ( auto leaf{ first }; leaf != nullptr; leaf = next_leaf( leaf ) ) { ++count; }
+        auto const count{ chain_length( first ) };
+        level_reserve reserve{ count };
+        build_levels( first, count, reserve );
+    }
+
+    // rebuild_levels() over the `count` leaves of the chain from `first`, out of `reserve` (taken for at least as
+    // many leaves): it cannot fail.
+    void build_levels( leaf_ptr const first, std::uint32_t count, level_reserve & reserve ) noexcept {
         if ( count <= 1 ) {
             free_index();
             height_ = 0;
             root_   = first;
             return;
         }
-        std::uint32_t nodes{ 0 };
-        for ( auto level{ count }; level > 1; ) {
-            level  = ( level + inner_keys ) / ( inner_keys + 1 );
-            nodes += level;
-        }
-        auto const pool{ std::make_unique_for_overwrite<inner_node *[]>( nodes ) };
-        std::uint32_t made{ 0 };
-        try {
-            for ( ; made != nodes; ++made ) { pool[ made ] = make_inner(); }
-        } catch ( ... ) {
-            while ( made != 0 ) { free_inner( pool[ --made ] ); }
-            throw;
-        }
-        auto const items{ std::make_unique_for_overwrite<item[]>( count ) };
+        auto const & pool { reserve.pool_  };
+        auto const & items{ reserve.items_ };
         {
             std::uint32_t i{ 0 };
             key_t previous_last{ 0 };
             for ( auto leaf{ first }; leaf != nullptr; leaf = next_leaf( leaf ) ) {
                 // the empty last leaf of an abandoned open_back() is indexed under a key above everything held
-                items[ i++ ] = item{ leaf, head( leaf ).size == 0 ? previous_last + 1 : leaf[ 0 ] };
+                items[ i++ ] = { leaf, head( leaf ).size == 0 ? previous_last + 1 : leaf[ 0 ] };
                 if ( head( leaf ).size != 0 ) { previous_last = last_key( leaf ); }
             }
         }
@@ -1579,12 +1635,13 @@ private:
             for ( std::uint32_t group{ 0 }; group != groups; ++group ) {
                 auto const children{ share + ( group < extra ? 1U : 0U ) };
                 auto const node{ pool[ next++ ] };
+                ++reserve.used_;
                 for ( std::uint32_t j{ 0 }; j != children; ++j ) {
                     node->child[ j ] = items[ from + j ].node;
                     if ( j != 0 ) { node->keys[ j - 1 ] = items[ from + j ].lowest; }
                 }
                 node->n = children - 1;
-                items[ group ] = item{ node, items[ from ].lowest };
+                items[ group ] = { node, items[ from ].lowest };
                 from += children;
             }
             count = groups;
@@ -1595,8 +1652,10 @@ private:
         root_   = items[ 0 ].node;
     }
 
+    // Ends a rewrite; `reserve` was taken for the leaves of the tree when it began (a rewrite never adds a leaf), so it
+    // cannot fail.
     template <typename Retire>
-    void finish_rewrite( leaf_ptr const write_leaf, unsigned const write_index, leaf_ptr const last_complete, std::uint32_t const kept, Retire & retire ) {
+    void finish_rewrite( leaf_ptr const write_leaf, unsigned const write_index, leaf_ptr const last_complete, std::uint32_t const kept, Retire & retire, level_reserve & reserve ) noexcept {
         if ( root_ == nullptr ) { return; }
         auto const first{ leftmost_leaf() };
         leaf_ptr last_kept{ last_complete };
@@ -1632,7 +1691,19 @@ private:
         if ( head( last_kept ).cap == leaf_capacity ) { links( last_kept )[ 0 ] = nullptr; }
         size_ = kept;
         tail_ = last_kept;
-        if ( next_leaf( first ) != nullptr ) { index_chain( first ); } else { rebuild_levels( first ); }
+        if ( next_leaf( first ) != nullptr && size_ >= next_eval_ ) {
+            // a directory whose table cannot be had leaves the inner levels to index the chain
+            bool adopted{ false };
+            try {
+                adopted = adopt_directory( first );
+            } catch ( ... ) {
+            }
+            if ( adopted ) {
+                return;
+            }
+            next_eval_ = doubled( size_ );
+        }
+        build_levels( first, chain_length( first ), reserve );
     }
 
     // ---- invariants -------------------------------------------------------------------------

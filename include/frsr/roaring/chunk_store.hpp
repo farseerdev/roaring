@@ -258,10 +258,12 @@ public:
     // operations, &= and -=): the walk visits the entries in key order and, for each, either
     // keeps it (put back as it is, or as the walk modified it in place) or replaces it; every
     // entry it does not mention is dropped. The payloads that would be freed are retired for
-    // take_retired() instead. finish() ends the rewrite and must be called once.
+    // take_retired() instead (a payload the pool has no room for is freed). Whatever the rewrite needs from the
+    // allocator is taken when it begins (a table of a wide chunk key reserves its index), so no step after that
+    // can fail. finish() ends a rewrite that has written anything, once; one that has not may be dropped as it is.
     class rewriter {
     public:
-        explicit rewriter( chunk_store & store ) noexcept : store_{ &store }, inner_{ store.live_, retire_into{ &store } } {}
+        explicit rewriter( chunk_store & store ) : store_{ &store }, inner_{ store.live_, retire_into{ &store } } {}
 
         // The entry at `from`, which the walk has finished with, is kept.
         void keep( cursor const from ) { inner_.keep( from ); }
@@ -269,7 +271,7 @@ public:
         // The walk's current entry is replaced by (key, container).
         void put( chunk_type const key, handle_type && container ) { inner_.put( key, std::move( container ) ); }
 
-        void finish() {
+        void finish() noexcept {
             inner_.finish();
             ++store_->generation_;
         }
@@ -277,7 +279,7 @@ public:
     private:
         struct retire_into {
             chunk_store * store;
-            void operator()( handle_type && handle ) const { store->retire( std::move( handle ) ); }
+            void operator()( handle_type && handle ) const noexcept { store->try_retire( std::move( handle ) ); }
         };
 
         chunk_store *                                          store_;

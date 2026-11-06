@@ -377,7 +377,7 @@ public:
             ++write_;
         }
 
-        void finish() {
+        void finish() noexcept {
             for ( auto i{ write_ }; i < table_->size_; ++i ) {
                 retire_( std::move( table_->slots_[ i ] ) );
             }
