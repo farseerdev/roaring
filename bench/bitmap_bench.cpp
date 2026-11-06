@@ -7162,6 +7162,291 @@ struct register_cpp_index_build_registrar {
 };
 #endif
 
+// ---- IndexUpdate: rows of a per-value bitmap index move to another value ----
+// The index of a table (one bitmap per value, over 2^20 rows, built as IndexBuild builds it) is copied, sharing
+// its containers, and a batch of rows changes value: each value's bitmap has the rows that left it removed and
+// the rows that came to it added, both handed over as one ascending list per value. The rows of a batch are
+// drawn at random or are one block of consecutive rows. The reference removes and adds a value's list chunk by
+// chunk: a merge into the array, the bits set or cleared in a bitset, a value at a time into a run, and a new
+// chunk in the form its count calls for. Checksum = values held after the batch.
+struct IndexUpdateShape { char const *label; std::uint32_t values; std::uint32_t rows; bool block; };
+static constexpr IndexUpdateShape kIndexUpdateShapes[]{
+    { "values=200/rows=64/random"  , 200, 64  , false },
+    { "values=200/rows=4096/random", 200, 4096, false },
+    { "values=200/rows=4096/block" , 200, 4096, true  },
+    { "values=8/rows=64/random"    , 8  , 64  , false },
+    { "values=8/rows=4096/random"  , 8  , 4096, false },
+    { "values=8/rows=4096/block"   , 8  , 4096, true  },
+};
+static constexpr std::uint32_t kIndexUpdateRows{ std::uint32_t{ 1 } << 20 };
+
+struct IndexUpdateData {
+    std::vector<std::vector<std::uint32_t>> base;    // per value: its rows, ascending
+    std::vector<std::vector<std::uint32_t>> removed; // per value: the rows that leave it, ascending
+    std::vector<std::vector<std::uint32_t>> added;   // per value: the rows that come to it, ascending
+};
+static IndexUpdateData index_update_data( IndexUpdateShape const &shape ) {
+    std::mt19937_64 rng{ 0x1DB0'0DA7ULL + shape.values * 131ULL + shape.rows + ( shape.block ? 7ULL : 0ULL ) };
+    IndexUpdateData d;
+    d.base.resize( shape.values );
+    d.removed.resize( shape.values );
+    d.added.resize( shape.values );
+    std::vector<std::uint32_t> value_of( kIndexUpdateRows );
+    for ( std::uint32_t row{ 0 }; row < kIndexUpdateRows; ++row ) {
+        value_of[ row ] = static_cast<std::uint32_t>( rng() % shape.values );
+        d.base[ value_of[ row ] ].push_back( row );
+    }
+    std::vector<std::uint32_t> moved;
+    if ( shape.block ) {
+        auto const first{ static_cast<std::uint32_t>( rng() % ( kIndexUpdateRows - shape.rows ) ) };
+        for ( std::uint32_t i{ 0 }; i < shape.rows; ++i ) { moved.push_back( first + i ); }
+    } else {
+        std::set<std::uint32_t> picked;
+        while ( picked.size() < shape.rows ) { picked.insert( static_cast<std::uint32_t>( rng() % kIndexUpdateRows ) ); }
+        moved.assign( picked.begin(), picked.end() );
+    }
+    for ( auto const row : moved ) {
+        auto const from{ value_of[ row ] };
+        auto const to  { static_cast<std::uint32_t>( ( from + 1 + rng() % ( shape.values - 1 ) ) % shape.values ) };
+        d.removed[ from ].push_back( row );
+        d.added  [ to   ].push_back( row );
+    }
+    return d;
+}
+
+template <class Arm>
+struct register_frsr_index_update_registrar {
+    using TestBitmap32 = typename Arm::bitmap;
+    struct S { IndexUpdateData d; std::vector<TestBitmap32> index; };
+    static void run( IndexUpdateShape const &shape ) {
+        Entry e;
+        e.name        = std::string( "set_ops/" ) + Arm::label() + "IndexUpdate/" + shape.label;
+        e.description = "frsr::roaring::bitmap<uint32_t>: a copy of a per-value index, remove_many_sorted() of the "
+                        "rows that leave each value and add_many_sorted() of the rows that come to it.";
+        e.setup = [shape]() -> void * {
+            auto *s = new S;
+            s->d = index_update_data( shape );
+            s->index.resize( shape.values );
+            for ( std::uint32_t v{ 0 }; v < shape.values; ++v ) {
+                s->index[ v ].add_sorted_many( { s->d.base[ v ].data(), s->d.base[ v ].size() }, kIndexBuildBitsetThreshold );
+            }
+            return s;
+        };
+        e.run = []( void *sv ) -> int64_t {
+            auto const *s = static_cast<S const *>( sv );
+            auto copy{ s->index };
+            std::int64_t held{ 0 };
+            for ( std::size_t v{ 0 }; v < copy.size(); ++v ) {
+                copy[ v ].remove_many_sorted( { s->d.removed[ v ].data(), s->d.removed[ v ].size() } );
+                copy[ v ].add_many_sorted   ( { s->d.added  [ v ].data(), s->d.added  [ v ].size() } );
+                held += static_cast<std::int64_t>( copy[ v ].size() );
+            }
+            return held;
+        };
+        e.teardown       = []( void *sv ) { delete static_cast<S *>( sv ); };
+        e.ops_per_run    = 1;
+        e.inner_reps     = 1;
+        e.reusable_state = true;
+        g_benchmarks.push_back( std::move( e ) );
+    }
+};
+
+#if FRSR_ROARING_HAS_CROARING
+// The reference's sorted batch removal: chunk by chunk, an array merged in place, a bitset's bits cleared (an
+// array again at or below the array limit), a run a value at a time; a chunk left empty is dropped.
+static void croaring_remove_sorted( roaring_bitmap_t *const bm, std::span<std::uint32_t const> const values ) {
+    using namespace roaring::internal;
+    auto *const ra{ &bm->high_low_container };
+    std::size_t vi{ 0 };
+    while ( vi < values.size() ) {
+        auto const key{ static_cast<std::uint16_t>( values[ vi ] >> 16 ) };
+        auto const group_start{ vi };
+        do { ++vi; } while ( vi < values.size() && static_cast<std::uint16_t>( values[ vi ] >> 16 ) == key );
+        auto const pos{ ra_get_index( ra, key ) };
+        if ( pos < 0 ) { continue; }
+        ra_unshare_container_at_index( ra, static_cast<std::uint16_t>( pos ) );
+        auto typecode{ ra->typecodes[ pos ] };
+        auto *container{ ra->containers[ pos ] };
+        if ( typecode == ARRAY_CONTAINER_TYPE ) {
+            auto *const ac{ CAST_array( container ) };
+            auto *dst{ ac->array };
+            auto const *src{ ac->array };
+            auto const *const src_end{ ac->array + ac->cardinality };
+            auto ri{ group_start };
+            while ( src < src_end && ri < vi ) {
+                auto const removed{ static_cast<std::uint16_t>( values[ ri ] & 0xFFFF ) };
+                if ( *src < removed ) { *dst++ = *src++; }
+                else if ( *src == removed ) { ++src; ++ri; }
+                else { ++ri; }
+            }
+            if ( dst != src && src < src_end ) { std::memmove( dst, src, static_cast<std::size_t>( src_end - src ) * sizeof( *src ) ); }
+            dst += src_end - src;
+            ac->cardinality = static_cast<std::int32_t>( dst - ac->array );
+        } else if ( typecode == BITSET_CONTAINER_TYPE ) {
+            auto *const bc{ CAST_bitset( container ) };
+            for ( auto j{ group_start }; j < vi; ++j ) {
+                auto const low{ values[ j ] & 0xFFFF };
+                bc->cardinality -= static_cast<std::int32_t>( ( bc->words[ low >> 6 ] >> ( low & 63 ) ) & 1 );
+                bc->words[ low >> 6 ] &= ~( UINT64_C( 1 ) << ( low & 63 ) );
+            }
+            if ( bc->cardinality <= DEFAULT_MAX_SIZE ) {
+                auto *const ac{ array_container_from_bitset( bc ) };
+                bitset_container_free( bc );
+                container = ac;
+                typecode  = ARRAY_CONTAINER_TYPE;
+                ra->containers[ pos ] = ac;
+                ra->typecodes [ pos ] = ARRAY_CONTAINER_TYPE;
+            }
+        } else {
+            for ( auto j{ group_start }; j < vi; ++j ) {
+                std::uint8_t new_typecode;
+                auto *const new_container{ container_remove( container, static_cast<std::uint16_t>( values[ j ] & 0xFFFF ), typecode, &new_typecode ) };
+                if ( new_container != container ) {
+                    container_free( container, typecode );
+                    ra->containers[ pos ] = new_container;
+                    ra->typecodes [ pos ] = new_typecode;
+                }
+                container = new_container;
+                typecode  = new_typecode;
+            }
+        }
+        if ( !container_nonzero_cardinality( container, typecode ) ) {
+            container_free( container, typecode );
+            ra_remove_at_index( ra, pos );
+        }
+    }
+}
+
+// The reference's sorted batch addition: chunk by chunk, a new chunk an array up to the array limit and a bitset
+// past it, an array merged through a stack buffer (a bitset once the sum passes the limit), a bitset's bits set,
+// a run a value at a time.
+static void croaring_add_sorted( roaring_bitmap_t *const bm, std::span<std::uint32_t const> const values ) {
+    using namespace roaring::internal;
+    auto *const ra{ &bm->high_low_container };
+    auto const set_bits{ []( bitset_container_t *const bc, std::span<std::uint32_t const> const group ) {
+        for ( auto const value : group ) {
+            auto const low{ value & 0xFFFF };
+            if ( !( ( bc->words[ low >> 6 ] >> ( low & 63 ) ) & 1 ) ) {
+                bc->words[ low >> 6 ] |= UINT64_C( 1 ) << ( low & 63 );
+                ++bc->cardinality;
+            }
+        }
+    } };
+    std::size_t vi{ 0 };
+    while ( vi < values.size() ) {
+        auto const key{ static_cast<std::uint16_t>( values[ vi ] >> 16 ) };
+        auto const group_start{ vi };
+        do { ++vi; } while ( vi < values.size() && static_cast<std::uint16_t>( values[ vi ] >> 16 ) == key );
+        auto const group_size{ static_cast<std::int32_t>( vi - group_start ) };
+        auto const group{ values.subspan( group_start, vi - group_start ) };
+        auto const pos{ ra_get_index( ra, key ) };
+        if ( pos < 0 ) {
+            if ( group_size <= DEFAULT_MAX_SIZE ) {
+                auto *const ac{ array_container_create_given_capacity( group_size ) };
+                for ( auto const value : group ) { ac->array[ ac->cardinality++ ] = static_cast<std::uint16_t>( value & 0xFFFF ); }
+                ra_insert_new_key_value_at( ra, -pos - 1, key, ac, ARRAY_CONTAINER_TYPE );
+            } else {
+                auto *const bc{ bitset_container_create() };
+                set_bits( bc, group );
+                ra_insert_new_key_value_at( ra, -pos - 1, key, bc, BITSET_CONTAINER_TYPE );
+            }
+            continue;
+        }
+        ra_unshare_container_at_index( ra, static_cast<std::uint16_t>( pos ) );
+        auto typecode{ ra->typecodes[ pos ] };
+        auto *container{ ra->containers[ pos ] };
+        if ( typecode == ARRAY_CONTAINER_TYPE ) {
+            auto *const ac{ CAST_array( container ) };
+            if ( ac->cardinality + group_size > DEFAULT_MAX_SIZE ) {
+                auto *const bc{ bitset_container_from_array( ac ) };
+                set_bits( bc, group );
+                array_container_free( ac );
+                ra->containers[ pos ] = bc;
+                ra->typecodes [ pos ] = BITSET_CONTAINER_TYPE;
+            } else {
+                std::uint16_t merged[ DEFAULT_MAX_SIZE ];
+                std::int32_t mi{ 0 };
+                std::int32_t si{ 0 };
+                auto ni{ group_start };
+                while ( si < ac->cardinality && ni < vi ) {
+                    auto const nv{ static_cast<std::uint16_t>( values[ ni ] & 0xFFFF ) };
+                    if ( ac->array[ si ] < nv ) { merged[ mi++ ] = ac->array[ si++ ]; }
+                    else {
+                        if ( ac->array[ si ] == nv ) { ++si; }
+                        merged[ mi++ ] = nv;
+                        do { ++ni; } while ( ni < vi && static_cast<std::uint16_t>( values[ ni ] & 0xFFFF ) == nv );
+                    }
+                }
+                while ( si < ac->cardinality ) { merged[ mi++ ] = ac->array[ si++ ]; }
+                while ( ni < vi ) {
+                    auto const nv{ static_cast<std::uint16_t>( values[ ni ] & 0xFFFF ) };
+                    merged[ mi++ ] = nv;
+                    do { ++ni; } while ( ni < vi && static_cast<std::uint16_t>( values[ ni ] & 0xFFFF ) == nv );
+                }
+                if ( mi > ac->capacity ) { array_container_grow( ac, mi, false ); }
+                std::memcpy( ac->array, merged, static_cast<std::size_t>( mi ) * sizeof( std::uint16_t ) );
+                ac->cardinality = mi;
+            }
+        } else if ( typecode == BITSET_CONTAINER_TYPE ) {
+            set_bits( CAST_bitset( container ), group );
+        } else {
+            for ( auto const value : group ) {
+                std::uint8_t new_typecode;
+                auto *const new_container{ container_add( container, static_cast<std::uint16_t>( value & 0xFFFF ), typecode, &new_typecode ) };
+                if ( new_container != container ) {
+                    container_free( container, typecode );
+                    ra->containers[ pos ] = new_container;
+                    ra->typecodes [ pos ] = new_typecode;
+                }
+                container = new_container;
+                typecode  = new_typecode;
+            }
+        }
+    }
+}
+
+template <class Arm>
+struct register_cpp_index_update_registrar {
+    struct S {
+        IndexUpdateData d;
+        std::vector<roaring_bitmap_t *> index;
+        ~S() { for ( auto *const bm : index ) { roaring_bitmap_free( bm ); } }
+    };
+    static void run( IndexUpdateShape const &shape ) {
+        Entry e;
+        e.name        = std::string( "set_ops/" ) + Arm::label() + "IndexUpdate/" + shape.label;
+        e.description = "CRoaring: a copy of the same per-value index, each value's rows removed and added a chunk "
+                        "at a time. [croaring-ref] deps/croaring/src/roaring_array.c:ra_get_index";
+        e.setup = [shape]() -> void * {
+            auto *s = new S;
+            s->d = index_update_data( shape );
+            for ( std::uint32_t v{ 0 }; v < shape.values; ++v ) {
+                s->index.push_back( Arm::create() );
+                croaring_append_sorted( s->index.back(), { s->d.base[ v ].data(), s->d.base[ v ].size() }, kIndexBuildBitsetThreshold );
+            }
+            return s;
+        };
+        e.run = []( void *sv ) -> int64_t {
+            auto const *s = static_cast<S const *>( sv );
+            std::int64_t held{ 0 };
+            for ( std::size_t v{ 0 }; v < s->index.size(); ++v ) {
+                auto *const copy{ Arm::copy( s->index[ v ] ) };
+                croaring_remove_sorted( copy, { s->d.removed[ v ].data(), s->d.removed[ v ].size() } );
+                croaring_add_sorted   ( copy, { s->d.added  [ v ].data(), s->d.added  [ v ].size() } );
+                held += static_cast<std::int64_t>( roaring_bitmap_get_cardinality( copy ) );
+                roaring_bitmap_free( copy );
+            }
+            return held;
+        };
+        e.teardown       = []( void *sv ) { delete static_cast<S *>( sv ); };
+        e.ops_per_run    = 1;
+        e.inner_reps     = 1;
+        e.reusable_state = true;
+        g_benchmarks.push_back( std::move( e ) );
+    }
+};
+#endif
+
 // ========== top-level registration ==========
 
 void register_benchmarks() {
@@ -7228,6 +7513,12 @@ void register_benchmarks() {
         arms::for_each_frsr<register_frsr_index_build_registrar>(shape);
 #if FRSR_ROARING_HAS_CROARING
         arms::for_each_croaring<register_cpp_index_build_registrar>(shape);
+#endif
+    }
+    for (auto const &shape : kIndexUpdateShapes) {
+        arms::for_each_frsr<register_frsr_index_update_registrar>(shape);
+#if FRSR_ROARING_HAS_CROARING
+        arms::for_each_croaring<register_cpp_index_update_registrar>(shape);
 #endif
     }
     for (std::size_t count : kCounts) {
