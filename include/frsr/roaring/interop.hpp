@@ -631,7 +631,21 @@ struct interop_engine {
     static void and_stream( Bitmap & self, Source & source ) {
         size_type new_size{ 0 };
         typename store_type::rewriter rewrite{ self.chunks_ };
+        // A walk that an allocation failure stops keeps the result of the chunks it has reached and the chunks it has
+        // not as they are.
+        auto current{ self.chunks_.begin() };
+        failure_guard keep_the_rest{ [ & ]() noexcept {
+            for ( ; current != self.chunks_.end(); ++current ) {
+                if ( auto const kept{ self.chunks_.slot( current ).cardinality() }; kept != 0 ) {
+                    new_size += kept;
+                    rewrite.keep( current );
+                }
+            }
+            rewrite.finish();
+            self.size_ = new_size;
+        } };
         leapfrog( self, source, [ & ]( cursor const at, handle_type const & piece ) {
+            current = at;
             auto & slot{ self.chunks_.slot( at ) };
             if ( is_full( piece ) ) {
                 new_size += slot.cardinality();
@@ -646,6 +660,7 @@ struct interop_engine {
             }
             return true;
         } );
+        keep_the_rest.dismiss();
         rewrite.finish();
         self.size_ = new_size;
     }
@@ -697,6 +712,13 @@ struct interop_engine {
     template <typename Source>
     static void andnot_stream( Bitmap & self, Source & source ) {
         bool any_empty{ false };
+        // The rewrite that drops the chunks the walk empties begins first, so a walk that an allocation failure stops
+        // drops them too; the count is then taken anew.
+        typename store_type::rewriter drop{ self.chunks_ };
+        failure_guard drop_emptied{ [ & ]() noexcept {
+            keep_nonempty_chunks( self, drop );
+            self.repair_cardinality();
+        } };
         leapfrog( self, source, [ & ]( cursor const at, handle_type const & piece ) {
             auto & slot{ self.chunks_.slot( at ) };
             auto const before{ slot.cardinality() };
@@ -706,7 +728,8 @@ struct interop_engine {
             any_empty |= slot.cardinality() == 0;
             return true;
         } );
-        if ( any_empty ) { drop_empty_chunks( self ); }
+        drop_emptied.dismiss();
+        if ( any_empty ) { keep_nonempty_chunks( self, drop ); }
     }
 
     template <typename Source>
@@ -714,6 +737,9 @@ struct interop_engine {
         std::vector<std::pair<chunk_type, handle_type>> added;
         size_type added_size{ 0 };
         small_array_values<low_type> union_scratch;
+        // A union that an allocation failure stops leaves every chunk holding at least what it held: the count is
+        // taken anew.
+        failure_guard recount{ [ & ]() noexcept { self.repair_cardinality(); } };
         auto at{ self.chunks_.begin() };
         while ( !source.at_end() ) {
             auto const key{ source.key() };
@@ -736,6 +762,7 @@ struct interop_engine {
         }
         self.size_ += added_size;
         insert_added( self, added );
+        recount.dismiss();
     }
 
     // `container ^ piece` for a piece that is an interval cut to its chunk (one run): the flip of that range of the
@@ -756,6 +783,13 @@ struct interop_engine {
         std::vector<std::pair<chunk_type, handle_type>> added;
         size_type added_size{ 0 };
         bool any_empty{ false };
+        // The rewrite that drops the chunks the walk empties begins first, so a walk that an allocation failure stops
+        // drops them too; the count is then taken anew.
+        typename store_type::rewriter drop{ self.chunks_ };
+        failure_guard drop_emptied{ [ & ]() noexcept {
+            keep_nonempty_chunks( self, drop );
+            self.repair_cardinality();
+        } };
         auto at{ self.chunks_.begin() };
         while ( !source.at_end() ) {
             auto const key{ source.key() };
@@ -779,9 +813,12 @@ struct interop_engine {
             }
             source.advance();
         }
+        if ( any_empty ) { keep_nonempty_chunks( self, drop ); }
+        drop_emptied.dismiss();
+        failure_guard recount{ [ & ]() noexcept { self.repair_cardinality(); } };
         self.size_ += added_size;
-        if ( any_empty ) { drop_empty_chunks( self ); }
         insert_added( self, added );
+        recount.dismiss();
     }
 
     template <typename Source>
@@ -878,6 +915,11 @@ struct interop_engine {
     // Removes the chunks whose container went empty.
     static void drop_empty_chunks( Bitmap & self ) {
         typename store_type::rewriter rewrite{ self.chunks_ };
+        keep_nonempty_chunks( self, rewrite );
+    }
+
+    // drop_empty_chunks() with a rewrite of the table that has begun and written nothing yet: it cannot fail.
+    static void keep_nonempty_chunks( Bitmap & self, typename store_type::rewriter & rewrite ) noexcept {
         for ( auto at{ self.chunks_.begin() }; at != self.chunks_.end(); ++at ) {
             if ( self.chunks_.slot( at ).cardinality() != 0 ) { rewrite.keep( at ); }
         }

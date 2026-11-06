@@ -300,6 +300,7 @@ if(FRSR_ROARING_BUILD_TESTS)
         tests/ranked_view.cpp
         tests/bitmap_bounds.cpp
         tests/bitmap_iteration.cpp
+        tests/in_place_allocation_failure.cpp
     )
     target_link_libraries(frsr_roaring_tests
         PRIVATE

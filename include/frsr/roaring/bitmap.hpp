@@ -2456,17 +2456,29 @@ private:
         auto const chunk{ layout_type::chunk_key( value ) };
         auto const low{ layout_type::low_key( value ) };
 
+        // A new chunk enters the table empty and is given its value there. Where one value does not fit the handle (no
+        // inline buffer) its container is given the value first, so that a failed allocation leaves no empty chunk.
+        constexpr bool value_fits_handle{ handle_type::template inline_capacity<low_type> != 0 };
+        auto const with_value{ [ low ] {
+            handle_type container;
+            if constexpr ( !value_fits_handle ) {
+                std::ignore = detail::container_add( container, low );
+            }
+            return container;
+        } };
         // One comparison with the last chunk decides the three cases that need no search (the reference's
         // ra_get_index probes the same key first): the chunk of an ascending run of adds is the last one, and a
         // chunk above it is an append.
         // [croaring-ref] deps/croaring/src/roaring_array.c:ra_get_index
         auto const append{ [ & ] {
-            chunks_.push_back( chunk, handle_type{} );
+            chunks_.push_back( chunk, with_value() );
             return chunks_.last();
         } };
         auto at{ chunks_.end() };
+        bool new_chunk{ false };
         if ( chunks_.empty() ) {
             at = append();
+            new_chunk = true;
         } else {
             auto const last{ chunks_.last() };
             auto const last_chunk{ chunks_.key( last ) };
@@ -2474,11 +2486,13 @@ private:
                 at = last;
             } else if ( chunk > last_chunk ) {
                 at = append();
+                new_chunk = true;
             } else {
                 at = chunks_.lower_bound( chunk );
                 assert( at != chunks_.end() );   // the last chunk is above this one
                 if ( chunks_.key( at ) != chunk ) {
-                    at = chunks_.insert( at, chunk, handle_type{} );
+                    at = chunks_.insert( at, chunk, with_value() );
+                    new_chunk = true;
                 }
             }
         }
@@ -2493,7 +2507,7 @@ private:
             ctx->payload_private = true;
         }
 
-        if ( !detail::container_add( chunks_.slot( at ), low ) ) { return false; }
+        if ( ( value_fits_handle || !new_chunk ) && !detail::container_add( chunks_.slot( at ), low ) ) { return false; }
 
         ++size_;
         promote_if_needed( chunks_.slot( at ) );

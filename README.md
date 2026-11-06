@@ -89,8 +89,10 @@ What never allocates is always `noexcept`: `clear`, `swap`, moves, the destructo
 `size`, `intersects`, `validate`, ...) and the interop queries against a `key_range`, bit words or a bit-set of up to
 131072 bits.
 
-When an allocation does throw, a bitmap stays valid. The chunk table is left as it was; a materializing set
-operation never touches its operands; an in-place `^=` or `xor_many_in_place` leaves its left side valid with
+When an allocation does throw, a bitmap stays valid. A materializing set operation never touches its operands. An
+in-place set operation that fails part way (`|=`, `&=`, `-=`, `or_with`, `and_with`, `andnot_with`) leaves its left
+side with the operation applied to part of it: a union still holds every key it held, an intersection or a difference
+holds no key it did not hold. An in-place `^=`, `xor_with` or `xor_many_in_place` leaves its left side valid with
 unspecified contents.
 
 ## Compiled library and header-only mode

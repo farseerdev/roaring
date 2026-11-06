@@ -224,8 +224,9 @@ FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::add_sorted_many( std::s
         auto const chunk{ layout_type::chunk_key( *group ) };
         auto const group_end{ std::find_if( group, end, [ chunk ]( key_type const value ) { return layout_type::chunk_key( value ) != chunk; } ) };
         auto container{ make_policy_container_from_sorted_keys( { group, group_end }, bitset_threshold ) };
-        size_ += static_cast<size_type>( container.cardinality() );
-        chunks_.push_back( chunk, std::move( container ) );
+        auto const count{ static_cast<size_type>( container.cardinality() ) };
+        chunks_.push_back( chunk, std::move( container ) );   // counted once it is in: an append that fails adds nothing
+        size_ += count;
         group = group_end;
     }
 }
@@ -555,6 +556,13 @@ FRSR_ROARING_DEFINITION_INLINE auto FRSR_ROARING_BITMAP::union_few( bitmap const
     detail::small_array_values<low_type> array_union_scratch;
     std::size_t added{ 0 };
     std::size_t added_size{ 0 };
+    // A union that an allocation failure stops leaves every container holding at least what it held (and the table
+    // without the absent chunks): the count is taken anew (a lazy union keeps none).
+    detail::failure_guard recount{ [ this ]() noexcept {
+        if ( !lazy ) {
+            repair_cardinality();
+        }
+    } };
     auto at{ chunks_.begin() };
     for ( auto right{ other.chunks_.begin() }; right != other.chunks_.end(); ++right ) {
         auto const key{ other.chunks_.key( right ) };
@@ -580,6 +588,7 @@ FRSR_ROARING_DEFINITION_INLINE auto FRSR_ROARING_BITMAP::union_few( bitmap const
         chunks_.insert_absent_from( other.chunks_, added, []( handle_type const & container ) noexcept { return detail::container_size( container ) != 0; } );
         size_ += added_size;
     }
+    recount.dismiss();
     return *this;
 }
 
@@ -597,6 +606,13 @@ FRSR_ROARING_DEFINITION_INLINE auto FRSR_ROARING_BITMAP::union_merge( bitmap con
 #if FRSR_ROARING_COMBINE_STATS
     detail::combine_stats().record_call( chunks_.size(), other.chunks_.size() );
 #endif
+    // A union that an allocation failure stops leaves every container holding at least what it held: the count is
+    // taken anew (a lazy union keeps none).
+    detail::failure_guard recount{ [ this ]() noexcept {
+        if ( !lazy ) {
+            repair_cardinality();
+        }
+    } };
 
     // Walk both tables with the containers of shared keys united in place. The table is
     // rebuilt only from the first key the other bitmap holds and this one lacks; while none
@@ -629,11 +645,24 @@ FRSR_ROARING_DEFINITION_INLINE auto FRSR_ROARING_BITMAP::union_merge( bitmap con
         }
     }
     if ( right == other.chunks_.end() ) {
+        recount.dismiss();
         return *this;
     }
 
-    // The rest of the other bitmap is merged into the rest of this table (or appended to it).
+    // The rest of the other bitmap is merged into the rest of this table (or appended to it). An allocation failure
+    // puts the entries already moved to the merged table back where they were (the ones whose key this table holds:
+    // the copies of the other's containers are dropped).
     detail::chunk_store<layout_type, CowPolicy> merged;
+    detail::failure_guard put_back{ [ & ]() noexcept {
+        auto to{ chunks_.begin() };
+        for ( auto from{ merged.begin() }; from != merged.end(); ++from ) {
+            auto const key{ merged.key( from ) };
+            to = chunks_.lower_bound( key, to );
+            if ( to != chunks_.end() && chunks_.key( to ) == key ) {
+                chunks_.slot( to ) = std::move( merged.slot( from ) );
+            }
+        }
+    } };
     merged.reserve( chunks_.size() + other.chunks_.size() );
     for ( auto kept{ chunks_.begin() }; kept != left; ++kept ) {
         merged.push_back( chunks_.key( kept ), std::move( chunks_.slot( kept ) ) );
@@ -686,6 +715,8 @@ FRSR_ROARING_DEFINITION_INLINE auto FRSR_ROARING_BITMAP::union_merge( bitmap con
         }
         ++right;
     }
+    put_back.dismiss();
+    recount.dismiss();
 
     chunks_ = std::move( merged );
     return *this;
@@ -795,399 +826,417 @@ FRSR_ROARING_DEFINITION_INLINE auto FRSR_ROARING_BITMAP::combine( bitmap const &
         result.handle = nullptr;
     } };
 
-    while ( left != chunks_.end() ) {
-        auto const left_key{ chunks_.key( left ) };
-        while ( right != other.chunks_.end() && other.chunks_.key( right ) < left_key ) {
-            ++right;
-        }
+    try {
+        while ( left != chunks_.end() ) {
+            auto const left_key{ chunks_.key( left ) };
+            while ( right != other.chunks_.end() && other.chunks_.key( right ) < left_key ) {
+                ++right;
+            }
 
-        if ( right == other.chunks_.end() || left_key < other.chunks_.key( right ) ) {
-            if ( !keep_unmatched_left ) {
-                if ( right == other.chunks_.end() ) {
-                    break;  // bit_and: nothing to the right can match — drop the remainder via truncate
+            if ( right == other.chunks_.end() || left_key < other.chunks_.key( right ) ) {
+                if ( !keep_unmatched_left ) {
+                    if ( right == other.chunks_.end() ) {
+                        break;  // bit_and: nothing to the right can match — drop the remainder via truncate
+                    }
+                    ++left;
+                    continue;
+                }
+                size_ += detail::container_size( chunks_.slot( left ) );
+                rewrite.keep( left );
+                ++left;
+                continue;
+            }
+
+            auto       & left_container { chunks_.slot( left ) };
+            auto const & right_container{ other.chunks_.slot( right ) };
+    #if FRSR_ROARING_COMBINE_STATS
+            detail::combine_stats().record_pair( left_container, right_container, op );
+    #endif
+            // A shared left payload is never mutated in place: cloning it only to
+            // overwrite the clone costs a full payload copy on top of the kernel,
+            // where computing straight into a fresh result costs the kernel alone.
+            // So the in-place kernels below run only when we are the sole holder,
+            // and a shared left container takes the materializing arm for its pair —
+            // emitted into our own table exactly as the materializing arms already
+            // do in in-place mode. This is the rule CRoaring applies to a
+            // SHARED_CONTAINER_TYPE operand (container_and rather than container_iand).
+            bool const mutate_left{ in_place && left_container.payload_is_unshared() };
+            if ( left_container.holds_array() && right_container.holds_array() ) {
+                // The materializing arm below needs min(|la|,|ra|) + one SIMD vector of
+                // result capacity. When the recycled scratch cannot hold that, it has to
+                // GROW the payload — an allocation per pair, which at small container
+                // cardinalities costs far more than the whole intersection. The in-place
+                // kernel writes the result into the left slot's own payload, needs no
+                // result buffer at all, and so is taken exactly in that case; when the
+                // recycled buffer already fits, the materializing arm is the cheaper of
+                // the two (it stores matches straight out instead of through the
+                // overwrite-hazard staging the in-place kernel must use).
+                // [croaring-ref] deps/croaring/src/array_util.c:intersect_vector16_inplace
+                // The in-place kernel pays a fixed per-block staging overhead (it cannot
+                // store matches straight into a payload it is still reading), so it only
+                // repays the avoided allocation while the blocks are few: measured, it
+                // wins by ~30% at 64-element operands and loses by ~30% at ~1000.
+                auto const intersect_result_count{ std::min( left_container.count(), right_container.count() ) };
+                if ( op == detail::set_operation::bit_and && mutate_left &&
+                     intersect_result_count <= detail::kInplaceIntersectMaxElements &&
+                     result_chunks.retired_capacity( detail::container_kind::array ) < intersect_result_count + 8U ) {
+                    detail::intersect_array_array_inplace<layout_type>( left_container.as_array(), right_container.as_array() );
+                    if ( auto const count{ detail::container_size( left_container ) }; count != 0 ) {
+                        size_ += count;
+                        rewrite.keep( left );
+                    }
+                } else if ( op == detail::set_operation::bit_and ) {
+                    // Intersect directly into a fresh result array's storage: array∩array
+                    // is always an array (|result| ≤ min(|la|,|ra|) < bitset threshold).
+                    // A fresh handle is mandatory anyway — the SIMD kernels store full
+                    // vectors past the true count, so the result cannot alias the input —
+                    // and writing it inline skips the reusable-scratch buffer plus the
+                    // scratch→container copy (CRoaring likewise writes the result inline).
+                    // std::as_const avoids an unneeded write-barrier clone under a
+                    // refcounted CowPolicy. Seeding from a retired scratch slot makes
+                    // the inline write land in a reused payload (scratch-reuse path).
+                    auto result{ open_result( detail::container_kind::array ) };
+                    auto result_array{ result.handle->as_array() };
+                    detail::combine_array_array_into<layout_type>(
+                        std::as_const( left_container ).as_array(),
+                        right_container.as_array(),
+                        detail::set_operation::bit_and,
+                        result_array.values
+                    );
+                    if ( !result_array.values.empty() ) {
+                        result_array.sync_header();
+                        auto const count{ static_cast<size_type>( result_array.values.size() ) };
+                        commit_result( left_key, result, count );
+                    }
+                } else if ( mutate_left ) {
+                    detail::difference_array_array_inplace<layout_type>( left_container.as_array(), right_container.as_array() );
+                    if ( left_container.count() != 0 ) {
+                        auto container{ make_fast_container( std::move( left_container ) ) };
+                        emit( left_key, std::move( container ), detail::container_size( container ) );
+                    }
+                } else {
+                    // array \ array with a shared left payload: write the survivors into
+                    // a fresh handle (what difference_into does for every pair).
+                    auto result{ open_result( detail::container_kind::array ) };
+                    auto result_array{ result.handle->as_array() };
+                    detail::difference_array_array_to_vector<layout_type>(
+                        std::as_const( left_container ).as_array(),
+                        right_container.as_array(),
+                        result_array.values
+                    );
+                    if ( !result_array.values.empty() ) {
+                        result_array.sync_header();
+                        auto const count{ static_cast<size_type>( result_array.values.size() ) };
+                        commit_result( left_key, result, count );
+                    }
                 }
                 ++left;
                 continue;
             }
-            size_ += detail::container_size( chunks_.slot( left ) );
-            rewrite.keep( left );
-            ++left;
-            continue;
-        }
-
-        auto       & left_container { chunks_.slot( left ) };
-        auto const & right_container{ other.chunks_.slot( right ) };
-#if FRSR_ROARING_COMBINE_STATS
-        detail::combine_stats().record_pair( left_container, right_container, op );
-#endif
-        // A shared left payload is never mutated in place: cloning it only to
-        // overwrite the clone costs a full payload copy on top of the kernel,
-        // where computing straight into a fresh result costs the kernel alone.
-        // So the in-place kernels below run only when we are the sole holder,
-        // and a shared left container takes the materializing arm for its pair —
-        // emitted into our own table exactly as the materializing arms already
-        // do in in-place mode. This is the rule CRoaring applies to a
-        // SHARED_CONTAINER_TYPE operand (container_and rather than container_iand).
-        bool const mutate_left{ in_place && left_container.payload_is_unshared() };
-        if ( left_container.holds_array() && right_container.holds_array() ) {
-            // The materializing arm below needs min(|la|,|ra|) + one SIMD vector of
-            // result capacity. When the recycled scratch cannot hold that, it has to
-            // GROW the payload — an allocation per pair, which at small container
-            // cardinalities costs far more than the whole intersection. The in-place
-            // kernel writes the result into the left slot's own payload, needs no
-            // result buffer at all, and so is taken exactly in that case; when the
-            // recycled buffer already fits, the materializing arm is the cheaper of
-            // the two (it stores matches straight out instead of through the
-            // overwrite-hazard staging the in-place kernel must use).
-            // [croaring-ref] deps/croaring/src/array_util.c:intersect_vector16_inplace
-            // The in-place kernel pays a fixed per-block staging overhead (it cannot
-            // store matches straight into a payload it is still reading), so it only
-            // repays the avoided allocation while the blocks are few: measured, it
-            // wins by ~30% at 64-element operands and loses by ~30% at ~1000.
-            auto const intersect_result_count{ std::min( left_container.count(), right_container.count() ) };
-            if ( op == detail::set_operation::bit_and && mutate_left &&
-                 intersect_result_count <= detail::kInplaceIntersectMaxElements &&
-                 result_chunks.retired_capacity( detail::container_kind::array ) < intersect_result_count + 8U ) {
-                detail::intersect_array_array_inplace<layout_type>( left_container.as_array(), right_container.as_array() );
-                if ( auto const count{ detail::container_size( left_container ) }; count != 0 ) {
-                    size_ += count;
-                    rewrite.keep( left );
-                }
-            } else if ( op == detail::set_operation::bit_and ) {
-                // Intersect directly into a fresh result array's storage: array∩array
-                // is always an array (|result| ≤ min(|la|,|ra|) < bitset threshold).
-                // A fresh handle is mandatory anyway — the SIMD kernels store full
-                // vectors past the true count, so the result cannot alias the input —
-                // and writing it inline skips the reusable-scratch buffer plus the
-                // scratch→container copy (CRoaring likewise writes the result inline).
-                // std::as_const avoids an unneeded write-barrier clone under a
-                // refcounted CowPolicy. Seeding from a retired scratch slot makes
-                // the inline write land in a reused payload (scratch-reuse path).
-                auto result{ open_result( detail::container_kind::array ) };
-                auto result_array{ result.handle->as_array() };
-                detail::combine_array_array_into<layout_type>(
-                    std::as_const( left_container ).as_array(),
-                    right_container.as_array(),
-                    detail::set_operation::bit_and,
-                    result_array.values
-                );
-                if ( !result_array.values.empty() ) {
-                    result_array.sync_header();
-                    auto const count{ static_cast<size_type>( result_array.values.size() ) };
-                    commit_result( left_key, result, count );
-                }
-            } else if ( mutate_left ) {
-                detail::difference_array_array_inplace<layout_type>( left_container.as_array(), right_container.as_array() );
-                if ( left_container.count() != 0 ) {
-                    auto container{ make_fast_container( std::move( left_container ) ) };
-                    emit( left_key, std::move( container ), detail::container_size( container ) );
-                }
-            } else {
-                // array \ array with a shared left payload: write the survivors into
-                // a fresh handle (what difference_into does for every pair).
-                auto result{ open_result( detail::container_kind::array ) };
-                auto result_array{ result.handle->as_array() };
-                detail::difference_array_array_to_vector<layout_type>(
-                    std::as_const( left_container ).as_array(),
-                    right_container.as_array(),
-                    result_array.values
-                );
-                if ( !result_array.values.empty() ) {
-                    result_array.sync_header();
-                    auto const count{ static_cast<size_type>( result_array.values.size() ) };
-                    commit_result( left_key, result, count );
-                }
-            }
-            ++left;
-            continue;
-        }
-        if ( left_container.holds_bitset() && right_container.holds_bitset() ) {
-            if ( mutate_left ) {
-                auto left_bitset{ left_container.as_bitset() };
-                detail::combine_bitset_bitset_inplace<layout_type>( left_bitset, right_container.as_bitset(), op );
-                if ( left_bitset.size() != 0 ) {
-                    size_ += left_bitset.size();
-                    rewrite.keep( left );
-                }
-            } else {
-                // Direct-init (not assignment into a pre-declared handle): the prvalue
-                // return is elided straight into `container`, halving the
-                // copy_fields_from traffic vs move-assigning into an already-live handle.
-                auto container{ [ & ]() -> handle_type {
-                    // Opt-in (tuning.hpp): a materializing AND counts the common bits first and, below the
-                    // array limit, extracts them straight from the operands' words, as the reference does,
-                    // instead of writing an intermediate bitset. The in-place walk keeps its accumulators.
-                    if constexpr ( detail::kAndDemotesSparseBitsets ) {
-                        if ( !in_place && op == detail::set_operation::bit_and ) {
-                            auto const left_bitset { std::as_const( left_container ).as_bitset() };
-                            auto const right_bitset{ right_container.as_bitset() };
-                            auto const cardinality { detail::and_popcount_words( left_bitset.words.begin(), right_bitset.words.begin(), left_bitset.words.size() ) };
-                            if ( cardinality < array_to_bitset_threshold ) {
-                                auto array{ detail::intersect_bitset_bitset_to_array<layout_type, CowPolicy>(
-                                    left_bitset, right_bitset, cardinality, result_chunks.take_retired( detail::container_kind::array )
-                                ) };
-                                if constexpr ( uses_default_container_set ) {
-                                    return array;
-                                } else {
-                                    return optimize_container_for_policy( std::move( array ) );
+            if ( left_container.holds_bitset() && right_container.holds_bitset() ) {
+                if ( mutate_left ) {
+                    auto left_bitset{ left_container.as_bitset() };
+                    detail::combine_bitset_bitset_inplace<layout_type>( left_bitset, right_container.as_bitset(), op );
+                    if ( left_bitset.size() != 0 ) {
+                        size_ += left_bitset.size();
+                        rewrite.keep( left );
+                    }
+                } else {
+                    // Direct-init (not assignment into a pre-declared handle): the prvalue
+                    // return is elided straight into `container`, halving the
+                    // copy_fields_from traffic vs move-assigning into an already-live handle.
+                    auto container{ [ & ]() -> handle_type {
+                        // Opt-in (tuning.hpp): a materializing AND counts the common bits first and, below the
+                        // array limit, extracts them straight from the operands' words, as the reference does,
+                        // instead of writing an intermediate bitset. The in-place walk keeps its accumulators.
+                        if constexpr ( detail::kAndDemotesSparseBitsets ) {
+                            if ( !in_place && op == detail::set_operation::bit_and ) {
+                                auto const left_bitset { std::as_const( left_container ).as_bitset() };
+                                auto const right_bitset{ right_container.as_bitset() };
+                                auto const cardinality { detail::and_popcount_words( left_bitset.words.begin(), right_bitset.words.begin(), left_bitset.words.size() ) };
+                                if ( cardinality < array_to_bitset_threshold ) {
+                                    auto array{ detail::intersect_bitset_bitset_to_array<layout_type, CowPolicy>(
+                                        left_bitset, right_bitset, cardinality, result_chunks.take_retired( detail::container_kind::array )
+                                    ) };
+                                    if constexpr ( uses_default_container_set ) {
+                                        return array;
+                                    } else {
+                                        return optimize_container_for_policy( std::move( array ) );
+                                    }
                                 }
                             }
                         }
+                        return combine_bitset_bitset_for_policy(
+                            std::as_const( left_container ).as_bitset(),
+                            right_container.as_bitset(),
+                            op,
+                            result_chunks.take_retired( detail::container_kind::bitset )
+                        );
+                    }() };
+                    // AND results NOT demoted (measured): the in-place fold walk is
+                    // where the run-heavy witness's AND-fold accumulator lives —
+                    // demoting it to array cost ~12% regardless of threshold or
+                    // run∩bitset exemption (the demoted accumulator loses the dense
+                    // arms for every subsequent fold pair). ANDNOT results are
+                    // demoted: subtraction traffic is not fold-accumulator traffic.
+                    if ( op == detail::set_operation::bit_andnot ) {
+                        container = demote_sparse_bitset( std::move( container ), result_chunks );
                     }
-                    return combine_bitset_bitset_for_policy(
-                        std::as_const( left_container ).as_bitset(),
-                        right_container.as_bitset(),
-                        op,
-                        result_chunks.take_retired( detail::container_kind::bitset )
-                    );
-                }() };
-                // AND results NOT demoted (measured): the in-place fold walk is
-                // where the run-heavy witness's AND-fold accumulator lives —
-                // demoting it to array cost ~12% regardless of threshold or
-                // run∩bitset exemption (the demoted accumulator loses the dense
-                // arms for every subsequent fold pair). ANDNOT results are
-                // demoted: subtraction traffic is not fold-accumulator traffic.
-                if ( op == detail::set_operation::bit_andnot ) {
-                    container = demote_sparse_bitset( std::move( container ), result_chunks );
-                }
-                if ( auto const bitset_size{ detail::container_size( container ) }; bitset_size != 0 ) {
-                    emit( left_key, std::move( container ), bitset_size );
-                }
-            }
-            ++left;
-            continue;
-        }
-        if ( mutate_left && left_container.holds_array() && right_container.holds_bitset() ) {
-            // In-place array∩bitset / array\bitset: the result is a subset of our
-            // own array payload, so filter it in place instead of building a fresh
-            // container through combine_containers. The mutable as_array() write
-            // barrier keeps this alloc-free when we are the sole referent (rc == 1,
-            // the common case for an accumulator after its first combine); a shared
-            // array clones once — the same one allocation the generic path would
-            // pay — then compacts. Result ⊆ the array ⇒ always still an array, so
-            // no representation re-decision (deferred to optimize(), exactly as the
-            // bitset∩bitset arm above defers). Mirrors that arm's slot handling;
-            // only the kernel (and the filter polarity, keyed off op) differs.
-            // (Materializing mode must not mutate *this — it takes the generic arm.)
-            // mutate_left has already established sole ownership, so the payload
-            // is written without a second write-barrier test; and a filter that
-            // drops nothing leaves the same set, whose header is still exact.
-            auto left_array{ detail::as_array_already_private( left_container ) };
-            auto const unfiltered_count{ left_array.values.size() };
-            detail::filter_array_bitset_inplace<layout_type>( left_array, right_container.as_bitset(), op == detail::set_operation::bit_and );
-            if ( !left_array.values.empty() ) {
-                if ( left_array.values.size() != unfiltered_count ) {
-                    left_array.sync_header();
-                }
-                size_ += left_array.values.size();
-                rewrite.keep( left );
-            }
-            ++left;
-            continue;
-        }
-        if ( mutate_left && left_container.holds_array() && right_container.holds_run() ) {
-            // In-place array∩run / array\run: same contract as the array-vs-
-            // bitset arm above (result ⊆ our own array payload — compact in
-            // place, alloc-free at rc == 1, always still an array). Without
-            // this arm every RUN-involved pair falls through to the generic
-            // combine_containers visit machinery, whose per-pair dispatch +
-            // scratch + representation re-decision dominates N-way-AND-fold
-            // shapes over run-encoded (storage-optimize()d) operands.
-            auto left_array{ left_container.as_array() };
-            detail::filter_array_run_inplace<layout_type>( left_array, right_container.as_run(), op == detail::set_operation::bit_and );
-            if ( !left_array.values.empty() ) {
-                left_array.sync_header();
-                size_ += left_array.values.size();
-                rewrite.keep( left );
-            }
-            ++left;
-            continue;
-        }
-        bool const left_is_array { left_container.holds_array()  };
-        bool const right_is_array{ right_container.holds_array() };
-        if ( ( op == detail::set_operation::bit_and &&
-               ( ( left_is_array && right_container.holds_bitset() ) ||
-                 ( left_container.holds_bitset() && right_is_array ) ) ) ||
-             ( op == detail::set_operation::bit_andnot && left_is_array && right_container.holds_bitset() ) ) {
-            // Materializing array∩bitset (either orientation — the in-place
-            // left-array case is already consumed by the alloc-free arm above):
-            // the result is an array ⊆ the array side, so write it inline into a
-            // fresh handle, CRoaring-style, instead of paying the generic
-            // visit/variant dispatch plus representation re-decision of
-            // combine_containers (the dominant per-pair overhead in profiles).
-            auto const & array_side { left_is_array ? std::as_const( left_container ) : right_container };
-            auto const & bitset_side{ left_is_array ? right_container : std::as_const( left_container ) };
-            // Saturated bitset (its header keeps an exact count, see
-            // bitset_ops.hpp's repair note): the intersection IS the array
-            // side — share it via a CoW handle copy instead of probing every
-            // key against all-ones words (the all-survive regime is the
-            // filter kernel's slowest — store-to-load aliasing on the
-            // coinciding cursors). Same shape as the full-domain-run arm below.
-            if ( op == detail::set_operation::bit_and && detail::container_is_known_full<layout_type, CowPolicy>( bitset_side ) ) {
-                if ( auto const count{ static_cast<size_type>( array_side.as_array().values.size() ) }; count != 0 ) {
-                    emit( left_key, handle_type{ array_side }, count );
+                    if ( auto const bitset_size{ detail::container_size( container ) }; bitset_size != 0 ) {
+                        emit( left_key, std::move( container ), bitset_size );
+                    }
                 }
                 ++left;
                 continue;
             }
-            auto result{ open_result( detail::container_kind::array ) };
-            auto result_array{ result.handle->as_array() };
-            detail::filter_array_bitset_into<layout_type>(
-                array_side.as_array(),
-                bitset_side.as_bitset(),
-                op == detail::set_operation::bit_and,
-                result_array.values
-            );
-            if ( !result_array.values.empty() ) {
-                result_array.sync_header();
-                auto const count{ static_cast<size_type>( result_array.values.size() ) };
-                commit_result( left_key, result, count );
+            if ( mutate_left && left_container.holds_array() && right_container.holds_bitset() ) {
+                // In-place array∩bitset / array\bitset: the result is a subset of our
+                // own array payload, so filter it in place instead of building a fresh
+                // container through combine_containers. The mutable as_array() write
+                // barrier keeps this alloc-free when we are the sole referent (rc == 1,
+                // the common case for an accumulator after its first combine); a shared
+                // array clones once — the same one allocation the generic path would
+                // pay — then compacts. Result ⊆ the array ⇒ always still an array, so
+                // no representation re-decision (deferred to optimize(), exactly as the
+                // bitset∩bitset arm above defers). Mirrors that arm's slot handling;
+                // only the kernel (and the filter polarity, keyed off op) differs.
+                // (Materializing mode must not mutate *this — it takes the generic arm.)
+                // mutate_left has already established sole ownership, so the payload
+                // is written without a second write-barrier test; and a filter that
+                // drops nothing leaves the same set, whose header is still exact.
+                auto left_array{ detail::as_array_already_private( left_container ) };
+                auto const unfiltered_count{ left_array.values.size() };
+                detail::filter_array_bitset_inplace<layout_type>( left_array, right_container.as_bitset(), op == detail::set_operation::bit_and );
+                if ( !left_array.values.empty() ) {
+                    if ( left_array.values.size() != unfiltered_count ) {
+                        left_array.sync_header();
+                    }
+                    size_ += left_array.values.size();
+                    rewrite.keep( left );
+                }
+                ++left;
+                continue;
             }
-            ++left;
-            continue;
-        }
-        if ( op == detail::set_operation::bit_and &&
-             ( ( left_container.holds_run() && right_is_array ) ||
-               ( left_is_array && right_container.holds_run() ) ) ) {
-            // array-side ∩ run-side (run on either side; the in-place left-array
-            // case is already consumed by the alloc-free arm above): the result is
-            // an array ⊆ the array side — write it inline into a fresh/retired
-            // handle instead of paying the generic visit dispatch + scratch +
-            // representation re-decision. This is the dominant fold pair when the
-            // ACCUMULATOR is run-encoded (a shallow copy of a storage-optimize()d
-            // bitmap, a downstream N-way AND fold seed): run-left probe counts ran
-            // ~30x the array-left ones on the run-heavy witness model. Both sides are only
-            // read (std::as_const), so a shared left container needs no clone.
-            // Outlined: cold for array/bitset-dominated workloads — keeping these
-            // bodies inline in the walk cost the bitset-heavy witness ~4% (spine
-            // i-cache footprint), same mechanism as the AVX-512 in-place dispatch
-            // finding in bitset_ops.hpp.
-            [ & ] [[ gnu::noinline ]] () {
-                auto const & array_side{ left_is_array ? std::as_const( left_container ) : right_container };
-                auto const & run_side  { left_is_array ? right_container : std::as_const( left_container ) };
-                // Full-domain run (a storage-optimize()d saturated chunk — the
-                // common accumulator seed): the intersection IS the array side, so
-                // share its payload via a CoW handle copy instead of galloping and
-                // memcpy-ing it into a fresh container (CRoaring clones here; the
-                // CoW copy is strictly cheaper). Mirrors intersect_run_run's
-                // is_full fast path and the saturated-bitset arm above.
-                if ( detail::container_is_known_full<layout_type, CowPolicy>( run_side ) ) {
+            if ( mutate_left && left_container.holds_array() && right_container.holds_run() ) {
+                // In-place array∩run / array\run: same contract as the array-vs-
+                // bitset arm above (result ⊆ our own array payload — compact in
+                // place, alloc-free at rc == 1, always still an array). Without
+                // this arm every RUN-involved pair falls through to the generic
+                // combine_containers visit machinery, whose per-pair dispatch +
+                // scratch + representation re-decision dominates N-way-AND-fold
+                // shapes over run-encoded (storage-optimize()d) operands.
+                auto left_array{ left_container.as_array() };
+                detail::filter_array_run_inplace<layout_type>( left_array, right_container.as_run(), op == detail::set_operation::bit_and );
+                if ( !left_array.values.empty() ) {
+                    left_array.sync_header();
+                    size_ += left_array.values.size();
+                    rewrite.keep( left );
+                }
+                ++left;
+                continue;
+            }
+            bool const left_is_array { left_container.holds_array()  };
+            bool const right_is_array{ right_container.holds_array() };
+            if ( ( op == detail::set_operation::bit_and &&
+                   ( ( left_is_array && right_container.holds_bitset() ) ||
+                     ( left_container.holds_bitset() && right_is_array ) ) ) ||
+                 ( op == detail::set_operation::bit_andnot && left_is_array && right_container.holds_bitset() ) ) {
+                // Materializing array∩bitset (either orientation — the in-place
+                // left-array case is already consumed by the alloc-free arm above):
+                // the result is an array ⊆ the array side, so write it inline into a
+                // fresh handle, CRoaring-style, instead of paying the generic
+                // visit/variant dispatch plus representation re-decision of
+                // combine_containers (the dominant per-pair overhead in profiles).
+                auto const & array_side { left_is_array ? std::as_const( left_container ) : right_container };
+                auto const & bitset_side{ left_is_array ? right_container : std::as_const( left_container ) };
+                // Saturated bitset (its header keeps an exact count, see
+                // bitset_ops.hpp's repair note): the intersection IS the array
+                // side — share it via a CoW handle copy instead of probing every
+                // key against all-ones words (the all-survive regime is the
+                // filter kernel's slowest — store-to-load aliasing on the
+                // coinciding cursors). Same shape as the full-domain-run arm below.
+                if ( op == detail::set_operation::bit_and && detail::container_is_known_full<layout_type, CowPolicy>( bitset_side ) ) {
                     if ( auto const count{ static_cast<size_type>( array_side.as_array().values.size() ) }; count != 0 ) {
                         emit( left_key, handle_type{ array_side }, count );
                     }
-                    return;
+                    ++left;
+                    continue;
                 }
                 auto result{ open_result( detail::container_kind::array ) };
                 auto result_array{ result.handle->as_array() };
-                detail::filter_array_run_into<layout_type>( array_side.as_array(), run_side.as_run(), result_array.values );
+                detail::filter_array_bitset_into<layout_type>(
+                    array_side.as_array(),
+                    bitset_side.as_bitset(),
+                    op == detail::set_operation::bit_and,
+                    result_array.values
+                );
                 if ( !result_array.values.empty() ) {
                     result_array.sync_header();
                     auto const count{ static_cast<size_type>( result_array.values.size() ) };
                     commit_result( left_key, result, count );
                 }
-            }();
-            ++left;
-            continue;
-        }
-        if ( op == detail::set_operation::bit_and && left_container.holds_run() && right_container.holds_run() ) {
-            // run ∩ run: the merge writes its runs straight into a fresh result payload (the
-            // reference's shape: the intersection lands in the destination run container, then
-            // one size decision), instead of building a standalone run_container and copying
-            // it into a handle — two allocations and a copy per pair, most of the cost of a
-            // pair of short run lists. Outlined like the other run arms.
-            // [croaring-ref] deps/croaring/src/roaring.c:container_and (run, run)
-            [ & ] [[ gnu::noinline ]] () {
-                auto const & lhs{ std::as_const( left_container ) };
-                // A full-domain side leaves the other: share its payload.
-                if ( detail::container_is_known_full<layout_type, CowPolicy>( lhs ) ) {
-                    if ( auto const count{ static_cast<size_type>( detail::container_size( right_container ) ) }; count != 0 ) {
-                        emit( left_key, handle_type{ right_container }, count );
+                ++left;
+                continue;
+            }
+            if ( op == detail::set_operation::bit_and &&
+                 ( ( left_container.holds_run() && right_is_array ) ||
+                   ( left_is_array && right_container.holds_run() ) ) ) {
+                // array-side ∩ run-side (run on either side; the in-place left-array
+                // case is already consumed by the alloc-free arm above): the result is
+                // an array ⊆ the array side — write it inline into a fresh/retired
+                // handle instead of paying the generic visit dispatch + scratch +
+                // representation re-decision. This is the dominant fold pair when the
+                // ACCUMULATOR is run-encoded (a shallow copy of a storage-optimize()d
+                // bitmap, a downstream N-way AND fold seed): run-left probe counts ran
+                // ~30x the array-left ones on the run-heavy witness model. Both sides are only
+                // read (std::as_const), so a shared left container needs no clone.
+                // Outlined: cold for array/bitset-dominated workloads — keeping these
+                // bodies inline in the walk cost the bitset-heavy witness ~4% (spine
+                // i-cache footprint), same mechanism as the AVX-512 in-place dispatch
+                // finding in bitset_ops.hpp.
+                [ & ] [[ gnu::noinline ]] () {
+                    auto const & array_side{ left_is_array ? std::as_const( left_container ) : right_container };
+                    auto const & run_side  { left_is_array ? right_container : std::as_const( left_container ) };
+                    // Full-domain run (a storage-optimize()d saturated chunk — the
+                    // common accumulator seed): the intersection IS the array side, so
+                    // share its payload via a CoW handle copy instead of galloping and
+                    // memcpy-ing it into a fresh container (CRoaring clones here; the
+                    // CoW copy is strictly cheaper). Mirrors intersect_run_run's
+                    // is_full fast path and the saturated-bitset arm above.
+                    if ( detail::container_is_known_full<layout_type, CowPolicy>( run_side ) ) {
+                        if ( auto const count{ static_cast<size_type>( array_side.as_array().values.size() ) }; count != 0 ) {
+                            emit( left_key, handle_type{ array_side }, count );
+                        }
+                        return;
                     }
-                    return;
-                }
-                if ( detail::container_is_known_full<layout_type, CowPolicy>( right_container ) ) {
-                    if ( auto const count{ static_cast<size_type>( detail::container_size( lhs ) ) }; count != 0 ) {
-                        emit( left_key, handle_type{ lhs }, count );
+                    auto result{ open_result( detail::container_kind::array ) };
+                    auto result_array{ result.handle->as_array() };
+                    detail::filter_array_run_into<layout_type>( array_side.as_array(), run_side.as_run(), result_array.values );
+                    if ( !result_array.values.empty() ) {
+                        result_array.sync_header();
+                        auto const count{ static_cast<size_type>( result_array.values.size() ) };
+                        commit_result( left_key, result, count );
                     }
-                    return;
-                }
-                // A retired payload is offered by kind, and only the array and bitset kinds are
-                // parked, so a run result starts from an empty run handle.
-                result_under_construction result{ *std::construct_at( in_place ? &staged.handle : result_chunks.open_back(), handle_type::make_run() ) };
-                auto result_run{ result.handle->as_run() };
-                auto const cardinality{ detail::intersect_run_run_into<layout_type>( lhs.as_run(), right_container.as_run(), result_run.runs ) };
-                if ( cardinality == 0 ) {
-                    return;
-                }
-                auto const run_count{ result_run.runs.size() };
-                auto const run_bytes{ run_count * sizeof( typename detail::run_container<layout_type>::run ) };
-                auto const array_bytes{ cardinality * sizeof( typename layout_type::low_type ) };
-                constexpr auto bitset_bytes{ layout_type::word_count * sizeof( std::uint64_t ) };
-                if ( run_bytes <= array_bytes && !( cardinality >= array_to_bitset_threshold && bitset_bytes <= run_bytes ) ) {
-                    result.handle->set_cardinality( static_cast<std::uint32_t>( cardinality ) );
-                    result.handle->set_endpoints( result_run.runs.front().begin, result_run.runs.back().end );
-                    commit_result( left_key, result, static_cast<size_type>( cardinality ) );
-                    return;
-                }
-                // The runs are not the smallest form: the size decision the other run results
-                // take, over the runs just written.
-                detail::run_container<layout_type> merged;
-                merged.runs.reserve( static_cast<std::uint32_t>( run_count ) );
-                for ( auto const & current : std::as_const( result_run.runs ) ) { merged.runs.push_back( current ); }
-                merged.cardinality = static_cast<typename detail::run_container<layout_type>::cardinality_type>( cardinality );
-                *result.handle = handle_type{};
-                result.handle = nullptr;  // the slot is free for the emit below
-                emit( left_key, detail::make_container_from_runs<layout_type, CowPolicy>( std::move( merged ), array_to_bitset_threshold ), static_cast<size_type>( cardinality ) );
-            }();
+                }();
+                ++left;
+                continue;
+            }
+            if ( op == detail::set_operation::bit_and && left_container.holds_run() && right_container.holds_run() ) {
+                // run ∩ run: the merge writes its runs straight into a fresh result payload (the
+                // reference's shape: the intersection lands in the destination run container, then
+                // one size decision), instead of building a standalone run_container and copying
+                // it into a handle — two allocations and a copy per pair, most of the cost of a
+                // pair of short run lists. Outlined like the other run arms.
+                // [croaring-ref] deps/croaring/src/roaring.c:container_and (run, run)
+                [ & ] [[ gnu::noinline ]] () {
+                    auto const & lhs{ std::as_const( left_container ) };
+                    // A full-domain side leaves the other: share its payload.
+                    if ( detail::container_is_known_full<layout_type, CowPolicy>( lhs ) ) {
+                        if ( auto const count{ static_cast<size_type>( detail::container_size( right_container ) ) }; count != 0 ) {
+                            emit( left_key, handle_type{ right_container }, count );
+                        }
+                        return;
+                    }
+                    if ( detail::container_is_known_full<layout_type, CowPolicy>( right_container ) ) {
+                        if ( auto const count{ static_cast<size_type>( detail::container_size( lhs ) ) }; count != 0 ) {
+                            emit( left_key, handle_type{ lhs }, count );
+                        }
+                        return;
+                    }
+                    // A retired payload is offered by kind, and only the array and bitset kinds are
+                    // parked, so a run result starts from an empty run handle.
+                    result_under_construction result{ *std::construct_at( in_place ? &staged.handle : result_chunks.open_back(), handle_type::make_run() ) };
+                    auto result_run{ result.handle->as_run() };
+                    auto const cardinality{ detail::intersect_run_run_into<layout_type>( lhs.as_run(), right_container.as_run(), result_run.runs ) };
+                    if ( cardinality == 0 ) {
+                        return;
+                    }
+                    auto const run_count{ result_run.runs.size() };
+                    auto const run_bytes{ run_count * sizeof( typename detail::run_container<layout_type>::run ) };
+                    auto const array_bytes{ cardinality * sizeof( typename layout_type::low_type ) };
+                    constexpr auto bitset_bytes{ layout_type::word_count * sizeof( std::uint64_t ) };
+                    if ( run_bytes <= array_bytes && !( cardinality >= array_to_bitset_threshold && bitset_bytes <= run_bytes ) ) {
+                        result.handle->set_cardinality( static_cast<std::uint32_t>( cardinality ) );
+                        result.handle->set_endpoints( result_run.runs.front().begin, result_run.runs.back().end );
+                        commit_result( left_key, result, static_cast<size_type>( cardinality ) );
+                        return;
+                    }
+                    // The runs are not the smallest form: the size decision the other run results
+                    // take, over the runs just written.
+                    detail::run_container<layout_type> merged;
+                    merged.runs.reserve( static_cast<std::uint32_t>( run_count ) );
+                    for ( auto const & current : std::as_const( result_run.runs ) ) { merged.runs.push_back( current ); }
+                    merged.cardinality = static_cast<typename detail::run_container<layout_type>::cardinality_type>( cardinality );
+                    *result.handle = handle_type{};
+                    result.handle = nullptr;  // the slot is free for the emit below
+                    emit( left_key, detail::make_container_from_runs<layout_type, CowPolicy>( std::move( merged ), array_to_bitset_threshold ), static_cast<size_type>( cardinality ) );
+                }();
+                ++left;
+                continue;
+            }
+            if ( op == detail::set_operation::bit_and &&
+                 ( ( left_container.holds_run   () && right_container.holds_bitset() ) ||
+                   ( left_container.holds_bitset() && right_container.holds_run   () ) ) ) {
+                // run ∩ bitset (either orientation): masked source words land directly
+                // in a fresh/retired bitset payload with the popcount fused into the
+                // fill — the generic path pays a zero-initialized stack word_array, an
+                // 8 KB container-build copy, a separate popcount pass, and the visit
+                // dispatch. The other dominant pair of the run-encoded-accumulator
+                // fold shape (see the array-side ∩ run-side arm above).
+                [ & ] [[ gnu::noinline ]] () {   // outlined: see the arm above
+                    auto const & run_side   { left_container.holds_run() ? std::as_const( left_container ) : right_container };
+                    auto const & bitset_side{ left_container.holds_run() ? right_container : std::as_const( left_container ) };
+                    auto container{ intersect_run_bitset_by_coverage( run_side, bitset_side, result_chunks ) };
+                    if ( auto const container_count{ detail::container_size( container ) }; container_count != 0 ) {
+                        emit( left_key, std::move( container ), container_count );
+                    }
+                }();
+                ++left;
+                continue;
+            }
+            if ( mutate_left && op == detail::set_operation::bit_andnot &&
+                 left_container.holds_bitset() && right_container.holds_array() ) {
+                // In-place bitset\array: clear the array's bits from our own 8 KB
+                // block (exact cardinality bookkeeping, no allocation; the mutable
+                // as_bitset() write barrier clones once at rc > 1, as elsewhere).
+                [ & ] [[ gnu::noinline ]] () {   // outlined: see the array∩run arm above
+                    auto left_bitset{ left_container.as_bitset() };
+                    detail::difference_bitset_array_inplace<layout_type>( left_bitset, right_container.as_array() );
+                    if ( left_bitset.size() != 0 ) {
+                        size_ += left_bitset.size();
+                        rewrite.keep( left );
+                    }
+                }();
+                ++left;
+                continue;
+            }
+            auto container{ combine_containers_for_policy(
+                left_container,
+                right_container,
+                op
+            ) };
+            auto const container_size{ detail::container_size( container ) };
+            if ( container_size != 0 ) {
+                emit( left_key, std::move( container ), container_size );
+            }
             ++left;
-            continue;
         }
-        if ( op == detail::set_operation::bit_and &&
-             ( ( left_container.holds_run   () && right_container.holds_bitset() ) ||
-               ( left_container.holds_bitset() && right_container.holds_run   () ) ) ) {
-            // run ∩ bitset (either orientation): masked source words land directly
-            // in a fresh/retired bitset payload with the popcount fused into the
-            // fill — the generic path pays a zero-initialized stack word_array, an
-            // 8 KB container-build copy, a separate popcount pass, and the visit
-            // dispatch. The other dominant pair of the run-encoded-accumulator
-            // fold shape (see the array-side ∩ run-side arm above).
-            [ & ] [[ gnu::noinline ]] () {   // outlined: see the arm above
-                auto const & run_side   { left_container.holds_run() ? std::as_const( left_container ) : right_container };
-                auto const & bitset_side{ left_container.holds_run() ? right_container : std::as_const( left_container ) };
-                auto container{ intersect_run_bitset_by_coverage( run_side, bitset_side, result_chunks ) };
-                if ( auto const container_count{ detail::container_size( container ) }; container_count != 0 ) {
-                    emit( left_key, std::move( container ), container_count );
+    } catch ( ... ) {
+        // In-place mode: a walk that an allocation failure stops keeps the result of the entries it has reached and
+        // the entries it has not as they are (a materializing walk leaves a valid part of the result in `out`). A
+        // handler rather than a guard, so that nothing outside the walk refers to its cursor.
+        if constexpr ( !detail::allocation_failure_terminates ) {
+            if ( in_place ) {
+                for ( ; left != chunks_.end(); ++left ) {
+                    if ( auto const kept{ detail::container_size( chunks_.slot( left ) ) }; kept != 0 ) {
+                        size_ += kept;
+                        rewrite.keep( left );
+                    }
                 }
-            }();
-            ++left;
-            continue;
+                rewrite.finish();
+            }
         }
-        if ( mutate_left && op == detail::set_operation::bit_andnot &&
-             left_container.holds_bitset() && right_container.holds_array() ) {
-            // In-place bitset\array: clear the array's bits from our own 8 KB
-            // block (exact cardinality bookkeeping, no allocation; the mutable
-            // as_bitset() write barrier clones once at rc > 1, as elsewhere).
-            [ & ] [[ gnu::noinline ]] () {   // outlined: see the array∩run arm above
-                auto left_bitset{ left_container.as_bitset() };
-                detail::difference_bitset_array_inplace<layout_type>( left_bitset, right_container.as_array() );
-                if ( left_bitset.size() != 0 ) {
-                    size_ += left_bitset.size();
-                    rewrite.keep( left );
-                }
-            }();
-            ++left;
-            continue;
-        }
-        auto container{ combine_containers_for_policy(
-            left_container,
-            right_container,
-            op
-        ) };
-        auto const container_size{ detail::container_size( container ) };
-        if ( container_size != 0 ) {
-            emit( left_key, std::move( container ), container_size );
-        }
-        ++left;
+        throw;
     }
 
     if ( in_place ) {

@@ -24,6 +24,7 @@
 
 #include <concepts>
 #include <ranges>
+#include <utility>
 
 namespace frsr::roaring::detail {
 
@@ -32,6 +33,29 @@ void allocation_policy_probe() FRSR_ROARING_NOEXCEPT_EXCEPT_BADALLOC;
 
 // True when an allocation failure cannot be observed as an exception.
 inline constexpr bool allocation_failure_terminates{ noexcept( allocation_policy_probe() ) };
+
+// Calls `recover` (which must not throw) when the scope that holds it is left by an exception: it puts back the
+// invariants of a change that an allocation failure stopped half way. A scope left normally calls dismiss() first.
+// In a build where an allocation failure terminates there is nothing to recover from and it does nothing.
+template <typename Recover>
+class [[nodiscard]] failure_guard {
+public:
+    explicit failure_guard( Recover recover ) noexcept : recover_{ std::move( recover ) } {}
+    failure_guard( failure_guard const & ) = delete;
+    ~failure_guard() {
+        if constexpr ( !allocation_failure_terminates ) {
+            if ( armed_ ) {
+                recover_();
+            }
+        }
+    }
+
+    void dismiss() noexcept { armed_ = false; }
+
+private:
+    Recover recover_;
+    bool    armed_{ true };
+};
 
 // A range of keys that is walked without calling anything that can throw (contiguous storage of the keys).
 template <typename Range, typename Key>
