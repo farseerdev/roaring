@@ -7037,6 +7037,20 @@ struct register_cpp_bulk_add_registrar {
 // value per row, `blocks` per 64 consecutive rows. Fewer values make the chunks of each bitmap fuller:
 // arrays below the threshold, bitsets well above it, the forms the two libraries agree on only from the
 // threshold up. Checksum = values held.
+//
+// Under glibc's allocator the time of a run also depends on whether the heap is trimmed after it. The index a
+// run frees coalesces, and once a free reaches the top of the heap glibc hands the memory above its trim
+// threshold back to the system, so the next run faults every page of its bitsets in again: two to four times
+// the time of a run that reuses them. frsr keeps each container's header in the chunk table, so where the
+// chunks are bitsets all a run frees is 8 KiB payload blocks and tables, which coalesce to the top. The
+// reference also frees a small header per container; glibc keeps the last few freed blocks of each small size
+// in a per-thread cache that never coalesces, and one of them left just below the top keeps the rest of the
+// freed heap off it, so nothing is trimmed. Whether one is left there depends on where the heap's blocks
+// happen to lie, not on the calls: the reference's two arms make the same allocation calls, and on the spread
+// shapes one is trimmed and the other is not. With trimming off (GLIBC_TUNABLES=glibc.malloc.trim_threshold=...)
+// both libraries reuse the memory and the frsr arms are the faster; with that cache off
+// (glibc.malloc.tcache_count=0) both are trimmed. Under mimalloc, which keeps the freed memory for the next
+// run, neither is.
 struct IndexBuildShape { char const *label; std::uint32_t values; std::uint32_t block; };
 static constexpr IndexBuildShape kIndexBuildShapes[]{
     { "spread/values=200", 200, 1 },
