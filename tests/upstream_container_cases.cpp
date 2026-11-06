@@ -215,10 +215,9 @@ TEST( UpstreamContainers, run_shrink_to_fit_race_test ) {
 // ---- tests/util_unit.c ----
 
 // avx512_extract_uint16_sparse_matches_scalar: the AVX-512 decoder of a bitset into 16-bit values, on sparse words
-// spread out or in runs (so that some words hold more than 32 values), on both sides of 1024 values (where the
-// decoder is first chosen) and of 2048, into an output of exactly the decoded count. The reference's decoder also
-// stops at a given capacity; this one always decodes the whole block. Through a bitmap, the bitset of the same words
-// demotes to the same values on any CPU.
+// spread out or in runs (so that some words hold more than 32 values), around 1024 and 2048 values, into an output of
+// exactly the decoded count: nothing is written past it. The reference's decoder also stops at a given capacity; this
+// one is given the exact count. Through a bitmap, the bitset of the same words demotes to the same values on any CPU.
 TEST( UpstreamContainers, avx512_extract_uint16_sparse_matches_scalar ) {
     std::mt19937_64 rng{ 1234 };
     for ( std::size_t const target : { 1U, 7U, 64U, 500U, 1000U, 1023U, 1024U, 1025U, 2047U, 2048U, 3000U, 4096U } ) {
@@ -248,7 +247,7 @@ TEST( UpstreamContainers, avx512_extract_uint16_sparse_matches_scalar ) {
 #if FRSR_ROARING_X86_V4
             if ( detail::have_x86_v4() ) {
                 std::vector<std::uint16_t> decoded( cardinality );
-                EXPECT_EQ( detail::x86_v4::extract_setbits_uint16( words.data(), words.size(), decoded.data() ), cardinality );
+                detail::x86_v4::extract_setbits_uint16( words.data(), words.size(), decoded.data(), cardinality );
                 EXPECT_EQ( decoded, lows );
             }
 #endif
