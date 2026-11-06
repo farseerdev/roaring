@@ -1575,16 +1575,70 @@ template <bool Greater, typename Element, typename Key, typename KeyOf = identit
 // The first run at or after `index` (< `size`) whose end is not below `value` (`size` if none). The run the
 // previous value landed in usually still reaches this one: one compare. A value a few runs ahead is reached by
 // predictable linear steps (a gallop over such a skip mispredicts more than it saves); a value further ahead
-// pays the gallop, kept out of line so it does not weigh on the loops that call this per array value.
+// is reached out of line, so it does not weigh on the loops that call this per array value: first by strides
+// over blocks of runs, each tested by the end of its last run, then by strides that double from there and a binary
+// search of the last one.
 inline constexpr std::size_t linear_run_steps{ 16 };
+
+// The strides of the out-of-line run search: a block of runs_per_stride runs is passed by one compare, which is
+// cheaper than a search for a skip of a few dozen runs; strides_before_doubling of them come before the strides
+// double.
+inline constexpr std::size_t runs_per_stride{ 8 };
+inline constexpr std::size_t strides_before_doubling{ 2 };
 
 // The array values per run from which the values that follow a kept one in its run are moved by one copy loop
 // (see filter_array_run_into) instead of being tested one by one.
 inline constexpr std::size_t values_per_run_for_stretch_copy{ 16 };
 
+// How filter_array_run_into crosses a stretch of array values that lies before a run or inside it:
+//  - per_value: each value on its own, tested against the run list (a few values to a run);
+//  - stepped:   the difference only; a loop steps over the stretch (the values a run covers up to
+//               covered_steps_before_gallop of them, then by a gallop);
+//  - whole:     the stretch is bounded at once (a copy loop for the values the intersection keeps, a gallop and one
+//               copy for the difference).
+enum class stretch_form : std::uint8_t { per_value, stepped, whole };
+
+// The array values per run from which the difference steps over its stretches, and from which it crosses them whole.
+inline constexpr std::size_t values_per_run_for_difference_steps{ 8 };
+inline constexpr std::size_t values_per_run_for_difference_whole{ 32 };
+
+// The covered values the stepped difference steps over before it gallops past the rest of the run.
+inline constexpr std::size_t covered_steps_before_gallop{ 8 };
+
 template <typename Run, typename Value>
-[[gnu::noinline]] inline std::size_t gallop_to_run_reaching( Run const * const runs, std::size_t const index, std::size_t const size, Value const value ) noexcept {
-    return gallop_forward<false>( runs, index, size, value, run_end_key<Value>{} );
+[[nodiscard]] [[gnu::noinline]] inline std::size_t stride_to_run_reaching( Run const * const runs, std::size_t index, std::size_t const size, Value const value ) noexcept {
+    for ( std::size_t stride{ 0 }; stride < strides_before_doubling; ++stride ) {
+        if ( size - index < runs_per_stride ) {
+            while ( index < size && static_cast<Value>( runs[ index ].end ) < value ) {
+                ++index;
+            }
+            return index;
+        }
+        if ( static_cast<Value>( runs[ index + runs_per_stride - 1 ].end ) >= value ) {
+            while ( static_cast<Value>( runs[ index ].end ) < value ) {
+                ++index;
+            }
+            return index;
+        }
+        index += runs_per_stride;
+    }
+    // runs[index - 1] still ends below the value
+    auto step{ 2 * runs_per_stride };
+    while ( size - index > step && static_cast<Value>( runs[ index + step - 1 ].end ) < value ) {
+        index += step;
+        step *= 2;
+    }
+    auto const * const found{ std::lower_bound( runs + index, runs + std::min( index + step, size ), value, []( auto const & run, Value const limit ) noexcept {
+        return static_cast<Value>( run.end ) < limit;
+    } ) };
+    return static_cast<std::size_t>( found - runs );
+}
+
+// The first index in [`index`, `size`) whose value is above `end` (`size` if none): the gallop of the difference past
+// the values a run covers, out of line for the loop that steps over the first few.
+template <typename Value>
+[[nodiscard]] [[gnu::noinline]] inline std::size_t gallop_past_covered( Value const * const keys, std::size_t const index, std::size_t const size, Value const end ) noexcept {
+    return gallop_forward<true>( keys, index, size, end );
 }
 
 template <typename Run, typename Value>
@@ -1596,17 +1650,20 @@ template <typename Run, typename Value>
             return size;
         }
         if ( ++steps == linear_run_steps ) {
-            return gallop_to_run_reaching( runs, index, size, value );
+            return stride_to_run_reaching( runs, index, size, value );
         }
     }
     return index;
 }
 
-// With a few array values to a run the kept values come one by one (for the difference, the values in the gap before
-// a run), and the loop or copy that moves the stretch of values at once only adds an exit test or a call to each (a
-// mispredicted one when the stretches vary): the stretch form is the instantiation for lists with at least
-// values_per_run_for_stretch_copy values to a run. The in-place filter below is built the same way.
-template <typename Layout, typename OutVector, typename CowPolicy, typename Keep, bool LongStretches>
+// With a few array values to a run the kept values come one by one, and the loop or copy that moves the stretch of
+// values at once only adds an exit test or a call to each (a mispredicted one when the stretches vary): the whole
+// stretch form is the intersection's instantiation for lists with at least values_per_run_for_stretch_copy values to a
+// run (the in-place filter below has the same two forms) and the difference's from values_per_run_for_difference_whole
+// values to a run. The difference has the stepped form between: from values_per_run_for_difference_steps values to a
+// run, as in the reference, the values before a run are copied in one loop and the values it covers are passed one at
+// a time (up to covered_steps_before_gallop of them, then by a gallop, for a run that covers a long stretch).
+template <typename Layout, typename OutVector, typename CowPolicy, typename Keep, stretch_form Form>
 [[ gnu::hot, gnu::noinline ]] inline void filter_array_run_into_with(
     array_cref<Layout, CowPolicy> const lhs,
     run_cref<Layout, CowPolicy> const rhs,
@@ -1615,6 +1672,7 @@ template <typename Layout, typename OutVector, typename CowPolicy, typename Keep
     using low_type = typename Layout::low_type;
     // true_type: the intersection, false_type: the difference.
     constexpr bool keep_matches{ Keep::value };
+    static_assert( !keep_matches || Form != stretch_form::stepped, "the stepped form is the difference's" );
     auto const * const keys{ lhs.values.data() };
     auto const card{ static_cast<std::size_t>( lhs.values.size() ) };
     resize_uninitialized( result, lhs.values.size() );
@@ -1629,14 +1687,14 @@ template <typename Layout, typename OutVector, typename CowPolicy, typename Keep
     // libc call per run for a 20-element span put array∩run 12-19 % behind the
     // reference — and an inline copy in its place lost 1.7x on long runs, while
     // this loop is at parity on both. (run.end is inclusive.)
-    // The difference (keep_matches == false) keeps what the run does not cover,
-    // and the stretch it keeps before a run is the long one when the runs are few,
-    // so that stretch is bounded by a gallop and moved in one copy.
+    // The difference (keep_matches == false) keeps what the run does not cover;
+    // in the whole form the stretch it keeps before a run is bounded by a gallop
+    // and moved in one copy.
     // [croaring-ref] deps/croaring/src/containers/mixed_intersection.c:array_run_container_intersection
     // [croaring-ref] deps/croaring/src/containers/mixed_andnot.c:array_run_container_andnot
-    // The run cursor moves by a gallop on the run ends: one compare when the current run still reaches
-    // the value (the adjacent-run shape), and a few array values against thousands of short runs cost
-    // O(values * log runs) instead of O(runs).
+    // The run cursor moves by run_reaching: one compare when the current run still reaches the value (the
+    // adjacent-run shape), and a few array values against thousands of short runs cost O(values * log runs)
+    // instead of O(runs).
     auto const * const runs   { rhs.runs.data() };
     auto const         run_end{ static_cast<std::size_t>( rhs.runs.size() ) };
     std::size_t        run_ix { 0 };
@@ -1663,7 +1721,7 @@ template <typename Layout, typename OutVector, typename CowPolicy, typename Keep
         auto const & run{ runs[ run_ix ] };
         if ( value >= static_cast<low_type>( run.begin ) ) {
             if constexpr ( keep_matches ) {
-                if constexpr ( LongStretches ) {
+                if constexpr ( Form == stretch_form::whole ) {
                     // the values up to the end of the run
                     auto const stretch_end{ static_cast<std::size_t>( run.end ) + 1U };
                     do {
@@ -1673,16 +1731,32 @@ template <typename Layout, typename OutVector, typename CowPolicy, typename Keep
                     out[ written++ ] = value;
                     ++ap;
                 }
-            } else {
+            } else if constexpr ( Form != stretch_form::stepped ) {
                 ap = gallop_forward<true>( keys, ap, card, static_cast<low_type>( run.end ) );
+            } else {
+                // the values the run covers are stepped over, and past a few of them the rest are galloped over
+                auto const end{ static_cast<low_type>( run.end ) };
+                std::size_t steps{ 0 };
+                while ( ++ap < card && keys[ ap ] <= end ) {
+                    if ( ++steps == covered_steps_before_gallop ) {
+                        ap = gallop_past_covered( keys, ap, card, end );
+                        break;
+                    }
+                }
             }
         } else if constexpr ( keep_matches ) {
             ap = gallop_forward<false>( keys, ap, card, static_cast<low_type>( run.begin ) );
-        } else if constexpr ( LongStretches ) {
+        } else if constexpr ( Form == stretch_form::whole ) {
             auto const stretch_end{ gallop_forward<false>( keys, ap, card, static_cast<low_type>( run.begin ) ) };
             std::copy_n( keys + ap, stretch_end - ap, out + written );
             written += stretch_end - ap;
             ap = stretch_end;
+        } else if constexpr ( Form == stretch_form::stepped ) {
+            // the values before the run
+            auto const begin{ static_cast<low_type>( run.begin ) };
+            do {
+                out[ written++ ] = keys[ ap ];
+            } while ( ++ap < card && keys[ ap ] < begin );
         } else {
             out[ written++ ] = value;
             ++ap;
@@ -1698,10 +1772,20 @@ template <typename Layout, typename OutVector, typename CowPolicy = cow_value_se
     OutVector & result,
     Keep = {}
 ) {
-    if ( lhs.values.size() >= rhs.runs.size() * values_per_run_for_stretch_copy ) {
-        filter_array_run_into_with<Layout, OutVector, CowPolicy, Keep, true>( lhs, rhs, result );
+    auto const values{ static_cast<std::size_t>( lhs.values.size() ) };
+    auto const runs{ static_cast<std::size_t>( rhs.runs.size() ) };
+    if constexpr ( Keep::value ) {
+        if ( values >= runs * values_per_run_for_stretch_copy ) {
+            filter_array_run_into_with<Layout, OutVector, CowPolicy, Keep, stretch_form::whole>( lhs, rhs, result );
+        } else {
+            filter_array_run_into_with<Layout, OutVector, CowPolicy, Keep, stretch_form::per_value>( lhs, rhs, result );
+        }
+    } else if ( values >= runs * values_per_run_for_difference_whole ) {
+        filter_array_run_into_with<Layout, OutVector, CowPolicy, Keep, stretch_form::whole>( lhs, rhs, result );
+    } else if ( values >= runs * values_per_run_for_difference_steps ) {
+        filter_array_run_into_with<Layout, OutVector, CowPolicy, Keep, stretch_form::stepped>( lhs, rhs, result );
     } else {
-        filter_array_run_into_with<Layout, OutVector, CowPolicy, Keep, false>( lhs, rhs, result );
+        filter_array_run_into_with<Layout, OutVector, CowPolicy, Keep, stretch_form::per_value>( lhs, rhs, result );
     }
 }
 

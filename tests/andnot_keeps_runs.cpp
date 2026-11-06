@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <iterator>
 #include <limits>
 #include <random>
 #include <span>
@@ -743,5 +744,121 @@ TEST( ArrayMinusRuns, default_set ) { array_minus_runs_trials<eager_bitmap>( 0xA
 TEST( ArrayMinusRuns, array_and_run_set ) { array_minus_runs_trials<array_run_bitmap>( 0xA2202 ); }
 TEST( ArrayMinusRuns, sixteen_bit_keys ) { array_minus_runs_trials<bitmap<std::uint16_t>>( 0xA2203 ); }
 TEST( ArrayMinusRuns, eight_bit_keys ) { array_minus_runs_trials<bitmap<std::uint8_t>>( 0xA2204 ); }
+
+// ---- an array against a long run list: values that skip from none to hundreds of runs --------------------------
+// A short run every `period` values over the whole chunk, the last one ending a few values before the chunk's end, and
+// a sparse array whose consecutive values lie zero to a few hundred runs apart: before, inside and after a run, a
+// little more than a block of runs before the end, in the last few runs of the list and past the last one. A dense
+// array takes the form for many array values to a run. The difference, the intersection and both in-place forms are
+// compared with a membership table. The container set without bitsets keeps any run list as runs.
+
+template <typename Bitmap>
+void array_against_long_run_list( std::uint32_t const period, std::uint32_t const length, std::uint32_t const dense_step ) {
+    SCOPED_TRACE( ::testing::Message() << "period " << period << " length " << length << " dense step " << dense_step );
+    constexpr std::uint32_t base{ 2 * chunk_size };
+    constexpr std::uint32_t after_last_run{ 7 };
+    auto const last_start{ chunk_size - after_last_run - length };
+    std::vector<bool> operand_table( chunk_size );
+    for ( std::uint32_t start{ last_start }; ; start -= period ) {
+        for ( std::uint32_t i{ 0 }; i < length; ++i ) {
+            operand_table[ start + i ] = true;
+        }
+        if ( start < period ) {
+            break;
+        }
+    }
+    std::vector<bool> receiver_table( chunk_size );
+    // skips of none to hundreds of runs, each landing before, inside or right after a run
+    constexpr std::uint32_t runs_skipped[]{ 0, 0, 1, 2, 3, 5, 8, 13, 15, 16, 17, 20, 31, 40, 47, 48, 49, 64, 100, 250 };
+    std::uint32_t at{ 0 };
+    for ( std::uint32_t step{ 0 }; at < chunk_size; ++step ) {
+        receiver_table[ at ] = true;
+        at += runs_skipped[ step % std::size( runs_skipped ) ] * period + 1U + ( step * 13U ) % period;
+    }
+    // the last runs of the list (fewer than a block of them); for a sparse array also a stretch of consecutive values
+    // over several runs, and values every third one over the last five periods
+    for ( std::uint32_t runs_before_last{ 17 }; runs_before_last <= 22; ++runs_before_last ) {
+        receiver_table[ last_start - runs_before_last * period + 1 ] = true;
+    }
+    if ( dense_step == 0 ) {
+        for ( std::uint32_t value{ 1'000 }; value < 1'000 + 8 * period; ++value ) {
+            receiver_table[ value ] = true;
+        }
+        for ( std::uint32_t value{ chunk_size - 5 * period }; value < chunk_size; value += 3 ) {
+            receiver_table[ value ] = true;
+        }
+    }
+    receiver_table[ chunk_size - 1 ] = true;
+    if ( dense_step != 0 ) {
+        for ( std::uint32_t value{ 0 }; value < chunk_size; value += dense_step ) {
+            receiver_table[ value ] = true;
+        }
+    }
+
+    auto const listed{ [ & ]( auto const & keep ) {
+        std::vector<std::uint32_t> result;
+        for ( std::uint32_t value{ 0 }; value < chunk_size; ++value ) {
+            if ( keep( value ) ) {
+                result.push_back( base + value );
+            }
+        }
+        return result;
+    } };
+    auto const receiver_values{ listed( [ & ]( std::uint32_t const value ) { return receiver_table[ value ]; } ) };
+    auto const operand_values { listed( [ & ]( std::uint32_t const value ) { return operand_table[ value ]; } ) };
+    auto const difference_values{ listed( [ & ]( std::uint32_t const value ) { return receiver_table[ value ] && !operand_table[ value ]; } ) };
+    auto const intersection_values{ listed( [ & ]( std::uint32_t const value ) { return receiver_table[ value ] && operand_table[ value ]; } ) };
+
+    auto const build{ [ & ]( std::vector<std::uint32_t> const & values, bool const run_optimized ) {
+        Bitmap result;
+        for ( auto const value : values ) {
+            result.add( value );
+        }
+        if ( run_optimized ) {
+            result.optimize();
+        }
+        return result;
+    } };
+    auto const receiver{ build( receiver_values, false ) };
+    auto const operand { build( operand_values , true  ) };
+    // the kernel under test: one array chunk against one run chunk
+    ASSERT_EQ( receiver.statistics().array_containers, 1U );
+    ASSERT_EQ( operand.statistics().run_containers, 1U );
+
+    auto const difference{ receiver - operand };
+    EXPECT_EQ( difference.validate(), nullptr );
+    EXPECT_TRUE( std::ranges::equal( difference.to_vector(), difference_values ) ) << "-";
+    auto const intersection{ receiver & operand };
+    EXPECT_EQ( intersection.validate(), nullptr );
+    EXPECT_TRUE( std::ranges::equal( intersection.to_vector(), intersection_values ) ) << "&";
+    {
+        auto sole{ build( receiver_values, false ) };
+        sole -= operand;
+        EXPECT_EQ( sole.validate(), nullptr );
+        EXPECT_TRUE( std::ranges::equal( sole.to_vector(), difference_values ) ) << "-=";
+    }
+    {
+        auto sole{ build( receiver_values, false ) };
+        sole &= operand;
+        EXPECT_EQ( sole.validate(), nullptr );
+        EXPECT_TRUE( std::ranges::equal( sole.to_vector(), intersection_values ) ) << "&=";
+    }
+}
+
+TEST( ArrayMinusRuns, long_run_lists ) {
+    // 1638 runs (not a multiple of a block of runs), short and long; 2048 and 8192 runs, which only the container set
+    // without bitsets keeps as a run list
+    for ( auto const [period, length] : { std::pair{ 40U, 3U }, std::pair{ 40U, 30U }, std::pair{ 32U, 3U }, std::pair{ 8U, 3U } } ) {
+        array_against_long_run_list<array_run_bitmap>( period, length, 0 );
+        if ( period == 40U ) {
+            array_against_long_run_list<eager_bitmap>( period, length, 0 );
+        }
+    }
+    // more array values to a run: 327 runs against every ninth value (22 to a run) and a third of all values (66 to a
+    // run), and (an array chunk of the default set, so fewer than 4096 values) 33 runs against every seventeenth value
+    array_against_long_run_list<array_run_bitmap>( 200U, 100U, 9U );
+    array_against_long_run_list<array_run_bitmap>( 200U, 100U, 3U );
+    array_against_long_run_list<eager_bitmap>( 2'000U, 1'000U, 17U );
+}
 
 }  // namespace
