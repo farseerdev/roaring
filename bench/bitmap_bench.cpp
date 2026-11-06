@@ -3447,6 +3447,90 @@ static void register_nway_union_sparse(std::size_t count) {
 
 }
 
+// ---- OrManySparse: the union of many sparse bitmaps that stays sparse ----------
+// `count` bitmaps, each with 5 random values in each of 1024 chunks: the union holds about 5 * count values per
+// chunk (200 to 4000), so each of its containers is accumulated as a bitset and turned back into an array at the
+// end, the conversion the kernel BitsetToArray bands time alone.
+static constexpr std::uint32_t kOrManySparseChunks{ 1024 };
+static constexpr std::size_t   kOrManySparsePer   { 5 };
+
+static std::vector<std::vector<std::uint32_t>> or_many_sparse_values(std::size_t const count) {
+    std::mt19937_64 rng{ 0x0E3A + count };
+    std::vector<std::vector<std::uint32_t>> bitmaps(count);
+    for (auto &values : bitmaps) {
+        for (std::uint32_t chunk = 0; chunk < kOrManySparseChunks; ++chunk) {
+            for (std::size_t j = 0; j < kOrManySparsePer; ++j) {
+                values.emplace_back((chunk << 16) | static_cast<std::uint32_t>(rng() & 0xFFFF));
+            }
+        }
+    }
+    return bitmaps;
+}
+
+static std::string or_many_sparse_name(char const *const label, std::size_t const count) {
+    return std::string("set_ops/") + label + "OrManySparse/count=" + std::to_string(count) + "/per=" + std::to_string(kOrManySparsePer);
+}
+
+template <class Arm>
+struct register_frsr_or_many_sparse_registrar {
+    static void run(std::size_t const count) {
+        Entry e;
+        e.name        = or_many_sparse_name(Arm::label(), count);
+        e.description = "frsr::roaring::bitmap<uint32_t> or_many_in_place() into an empty bitmap over `count` bitmaps "
+                        "of 5 random values in each of 1024 chunks.";
+        e.setup = [count]() -> void * {
+            auto *s = new FrsrNWayState<Arm>;
+            for (auto const &values : or_many_sparse_values(count)) { s->bitmaps.emplace_back().add_many(values); }
+            for (auto const &bm : s->bitmaps) { s->ptrs.emplace_back(&bm); }
+            return s;
+        };
+        e.run = [](void *sv) -> int64_t {
+            auto *s = static_cast<FrsrNWayState<Arm> *>(sv);
+            s->accumulator = typename Arm::bitmap{};
+            s->accumulator.or_many_in_place({ s->ptrs.data(), s->ptrs.size() });
+            return static_cast<int64_t>(s->accumulator.size());
+        };
+        e.teardown       = [](void *sv) { delete static_cast<FrsrNWayState<Arm> *>(sv); };
+        e.ops_per_run    = static_cast<int64_t>(count);
+        e.inner_reps     = 1;
+        e.reusable_state = true;
+        g_benchmarks.push_back(std::move(e));
+    }
+};
+
+#if FRSR_ROARING_HAS_CROARING
+template <class Arm>
+struct register_cpp_or_many_sparse_registrar {
+    static void run(std::size_t const count) {
+        Entry e;
+        e.name        = or_many_sparse_name(Arm::label(), count);
+        e.description = "CRoaring roaring_bitmap_or_many() over `count` bitmaps of 5 random values in each of 1024 "
+                        "chunks. [croaring-ref] deps/croaring/microbenchmarks/bitset_to_array_bench.cpp:OrMany";
+        e.setup = [count]() -> void * {
+            auto *s = new CppNWayState<Arm>;
+            for (auto const &values : or_many_sparse_values(count)) {
+                auto *const bm{ s->bitmaps.emplace_back(Arm::create()) };
+                roaring_bitmap_add_many(bm, values.size(), values.data());
+                s->ptrs.emplace_back(bm);
+            }
+            return s;
+        };
+        e.run = [](void *sv) -> int64_t {
+            auto *s   = static_cast<CppNWayState<Arm> *>(sv);
+            auto *r   = roaring_bitmap_or_many(s->ptrs.size(), s->ptrs.data());
+            int64_t c = static_cast<int64_t>(roaring_bitmap_get_cardinality(r));
+            roaring_bitmap_free(r);
+            return c;
+        };
+        e.teardown       = [](void *sv) { delete static_cast<CppNWayState<Arm> *>(sv); };
+        e.ops_per_run    = static_cast<int64_t>(count);
+        e.inner_reps     = 1;
+        e.reusable_state = true;
+        g_benchmarks.push_back(std::move(e));
+    }
+};
+#endif
+
 // ========================================================================
 // Run-heavy repeated intersection
 //
@@ -6447,23 +6531,24 @@ static std::vector<std::uint32_t> to_array_values(ToArrayShape const &shape, std
 // 32-byte vector store that straddles a cache line on every other store (what an allocator's 16-byte
 // aligned block gives, depending on what was allocated before it) is a quarter slower once the buffer
 // outgrows the L2 cache, for either library.
-struct aligned_u32_buffer {
-    struct deleter { void operator()(std::uint32_t *p) const noexcept { ::operator delete( p, std::align_val_t{ 64 } ); } };
-    std::unique_ptr<std::uint32_t[], deleter> data_;
+template <typename T>
+struct aligned_buffer {
+    struct deleter { void operator()(T *p) const noexcept { ::operator delete( p, std::align_val_t{ 64 } ); } };
+    std::unique_ptr<T[], deleter> data_;
     std::size_t size_{};
     void resize(std::size_t const count) {
-        data_.reset(static_cast<std::uint32_t *>(::operator new(count * sizeof(std::uint32_t) + 1, std::align_val_t{ 64 })));
-        std::fill_n(data_.get(), count, std::uint32_t{});
+        data_.reset(static_cast<T *>(::operator new(count * sizeof(T) + 1, std::align_val_t{ 64 })));
+        std::fill_n(data_.get(), count, T{});
         size_ = count;
     }
-    [[nodiscard]] std::uint32_t *data() const noexcept { return data_.get(); }
+    [[nodiscard]] T *data() const noexcept { return data_.get(); }
     [[nodiscard]] std::size_t size() const noexcept { return size_; }
 };
 
 template <class Arm>
 struct register_frsr_to_array_registrar {
     using TestBitmap32 = typename Arm::bitmap;
-    struct S { TestBitmap32 bm; aligned_u32_buffer out; };
+    struct S { TestBitmap32 bm; aligned_buffer<std::uint32_t> out; };
     static void run(std::size_t chunks, ToArrayShape const &shape) {
         Entry e;
         char buf[128];
@@ -6494,7 +6579,7 @@ struct register_frsr_to_array_registrar {
 #if FRSR_ROARING_HAS_CROARING
 template <class Arm>
 struct register_cpp_to_array_registrar {
-    struct S { roaring_bitmap_t *bm{}; aligned_u32_buffer out; ~S() { if (bm) roaring_bitmap_free(bm); } };
+    struct S { roaring_bitmap_t *bm{}; aligned_buffer<std::uint32_t> out; ~S() { if (bm) roaring_bitmap_free(bm); } };
     static void run(std::size_t chunks, ToArrayShape const &shape) {
         Entry e;
         char buf[128];
@@ -6522,6 +6607,90 @@ struct register_cpp_to_array_registrar {
         g_benchmarks.push_back(std::move(e));
     }
 };
+#endif
+
+// ---- ToArray64: decode a whole 64-bit bitmap into a uint64 buffer --------------
+// A million values drawn at random from a universe of 8M (bitset containers of about 8000 values), 2M (bitset
+// containers of about 30000) or 100M (array containers of about 650), or a thousand runs of a thousand
+// consecutive values (run containers after optimize()).
+struct ToArray64Shape { char const *label; std::uint64_t universe; };
+static constexpr ToArray64Shape kToArray64Shapes[]{
+    { "universe=8M"  ,   8'000'000 },
+    { "universe=2M"  ,   2'000'000 },
+    { "universe=100M", 100'000'000 },
+    { "runs"         , 0           },
+};
+static constexpr std::size_t kToArray64Values{ 1'000'000 };
+
+static std::vector<std::uint64_t> to_array64_values(ToArray64Shape const &shape) {
+    std::mt19937_64 rng{ 0x64A7 + shape.universe };
+    std::vector<std::uint64_t> values;
+    values.reserve(kToArray64Values);
+    if (shape.universe == 0) {
+        constexpr std::uint64_t run_length{ 1'000 };
+        for (std::uint64_t run = 0; run < kToArray64Values / run_length; ++run) {
+            auto const first{ run * 100'000 + rng() % ( 100'000 - run_length ) };
+            for (std::uint64_t i = 0; i < run_length; ++i) { values.emplace_back(first + i); }
+        }
+        return values;
+    }
+    for (std::size_t i = 0; i < kToArray64Values; ++i) { values.emplace_back(rng() % shape.universe); }
+    return values;
+}
+
+template <class Arm>
+struct register_frsr_to_array64_registrar {
+    using Bitmap = typename Arm::bitmap;
+    struct S { Bitmap bm; aligned_buffer<std::uint64_t> out; };
+    static void run(ToArray64Shape const &shape) {
+        Entry e;
+        e.name        = std::string("set_ops/") + Arm::label() + "ToArray64/" + shape.label;
+        e.description = "frsr::roaring::bitmap<uint64_t> to_array_into() over a whole bitmap, into a buffer the state "
+                        "owns. Checksum = decoded count.";
+        e.setup = [shape]() -> void * {
+            auto *s = new S;
+            for (auto const value : to_array64_values(shape)) { std::ignore = s->bm.add(value); }
+            if (shape.universe == 0) { s->bm.optimize(); }
+            s->out.resize(s->bm.size());
+            return s;
+        };
+        e.run = [](void *sv) -> int64_t {
+            auto *s = static_cast<S *>(sv);
+            return static_cast<int64_t>(s->bm.to_array_into({ s->out.data(), s->out.size() }));
+        };
+        e.teardown       = [](void *sv) { delete static_cast<S *>(sv); };
+        e.ops_per_run    = 1;
+        e.inner_reps     = kBinaryInnerReps;
+        e.reusable_state = true;
+        g_benchmarks.push_back(std::move(e));
+    }
+};
+
+#if FRSR_ROARING_HAS_CROARING
+static void register_r64_to_array64(ToArray64Shape const &shape) {
+    struct S { roaring64_bitmap_t *bm{ roaring64_bitmap_create() }; aligned_buffer<std::uint64_t> out; ~S() { roaring64_bitmap_free(bm); } };
+    Entry e;
+    e.name        = std::string("set_ops/r64ToArray64/") + shape.label;
+    e.description = "CRoaring roaring64_bitmap_to_uint64_array() over a whole bitmap. "
+                    "[croaring-ref] deps/croaring/src/roaring64.c:roaring64_bitmap_to_uint64_array";
+    e.setup = [shape]() -> void * {
+        auto *s = new S;
+        for (auto const value : to_array64_values(shape)) { roaring64_bitmap_add(s->bm, value); }
+        if (shape.universe == 0) { roaring64_bitmap_run_optimize(s->bm); }
+        s->out.resize(roaring64_bitmap_get_cardinality(s->bm));
+        return s;
+    };
+    e.run = [](void *sv) -> int64_t {
+        auto *s = static_cast<S *>(sv);
+        roaring64_bitmap_to_uint64_array(s->bm, s->out.data());
+        return static_cast<int64_t>(s->out.size());
+    };
+    e.teardown       = [](void *sv) { delete static_cast<S *>(sv); };
+    e.ops_per_run    = 1;
+    e.inner_reps     = kBinaryInnerReps;
+    e.reusable_state = true;
+    g_benchmarks.push_back(std::move(e));
+}
 #endif
 
 // ---- Iterate / ForEach: visit every value of a whole bitmap -------------------
@@ -7853,6 +8022,18 @@ void register_benchmarks() {
         arms::for_each_croaring<register_cpp_index_update_registrar>(shape);
 #endif
     }
+    for (auto const &shape : kToArray64Shapes) {
+        arms::for_each_frsr64<register_frsr_to_array64_registrar>(shape);
+#if FRSR_ROARING_HAS_CROARING
+        register_r64_to_array64(shape);
+#endif
+    }
+    for (std::size_t const count : { std::size_t{ 40 }, std::size_t{ 100 }, std::size_t{ 200 }, std::size_t{ 400 }, std::size_t{ 800 } }) {
+        arms::for_each_frsr<register_frsr_or_many_sparse_registrar>(count);
+#if FRSR_ROARING_HAS_CROARING
+        arms::for_each_croaring<register_cpp_or_many_sparse_registrar>(count);
+#endif
+    }
     for (std::size_t count : kCounts) {
         register_nway_union(count);
         register_nway_union_sparse(count);
@@ -9132,6 +9313,145 @@ static void register_bitset_and_to_array() {
             d.description = "AND of two 8-chunk bitmaps whose containers are bitsets; the result holds " + std::to_string( bits ) +
                 " bits per 64-bit word, " + ( clustered ? "in whole shared words" : "spread over every word" ) + " (an array result for 1 to 4, a bitset above). Cost per chunk pair.";
             register_band( d );
+        }
+    }
+}
+
+// ---- B2b: a sparse bitset container turned into an array --------------------------------------
+// The conversion every operation pays when it leaves a bitset of at most 4096 values: the repair of a lazy union
+// (and so every union of many bitmaps), an intersection, a difference, a removal. `card` values laid out uniformly
+// at random over the chunk, at random within its first card * 4 values (clustered), or in runs of 16 at random
+// 16-aligned starts. A run converts 64 distinct containers in turn, so that the branch predictor cannot learn one,
+// and pays for the allocation of each array. Cost per container.
+// [croaring-ref] deps/croaring/microbenchmarks/bitset_to_array_bench.cpp:Decode
+enum class bitset_layout : std::uint8_t { uniform, clustered, runs };
+static constexpr std::size_t kBitsetToArrayInputs = 64;
+
+[[nodiscard]] static std::vector<std::uint16_t> bitset_layout_values( std::mt19937_64 & rng, std::size_t const card, bitset_layout const layout ) {
+    std::vector<std::uint16_t> values;
+    if ( layout == bitset_layout::runs ) {
+        std::vector<bool> taken( 65536 / 16 );
+        while ( values.size() < card ) {
+            auto const start = static_cast<std::uint32_t>( rng() % taken.size() );
+            if ( taken[ start ] ) {
+                continue;
+            }
+            taken[ start ] = true;
+            for ( std::uint32_t i = 0; i < 16 && values.size() < card; ++i ) {
+                values.emplace_back( static_cast<std::uint16_t>( start * 16 + i ) );
+            }
+        }
+    } else {
+        auto const universe = layout == bitset_layout::clustered ? std::min<std::size_t>( 65536, card * 4 ) : 65536;
+        std::vector<std::uint16_t> all( universe );
+        std::iota( all.begin(), all.end(), std::uint16_t{ 0 } );
+        std::shuffle( all.begin(), all.end(), rng );
+        values.assign( all.begin(), all.begin() + static_cast<std::ptrdiff_t>( card ) );
+    }
+    std::ranges::sort( values );
+    return values;
+}
+
+[[nodiscard]] static std::vector<std::vector<std::uint16_t>> bitset_to_array_inputs( std::size_t const card, bitset_layout const layout ) {
+    std::mt19937_64 rng{ 4321 + card * 7919 + static_cast<std::size_t>( layout ) };
+    std::vector<std::vector<std::uint16_t>> inputs;
+    for ( std::size_t i = 0; i < kBitsetToArrayInputs; ++i ) {
+        inputs.emplace_back( bitset_layout_values( rng, card, layout ) );
+    }
+    return inputs;
+}
+
+[[nodiscard]] static std::string bitset_to_array_name( char const * const label, std::size_t const card, char const * const layout ) {
+    return "kernel/" + std::string( label ) + "BitsetToArray/card=" + std::to_string( card ) + "/layout=" + layout;
+}
+
+template <class Arm>
+struct bitset_to_array_frsr_registrar {
+    using Bitmap = typename Arm::bitmap;
+    using Layout = typename Bitmap::layout_type;
+    using Handle = frsr::roaring::detail::container_handle<Layout, typename Bitmap::cow_policy>;
+    static void run( std::size_t const card, bitset_layout const layout, char const * const layout_name ) {
+        Entry e;
+        e.name        = bitset_to_array_name( Arm::label(), card, layout_name );
+        e.description = "frsr::roaring::bitmap<uint32_t>'s bitset-to-array conversion (detail::array_from_bitset) of 64 "
+                        "distinct bitset containers of " + std::to_string( card ) + " values each, in turn; cost per container.";
+        e.setup = [card, layout]() -> void * {
+            auto * const s = new std::vector<Handle>;
+            for ( auto const & values : bitset_to_array_inputs( card, layout ) ) {
+                auto & handle = s->emplace_back( Handle::make_bitset_zeroed() );
+                auto bits = handle.as_bitset();
+                for ( auto const value : values ) {
+                    std::ignore = bits.add( value );
+                }
+            }
+            return s;
+        };
+        e.run = []( void * sv ) -> int64_t {
+            std::int64_t checksum = 0;
+            for ( auto const & bitset : *static_cast<std::vector<Handle> const *>( sv ) ) {
+                auto const array = frsr::roaring::detail::array_from_bitset<Layout, typename Bitmap::cow_policy>( bitset.as_bitset(), bitset.cardinality() );
+                auto const & values = array.as_array().values;
+                checksum += static_cast<std::int64_t>( values.size() ) + values[ values.size() - 1 ];
+            }
+            return checksum;
+        };
+        e.teardown       = []( void * sv ) { delete static_cast<std::vector<Handle> *>( sv ); };
+        e.ops_per_run    = static_cast<std::int64_t>( kBitsetToArrayInputs );
+        e.inner_reps     = 20;
+        e.reusable_state = true;
+        g_benchmarks.push_back( std::move( e ) );
+    }
+};
+
+template <class Arm>
+struct bitset_to_array_cpp_registrar {
+    struct state {
+        std::vector<roaring::internal::bitset_container_t *> bitsets;
+        ~state() {
+            for ( auto * const bitset : bitsets ) {
+                roaring::internal::bitset_container_free( bitset );
+            }
+        }
+    };
+    static void run( std::size_t const card, bitset_layout const layout, char const * const layout_name ) {
+        Entry e;
+        e.name        = bitset_to_array_name( Arm::label(), card, layout_name );
+        e.description = "CRoaring array_container_from_bitset() (the internal conversion itself, which every public "
+                        "operation that leaves a sparse bitset calls) of 64 distinct bitset containers of " + std::to_string( card ) +
+                        " values each, in turn; cost per container. "
+                        "[croaring-ref] deps/croaring/src/containers/convert.c:array_container_from_bitset";
+        e.setup = [card, layout]() -> void * {
+            auto * const s = new state;
+            for ( auto const & values : bitset_to_array_inputs( card, layout ) ) {
+                auto * const bitset = s->bitsets.emplace_back( roaring::internal::bitset_container_create() );
+                for ( auto const value : values ) {
+                    roaring::internal::bitset_container_set( bitset, value );
+                }
+            }
+            return s;
+        };
+        e.run = []( void * sv ) -> int64_t {
+            std::int64_t checksum = 0;
+            for ( auto const * const bitset : static_cast<state const *>( sv )->bitsets ) {
+                auto * const array = roaring::internal::array_container_from_bitset( bitset );
+                checksum += array->cardinality + array->array[ array->cardinality - 1 ];
+                roaring::internal::array_container_free( array );
+            }
+            return checksum;
+        };
+        e.teardown       = []( void * sv ) { delete static_cast<state *>( sv ); };
+        e.ops_per_run    = static_cast<std::int64_t>( kBitsetToArrayInputs );
+        e.inner_reps     = 20;
+        e.reusable_state = true;
+        g_benchmarks.push_back( std::move( e ) );
+    }
+};
+
+static void register_bitset_to_array() {
+    for ( auto const & [layout, layout_name] : { std::pair{ bitset_layout::uniform, "uniform" }, std::pair{ bitset_layout::clustered, "clustered" }, std::pair{ bitset_layout::runs, "runs" } } ) {
+        for ( std::size_t const card : { 16, 64, 128, 256, 512, 768, 1000, 1023, 1024, 2048, 4096 } ) {
+            bitset_to_array_frsr_registrar<arms::FrsrShipped>::run( card, layout, layout_name );
+            arms::for_each_croaring<bitset_to_array_cpp_registrar>( card, layout, layout_name );
         }
     }
 }
@@ -10460,6 +10780,7 @@ static void register_benchmarks() {
     register_back_front();
     register_small_array_export();
     register_bitset_and_to_array();
+    register_bitset_to_array();
     register_sparse_flip();
     register_big_by_few_or_inplace();
     register_array_array();
