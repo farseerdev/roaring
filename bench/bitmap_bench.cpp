@@ -27,6 +27,8 @@
 #if FRSR_ROARING_HAS_CROARING
 #include <roaring/roaring.h>
 #include <roaring/roaring64.h>
+#include <roaring/containers/containers.h>
+#include <roaring/roaring_array.h>
 #endif
 
 namespace {
@@ -7026,6 +7028,140 @@ struct register_cpp_bulk_add_registrar {
 };
 #endif
 
+// ---- IndexBuild: a per-value bitmap index built from a table, window by window ----
+// The rows of a table are taken a window of 2^22 consecutive rows (64 chunks) at a time, grouped by their
+// value, and each value's rows (ascending) are appended to that value's bitmap in one call, every chunk
+// built in its final form with 1024 values as the bitset threshold. From the second window on the bitmaps
+// already hold the earlier chunks, so the call appends past them. The reference appends each chunk with
+// ra_append; frsr calls add_sorted_many. A shape is how the rows spread over the values: `spread` draws a
+// value per row, `blocks` per 64 consecutive rows. Fewer values make the chunks of each bitmap fuller:
+// arrays below the threshold, bitsets well above it, the forms the two libraries agree on only from the
+// threshold up. Checksum = values held.
+struct IndexBuildShape { char const *label; std::uint32_t values; std::uint32_t block; };
+static constexpr IndexBuildShape kIndexBuildShapes[]{
+    { "spread/values=200", 200, 1 },
+    { "spread/values=40" , 40 , 1 },
+    { "spread/values=8"  , 8  , 1 },
+    { "blocks/values=40" , 40 , 64 },
+};
+static constexpr std::uint32_t kIndexBuildWindowRows{ std::uint32_t{ 1 } << 22 };
+static constexpr std::uint32_t kIndexBuildWindows  { 3 };
+static constexpr std::uint16_t kIndexBuildBitsetThreshold{ 1024 };
+
+// rows[ window ][ value ]: the window's rows of that value, ascending
+using IndexBuildRows = std::vector<std::vector<std::vector<std::uint32_t>>>;
+static IndexBuildRows index_build_rows( IndexBuildShape const &shape ) {
+    std::mt19937_64 rng{ 0x1DB0'1D00ULL + shape.values * 131ULL + shape.block };
+    IndexBuildRows rows( kIndexBuildWindows, std::vector<std::vector<std::uint32_t>>( shape.values ) );
+    std::uint32_t value{ 0 };
+    for ( std::uint32_t row{ 0 }; row < kIndexBuildWindows * kIndexBuildWindowRows; ++row ) {
+        if ( row % shape.block == 0 ) {
+            value = static_cast<std::uint32_t>( rng() % shape.values );
+        }
+        rows[ row / kIndexBuildWindowRows ][ value ].push_back( row );
+    }
+    return rows;
+}
+
+template <class Arm>
+struct register_frsr_index_build_registrar {
+    using TestBitmap32 = typename Arm::bitmap;
+    struct S { IndexBuildRows rows; std::uint32_t values{}; };
+    static void run( IndexBuildShape const &shape ) {
+        Entry e;
+        e.name        = std::string( "set_ops/" ) + Arm::label() + "IndexBuild/" + shape.label;
+        e.description = "frsr::roaring::bitmap<uint32_t> add_sorted_many( rows, 1024 ) of every value's rows, window "
+                        "by window, into that value's bitmap.";
+        e.setup = [shape]() -> void * {
+            auto *s = new S;
+            s->rows   = index_build_rows( shape );
+            s->values = shape.values;
+            return s;
+        };
+        e.run = []( void *sv ) -> int64_t {
+            auto const *s = static_cast<S const *>( sv );
+            std::vector<TestBitmap32> index( s->values );
+            for ( auto const &window : s->rows ) {
+                for ( std::uint32_t v{ 0 }; v < s->values; ++v ) {
+                    index[ v ].add_sorted_many( { window[ v ].data(), window[ v ].size() }, kIndexBuildBitsetThreshold );
+                }
+            }
+            std::int64_t held{ 0 };
+            for ( auto const &bm : index ) { held += static_cast<std::int64_t>( bm.size() ); }
+            return held;
+        };
+        e.teardown       = []( void *sv ) { delete static_cast<S *>( sv ); };
+        e.ops_per_run    = 1;
+        e.inner_reps     = 1;
+        e.reusable_state = true;
+        g_benchmarks.push_back( std::move( e ) );
+    }
+};
+
+#if FRSR_ROARING_HAS_CROARING
+// The reference: each chunk's values appended past the bitmap's last chunk in the form their count calls for.
+static void croaring_append_sorted( roaring_bitmap_t *const bm, std::span<std::uint32_t const> const values, std::uint16_t const bitset_threshold ) {
+    using namespace roaring::internal;
+    auto *const ra{ &bm->high_low_container };
+    auto it{ values.begin() };
+    while ( it != values.end() ) {
+        auto const key{ static_cast<std::uint16_t>( *it >> 16 ) };
+        auto group_end{ it };
+        while ( group_end != values.end() && static_cast<std::uint16_t>( *group_end >> 16 ) == key ) { ++group_end; }
+        auto const group_size{ static_cast<std::int32_t>( group_end - it ) };
+        if ( group_size > bitset_threshold ) {
+            auto *const bc{ bitset_container_create() };
+            for ( auto p{ it }; p != group_end; ++p ) { bitset_container_set( bc, static_cast<std::uint16_t>( *p & 0xFFFF ) ); }
+            ra_append( ra, key, bc, BITSET_CONTAINER_TYPE );
+        } else {
+            auto *const ac{ array_container_create_given_capacity( group_size ) };
+            for ( auto p{ it }; p != group_end; ++p ) { ac->array[ ac->cardinality++ ] = static_cast<std::uint16_t>( *p & 0xFFFF ); }
+            ra_append( ra, key, ac, ARRAY_CONTAINER_TYPE );
+        }
+        it = group_end;
+    }
+}
+
+template <class Arm>
+struct register_cpp_index_build_registrar {
+    struct S { IndexBuildRows rows; std::uint32_t values{}; };
+    static void run( IndexBuildShape const &shape ) {
+        Entry e;
+        e.name        = std::string( "set_ops/" ) + Arm::label() + "IndexBuild/" + shape.label;
+        e.description = "CRoaring: every value's rows, window by window, appended to that value's bitmap a chunk at "
+                        "a time, a bitset above 1024 values and an array otherwise. "
+                        "[croaring-ref] deps/croaring/src/roaring_array.c:ra_append";
+        e.setup = [shape]() -> void * {
+            auto *s = new S;
+            s->rows   = index_build_rows( shape );
+            s->values = shape.values;
+            return s;
+        };
+        e.run = []( void *sv ) -> int64_t {
+            auto const *s = static_cast<S const *>( sv );
+            std::vector<roaring_bitmap_t *> index( s->values );
+            for ( auto &bm : index ) { bm = Arm::create(); }
+            for ( auto const &window : s->rows ) {
+                for ( std::uint32_t v{ 0 }; v < s->values; ++v ) {
+                    croaring_append_sorted( index[ v ], { window[ v ].data(), window[ v ].size() }, kIndexBuildBitsetThreshold );
+                }
+            }
+            std::int64_t held{ 0 };
+            for ( auto *const bm : index ) {
+                held += static_cast<std::int64_t>( roaring_bitmap_get_cardinality( bm ) );
+                roaring_bitmap_free( bm );
+            }
+            return held;
+        };
+        e.teardown       = []( void *sv ) { delete static_cast<S *>( sv ); };
+        e.ops_per_run    = 1;
+        e.inner_reps     = 1;
+        e.reusable_state = true;
+        g_benchmarks.push_back( std::move( e ) );
+    }
+};
+#endif
+
 // ========== top-level registration ==========
 
 void register_benchmarks() {
@@ -7086,6 +7222,12 @@ void register_benchmarks() {
         arms::for_each_frsr<register_frsr_binary_sparse_registrar>(count, b_chunk_offset);
 #if FRSR_ROARING_HAS_CROARING
         arms::for_each_croaring<register_cpp_binary_sparse_registrar>(count, b_chunk_offset);
+#endif
+    }
+    for (auto const &shape : kIndexBuildShapes) {
+        arms::for_each_frsr<register_frsr_index_build_registrar>(shape);
+#if FRSR_ROARING_HAS_CROARING
+        arms::for_each_croaring<register_cpp_index_build_registrar>(shape);
 #endif
     }
     for (std::size_t count : kCounts) {
