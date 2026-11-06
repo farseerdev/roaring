@@ -276,6 +276,9 @@ static constexpr uint64_t kBitmasks[] = {
 // The lookups a measured run of the contains bands makes (see FAMILY 1).
 static constexpr std::int64_t kContainsBatch{ 1000 };
 
+// The lookups, or add and remove pairs, a measured run of the random bands makes (see FAMILY 2).
+static constexpr std::int64_t kRandomBatch{ 1000 };
+
 // CRoaring microbench uses 2^20 preload. Keep a lower default here so the full
 // cross-backend suite remains runnable in one session while preserving behavior.
 static constexpr std::size_t kRandomPreload = (1U << 16);
@@ -650,6 +653,9 @@ static void register_contains_variants() {
 
 // ====== FAMILY 2: ContainsRandom / InsertRemoveRandom (per bitmask) ============
 // ported from deps/croaring/benchmarks/benchmark.cpp:3425-3643
+//
+// As in FAMILY 1, a measured run is a batch, read by the clock once as upstream's loop is: lookups, or pairs of an add
+// and a remove.
 
 #if FRSR_ROARING_HAS_CROARING
 
@@ -701,12 +707,16 @@ struct synthetic_frsr_ContainsRandom_registrar {
             };
             e.run = [](void *sv) -> int64_t {
                 auto *s = static_cast<frsrRandState<Arm> *>(sv);
-                uint64_t v = rand_u64(s->rng) & s->bitmask;
-                return s->r.contains(v) ? 1 : 0;
+                std::int64_t found{ 0 };
+                for (std::int64_t k{ 0 }; k < kRandomBatch; ++k) {
+                    uint64_t v = rand_u64(s->rng) & s->bitmask;
+                    found += s->r.contains(v) ? 1 : 0;
+                }
+                return found;
             };
             e.teardown = [](void *sv) { delete static_cast<frsrRandState<Arm> *>(sv); };
-            e.ops_per_run = 1;
-            e.inner_reps = 10000;
+            e.ops_per_run = kRandomBatch;
+            e.inner_reps = 10000 / kRandomBatch;
             e.reusable_state = true;
             g_benchmarks.push_back(std::move(e));
         }
@@ -735,15 +745,17 @@ struct synthetic_frsr_InsertRemoveRandom_registrar {
             };
             e.run = [](void *sv) -> int64_t {
                 auto *s = static_cast<frsrRandState<Arm> *>(sv);
-                uint64_t a = rand_u64(s->rng) & s->bitmask;
-                uint64_t r = rand_u64(s->rng) & s->bitmask;
-                s->r.add(a);
-                s->r.remove(r);
+                for (std::int64_t k{ 0 }; k < kRandomBatch; ++k) {
+                    uint64_t a = rand_u64(s->rng) & s->bitmask;
+                    uint64_t r = rand_u64(s->rng) & s->bitmask;
+                    s->r.add(a);
+                    s->r.remove(r);
+                }
                 return 0;
             };
             e.teardown = [](void *sv) { delete static_cast<frsrRandState<Arm> *>(sv); };
-            e.ops_per_run = 2;
-            e.inner_reps = 5000;
+            e.ops_per_run = 2 * kRandomBatch;
+            e.inner_reps = 5000 / kRandomBatch;
             e.reusable_state = true;
             g_benchmarks.push_back(std::move(e));
         }
@@ -765,7 +777,7 @@ static void register_random_variants() {
             e.description =
                 "synthetic_bench.cpp r64ContainsRandom: preload a "
                 "roaring64_bitmap_t with 2^20 values randomly chosen via "
-                "rand() & bitmask, then time one contains() per call on "
+                "rand() & bitmask, then time a batch of contains() on "
                 "fresh random (& bitmask) values. The 10 bitmasks cover "
                 "20, 32, 48, and 64 bit spreads.";
             e.setup = [mask]() -> void * {
@@ -778,16 +790,20 @@ static void register_random_variants() {
             };
             e.run = [](void *sv) -> int64_t {
                 auto *s = static_cast<r64RandState *>(sv);
-                uint64_t v = rand_u64(s->rng) & s->bitmask;
-                return roaring64_bitmap_contains(s->r, v) ? 1 : 0;
+                std::int64_t found{ 0 };
+                for (std::int64_t k{ 0 }; k < kRandomBatch; ++k) {
+                    uint64_t v = rand_u64(s->rng) & s->bitmask;
+                    found += roaring64_bitmap_contains(s->r, v) ? 1 : 0;
+                }
+                return found;
             };
             e.teardown = [](void *sv) {
                 auto *s = static_cast<r64RandState *>(sv);
                 roaring64_bitmap_free(s->r);
                 delete s;
             };
-            e.ops_per_run = 1;
-            e.inner_reps = 10000;
+            e.ops_per_run = kRandomBatch;
+            e.inner_reps = 10000 / kRandomBatch;
             e.reusable_state = true;
             g_benchmarks.push_back(std::move(e));
         }
@@ -813,16 +829,20 @@ static void register_random_variants() {
             };
             e.run = [](void *sv) -> int64_t {
                 auto *s = static_cast<cppRandState *>(sv);
-                uint64_t v = rand_u64(s->rng) & s->bitmask;
-                return s->r->contains(v) ? 1 : 0;
+                std::int64_t found{ 0 };
+                for (std::int64_t k{ 0 }; k < kRandomBatch; ++k) {
+                    uint64_t v = rand_u64(s->rng) & s->bitmask;
+                    found += s->r->contains(v) ? 1 : 0;
+                }
+                return found;
             };
             e.teardown = [](void *sv) {
                 auto *s = static_cast<cppRandState *>(sv);
                 delete s->r;
                 delete s;
             };
-            e.ops_per_run = 1;
-            e.inner_reps = 10000;
+            e.ops_per_run = kRandomBatch;
+            e.inner_reps = 10000 / kRandomBatch;
             e.reusable_state = true;
             g_benchmarks.push_back(std::move(e));
         }
@@ -845,16 +865,20 @@ static void register_random_variants() {
             };
             e.run = [](void *sv) -> int64_t {
                 auto *s = static_cast<setRandState *>(sv);
-                uint64_t v = rand_u64(s->rng) & s->bitmask;
-                return s->s->find(v) != s->s->end() ? 1 : 0;
+                std::int64_t found{ 0 };
+                for (std::int64_t k{ 0 }; k < kRandomBatch; ++k) {
+                    uint64_t v = rand_u64(s->rng) & s->bitmask;
+                    found += s->s->find(v) != s->s->end() ? 1 : 0;
+                }
+                return found;
             };
             e.teardown = [](void *sv) {
                 auto *s = static_cast<setRandState *>(sv);
                 delete s->s;
                 delete s;
             };
-            e.ops_per_run = 1;
-            e.inner_reps = 10000;
+            e.ops_per_run = kRandomBatch;
+            e.inner_reps = 10000 / kRandomBatch;
             e.reusable_state = true;
             g_benchmarks.push_back(std::move(e));
         }
@@ -867,8 +891,9 @@ static void register_random_variants() {
             e.description =
                 "synthetic_bench.cpp r64InsertRemoveRandom: preload a "
                 "roaring64_bitmap_t with 2^20 random (& bitmask) values, "
-                "then each call adds one fresh random value and removes "
-                "another. Reports per-pair cost (insert + remove).";
+                "then each step of a batch adds one fresh random value "
+                "and removes another. Reports per-pair cost (insert + "
+                "remove).";
             e.setup = [mask]() -> void * {
                 auto *s =
                     new r64RandState{roaring64_bitmap_create(), mask,
@@ -879,10 +904,12 @@ static void register_random_variants() {
             };
             e.run = [](void *sv) -> int64_t {
                 auto *s = static_cast<r64RandState *>(sv);
-                uint64_t a = rand_u64(s->rng) & s->bitmask;
-                uint64_t r = rand_u64(s->rng) & s->bitmask;
-                roaring64_bitmap_add(s->r, a);
-                roaring64_bitmap_remove(s->r, r);
+                for (std::int64_t k{ 0 }; k < kRandomBatch; ++k) {
+                    uint64_t a = rand_u64(s->rng) & s->bitmask;
+                    uint64_t r = rand_u64(s->rng) & s->bitmask;
+                    roaring64_bitmap_add(s->r, a);
+                    roaring64_bitmap_remove(s->r, r);
+                }
                 return 0;
             };
             e.teardown = [](void *sv) {
@@ -890,8 +917,8 @@ static void register_random_variants() {
                 roaring64_bitmap_free(s->r);
                 delete s;
             };
-            e.ops_per_run = 2;
-            e.inner_reps = 5000;
+            e.ops_per_run = 2 * kRandomBatch;
+            e.inner_reps = 5000 / kRandomBatch;
             e.reusable_state = true;
             g_benchmarks.push_back(std::move(e));
         }
@@ -917,10 +944,12 @@ static void register_random_variants() {
             };
             e.run = [](void *sv) -> int64_t {
                 auto *s = static_cast<cppRandState *>(sv);
-                uint64_t a = rand_u64(s->rng) & s->bitmask;
-                uint64_t r = rand_u64(s->rng) & s->bitmask;
-                s->r->add(a);
-                s->r->remove(r);
+                for (std::int64_t k{ 0 }; k < kRandomBatch; ++k) {
+                    uint64_t a = rand_u64(s->rng) & s->bitmask;
+                    uint64_t r = rand_u64(s->rng) & s->bitmask;
+                    s->r->add(a);
+                    s->r->remove(r);
+                }
                 return 0;
             };
             e.teardown = [](void *sv) {
@@ -928,8 +957,8 @@ static void register_random_variants() {
                 delete s->r;
                 delete s;
             };
-            e.ops_per_run = 2;
-            e.inner_reps = 5000;
+            e.ops_per_run = 2 * kRandomBatch;
+            e.inner_reps = 5000 / kRandomBatch;
             e.reusable_state = true;
             g_benchmarks.push_back(std::move(e));
         }
@@ -952,10 +981,12 @@ static void register_random_variants() {
             };
             e.run = [](void *sv) -> int64_t {
                 auto *s = static_cast<setRandState *>(sv);
-                uint64_t a = rand_u64(s->rng) & s->bitmask;
-                uint64_t r = rand_u64(s->rng) & s->bitmask;
-                s->s->insert(a);
-                s->s->erase(r);
+                for (std::int64_t k{ 0 }; k < kRandomBatch; ++k) {
+                    uint64_t a = rand_u64(s->rng) & s->bitmask;
+                    uint64_t r = rand_u64(s->rng) & s->bitmask;
+                    s->s->insert(a);
+                    s->s->erase(r);
+                }
                 return 0;
             };
             e.teardown = [](void *sv) {
@@ -963,8 +994,8 @@ static void register_random_variants() {
                 delete s->s;
                 delete s;
             };
-            e.ops_per_run = 2;
-            e.inner_reps = 5000;
+            e.ops_per_run = 2 * kRandomBatch;
+            e.inner_reps = 5000 / kRandomBatch;
             e.reusable_state = true;
             g_benchmarks.push_back(std::move(e));
         }
