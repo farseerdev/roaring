@@ -105,8 +105,8 @@ TEST( KernelCoverage, SortedUnionKernelsMatchReference ) {
     }
 }
 
-// The scalar merges, driven directly. Every output is exactly as large as the contract says (a union sa + sb,
-// an intersection min(sa, sb), a difference sa) so a write past it is an out-of-bounds write under ASan, and a
+// The scalar merges, driven directly. Every output is exactly as large as the contract says (a union and a
+// symmetric difference sa + sb, an intersection min(sa, sb), a difference sa) so a write past it is an out-of-bounds write under ASan, and a
 // guard on both sides catches the rest. The in-place layouts place the output over the first operand (the
 // difference and the intersection) or sb values before it (the union), the shapes the callers use.
 template <typename T, typename Generator>
@@ -130,14 +130,16 @@ void scalar_merges_case( std::uint64_t const seed, Generator && generate ) {
             EXPECT_TRUE( std::all_of( storage.begin(), storage.begin() + guard, [ & ]( T const v ) { return v == canary; } ) ) << what << ": wrote before the output";
             EXPECT_TRUE( std::all_of( storage.begin() + guard + slots, storage.end(), [ & ]( T const v ) { return v == canary; } ) ) << what << ": wrote past the output";
         } };
-        std::vector<T> expected_union, expected_and, expected_sub;
+        std::vector<T> expected_union, expected_and, expected_sub, expected_xor;
         std::ranges::set_union( a, b, std::back_inserter( expected_union ) );
         std::ranges::set_intersection( a, b, std::back_inserter( expected_and ) );
         std::ranges::set_difference( a, b, std::back_inserter( expected_sub ) );
+        std::ranges::set_symmetric_difference( a, b, std::back_inserter( expected_xor ) );
 
         check( expected_union, a.size() + b.size(), [ & ]( T * const out ) { return detail::union_sorted_scalar( a.data(), a.size(), b.data(), b.size(), out ); }, "union" );
         check( expected_and, std::min( a.size(), b.size() ), [ & ]( T * const out ) { return detail::intersect_sorted_scalar( a.data(), a.size(), b.data(), b.size(), out ); }, "intersection" );
         check( expected_sub, a.size(), [ & ]( T * const out ) { return detail::difference_sorted_scalar( a.data(), a.size(), b.data(), b.size(), out ); }, "difference" );
+        check( expected_xor, a.size() + b.size(), [ & ]( T * const out ) { return detail::xor_sorted_scalar( a.data(), a.size(), b.data(), b.size(), out ); }, "symmetric difference" );
 
         // In place over the first operand.
         {
@@ -189,6 +191,88 @@ TEST( KernelCoverage, ScalarMergesMatchReferenceUint16Structured ) {
 }
 TEST( KernelCoverage, ScalarMergesMatchReferenceUint32Blocky ) {
     scalar_merges_case<std::uint32_t>( 0x32B10C, []( std::mt19937_64 & rng, std::size_t const n ) { return blocky_values<std::uint32_t>( rng, n, 100'000 ); } );
+}
+
+// Array pairs of very different sizes through the real dispatch, materialized and in place, both ways round: the
+// short side's size on either side of each ratio the merges switch on, the short side empty, all below, all above,
+// interleaved with or a subset of the long one, or holding the chunk's end values; and pairs of similar sizes whose
+// four-value block loop leaves one to three values on one side against hundreds on the other.
+TEST( KernelCoverage, SkewedArrayMergesMatchReference ) {
+    std::mt19937_64 rng{ 0x5E3D };
+    constexpr std::uint32_t base{ 0x30000U };
+    auto const distinct{ [ & ]( std::size_t const n, std::uint32_t const first, std::uint32_t const last ) {
+        std::set<std::uint16_t> chosen;
+        while ( chosen.size() < n ) {
+            chosen.insert( static_cast<std::uint16_t>( first + rng() % ( last - first ) ) );
+        }
+        return std::vector<std::uint16_t>{ chosen.begin(), chosen.end() };
+    } };
+    auto const check{ [ & ]( std::vector<std::uint16_t> const & lows_a, std::vector<std::uint16_t> const & lows_b, char const * const shape ) {
+        auto const va{ in_chunk( lows_a, base ) };
+        auto const vb{ in_chunk( lows_b, base ) };
+        SCOPED_TRACE( ::testing::Message() << shape << " sa " << va.size() << " sb " << vb.size() );
+        Bitmap32 a;
+        a.add_many( va );
+        Bitmap32 b;
+        b.add_many( vb );
+        auto const expected_or{ set_union_of( va, vb ) };
+        auto const expected_and{ set_intersection_of( va, vb ) };
+        auto const expected_xor{ set_symmetric_difference_of( va, vb ) };
+        auto const expected_ab{ set_difference_of( va, vb ) };
+        auto const expected_ba{ set_difference_of( vb, va ) };
+        EXPECT_TRUE( matches( a | b, expected_or ) ) << "a | b";
+        EXPECT_TRUE( matches( b | a, expected_or ) ) << "b | a";
+        EXPECT_TRUE( matches( a & b, expected_and ) ) << "a & b";
+        EXPECT_TRUE( matches( b & a, expected_and ) ) << "b & a";
+        EXPECT_TRUE( matches( a ^ b, expected_xor ) ) << "a ^ b";
+        EXPECT_TRUE( matches( b ^ a, expected_xor ) ) << "b ^ a";
+        EXPECT_TRUE( matches( a - b, expected_ab ) ) << "a - b";
+        EXPECT_TRUE( matches( b - a, expected_ba ) ) << "b - a";
+        EXPECT_EQ( a.intersects( b ), !expected_and.empty() );
+        EXPECT_EQ( b.intersects( a ), !expected_and.empty() );
+        { auto t{ a }; t |= b; EXPECT_TRUE( matches( t, expected_or ) ) << "a |= b"; }
+        { auto t{ b }; t |= a; EXPECT_TRUE( matches( t, expected_or ) ) << "b |= a"; }
+        { auto t{ a }; t &= b; EXPECT_TRUE( matches( t, expected_and ) ) << "a &= b"; }
+        { auto t{ b }; t &= a; EXPECT_TRUE( matches( t, expected_and ) ) << "b &= a"; }
+        { auto t{ a }; t ^= b; EXPECT_TRUE( matches( t, expected_xor ) ) << "a ^= b"; }
+        { auto t{ a }; t -= b; EXPECT_TRUE( matches( t, expected_ab ) ) << "a -= b"; }
+        { auto t{ b }; t -= a; EXPECT_TRUE( matches( t, expected_ba ) ) << "b -= a"; }
+    } };
+    for ( std::size_t const longer : { std::size_t{ 256 }, std::size_t{ 1000 }, std::size_t{ 4000 } } ) {
+        for ( std::size_t const ratio : { detail::kSkewedMergeRatio, detail::kSkewedVectorMergeRatio, detail::kSkewedIntersectRatioThreshold, detail::kSkewedVectorDifferenceRatio } ) {
+            for ( std::size_t const shorter : { longer / ratio - 1, longer / ratio, longer / ratio + 1 } ) {
+                if ( shorter > longer ) {
+                    continue;
+                }
+                auto const spread{ distinct( longer, 0, 65536 ) };
+                check( distinct( shorter, 0, 65536 ), spread, "interleaved" );
+                auto subset{ spread };
+                std::ranges::shuffle( subset, rng );
+                subset.resize( shorter );
+                std::ranges::sort( subset );
+                check( subset, spread, "subset" );
+                auto const upper{ distinct( longer, 32768, 65536 ) };
+                check( distinct( shorter, 0, 32768 ), upper, "below" );
+                auto const lower{ distinct( longer, 0, 32768 ) };
+                check( distinct( shorter, 32768, 65536 ), lower, "above" );
+                auto edges{ distinct( shorter, 1, 65535 ) };
+                edges.insert( edges.begin(), 0 );
+                edges.push_back( 65535 );
+                check( edges, spread, "chunk ends" );
+            }
+        }
+        check( {}, distinct( longer, 0, 65536 ), "empty" );
+    }
+    // The first side's low values meet the second side's spread ones in blocks of four; then its last one to three
+    // values, above every other, remain against most of the second side.
+    for ( std::size_t const low : { std::size_t{ 200 }, std::size_t{ 201 }, std::size_t{ 202 }, std::size_t{ 203 } } ) {
+        for ( std::size_t const high : { std::size_t{ 1 }, std::size_t{ 2 }, std::size_t{ 3 } } ) {
+            auto first{ distinct( low, 0, 1000 ) };
+            auto const top{ distinct( high, 60000, 65536 ) };
+            first.insert( first.end(), top.begin(), top.end() );
+            check( first, distinct( low, 0, 65536 ), "tail" );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

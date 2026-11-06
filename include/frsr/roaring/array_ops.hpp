@@ -652,11 +652,72 @@ inline std::size_t intersect_sorted_uint16(
 } // namespace x86_vp2
 #endif // FRSR_ROARING_VP2
 
+// Exponential (galloping) forward search: first index in [lo, hi) whose key is
+// >= limit (Greater == false) or > limit (Greater == true). Two probes settle a
+// skip of 0-1 elements (the tiny-skip shapes the linear walk was chosen for),
+// while a long skip costs O(log skip) — HW instruction counters on the
+// production fold showed the pure linear walk retiring ~7x the instructions of
+// a downstream engine's binary-search-per-run kernel on real model shapes,
+// whose skew the ArrayRunAndFold bench (which settled the linear walk) does
+// not reproduce.
+//
+// The elements need not be bare keys: `key_of` projects the compared key out of an element (the run
+// lists are searched by their end), so the run kernels share this search rather than carry their own.
+struct identity_key {
+    template <typename T>
+    [[nodiscard]] constexpr T const & operator()( T const & value ) const noexcept { return value; }
+};
+
+// The key of a run in a sorted run list: its inclusive end, as `Key`.
+template <typename Key>
+struct run_end_key {
+    template <typename Run>
+    [[nodiscard]] constexpr Key operator()( Run const & run ) const noexcept { return static_cast<Key>( run.end ); }
+};
+
+template <bool Greater, typename Element, typename Key, typename KeyOf = identity_key>
+[[nodiscard]] [[gnu::always_inline]] inline std::size_t gallop_forward(
+    Element const * const keys, std::size_t lo, std::size_t const hi, Key const limit, KeyOf const key_of = {}
+) noexcept {
+    auto const below{ [ key_of ]( Element const & element, Key const lim ) noexcept {
+        auto const key{ key_of( element ) };
+        return Greater ? key <= lim : key < lim;
+    } };
+    if ( lo == hi || !below( keys[ lo ], limit ) ) {
+        return lo;
+    }
+    // A skip of up to four elements settles with predictable compares and no search: the dominant
+    // outcome when the key sequence and the limits interleave closely (short runs against an array).
+    // [croaring-ref] deps/croaring/include/roaring/array_util.h:advanceUntil
+    for ( std::size_t offset{ 1 }; offset <= 3; ++offset ) {
+        if ( lo + offset >= hi || !below( keys[ lo + offset ], limit ) ) {
+            return lo + offset;
+        }
+    }
+    lo += 3;
+    std::size_t step{ 1 };
+    while ( lo + step < hi && below( keys[ lo + step ], limit ) ) {
+        lo += step;
+        step <<= 1U;
+    }
+    auto const window_end{ std::min( lo + step, hi ) };
+    // keys[lo] fails the bound; the first passing key lies in (lo, window_end].
+    ++lo;
+    auto const * const found{ Greater
+        ? std::upper_bound( keys + lo, keys + window_end, limit, [ key_of ]( Key const lim, Element const & element ) noexcept { return lim < key_of( element ); } )
+        : std::lower_bound( keys + lo, keys + window_end, limit, [ key_of ]( Element const & element, Key const lim ) noexcept { return key_of( element ) < lim; } ) };
+    return static_cast<std::size_t>( found - keys );
+}
+
 // Hybrid branchless scalar merges of two sorted arrays. A branch per value mispredicts about once per value
 // on sets that interleave unpredictably, so while four values remain on each side the merge first looks for a
 // block of four to handle at once (all below the other side's current value, or equal to the other side's next
 // four), which is common and well predicted on clustered data; otherwise it takes four branchless steps.
-// [croaring-ref] deps/croaring/src/array_util.c:intersect_uint16, union_uint16, difference_uint16
+// The branchless steps carry a dependency from one value to the next, so they cost several cycles per value: when
+// one side is kSkewedMergeRatio times shorter than the other, from the start or once fewer than four values remain
+// on one side, each value of the short side is instead placed in the long one by galloping, and the long side's
+// values between two of them are handled as one block.
+// [croaring-ref] deps/croaring/src/array_util.c:intersect_uint16, union_uint16, difference_uint16, xor_uint16
 // A tail copy: both pointers may be null for an empty tail, which memmove does not allow.
 template <typename T>
 [[ gnu::always_inline ]] inline void move_tail( T * const to, T const * const from, std::size_t const count ) noexcept {
@@ -668,6 +729,74 @@ template <typename T>
     return std::memcmp( a, b, 4 * sizeof( T ) ) == 0;
 }
 
+// Whether `shorter` is more than `ratio` times shorter than `longer`.
+// [croaring-ref] deps/croaring/include/roaring/array_util.h:croaring_skewed_sizes
+[[nodiscard]] constexpr bool shorter_by( std::size_t const ratio, std::size_t const shorter, std::size_t const longer ) noexcept {
+    return shorter * ratio < longer;
+}
+
+// Whether either of two lengths is more than `ratio` times the other.
+[[nodiscard]] constexpr bool lengths_apart( std::size_t const ratio, std::size_t const x, std::size_t const y ) noexcept {
+    return shorter_by( ratio, x, y ) || shorter_by( ratio, y, x );
+}
+
+// What a merge that keeps the long side's values does with a value of the short side: the union writes it, the
+// symmetric difference writes it when the long side lacks it, the long side minus the short one never writes it.
+enum class short_value_kept : std::uint8_t { always, when_absent, never };
+
+// The skewed form of a merge that keeps the long side's values. The long side's values below the next short-side
+// value move as one block; every write lands at out[ k ] with k at most the values read from both sides, so `out`
+// may start up to `ss` values before `large` (the in-place union layout) or be `large` (the in-place difference).
+// [croaring-ref] deps/croaring/src/array_util.c:union_skewed_uint16, xor_skewed_uint16, difference_skewed_small_a2_uint16
+template <short_value_kept Kept, typename T>
+[[ gnu::hot ]] inline std::size_t merge_skewed_keeping_long(
+    T const * const small, std::size_t const ss,
+    T const * const large, std::size_t const sl,
+    T * const out
+) noexcept {
+    std::size_t j{ 0 };
+    std::size_t k{ 0 };
+    for ( std::size_t i{ 0 }; i < ss; ++i ) {
+        auto const value{ small[ i ] };
+        auto const at{ gallop_forward<false>( large, j, sl, value ) };
+        move_tail( out + k, large + j, at - j );
+        k += at - j;
+        auto const held{ at < sl && large[ at ] == value };
+        j = at + held;
+        if constexpr ( Kept == short_value_kept::always ) {
+            out[ k++ ] = value;
+        } else if constexpr ( Kept == short_value_kept::when_absent ) {
+            out[ k ] = value;
+            k += !held;
+        }
+    }
+    move_tail( out + k, large + j, sl - j );
+    return k + ( sl - j );
+}
+
+// The skewed form of a merge that keeps only short-side values: those the long side holds (Held, the intersection)
+// or lacks (the short side minus the long one). A write lands at or below the short side's read position, so `out`
+// may be `small`; a write of a held value also lands at or below the long side's, so the intersection's `out` may
+// be `large` instead.
+// [croaring-ref] deps/croaring/src/array_util.c:intersect_tail_uint16, difference_skewed_small_a1_uint16
+template <bool Held, typename T>
+[[ gnu::hot ]] inline std::size_t filter_skewed_short(
+    T const * const small, std::size_t const ss,
+    T const * const large, std::size_t const sl,
+    T * const out
+) noexcept {
+    std::size_t j{ 0 };
+    std::size_t k{ 0 };
+    for ( std::size_t i{ 0 }; i < ss; ++i ) {
+        auto const value{ small[ i ] };
+        j = gallop_forward<false>( large, j, sl, value );
+        if ( ( j < sl && large[ j ] == value ) == Held ) {
+            out[ k++ ] = value;
+        }
+    }
+    return k;
+}
+
 // Every write goes to out[ k.. ] with k <= i, so `out` may be `a`, but not `b`.
 template <typename T>
 [[ gnu::hot ]] inline std::size_t intersect_sorted_scalar(
@@ -677,25 +806,34 @@ template <typename T>
 ) noexcept {
     assert( out != b || a == b );
     std::size_t i{ 0 }, j{ 0 }, k{ 0 };
-    while ( i + 4 <= sa && j + 4 <= sb ) {
-        if ( a[ i + 3 ] < b[ j ] ) {
-            i += 4;
-        } else if ( b[ j + 3 ] < a[ i ] ) {
-            j += 4;
-        } else if ( equal_blocks4( a + i, b + j ) ) {
-            std::memmove( out + k, a + i, 4 * sizeof( T ) );
-            k += 4;
-            i += 4;
-            j += 4;
-        } else {
-            for ( int step{ 0 }; step < 4; ++step ) {
-                T const x{ a[ i ] }, y{ b[ j ] };
-                out[ k ] = x;
-                k += ( x == y );
-                i += ( x <= y );
-                j += ( x >= y );
+    // A side this much shorter than the other goes straight to the galloping form below.
+    if ( !lengths_apart( kSkewedMergeRatio, sa, sb ) ) {
+        while ( i + 4 <= sa && j + 4 <= sb ) {
+            if ( a[ i + 3 ] < b[ j ] ) {
+                i += 4;
+            } else if ( b[ j + 3 ] < a[ i ] ) {
+                j += 4;
+            } else if ( equal_blocks4( a + i, b + j ) ) {
+                std::memmove( out + k, a + i, 4 * sizeof( T ) );
+                k += 4;
+                i += 4;
+                j += 4;
+            } else {
+                for ( int step{ 0 }; step < 4; ++step ) {
+                    T const x{ a[ i ] }, y{ b[ j ] };
+                    out[ k ] = x;
+                    k += ( x == y );
+                    i += ( x <= y );
+                    j += ( x >= y );
+                }
             }
         }
+    }
+    if ( shorter_by( kSkewedMergeRatio, sa - i, sb - j ) ) {
+        return k + filter_skewed_short<true>( a + i, sa - i, b + j, sb - j, out + k );
+    }
+    if ( shorter_by( kSkewedMergeRatio, sb - j, sa - i ) ) {
+        return k + filter_skewed_short<true>( b + j, sb - j, a + i, sa - i, out + k );
     }
     while ( i < sa && j < sb ) {
         T const x{ a[ i ] }, y{ b[ j ] };
@@ -716,28 +854,37 @@ template <typename T>
     T * const out
 ) noexcept {
     std::size_t i{ 0 }, j{ 0 }, k{ 0 };
-    while ( i + 4 <= sa && j + 4 <= sb ) {
-        if ( a[ i + 3 ] < b[ j ] ) {
-            std::memmove( out + k, a + i, 4 * sizeof( T ) );
-            k += 4;
-            i += 4;
-        } else if ( b[ j + 3 ] < a[ i ] ) {
-            std::memmove( out + k, b + j, 4 * sizeof( T ) );
-            k += 4;
-            j += 4;
-        } else if ( equal_blocks4( a + i, b + j ) ) {
-            std::memmove( out + k, a + i, 4 * sizeof( T ) );
-            k += 4;
-            i += 4;
-            j += 4;
-        } else {
-            for ( int step{ 0 }; step < 4; ++step ) {
-                T const x{ a[ i ] }, y{ b[ j ] };
-                out[ k++ ] = x < y ? x : y;
-                i += ( x <= y );
-                j += ( x >= y );
+    // A side this much shorter than the other goes straight to the galloping form below.
+    if ( !lengths_apart( kSkewedMergeRatio, sa, sb ) ) {
+        while ( i + 4 <= sa && j + 4 <= sb ) {
+            if ( a[ i + 3 ] < b[ j ] ) {
+                std::memmove( out + k, a + i, 4 * sizeof( T ) );
+                k += 4;
+                i += 4;
+            } else if ( b[ j + 3 ] < a[ i ] ) {
+                std::memmove( out + k, b + j, 4 * sizeof( T ) );
+                k += 4;
+                j += 4;
+            } else if ( equal_blocks4( a + i, b + j ) ) {
+                std::memmove( out + k, a + i, 4 * sizeof( T ) );
+                k += 4;
+                i += 4;
+                j += 4;
+            } else {
+                for ( int step{ 0 }; step < 4; ++step ) {
+                    T const x{ a[ i ] }, y{ b[ j ] };
+                    out[ k++ ] = x < y ? x : y;
+                    i += ( x <= y );
+                    j += ( x >= y );
+                }
             }
         }
+    }
+    if ( shorter_by( kSkewedMergeRatio, sa - i, sb - j ) ) {
+        return k + merge_skewed_keeping_long<short_value_kept::always>( a + i, sa - i, b + j, sb - j, out + k );
+    }
+    if ( shorter_by( kSkewedMergeRatio, sb - j, sa - i ) ) {
+        return k + merge_skewed_keeping_long<short_value_kept::always>( b + j, sb - j, a + i, sa - i, out + k );
     }
     while ( i < sa && j < sb ) {
         T const x{ a[ i ] }, y{ b[ j ] };
@@ -759,25 +906,34 @@ template <typename T>
     T * const out
 ) noexcept {
     std::size_t i{ 0 }, j{ 0 }, k{ 0 };
-    while ( i + 4 <= sa && j + 4 <= sb ) {
-        if ( a[ i + 3 ] < b[ j ] ) {
-            std::memmove( out + k, a + i, 4 * sizeof( T ) );
-            k += 4;
-            i += 4;
-        } else if ( b[ j + 3 ] < a[ i ] ) {
-            j += 4;
-        } else if ( equal_blocks4( a + i, b + j ) ) {
-            i += 4;
-            j += 4;
-        } else {
-            for ( int step{ 0 }; step < 4; ++step ) {
-                T const x{ a[ i ] }, y{ b[ j ] };
-                out[ k ] = x;
-                k += ( x < y );
-                i += ( x <= y );
-                j += ( x >= y );
+    // A side this much shorter than the other goes straight to the galloping form below.
+    if ( !lengths_apart( kSkewedMergeRatio, sa, sb ) ) {
+        while ( i + 4 <= sa && j + 4 <= sb ) {
+            if ( a[ i + 3 ] < b[ j ] ) {
+                std::memmove( out + k, a + i, 4 * sizeof( T ) );
+                k += 4;
+                i += 4;
+            } else if ( b[ j + 3 ] < a[ i ] ) {
+                j += 4;
+            } else if ( equal_blocks4( a + i, b + j ) ) {
+                i += 4;
+                j += 4;
+            } else {
+                for ( int step{ 0 }; step < 4; ++step ) {
+                    T const x{ a[ i ] }, y{ b[ j ] };
+                    out[ k ] = x;
+                    k += ( x < y );
+                    i += ( x <= y );
+                    j += ( x >= y );
+                }
             }
         }
+    }
+    if ( shorter_by( kSkewedMergeRatio, sb - j, sa - i ) ) {
+        return k + merge_skewed_keeping_long<short_value_kept::never>( b + j, sb - j, a + i, sa - i, out + k );
+    }
+    if ( shorter_by( kSkewedMergeRatio, sa - i, sb - j ) ) {
+        return k + filter_skewed_short<false>( a + i, sa - i, b + j, sb - j, out + k );
     }
     while ( i < sa && j < sb ) {
         T const x{ a[ i ] }, y{ b[ j ] };
@@ -1015,8 +1171,12 @@ inline std::size_t union_sorted_uint16(
 
     std::uint16_t merged[ 2 * W ];  // <= W pending + (W−1) leftovers
     std::size_t const nmerged{ union_sorted_uint16_scalar( pending, npending, rest_short, nshort, merged ) };
-    o += union_sorted_uint16_scalar( merged, nmerged, rest_long, nlong, o );
-    return static_cast<std::size_t>( o - out );
+    // The merged values meet only the values of the other side up to their maximum: that prefix is merged, the
+    // rest copied. (Merged with the whole other side, the few values would be galloped through it.)
+    std::size_t const met{ nmerged == 0 ? 0 : gallop_forward<true>( rest_long, 0, nlong, merged[ nmerged - 1 ] ) };
+    o += union_sorted_uint16_scalar( merged, nmerged, rest_long, met, o );
+    move_tail( o, rest_long + met, nlong - met );   // in place, rest_long may lie above `o`
+    return static_cast<std::size_t>( o - out ) + ( nlong - met );
 }
 
 // Extra output slots the kernel's full-vector stores need past sa + sb.
@@ -1055,28 +1215,25 @@ inline constexpr std::size_t decode_array_min_count{ 64 };
 #endif
 
 
-// True in-place union: grow lhs's payload to the worst-case size and merge
-// BACKWARDS (largest values first, writing down from slot la+lb-1). The write
-// cursor k never catches the read cursor i (k == i + j + dedup_slack, j >= 1
-// inside the loop), so no scratch buffer and no copy-back are needed — the
-// former merge-into-scratch + buffer-swap pays a full extra pass.
-// [croaring-ref] deps/croaring/src/array_util.c:union_uint16_inplace
+// True in-place union: one backward pass into room for every value of rhs (union_sorted_inplace, the sorted-group
+// add's merge), the values above each rhs value moved up as one block when rhs is short against lhs, and the room
+// the values both hold leave unused closed at the end.
+// [croaring-ref] deps/croaring/src/containers/array.c:array_array_container_inplace_union
 template <typename Layout, typename CowPolicy = cow_value_semantics>
 [[ gnu::hot ]] inline void union_array_array_inplace(
     array_ref<Layout, CowPolicy> lhs,
     array_cref<Layout, CowPolicy> const rhs
 ) {
-    auto const la{ lhs.values.size() };
-    auto const lb{ rhs.values.size() };
-    auto const total{ la + lb };
     if ( lhs.values.data() == rhs.values.data() ) [[unlikely]] { return; }  // self-union
 #if FRSR_ROARING_X86_V4
     // The AVX-512 merge cannot run backwards, so it takes CRoaring's in-place shape:
     // shift lhs up by lb and merge forwards into the vacated front — the kernel's
     // held-back block keeps the write cursor behind the shifted lhs (see its note).
     if constexpr ( std::is_same_v<typename Layout::low_type, std::uint16_t> ) {
-        if ( la >= x86_v4::union_min_side && lb >= x86_v4::union_min_side && have_x86_v4() ) {
-            lhs.values.resize_uninitialized( total );
+        auto const la{ lhs.values.size() };
+        auto const lb{ rhs.values.size() };
+        if ( la >= x86_v4::union_min_side && lb >= x86_v4::union_min_side && !lengths_apart( kSkewedVectorMergeRatio, la, lb ) && have_x86_v4() ) {
+            lhs.values.resize_uninitialized( la + lb );
             auto * const a{ lhs.values.data() };
             std::memmove( a + lb, a, la * sizeof( *a ) );
             auto const n{ x86_v4::union_sorted_uint16( a + lb, la, rhs.values.data(), lb, a ) };
@@ -1086,32 +1243,11 @@ template <typename Layout, typename CowPolicy = cow_value_semantics>
         }
     }
 #endif
-    lhs.values.resize_uninitialized( total );
-    auto       * const a{ lhs.values.data() };
-    auto const * const b{ rhs.values.data() };
-
-    auto i{ la };
-    auto j{ lb };
-    auto k{ total };
-    while ( i > 0 && j > 0 ) {
-        if ( a[ i - 1 ] > b[ j - 1 ] ) {
-            a[ --k ] = a[ --i ];
-        } else if ( b[ j - 1 ] > a[ i - 1 ] ) {
-            a[ --k ] = b[ --j ];
-        } else {
-            a[ --k ] = a[ --i ];
-            --j;
-        }
-    }
-    while ( j > 0 ) {
-        a[ --k ] = b[ --j ];
-    }
-    // The merged tail lives at [k, total); the untouched prefix a[0, i) is
-    // already in place. Close the dedup gap between them (no-op when k == i).
-    if ( k != i ) {
-        std::memmove( a + i, a + k, std::size_t{ total - k } * sizeof( *a ) );
-    }
-    lhs.values.resize_uninitialized( i + ( total - k ) );
+    auto const la{ lhs.values.size() };
+    auto const lb{ rhs.values.size() };
+    lhs.values.resize_uninitialized( la + lb );
+    auto const added{ union_sorted_inplace( lhs.values.data(), la, rhs.values.data(), lb ) };
+    lhs.values.resize_uninitialized( static_cast<std::uint32_t>( la + added ) );
     lhs.sync_header();
 }
 
@@ -1125,7 +1261,7 @@ template <typename Layout, typename OutVector, typename CowPolicy = cow_value_se
     if constexpr ( std::is_same_v<typename Layout::low_type, std::uint16_t> ) {
         auto const sa{ lhs.values.size() };
         auto const sb{ rhs.values.size() };
-        if ( sa >= x86_v4::union_min_side && sb >= x86_v4::union_min_side && have_x86_v4() ) {
+        if ( sa >= x86_v4::union_min_side && sb >= x86_v4::union_min_side && !lengths_apart( kSkewedVectorMergeRatio, sa, sb ) && have_x86_v4() ) {
             resize_uninitialized( out, sa + sb + x86_v4::union_store_slack );
             auto const n{ x86_v4::union_sorted_uint16( lhs.values.data(), sa, rhs.values.data(), sb, out.data() ) };
             out.resize( static_cast<std::uint32_t>( n ) );
@@ -1244,7 +1380,7 @@ template <typename Layout, typename OutVector, typename CowPolicy = cow_value_se
     if constexpr ( kSimdArrayIntersect && std::is_same_v<typename Layout::low_type, std::uint16_t> ) {
         auto const sa{ lhs.values.size() };
         auto const sb{ rhs.values.size() };
-        if ( sa >= 8U && sb >= 8U ) {
+        if ( sa >= 8U && sb >= 8U && !lengths_apart( kSkewedVectorDifferenceRatio, sa, sb ) ) {
             resize_uninitialized( out, sa + 8U );
             auto const count{ difference_array_array_sse42( lhs.values.data(), sa, rhs.values.data(), sb, out.data() ) };
             out.resize( static_cast<std::uint32_t>( count ) );
@@ -1270,27 +1406,36 @@ template <typename T>
     T * const out
 ) noexcept {
     std::size_t i{ 0 }, j{ 0 }, k{ 0 };
-    while ( i + 4 <= sa && j + 4 <= sb ) {
-        if ( a[ i + 3 ] < b[ j ] ) {
-            std::memcpy( out + k, a + i, 4 * sizeof( T ) );
-            k += 4;
-            i += 4;
-        } else if ( b[ j + 3 ] < a[ i ] ) {
-            std::memcpy( out + k, b + j, 4 * sizeof( T ) );
-            k += 4;
-            j += 4;
-        } else if ( equal_blocks4( a + i, b + j ) ) {
-            i += 4;
-            j += 4;
-        } else {
-            for ( int step{ 0 }; step < 4; ++step ) {
-                T const x{ a[ i ] }, y{ b[ j ] };
-                out[ k ] = x < y ? x : y;
-                k += ( x != y );
-                i += ( x <= y );
-                j += ( x >= y );
+    // A side this much shorter than the other goes straight to the galloping form below.
+    if ( !lengths_apart( kSkewedMergeRatio, sa, sb ) ) {
+        while ( i + 4 <= sa && j + 4 <= sb ) {
+            if ( a[ i + 3 ] < b[ j ] ) {
+                std::memcpy( out + k, a + i, 4 * sizeof( T ) );
+                k += 4;
+                i += 4;
+            } else if ( b[ j + 3 ] < a[ i ] ) {
+                std::memcpy( out + k, b + j, 4 * sizeof( T ) );
+                k += 4;
+                j += 4;
+            } else if ( equal_blocks4( a + i, b + j ) ) {
+                i += 4;
+                j += 4;
+            } else {
+                for ( int step{ 0 }; step < 4; ++step ) {
+                    T const x{ a[ i ] }, y{ b[ j ] };
+                    out[ k ] = x < y ? x : y;
+                    k += ( x != y );
+                    i += ( x <= y );
+                    j += ( x >= y );
+                }
             }
         }
+    }
+    if ( shorter_by( kSkewedMergeRatio, sa - i, sb - j ) ) {
+        return k + merge_skewed_keeping_long<short_value_kept::when_absent>( a + i, sa - i, b + j, sb - j, out + k );
+    }
+    if ( shorter_by( kSkewedMergeRatio, sb - j, sa - i ) ) {
+        return k + merge_skewed_keeping_long<short_value_kept::when_absent>( b + j, sb - j, a + i, sa - i, out + k );
     }
     while ( i < sa && j < sb ) {
         T const x{ a[ i ] }, y{ b[ j ] };
@@ -1415,7 +1560,11 @@ inline constexpr std::size_t sse42_xor_min_side{ 8 };
     for ( std::size_t i{ 0 }; i < pending_count; ++i ) {
         if ( kept != 0 && pending[ kept - 1 ] == pending[ i ] ) { --kept; } else { pending[ kept++ ] = pending[ i ]; }
     }
-    return count + xor_sorted_scalar( static_cast<std::uint16_t const *>( pending ), kept, rest, rest_count, out + count );
+    // The pending values meet only the values of `rest` up to their maximum: that prefix is merged, the rest copied.
+    std::size_t const met{ kept == 0 ? 0 : gallop_forward<true>( rest, 0, rest_count, pending[ kept - 1 ] ) };
+    count += xor_sorted_scalar( static_cast<std::uint16_t const *>( pending ), kept, rest, met, out + count );
+    std::memcpy( out + count, rest + met, ( rest_count - met ) * sizeof( std::uint16_t ) );
+    return count + ( rest_count - met );
 }
 
 // How many values two sorted arrays share: the intersection kernel above with the stores replaced by a count of the
@@ -1491,7 +1640,7 @@ template <typename Layout, typename OutVector, typename CowPolicy = cow_value_se
     if constexpr ( std::is_same_v<typename Layout::low_type, std::uint16_t> ) {
         auto const sa{ lhs.values.size() };
         auto const sb{ rhs.values.size() };
-        if ( sa >= sse42_xor_min_side && sb >= sse42_xor_min_side ) {
+        if ( sa >= sse42_xor_min_side && sb >= sse42_xor_min_side && !lengths_apart( kSkewedVectorMergeRatio, sa, sb ) ) {
             resize_uninitialized( out, sa + sb + 8U );
             out.resize( static_cast<std::uint32_t>( xor_sorted_uint16_sse( lhs.values.data(), sa, rhs.values.data(), sb, out.data() ) ) );
             return;
@@ -1515,63 +1664,6 @@ template <typename Layout, typename OutVector, typename CowPolicy = cow_value_se
 // run variant measured SLOWER on the ArrayRunAndFold bench — mispredicted
 // probes beat its O(runs·log n) on real shapes). [croaring-ref: the block-copy
 // shape of a downstream engine's run∩array kernel.]
-// Exponential (galloping) forward search: first index in [lo, hi) whose key is
-// >= limit (Greater == false) or > limit (Greater == true). Two probes settle a
-// skip of 0-1 elements (the tiny-skip shapes the linear walk was chosen for),
-// while a long skip costs O(log skip) — HW instruction counters on the
-// production fold showed the pure linear walk retiring ~7x the instructions of
-// a downstream engine's binary-search-per-run kernel on real model shapes,
-// whose skew the ArrayRunAndFold bench (which settled the linear walk) does
-// not reproduce.
-//
-// The elements need not be bare keys: `key_of` projects the compared key out of an element (the run
-// lists are searched by their end), so the run kernels share this search rather than carry their own.
-struct identity_key {
-    template <typename T>
-    [[nodiscard]] constexpr T const & operator()( T const & value ) const noexcept { return value; }
-};
-
-// The key of a run in a sorted run list: its inclusive end, as `Key`.
-template <typename Key>
-struct run_end_key {
-    template <typename Run>
-    [[nodiscard]] constexpr Key operator()( Run const & run ) const noexcept { return static_cast<Key>( run.end ); }
-};
-
-template <bool Greater, typename Element, typename Key, typename KeyOf = identity_key>
-[[nodiscard]] [[gnu::always_inline]] inline std::size_t gallop_forward(
-    Element const * const keys, std::size_t lo, std::size_t const hi, Key const limit, KeyOf const key_of = {}
-) noexcept {
-    auto const below{ [ key_of ]( Element const & element, Key const lim ) noexcept {
-        auto const key{ key_of( element ) };
-        return Greater ? key <= lim : key < lim;
-    } };
-    if ( lo == hi || !below( keys[ lo ], limit ) ) {
-        return lo;
-    }
-    // A skip of up to four elements settles with predictable compares and no search: the dominant
-    // outcome when the key sequence and the limits interleave closely (short runs against an array).
-    // [croaring-ref] deps/croaring/include/roaring/array_util.h:advanceUntil
-    for ( std::size_t offset{ 1 }; offset <= 3; ++offset ) {
-        if ( lo + offset >= hi || !below( keys[ lo + offset ], limit ) ) {
-            return lo + offset;
-        }
-    }
-    lo += 3;
-    std::size_t step{ 1 };
-    while ( lo + step < hi && below( keys[ lo + step ], limit ) ) {
-        lo += step;
-        step <<= 1U;
-    }
-    auto const window_end{ std::min( lo + step, hi ) };
-    // keys[lo] fails the bound; the first passing key lies in (lo, window_end].
-    ++lo;
-    auto const * const found{ Greater
-        ? std::upper_bound( keys + lo, keys + window_end, limit, [ key_of ]( Key const lim, Element const & element ) noexcept { return lim < key_of( element ); } )
-        : std::lower_bound( keys + lo, keys + window_end, limit, [ key_of ]( Element const & element, Key const lim ) noexcept { return key_of( element ) < lim; } ) };
-    return static_cast<std::size_t>( found - keys );
-}
-
 // The first run at or after `index` (< `size`) whose end is not below `value` (`size` if none). The run the
 // previous value landed in usually still reaches this one: one compare. A value a few runs ahead is reached by
 // predictable linear steps (a gallop over such a skip mispredicts more than it saves); a value further ahead
