@@ -188,48 +188,20 @@ FRSR_ROARING_BITMAP_TEMPLATE
 FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::remove_many_sorted( std::span<key_type const> const sorted_values ) noexcept( detail::allocation_failure_terminates ) {
     assert( std::ranges::is_sorted( sorted_values ) );
     settle_counts();
-    if ( sorted_values.empty() ) {
-        return;
-    }
-
-    chunk_type current_chunk{};
-    detail::small_array_values<low_type> grouped_values;
-    auto flush_group{ [&]() {
-        if ( grouped_values.empty() ) {
+    for_each_chunk_group( sorted_values, [ & ]( chunk_type const chunk, std::span<low_type const> const lows ) {
+        auto const at{ chunks_.lower_bound( chunk ) };
+        if ( at == chunks_.end() || chunks_.key( at ) != chunk ) {
             return;
         }
-
-        auto const at{ chunks_.lower_bound( current_chunk ) };
-        if ( at != chunks_.end() && chunks_.key( at ) == current_chunk ) {
-            auto & slot{ chunks_.slot( at ) };
-            size_ -= static_cast<size_type>( detail::container_remove_sorted( slot, std::span<low_type const>{ grouped_values.data(), grouped_values.size() }, array_to_bitset_threshold ) );
-            if ( detail::container_size( slot ) == 0 ) {
-                chunks_.erase( at );
-            } else if ( !slot.holds_run() || !uses_default_container_set ) {
-                // A run slot that only lost values already has the smallest form, whichever the policy.
-                slot = optimize_container_for_policy( std::move( slot ) );
-            }
+        auto & slot{ chunks_.slot( at ) };
+        size_ -= static_cast<size_type>( detail::container_remove_sorted( slot, lows, array_to_bitset_threshold ) );
+        if ( detail::container_size( slot ) == 0 ) {
+            chunks_.erase( at );
+        } else if ( !slot.holds_run() || !uses_default_container_set ) {
+            // A run slot that only lost values already has the smallest form, whichever the policy.
+            slot = optimize_container_for_policy( std::move( slot ) );
         }
-
-        grouped_values.clear();
-    } };
-
-    for ( auto const value : sorted_values ) {
-        auto const chunk{ layout_type::chunk_key( value ) };
-        auto const low{ layout_type::low_key( value ) };
-        if ( grouped_values.empty() ) {
-            current_chunk = chunk;
-        } else if ( chunk != current_chunk ) {
-            flush_group();
-            current_chunk = chunk;
-        }
-
-        if ( grouped_values.empty() || grouped_values.back() != low ) {
-            grouped_values.push_back( low );
-        }
-    }
-
-    flush_group();
+    } );
 }
 
 FRSR_ROARING_BITMAP_TEMPLATE

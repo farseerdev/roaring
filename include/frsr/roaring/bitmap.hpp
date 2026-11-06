@@ -2421,36 +2421,35 @@ private:
     // parts of that chunk's values, duplicates dropped, in a buffer that is reused from chunk to chunk.
     template <typename Process>
     static void for_each_chunk_group( std::span<key_type const> const sorted_values, Process && process ) {
-        if ( sorted_values.empty() ) {
-            return;
-        }
-        // A chunk holds at most 65536 distinct lows (one more slot takes the store of a duplicate).
-        constexpr std::size_t max_lows{ std::size_t{ 1 } << 16 };
+        // A chunk's values are found first, then their low parts copied with the duplicates counted on the side (a
+        // duplicate equals the value before it), so the copy has no dependency from one value to the next; the copy
+        // is compacted only when it holds duplicates.
+        auto const * const keys{ sorted_values.data() };
+        auto const size{ sorted_values.size() };
         detail::small_array_values<low_type> lows;
-        auto capacity{ std::min( sorted_values.size(), std::size_t{ 2048 } ) + 1 };
-        detail::resize_uninitialized( lows, capacity );
-        auto *       out     { lows.data() };
-        auto         chunk   { layout_type::chunk_key( sorted_values.front() ) };
-        std::size_t  count   { 0 };
-        auto         previous{ layout_type::low_key( sorted_values.front() ) };   // the value before the current one: ascending, so a duplicate equals it
-        for ( auto const value : sorted_values ) {
-            auto const value_chunk{ layout_type::chunk_key( value ) };
-            auto const low        { layout_type::low_key  ( value ) };
-            if ( value_chunk != chunk ) [[unlikely]] {
-                process( chunk, std::span<low_type const>{ out, count } );
-                chunk = value_chunk;
-                count = 0;
+        std::size_t begin{ 0 };
+        while ( begin < size ) {
+            auto const chunk{ layout_type::chunk_key( keys[ begin ] ) };
+            auto end{ begin + 1 };
+            while ( end < size && layout_type::chunk_key( keys[ end ] ) == chunk ) {
+                ++end;
             }
-            if ( count + 1 == capacity ) [[unlikely]] {
-                capacity = std::min( capacity * 2, max_lows + 1 );
-                detail::resize_uninitialized( lows, capacity );
-                out = lows.data();
+            auto const count{ end - begin };
+            if ( lows.size() < count ) {
+                detail::resize_uninitialized( lows, static_cast<std::uint32_t>( count ) );
             }
-            out[ count ] = low;
-            count       += ( count == 0 ) | ( low != previous );
-            previous     = low;
+            auto * const out{ lows.data() };
+            auto const * const group{ keys + begin };
+            auto repeats{ std::uint32_t{ 0 } };
+            out[ 0 ] = layout_type::low_key( group[ 0 ] );
+            for ( std::size_t i{ 1 }; i < count; ++i ) {
+                out[ i ]  = layout_type::low_key( group[ i ] );
+                repeats  += static_cast<std::uint32_t>( group[ i ] == group[ i - 1U ] );
+            }
+            auto const kept{ repeats == 0 ? count : static_cast<std::size_t>( std::unique( out, out + count ) - out ) };
+            process( chunk, std::span<low_type const>{ out, kept } );
+            begin = end;
         }
-        process( chunk, std::span<low_type const>{ out, count } );
     }
 
     [[nodiscard]] bool add_impl( key_type const value, bulk_context * const ctx ) {
