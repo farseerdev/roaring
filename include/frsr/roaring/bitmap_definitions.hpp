@@ -761,11 +761,8 @@ FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::repair_cardinality() no
     for ( auto & slot : chunks_.slots() ) {
         if ( slot.holds_bitset() && !slot.cardinality_valid() ) {
             auto bitset{ slot.as_bitset() };
-            std::size_t cardinality{ 0 };
-            for ( auto const word : bitset.words ) {
-                cardinality += static_cast<std::size_t>( std::popcount( word ) );
-            }
-            bitset.cardinality = static_cast<std::uint32_t>( cardinality );
+            auto const & words{ bitset.words.as_array() };
+            bitset.cardinality = static_cast<std::uint32_t>( detail::popcount_words( words.data(), words.size() ) );
             bitset.mark_endpoints_stale();
         }
         size_ += detail::container_size( slot );
