@@ -321,7 +321,7 @@ TEST( KernelCoverage, BitsetIntersectionExtractionMixedWords ) {
 }
 
 // ---------------------------------------------------------------------------
-// The AVX-512 extraction of a bitset into the 16-bit values it holds: zero words spread out, in stretches,
+// The AVX-512 extraction of a bitset into the values it holds, 16- and 64-bit: zero words spread out, in stretches,
 // between groups of nonzero words or after the last value, and lengths that end inside a group of eight words.
 // ---------------------------------------------------------------------------
 
@@ -375,6 +375,40 @@ TEST( KernelCoverage, BitsetExtractionSparse ) {
                     expect_setbits_extracted( words, n );
                 }
             }
+        }
+    }
+}
+
+TEST( KernelCoverage, BitsetExtractionUint64 ) {
+    if ( !detail::have_x86_v4() ) {
+        GTEST_SKIP() << "no AVX-512 VBMI2";
+    }
+    std::mt19937_64 rng{ 0x64B175 };
+    for ( int trial{ 0 }; trial < 300; ++trial ) {
+        block_words words{};
+        for ( auto & word : words ) {
+            switch ( rng() % 6 ) {
+                case 0: break;
+                case 1: word = ~std::uint64_t{ 0 }; break;
+                case 2: word = rng() & rng() & rng(); break;
+                default: word = rng(); for ( auto thin{ trial % 4 }; thin > 0; --thin ) { word &= rng() | rng(); } break;
+            }
+        }
+        auto const base{ ( std::uint64_t{ 0xABCDE } << 32 ) | ( ( rng() & 0xFFFF ) << 16 ) };
+        for ( std::size_t const n : { std::size_t{ 1024 }, std::size_t{ 1021 }, std::size_t{ 3 } } ) {
+            SCOPED_TRACE( ::testing::Message() << "trial " << trial << " n " << n );
+            std::vector<std::uint64_t> expected;
+            for ( std::size_t i{ 0 }; i < n; ++i ) {
+                for ( auto w{ words[ i ] }; w != 0; w &= w - 1 ) { expected.emplace_back( base + i * 64 + static_cast<std::uint64_t>( std::countr_zero( w ) ) ); }
+            }
+            constexpr std::size_t guard{ 8 };
+            constexpr std::uint64_t canary{ 0xCAFE'F00D'CAFE'F00DULL };
+            std::vector<std::uint64_t> storage( guard + expected.size() + guard, canary );
+            auto const * const end{ detail::x86_v4::extract_setbits_uint64( words.data(), n, storage.data() + guard, expected.size(), base ) };
+            ASSERT_EQ( static_cast<std::size_t>( end - ( storage.data() + guard ) ), expected.size() );
+            EXPECT_TRUE( std::equal( expected.begin(), expected.end(), storage.begin() + guard ) );
+            EXPECT_TRUE( std::all_of( storage.begin(), storage.begin() + guard, [ & ]( auto const v ) { return v == canary; } ) ) << "wrote before the output";
+            EXPECT_TRUE( std::all_of( storage.begin() + static_cast<std::ptrdiff_t>( guard + expected.size() ), storage.end(), [ & ]( auto const v ) { return v == canary; } ) ) << "wrote past the output";
         }
     }
 }
