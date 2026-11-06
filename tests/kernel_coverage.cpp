@@ -321,6 +321,67 @@ TEST( KernelCoverage, BitsetIntersectionExtractionMixedWords ) {
 }
 
 // ---------------------------------------------------------------------------
+// The AVX-512 extraction of a bitset into the 16-bit values it holds: zero words spread out, in stretches,
+// between groups of nonzero words or after the last value, and lengths that end inside a group of eight words.
+// ---------------------------------------------------------------------------
+
+#if FRSR_ROARING_X86_V4
+
+using block_words = std::array<std::uint64_t, 1024>;
+
+// About `card` set bits: at random over the block, at random over its first card * 4 bits, in runs of 16 at
+// 16-aligned starts, packed into every other word with the words between them zero, or at random within some
+// groups of eight words, the other groups zero.
+[[nodiscard]] block_words sparse_block( std::mt19937_64 & rng, std::size_t const card, unsigned const shape ) {
+    block_words words{};
+    auto const set{ [ & ]( std::size_t const bit ) { words[ bit / 64 ] |= std::uint64_t{ 1 } << ( bit % 64 ); } };
+    for ( std::size_t k{ 0 }; k < card; ++k ) {
+        switch ( shape ) {
+            case 0: set( rng() % 65536 ); break;
+            case 1: set( rng() % std::min<std::size_t>( 65536, card * 4 ) ); break;
+            case 2: set( ( rng() % 4096 ) * 16 + k % 16 ); break;
+            case 3: set( ( rng() % 512 ) * 128 + rng() % 64 ); break;
+            default: set( ( rng() % 16 ) * 4096 + rng() % 512 ); break;
+        }
+    }
+    return words;
+}
+
+void expect_setbits_extracted( block_words const & words, std::size_t const n ) {
+    std::vector<std::uint16_t> expected;
+    for ( std::size_t i{ 0 }; i < n; ++i ) {
+        for ( auto w{ words[ i ] }; w != 0; w &= w - 1 ) { expected.emplace_back( static_cast<std::uint16_t>( i * 64 + std::countr_zero( w ) ) ); }
+    }
+    constexpr std::size_t guard{ 8 };
+    constexpr std::uint16_t canary{ 0xCAFE };
+    std::vector<std::uint16_t> storage( guard + expected.size() + guard, canary );
+    detail::x86_v4::extract_setbits_uint16( words.data(), n, storage.data() + guard, expected.size() );
+    EXPECT_TRUE( std::equal( expected.begin(), expected.end(), storage.begin() + guard ) );
+    EXPECT_TRUE( std::all_of( storage.begin(), storage.begin() + guard, [ & ]( auto const v ) { return v == canary; } ) ) << "wrote before the output";
+    EXPECT_TRUE( std::all_of( storage.begin() + static_cast<std::ptrdiff_t>( guard + expected.size() ), storage.end(), [ & ]( auto const v ) { return v == canary; } ) ) << "wrote past the output";
+}
+
+TEST( KernelCoverage, BitsetExtractionSparse ) {
+    if ( !detail::have_x86_v4() ) {
+        GTEST_SKIP() << "no AVX-512 VBMI2";
+    }
+    std::mt19937_64 rng{ 0x5E7B175 };
+    for ( std::size_t const card : { 1, 16, 100, 1000, 1024, 2047, 2048, 2049, 3000, 4096, 6000 } ) {
+        for ( unsigned shape{ 0 }; shape < 5; ++shape ) {
+            for ( int trial{ 0 }; trial < 8; ++trial ) {
+                auto const words{ sparse_block( rng, card, shape ) };
+                for ( std::size_t const n : { std::size_t{ 1024 }, std::size_t{ 1021 }, std::size_t{ 13 }, std::size_t{ 8 }, std::size_t{ 5 } } ) {
+                    SCOPED_TRACE( ::testing::Message() << "card " << card << " shape " << shape << " trial " << trial << " n " << n );
+                    expect_setbits_extracted( words, n );
+                }
+            }
+        }
+    }
+}
+
+#endif // FRSR_ROARING_X86_V4
+
+// ---------------------------------------------------------------------------
 // Small-array export into a caller's buffer: every cardinality around the vector
 // widths, misaligned destinations, a guarded buffer, and the top chunk.
 // ---------------------------------------------------------------------------

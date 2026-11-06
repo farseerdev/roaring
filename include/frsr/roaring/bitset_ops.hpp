@@ -134,48 +134,72 @@ inline void settle_stale_cardinality( bitset_ref<Layout, CowPolicy> lhs ) noexce
 #if FRSR_ROARING_X86_V4
 namespace x86_v4 {
 
-// Density above which the AVX-512 decoder below repays its per-word cost over the
-// byte-table SSE decoder: measured by CRoaring at ~1024 set bits per 8 KB block
-// (1.2x there, 1.4x at the array/bitset boundary).
-inline constexpr std::uint32_t extract_setbits_min_cardinality{ 1024 };
+// The byte indices 0..63: VPCOMPRESSB under a word's bits keeps the positions of its set bits, in order.
+alignas( 64 ) inline constexpr std::uint8_t byte_indices[ 64 ]{
+     0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15,
+    16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
+    32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47,
+    48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63
+};
 
-// AVX-512 VBMI2 set-bit decoder for one 8 KB block into 16-bit values: per word,
-// VPCOMPRESSB compacts the byte indices 0..63 named by the word's bits into a
-// vector, which is widened to 16 bits, offset by the word base and masked-stored
-// (two halves when more than 32 bits are set). A zero word costs one add. Masked
-// stores write exactly the decoded count, so `out` needs only popcount slots.
+// The low `count` bits set, for a masked store of `count` values (0 to 64 of them).
+[[nodiscard]] inline std::uint64_t low_lanes( unsigned const count ) noexcept {
+    return count == 64U ? ~std::uint64_t{ 0 } : ( std::uint64_t{ 1 } << count ) - 1U;
+}
+
+// Writes the `count` set-bit positions of `word`, plus the 16-bit lanes of `base`, to `out`: VPCOMPRESSB compacts
+// the byte indices the word names, which are widened to 16 bits and masked-stored (two halves when more than 32
+// bits are set). A zero word writes nothing.
+FRSR_ROARING_X86_V4_HELPER
+inline void decode_word_uint16( std::uint64_t const word, unsigned const count, __m512i const base, __m512i const indices, std::uint16_t * const out ) noexcept {
+    __m512i const packed{ _mm512_maskz_compress_epi8( static_cast<__mmask64>( word ), indices ) };
+    auto const lanes{ low_lanes( count ) };
+    _mm512_mask_storeu_epi16( out, static_cast<__mmask32>( lanes ),
+        _mm512_add_epi16( base, _mm512_cvtepu8_epi16( _mm512_castsi512_si256( packed ) ) ) );
+    if ( count > 32U ) {
+        _mm512_mask_storeu_epi16( out + 32, static_cast<__mmask32>( lanes >> 32U ),
+            _mm512_add_epi16( base, _mm512_cvtepu8_epi16( _mm512_extracti64x4_epi64( packed, 1 ) ) ) );
+    }
+}
+
+// AVX-512 VBMI2 set-bit decoder for one 8 KB block into the `count` 16-bit values its first `n` words hold (the
+// array conversion passes the cardinality). The words are taken eight at a time: a group of zero words, one
+// VPTESTMQ, is passed over, and the words of the others are decoded one by one, a zero word skipped by its own
+// test. Once `count` values are written it stops, instead of scanning the words past the last value: a few
+// values clustered at the start of a block cost a few groups.
 // [croaring-ref] deps/croaring/src/bitset_util.c:bitset_extract_setbits_avx512_uint16
 FRSR_ROARING_X86_V4_KERNEL
-inline std::size_t extract_setbits_uint16(
-    std::uint64_t const * const words, std::size_t const n, std::uint16_t * out
+inline void extract_setbits_uint16(
+    std::uint64_t const * const words, std::size_t const n, std::uint16_t * out, std::size_t const count
 ) noexcept {
-    alignas( 64 ) static constexpr std::uint8_t index_table[ 64 ]{
-         0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15,
-        16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
-        32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47,
-        48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63
-    };
-    auto const * const start{ out };
-    __m512i       base    { _mm512_setzero_si512() };
-    __m512i const inc64   { _mm512_set1_epi16( 64 ) };
-    __m512i const indices { _mm512_load_si512( index_table ) };
-    for ( std::size_t i{ 0 }; i < n; ++i ) {
-        std::uint64_t const w{ words[ i ] };
-        if ( w != 0 ) {
-            auto const count{ static_cast<unsigned>( std::popcount( w ) ) };
-            __m512i const packed{ _mm512_maskz_compress_epi8( static_cast<__mmask64>( w ), indices ) };
-            std::uint64_t const lanes{ ~std::uint64_t{ 0 } >> ( 64U - count ) };
-            _mm512_mask_storeu_epi16( out, static_cast<__mmask32>( lanes ),
-                _mm512_add_epi16( base, _mm512_cvtepu8_epi16( _mm512_castsi512_si256( packed ) ) ) );
-            if ( count > 32U ) {
-                _mm512_mask_storeu_epi16( out + 32, static_cast<__mmask32>( lanes >> 32U ),
-                    _mm512_add_epi16( base, _mm512_cvtepu8_epi16( _mm512_extracti64x4_epi64( packed, 1 ) ) ) );
+    auto const * const end{ out + count };
+    __m512i const indices{ _mm512_load_si512( byte_indices ) };
+    __m512i const inc64  { _mm512_set1_epi16( 64 ) };
+    __m512i const inc512 { _mm512_set1_epi16( 512 ) };
+    __m512i       base   { _mm512_setzero_si512() };
+    std::size_t i{ 0 };
+    for ( ; i + 8 <= n && out < end; i += 8 ) {
+        __m512i const group{ _mm512_loadu_si512( words + i ) };
+        if ( _mm512_test_epi64_mask( group, group ) != 0 ) {
+            auto word_base{ base };
+            for ( std::size_t j{ 0 }; j < 8; ++j ) {
+                auto const word{ words[ i + j ] };
+                if ( word != 0 ) {
+                    auto const added{ static_cast<unsigned>( std::popcount( word ) ) };
+                    decode_word_uint16( word, added, word_base, indices, out );
+                    out += added;
+                }
+                word_base = _mm512_add_epi16( word_base, inc64 );
             }
-            out += count;
         }
-        base = _mm512_add_epi16( base, inc64 );
+        base = _mm512_add_epi16( base, inc512 );
     }
-    return static_cast<std::size_t>( out - start );
+    for ( auto value_base{ static_cast<std::uint32_t>( i * 64 ) }; i < n && out < end; ++i, value_base += 64 ) {
+        for ( auto word{ words[ i ] }; word != 0; word &= word - 1 ) {
+            *out++ = static_cast<std::uint16_t>( value_base + static_cast<std::uint32_t>( std::countr_zero( word ) ) );
+        }
+    }
+    assert( out == end );
 }
 
 // AVX-512 VBMI2 set-bit decoder into 32-bit values: the same byte-index compress
@@ -189,15 +213,9 @@ inline std::uint32_t * extract_setbits_uint32(
     std::uint64_t const * const words, std::size_t const n,
     std::uint32_t * out, std::uint32_t * const out_end, std::uint32_t const base
 ) noexcept {
-    alignas( 64 ) static constexpr std::uint8_t index_table[ 64 ]{
-         0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15,
-        16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
-        32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47,
-        48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63
-    };
     __m512i       base_lanes{ _mm512_set1_epi32( static_cast<int>( base ) ) };
     __m512i const inc64     { _mm512_set1_epi32( 64 ) };
-    __m512i const indices   { _mm512_load_si512( index_table ) };
+    __m512i const indices   { _mm512_load_si512( byte_indices ) };
     std::size_t index{ 0 };
     FRSR_ROARING_LOOP_ALIGN for ( ; index < n; ++index ) {
         auto const word{ words[ index ] };
@@ -248,28 +266,15 @@ inline std::size_t extract_intersection_setbits_uint16(
     std::uint64_t const * const words1, std::uint64_t const * const words2, std::size_t const n,
     std::uint16_t * out, std::size_t const card
 ) noexcept {
-    alignas( 64 ) static constexpr std::uint8_t index_table[ 64 ]{
-         0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15,
-        16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
-        32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47,
-        48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63
-    };
     auto const * const start{ out };
     auto const * const end  { out + card };
     __m512i       base   { _mm512_setzero_si512() };
     __m512i const inc64  { _mm512_set1_epi16( 64 ) };
-    __m512i const indices{ _mm512_load_si512( index_table ) };
+    __m512i const indices{ _mm512_load_si512( byte_indices ) };
     FRSR_ROARING_LOOP_ALIGN for ( std::size_t i{ 0 }; i < n && out < end; ++i ) {
         std::uint64_t const w{ words1[ i ] & words2[ i ] };
         auto const count{ static_cast<unsigned>( std::popcount( w ) ) };
-        __m512i const packed{ _mm512_maskz_compress_epi8( static_cast<__mmask64>( w ), indices ) };
-        std::uint64_t const lanes{ count == 64U ? ~std::uint64_t{ 0 } : ( std::uint64_t{ 1 } << count ) - 1U };
-        _mm512_mask_storeu_epi16( out, static_cast<__mmask32>( lanes ),
-            _mm512_add_epi16( base, _mm512_cvtepu8_epi16( _mm512_castsi512_si256( packed ) ) ) );
-        if ( count > 32U ) {
-            _mm512_mask_storeu_epi16( out + 32, static_cast<__mmask32>( lanes >> 32U ),
-                _mm512_add_epi16( base, _mm512_cvtepu8_epi16( _mm512_extracti64x4_epi64( packed, 1 ) ) ) );
-        }
+        decode_word_uint16( w, count, base, indices, out );
         out += count;
         base = _mm512_add_epi16( base, inc64 );
     }
@@ -355,23 +360,22 @@ template <typename Layout, typename CowPolicy = cow_value_semantics>
     container_handle<Layout, CowPolicy> result;
     auto array{ result.as_array() };
     auto const & words{ bitset.words.as_array() };
-    // Below the vector decoder's break-even the plain trailing-zero loop is the fastest, as in the reference: the
-    // set bits of a sparse bitset are a couple per word, and a table-driven byte decode pays for every byte.
+    resize_uninitialized( array.values, cardinality );
+    // The vector decoder wins at every cardinality, down to a few values per block, as in the reference.
 #if FRSR_ROARING_X86_V4
     if constexpr ( std::is_same_v<typename Layout::low_type, std::uint16_t> ) {
-        if ( cardinality >= x86_v4::extract_setbits_min_cardinality && have_x86_v4() ) {
-            resize_uninitialized( array.values, cardinality );
-            auto const decoded{ x86_v4::extract_setbits_uint16( words.data(), words.size(), array.values.data() ) };
-            assert( decoded == cardinality );
-            array.values.resize( static_cast<std::uint32_t>( decoded ) );
+        if ( have_x86_v4() ) [[likely]] {
+            x86_v4::extract_setbits_uint16( words.data(), words.size(), array.values.data(), cardinality );
             array.sync_header();
             return result;
         }
     }
 #endif
-    resize_uninitialized( array.values, cardinality );
+    // The plain trailing-zero loop, which stops at the last value instead of scanning the zero words past it.
     auto * out{ array.values.data() };
-    for ( std::size_t word_index{ 0 }; word_index < words.size(); ++word_index ) {
+    auto const * const end{ out + cardinality };
+    for ( std::size_t word_index{ 0 }; out != end; ++word_index ) {
+        assert( word_index < words.size() );
         auto word{ words[ word_index ] };
         auto const base{ static_cast<std::uint32_t>( word_index ) << 6U };
         while ( word != 0 ) {
