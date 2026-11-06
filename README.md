@@ -97,17 +97,21 @@ unspecified contents.
 
 ## Copies
 
-Under a refcounted copy-on-write policy (`cow_atomic_refcount`, `cow_unsynchronized_refcount`) a copy of a bitmap whose
-keys are up to 32 bits wide shares the whole chunk table with the bitmap it was copied from: it takes one count on the
-table and touches nothing else, and dropping it gives the count back. The first call that changes either bitmap gives
-that bitmap a table of its own, which costs what copying the table cost before (one allocation, and one count on each
-payload, which stays shared until it is written); a call that would change nothing (`remove` of an absent key, `&=` with
-a superset, `-=` of a disjoint operand, an `optimize` that converts nothing, ...) finds that out on the shared table and
-leaves it shared. A `|=` with a bitmap is, by default, the exception: it makes the table its own whatever it adds (a
-`|=` with a view, keys or a range still asks first). `is_unique()` tells whether another bitmap holds the table and
-`shares_storage_with( other )` whether two bitmaps hold the same one. A table with room for only a few chunks is copied
-instead (see the knobs below), and so is the chunk table of a bitmap of 64-bit keys; both copies share the payloads.
-Under value semantics a copy copies everything.
+A copy of a bitmap shares its containers' payloads under a refcounted copy-on-write policy (`cow_atomic_refcount`,
+`cow_unsynchronized_refcount`): it takes one count on each, and the first change of a container makes that one its
+own. Under value semantics a copy copies everything.
+
+A build can have copies share the chunk table as well (`FRSR_ROARING_TABLE_SHARING=1`, off by default; see the knobs
+below). Then under a refcounted policy a copy of a bitmap whose keys are up to 32 bits wide shares the whole chunk table
+with the bitmap it was copied from: it takes one count on the table and touches nothing else, and dropping it gives the
+count back. The first call that changes either bitmap gives that bitmap a table of its own, which costs what copying the
+table cost before (one allocation, and one count on each payload, which stays shared until it is written); a call that
+would change nothing (`remove` of an absent key, `&=` with a superset, `-=` of a disjoint operand, an `optimize` that
+converts nothing, ...) finds that out on the shared table and leaves it shared. A `|=` with a bitmap is, by default, the
+exception: it makes the table its own whatever it adds (a `|=` with a view, keys or a range still asks first).
+`is_unique()` tells whether another bitmap holds the table and `shares_storage_with( other )` whether two bitmaps hold
+the same one. A table with room for only a few chunks is copied instead (see the knobs below), and so is the chunk table
+of a bitmap of 64-bit keys; both copies share the payloads.
 
 A call that changes nothing on a shared table leaves its containers as they are, where on a table of its own some such
 calls re-encode a container they rewrite (an `&=` with a superset may turn a run into an array, for instance): the keys
@@ -121,14 +125,15 @@ each copy is its holder's own to change.
 The parts of the sharing that trade one cost for another are compile-time knobs, all in
 `include/frsr/roaring/table_sharing_policy.hpp`, set with macros (and CMake cache variables) of the names below. They
 change the compiled bitmaps, so a program must be built with the values of the library it links (a mismatch fails to
-link). None of them changes anything under value semantics. The supported configurations are the defaults, sharing
-off, and the defaults with one knob set to another tested value (a small-table capacity of 0 or 16, a prefetch
+link). None of them changes anything under value semantics, and with sharing off a refcounted bitmap compiles to what
+it is without the sharing. The supported configurations are sharing off (the default), sharing on with the other
+defaults, and sharing on with one knob set to another tested value (a small-table capacity of 0 or 16, a prefetch
 distance of 8, a flag flipped); `tests/table_sharing_matrix.sh` builds and tests each, and any other combination does
 not compile.
 
 | knob | default | what it trades |
 |---|---|---|
-| `FRSR_ROARING_TABLE_SHARING` | 1 | 0: a copy copies the table and counts every payload, as before tables were shared |
+| `FRSR_ROARING_TABLE_SHARING` | 0 | 1: a copy shares the chunk table (above); 0: a copy copies the table and counts every payload |
 | `FRSR_ROARING_TABLE_SHARING_SMALL_CAPACITY` | 4 | a table with room for at most this many chunks carries no count and is copied: for a table of a few chunks a copy costs less than the first change of a shared one, which pays for a table of its own out of line (0: share every table) |
 | `FRSR_ROARING_TABLE_SHARING_UNION_CHECKS_FIRST` | 0 | 1: `a \|= b` on a shared table asks whether `b` adds anything and stays shared when it does not; costs a read of both bitmaps when it does add |
 | `FRSR_ROARING_TABLE_SHARING_SUBTRACT_CHECKS_FIRST` | 1 | `a -= b` on a shared table asks whether they intersect (stopping at the first common key) and stays shared when they do not; 0 builds the difference aside, copying every container `a` keeps, and keeps it only when it lost keys |

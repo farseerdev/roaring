@@ -474,8 +474,9 @@ public:
 
     [[nodiscard]] bool empty() const noexcept { return size_ == 0; }
 
-    // Under a refcounted CowPolicy a copy of a bitmap whose chunk keys are 16 bits wide (a key of up to 32 bits) shares
-    // the chunk table with the bitmap it was copied from instead of copying it: a copy costs one count on the table.
+    // In a build with table sharing on (FRSR_ROARING_TABLE_SHARING=1, table_sharing_policy.hpp), under a refcounted
+    // CowPolicy a copy of a bitmap whose chunk keys are 16 bits wide (a key of up to 32 bits) shares the chunk table
+    // with the bitmap it was copied from instead of copying it: a copy costs one count on the table.
     // The first call that changes either of them gives it a table of its own (copying the table then, as a copy did
     // before), and a call that would change nothing leaves the table shared. Whether no other bitmap holds this
     // bitmap's table:

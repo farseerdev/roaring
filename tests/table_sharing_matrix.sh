@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Builds and runs the tests in every supported configuration of the table sharing knobs
-# (include/frsr/roaring/table_sharing_policy.hpp): the defaults, sharing off, and the defaults with each knob set
-# otherwise, each also in the build that counts every table as shared (FRSR_ROARING_TEST_SHARE_EVERY_TABLE). The
-# builds keep assertions on.
+# (include/frsr/roaring/table_sharing_policy.hpp): sharing off (the default), sharing on, and sharing on with each
+# knob set otherwise, each configuration that shares also in the build that counts every table as shared
+# (FRSR_ROARING_TEST_SHARE_EVERY_TABLE). The builds keep assertions on.
 #
 #   tests/table_sharing_matrix.sh <build root> [extra cmake arguments...]
 #
@@ -19,16 +19,17 @@ shift
 mkdir -p "${build_root}"
 
 # name and knob settings of each supported configuration
+on=-DFRSR_ROARING_TABLE_SHARING=1
 configs=(
-    "default|"
-    "sharing-off|-DFRSR_ROARING_TABLE_SHARING=0"
-    "small-tables-shared|-DFRSR_ROARING_TABLE_SHARING_SMALL_CAPACITY=0"
-    "small-tables-to-16|-DFRSR_ROARING_TABLE_SHARING_SMALL_CAPACITY=16"
-    "union-checks-first|-DFRSR_ROARING_TABLE_SHARING_UNION_CHECKS_FIRST=1"
-    "subtract-builds-aside|-DFRSR_ROARING_TABLE_SHARING_SUBTRACT_CHECKS_FIRST=0"
-    "key-list-unshares|-DFRSR_ROARING_TABLE_SHARING_KEY_LIST_CHECKS_FIRST=0"
-    "optimize-in-place|-DFRSR_ROARING_TABLE_SHARING_OPTIMIZE_ASIDE=0"
-    "prefetch-8|-DFRSR_ROARING_TABLE_SHARING_PREFETCH_DISTANCE=8"
+    "sharing-off|"
+    "sharing|${on}"
+    "small-tables-shared|${on} -DFRSR_ROARING_TABLE_SHARING_SMALL_CAPACITY=0"
+    "small-tables-to-16|${on} -DFRSR_ROARING_TABLE_SHARING_SMALL_CAPACITY=16"
+    "union-checks-first|${on} -DFRSR_ROARING_TABLE_SHARING_UNION_CHECKS_FIRST=1"
+    "subtract-builds-aside|${on} -DFRSR_ROARING_TABLE_SHARING_SUBTRACT_CHECKS_FIRST=0"
+    "key-list-unshares|${on} -DFRSR_ROARING_TABLE_SHARING_KEY_LIST_CHECKS_FIRST=0"
+    "optimize-in-place|${on} -DFRSR_ROARING_TABLE_SHARING_OPTIMIZE_ASIDE=0"
+    "prefetch-8|${on} -DFRSR_ROARING_TABLE_SHARING_PREFETCH_DISTANCE=8"
 )
 
 failed=()

@@ -2,20 +2,20 @@
 
 // The knobs of chunk-table sharing, in one place.
 //
-// Under a refcounted copy-on-write policy a copy of a bitmap whose chunk keys are 16 bits wide holds the chunk
-// table of its source, and the first call that changes either of them gives it a table of its own (see
-// chunk_array.hpp, chunk_store.hpp and bitmap::is_unique). The parts of that machinery that trade one cost for
-// another are compile-time constants here; a build sets any of them otherwise with the macro of the same name
-// (-DFRSR_ROARING_TABLE_SHARING_...=<value>), and the branches it turns off compile to nothing. None of them changes
-// anything under value semantics, and with sharing off (FRSR_ROARING_TABLE_SHARING=0) a refcounted bitmap is laid
-// out and compiled as it is without this machinery.
+// A build that turns sharing on (FRSR_ROARING_TABLE_SHARING=1; it is off by default) makes a copy of a bitmap whose
+// chunk keys are 16 bits wide hold the chunk table of its source under a refcounted copy-on-write policy, and the
+// first call that changes either of them gives it a table of its own (see chunk_array.hpp, chunk_store.hpp and
+// bitmap::is_unique). The parts of that machinery that trade one cost for another are compile-time constants here; a
+// build sets any of them otherwise with the macro of the same name (-DFRSR_ROARING_TABLE_SHARING_...=<value>), and
+// the branches it turns off compile to nothing. None of them changes anything under value semantics, and with sharing
+// off a refcounted bitmap is laid out and compiled as it is without this machinery.
 //
 // The knobs change the code of the compiled bitmaps, so a program has to be built with the values its library was
 // built with; library_configuration.hpp makes any other combination fail to link.
 //
-// Only the defaults, sharing off, and the defaults with one knob set to one of its tested values are supported
-// (tests/table_sharing_matrix.sh builds and tests each); any other combination fails to compile here. To support one
-// more, add it to that script and to supported_configuration below.
+// Only sharing off (the default), sharing on with the other defaults, and sharing on with one knob set to one of its
+// tested values are supported (tests/table_sharing_matrix.sh builds and tests each); any other combination fails to
+// compile here. To support one more, add it to that script and to supported_configuration below.
 
 #include <cstdint>
 
@@ -23,8 +23,8 @@ namespace frsr::roaring::detail {
 
 struct table_sharing_defaults {
     // Whether copies share the chunk table at all. Off, a copy copies the table and takes a count on every payload,
-    // as it did before tables were shared.
-    static constexpr bool enabled{ true };
+    // and a refcounted bitmap holds none of the sharing machinery.
+    static constexpr bool enabled{ false };
 
     // A table whose block holds room for at most this many chunks carries no count and is never shared: a copy
     // copies it (0: every table that holds a chunk is shared). Sharing moves the cost of copying a table from the copy
@@ -134,8 +134,8 @@ private:
     };
 
 public:
-    // The tested configurations: sharing off, the defaults, and the defaults with one knob set to one of its tested
-    // values (a small-table capacity of 0 or 16, a prefetch distance of 8, or a flag flipped).
+    // The tested configurations: sharing off, sharing on with the other defaults, and sharing on with one knob set to
+    // one of its tested values (a small-table capacity of 0 or 16, a prefetch distance of 8, or a flag flipped).
     static constexpr bool supported_configuration{
         ( !enabled ) ||
         ( knobs_off_default <= 1 && tested_small_table_capacity && tested_prefetch_distance )

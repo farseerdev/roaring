@@ -24,7 +24,7 @@ env:
 
 jobs:
   linux:
-    name: ${{ matrix.compiler }} / ${{ matrix.sbo == 'on' && 'inline buffers' || 'no inline buffers' }} / ${{ matrix.mode }}
+    name: ${{ matrix.compiler }} / ${{ matrix.sbo == 'on' && 'inline buffers' || 'no inline buffers' }} / ${{ matrix.mode }}${{ matrix.sharing != 'off' && format(' / table sharing {0}', matrix.sharing) || '' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     strategy:
@@ -35,9 +35,16 @@ jobs:
         # compiled: the library holds the bitmap instantiations; header-only: every program instantiates its own;
         # lto: compiled, with link-time optimization across the library boundary.
         mode: [ compiled, header-only ]
+        # table sharing (off by default): on, and on with every table counted as shared at the start of each call
+        # that may change a bitmap, with assertions on (FRSR_ROARING_TEST_SHARE_EVERY_TABLE).
+        sharing: [ off ]
         include:
-          - { compiler: clang-22, sbo: off, mode: lto }
-          - { compiler: gcc-15,   sbo: off, mode: lto }
+          - { compiler: clang-22, sbo: off, mode: lto,      sharing: off }
+          - { compiler: gcc-15,   sbo: off, mode: lto,      sharing: off }
+          - { compiler: clang-22, sbo: off, mode: compiled, sharing: on }
+          - { compiler: gcc-15,   sbo: on,  mode: compiled, sharing: on }
+          - { compiler: clang-22, sbo: on,  mode: compiled, sharing: every-table }
+          - { compiler: gcc-15,   sbo: off, mode: compiled, sharing: every-table }
     steps:
       - uses: actions/checkout@v4
         with:
@@ -89,13 +96,28 @@ jobs:
             git -C "psiha/$name" checkout -q FETCH_HEAD
           done
           # psi::vm declares this out of line; its compiled library, which defines it, is not part of
-          # this build (serialization is off), so the one definition the headers need is built here.
+          # this build (serialization is off), so the one definition the headers need is built here. A build
+          # with assertions on also needs the Boost assertion handlers psi::vm enables.
           cat > psivm_shim.cpp <<'CPP'
+          #include <cstdio>
+          #include <cstdlib>
           #include <stdexcept>
           namespace psi::vm::detail {
           [[noreturn]] void throw_length_error()
           {
               throw std::length_error{ "psi::vm: requested size exceeds the allocator's addressable byte range" };
+          }
+          }
+          namespace boost {
+          [[noreturn]] void assertion_failed_msg( char const * expr, char const * msg, char const * function, char const * file, long line )
+          {
+              std::fprintf( stderr, "%s:%ld: %s: assertion failed: %s (%s)\n", file, line, function, expr, msg );
+              std::abort();
+          }
+          [[noreturn]] void assertion_failed( char const * expr, char const * function, char const * file, long line )
+          {
+              std::fprintf( stderr, "%s:%ld: %s: assertion failed: %s\n", file, line, function, expr );
+              std::abort();
           }
           }
           CPP
@@ -110,6 +132,10 @@ jobs:
             header-only) mode_args="-DFRSR_ROARING_HEADER_ONLY=ON" ;;
             lto)         mode_args="-DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON"
                          case "${{ matrix.compiler }}" in clang-*) mode_args="$mode_args -DCMAKE_EXE_LINKER_FLAGS=-fuse-ld=lld" ;; esac ;;
+          esac
+          case "${{ matrix.sharing }}" in
+            on)          mode_args="$mode_args -DFRSR_ROARING_TABLE_SHARING=1" ;;
+            every-table) mode_args="$mode_args -DFRSR_ROARING_TABLE_SHARING=1 -DFRSR_ROARING_TEST_SHARE_EVERY_TABLE=ON -DCMAKE_CXX_FLAGS_RELEASE=-O2" ;;
           esac
           cmake -S roaring -B build -G Ninja -DCMAKE_BUILD_TYPE=Release $mode_args \
             -DCMAKE_C_COMPILER="$CC" -DCMAKE_CXX_COMPILER="$CXX" \
