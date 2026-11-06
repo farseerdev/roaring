@@ -491,13 +491,17 @@ template <typename Layout, typename CowPolicy = cow_value_semantics>
 // threshold is honored as given rather than being re-gated on byte parity, which
 // would silently reduce it to the default. A run still wins over the bitset when it
 // is the smaller of the two (an explicit threshold trades against arrays only).
-template <typename Layout, typename RunSelectionPolicy = run_selection_eager>
-[[nodiscard]] inline container_kind choose_sorted_container_kind(
-    std::span<typename Layout::low_type const> const sorted_values,
-    std::size_t const bitset_threshold
+//
+// The decision needs the values only for their run count, which `count_runs( cap )` supplies (from the values or
+// from a bitset's words) and which is asked for only when runs are considered.
+template <typename Layout, typename RunSelectionPolicy, typename CountRuns>
+[[nodiscard]] inline container_kind choose_container_kind(
+    std::size_t const cardinality,
+    std::size_t const bitset_threshold,
+    CountRuns && count_runs
 ) {
-    auto const can_consider_run{ RunSelectionPolicy::eager && sorted_values.size() >= 64U };
-    auto const array_bytes{ sorted_values.size() * sizeof( typename Layout::low_type ) };
+    auto const can_consider_run{ RunSelectionPolicy::eager && cardinality >= 64U };
+    auto const array_bytes{ cardinality * sizeof( typename Layout::low_type ) };
     auto const bitset_bytes{ Layout::word_count * sizeof( std::uint64_t ) };
     // Only the ORDER of run_bytes against array_bytes/bitset_bytes matters below, so
     // the run scan may stop at the first count that can no longer win — decision-
@@ -508,17 +512,29 @@ template <typename Layout, typename RunSelectionPolicy = run_selection_eager>
     auto const run_count_cap{ std::max( array_bytes, bitset_bytes ) / run_bytes_per_run + 1U };
     auto const run_bytes{
         can_consider_run
-            ? run_count_from_sorted_values<Layout>( sorted_values, run_count_cap ) * run_bytes_per_run
+            ? count_runs( run_count_cap ) * run_bytes_per_run
             : std::numeric_limits<std::size_t>::max()
     };
 
-    if ( sorted_values.size() >= bitset_threshold && bitset_bytes <= run_bytes ) {
+    if ( cardinality >= bitset_threshold && bitset_bytes <= run_bytes ) {
         return container_kind::bitset;
     }
     if ( can_consider_run && run_bytes < array_bytes ) {
         return container_kind::run;
     }
     return container_kind::array;
+}
+
+template <typename Layout, typename RunSelectionPolicy = run_selection_eager>
+[[nodiscard]] inline container_kind choose_sorted_container_kind(
+    std::span<typename Layout::low_type const> const sorted_values,
+    std::size_t const bitset_threshold
+) {
+    return choose_container_kind<Layout, RunSelectionPolicy>(
+        sorted_values.size(),
+        bitset_threshold,
+        [ sorted_values ]( std::size_t const cap ) { return run_count_from_sorted_values<Layout>( sorted_values, cap ); }
+    );
 }
 
 template <typename Layout, typename CowPolicy = cow_value_semantics, typename RunSelectionPolicy = run_selection_eager>
@@ -1139,6 +1155,71 @@ template <typename Layout, typename CowPolicy = cow_value_semantics, typename Ru
         return container;
     }
     return optimize_container_for_storage<Layout, CowPolicy, RunSelectionPolicy>( std::move( container ), bitset_threshold );
+}
+
+// make_container_from_sorted_values for one chunk's values as the bitmap is handed them: whole keys, ascending,
+// duplicates allowed. Built straight into the container's payload with no staging copy of the low parts, as the
+// reference does: from the threshold on, the form is decided first, as make_container_from_sorted_values decides
+// it, from the distinct values and their runs counted on the keys, and a bitset is scattered straight from them;
+// otherwise the low parts are copied into an array, which make_container_from_filled_array settles (an eager
+// policy may prefer runs).
+// [croaring-ref] deps/croaring/src/roaring_array.c:ra_append (each chunk is appended in its final form)
+template <typename Layout, typename CowPolicy = cow_value_semantics, typename RunSelectionPolicy = run_selection_eager>
+[[nodiscard]] inline container_handle<Layout, CowPolicy> make_container_from_sorted_keys(
+    std::span<typename Layout::key_type const> const sorted_keys,
+    std::size_t const bitset_threshold
+) {
+    using handle_type = container_handle<Layout, CowPolicy>;
+    assert( !sorted_keys.empty() );
+    auto const * const keys{ sorted_keys.data() };
+    auto const size { sorted_keys.size() };
+    auto const front{ Layout::low_key( sorted_keys.front() ) };
+    auto const back { Layout::low_key( sorted_keys.back () ) };
+    // Ascending, so a duplicate equals the value before it and a run starts past a gap: both counted on the side,
+    // which keeps the copy and the counts free of a dependency from one value to the next.
+    if ( size >= bitset_threshold ) {
+        // Decided before anything is built, from the distinct values and their runs; a bitset is scattered straight
+        // from the keys, any other form is settled from the array below.
+        auto repeats  { std::uint32_t{ 0 } };
+        auto run_count{ std::size_t{ 1 } };
+        for ( std::size_t i{ 1 }; i < size; ++i ) {
+            auto const step{ keys[ i ] - keys[ i - 1U ] };
+            repeats   += static_cast<std::uint32_t>( step == 0U );
+            run_count += static_cast<std::size_t>( step > 1U );
+        }
+        auto const distinct{ static_cast<std::uint32_t>( size ) - repeats };
+        auto const kind{ choose_container_kind<Layout, RunSelectionPolicy>(
+            distinct,
+            bitset_threshold,
+            [ run_count ]( std::size_t const cap ) { return std::min( run_count, cap ); }
+        ) };
+        if ( kind == container_kind::bitset ) {
+            auto result{ handle_type::make_bitset_zeroed() };
+            auto & words{ result.as_bitset().words.as_array() };
+            for ( std::size_t i{ 0 }; i < size; ++i ) {
+                auto const low{ Layout::low_key( keys[ i ] ) };
+                words[ static_cast<std::size_t>( low ) >> 6U ] |= std::uint64_t{ 1 } << ( static_cast<unsigned>( low ) & 63U );
+            }
+            result.set_cardinality( distinct );
+            result.set_endpoints( front, back );
+            return result;
+        }
+    }
+    auto repeats{ std::uint32_t{ 0 } };
+    handle_type result;
+    auto array{ result.as_array() };
+    array.values.resize_uninitialized( static_cast<std::uint32_t>( size ) );
+    auto * const out{ array.values.data() };
+    out[ 0 ] = front;
+    for ( std::size_t i{ 1 }; i < size; ++i ) {
+        out[ i ]  = Layout::low_key( keys[ i ] );
+        repeats  += static_cast<std::uint32_t>( keys[ i ] == keys[ i - 1U ] );
+    }
+    if ( repeats != 0 ) [[unlikely]] {
+        array.values.resize_uninitialized( static_cast<std::uint32_t>( std::unique( out, out + size ) - out ) );
+    }
+    array.sync_header();
+    return make_container_from_filled_array<Layout, CowPolicy, RunSelectionPolicy>( std::move( result ), bitset_threshold );
 }
 
 // Flip of [begin, end] in a run container: the range joins the runs as one more

@@ -817,7 +817,7 @@ public:
         remove_many_sorted( sorted_values );
     }
 
-    [[ gnu::cold ]] void add_sorted_many(
+    void add_sorted_many(
         std::span<key_type const> const sorted_values,
         std::uint16_t const bitset_threshold = static_cast<std::uint16_t>( array_to_bitset_threshold )
     );
@@ -2162,6 +2162,25 @@ private:
             detail::small_array_values<low_type> values;
             values.assign( sorted_values.begin(), sorted_values.end() );
             return make_policy_container_from_sorted_vector<ForcedRunSelectionPolicy>( std::move( values ), bitset_threshold );
+        }
+    }
+
+    // One chunk's values as given to add_sorted_many (whole keys, ascending, duplicates allowed).
+    [[nodiscard]] static handle_type make_policy_container_from_sorted_keys(
+        std::span<key_type const> const sorted_keys,
+        std::uint16_t const bitset_threshold
+    ) {
+        if constexpr ( uses_default_container_set ) {
+            return detail::make_container_from_sorted_keys<layout_type, CowPolicy, RunSelectionPolicy>( sorted_keys, bitset_threshold );
+        } else {
+            detail::small_array_values<low_type> values;
+            for ( auto const key : sorted_keys ) {
+                auto const low{ layout_type::low_key( key ) };
+                if ( values.empty() || values.back() != low ) {
+                    values.push_back( low );
+                }
+            }
+            return make_policy_container_from_sorted_vector( std::move( values ), bitset_threshold );
         }
     }
 

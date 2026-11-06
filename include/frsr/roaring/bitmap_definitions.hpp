@@ -234,17 +234,28 @@ FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::remove_many_sorted( std
 
 FRSR_ROARING_BITMAP_TEMPLATE
 FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::add_sorted_many( std::span<key_type const> const sorted_values, std::uint16_t const bitset_threshold ) {
-    if ( !empty() ) {
+    if ( sorted_values.empty() ) {
+        return;
+    }
+    settle_counts();
+    // Chunks past the last one held are appended, each built in its final form; values reaching back into the
+    // chunks held are merged into them.
+    // [croaring-ref] deps/croaring/src/roaring_array.c:ra_append
+    if ( !chunks_.empty() && layout_type::chunk_key( sorted_values.front() ) <= chunks_.key( chunks_.last() ) ) {
         add_many_sorted( sorted_values );
         return;
     }
 
-    chunks_.clear();
-    size_ = 0;
-    for_each_chunk_group( sorted_values, [ & ]( chunk_type const chunk, std::span<low_type const> const lows ) {
-        chunks_.push_back( chunk, make_policy_container_from_sorted_values( lows, bitset_threshold ) );
-        size_ += lows.size();
-    } );
+    auto const end{ sorted_values.end() };
+    auto group{ sorted_values.begin() };
+    while ( group != end ) {
+        auto const chunk{ layout_type::chunk_key( *group ) };
+        auto const group_end{ std::find_if( group, end, [ chunk ]( key_type const value ) { return layout_type::chunk_key( value ) != chunk; } ) };
+        auto container{ make_policy_container_from_sorted_keys( { group, group_end }, bitset_threshold ) };
+        size_ += static_cast<size_type>( container.cardinality() );
+        chunks_.push_back( chunk, std::move( container ) );
+        group = group_end;
+    }
 }
 
 FRSR_ROARING_BITMAP_TEMPLATE

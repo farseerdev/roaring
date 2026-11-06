@@ -259,6 +259,82 @@ TEST(FrsrRoaringSmoke, SortedBulkConstructionHonorsAnExplicitBitsetThreshold) {
     EXPECT_EQ( under_threshold.statistics().array_containers, 1U );
 }
 
+TEST(FrsrRoaringSmoke, SortedBulkConstructionAppendedChunkByChunkMatchesOneCall) {
+    // An index is built a window of chunks at a time: values past the bitmap's last chunk are appended with the
+    // caller's threshold, exactly as if all of them had been given in one call.
+    using LazyBitmap = frsr::roaring::bitmap<
+        std::uint32_t,
+        frsr::roaring::default_container_set<std::uint32_t>,
+        frsr::roaring::detail::cow_value_semantics,
+        frsr::roaring::detail::run_selection_lazy
+    >;
+    // Per chunk: 300 values (array), 2'000 (between the explicit threshold and the array limit: a bitset only
+    // because it was asked for), 8'000 (bitset), and a dense run.
+    std::vector<std::uint32_t> values;
+    for ( std::uint32_t chunk{ 0U }; chunk < 8U; ++chunk ) {
+        auto const base{ chunk << 16U };
+        auto const count{ std::array{ 300U, 2'000U, 8'000U, 3'000U }[ chunk % 4U ] };
+        auto const stride{ chunk % 4U == 3U ? 1U : 65'536U / count };
+        for ( std::uint32_t i{ 0U }; i < count; ++i ) {
+            values.push_back( base + i * stride );
+        }
+    }
+    auto const check{ [ & ]<typename Bitmap>( Bitmap const & ) {
+        Bitmap whole;
+        whole.add_sorted_many( values, 1'024U );
+        Bitmap windowed;
+        auto const half{ static_cast<std::size_t>( std::ranges::find_if( values, []( std::uint32_t const value ) { return value >= ( 4U << 16U ); } ) - values.begin() ) };
+        windowed.add_sorted_many( std::span{ values }.first( half ), 1'024U );
+        windowed.add_sorted_many( std::span{ values }.subspan( half ), 1'024U );
+        EXPECT_EQ( windowed.to_vector(), values );
+        EXPECT_EQ( windowed.size(), values.size() );
+        EXPECT_EQ( windowed.statistics().array_containers , whole.statistics().array_containers  );
+        EXPECT_EQ( windowed.statistics().bitset_containers, whole.statistics().bitset_containers );
+        EXPECT_EQ( windowed.statistics().run_containers   , whole.statistics().run_containers    );
+        EXPECT_EQ( windowed, whole );
+    } };
+    check( TestBitmap{} );
+    check( LazyBitmap{} );
+    LazyBitmap lazy;
+    lazy.add_sorted_many( values, 1'024U );
+    EXPECT_EQ( lazy.statistics().array_containers , 2U );
+    EXPECT_EQ( lazy.statistics().bitset_containers, 6U );
+
+    // Values reaching back into a chunk already held are merged into it.
+    LazyBitmap merged;
+    merged.add_sorted_many( std::vector<std::uint32_t>{ 1U, 5U, ( 1U << 16U ) + 2U }, 1'024U );
+    merged.add_sorted_many( std::vector<std::uint32_t>{ 3U, ( 1U << 16U ) + 2U, ( 2U << 16U ) + 9U }, 1'024U );
+    EXPECT_EQ( merged.to_vector(), ( std::vector<std::uint32_t>{ 1U, 3U, 5U, ( 1U << 16U ) + 2U, ( 2U << 16U ) + 9U } ) );
+    EXPECT_EQ( merged.size(), 5U );
+}
+
+TEST(FrsrRoaringSmoke, SortedBulkConstructionDropsDuplicates) {
+    // Duplicates count once, also where the count with them reaches the threshold and the values without them do not.
+    std::vector<std::uint32_t> values;
+    for ( std::uint32_t value{ 0U }; value < 600U; ++value ) {
+        values.push_back( value * 7U );
+        values.push_back( value * 7U );
+    }
+    TestBitmap bitmap;
+    bitmap.add_sorted_many( values, 1'024U );
+    EXPECT_EQ( bitmap.size(), 600U );
+    EXPECT_EQ( bitmap.statistics().array_containers, 1U );
+    EXPECT_TRUE( bitmap.contains( 7U * 599U ) );
+    EXPECT_FALSE( bitmap.contains( 1U ) );
+
+    std::vector<std::uint32_t> dense;
+    for ( std::uint32_t value{ 0U }; value < 3'000U; ++value ) {
+        dense.push_back( value * 3U );
+        dense.push_back( value * 3U );
+    }
+    TestBitmap bitset;
+    bitset.add_sorted_many( dense, 1'024U );
+    EXPECT_EQ( bitset.size(), 3'000U );
+    EXPECT_EQ( bitset.statistics().bitset_containers, 1U );
+    EXPECT_EQ( bitset.front(), 0U );
+    EXPECT_EQ( bitset.back(), 3U * 2'999U );
+}
+
 TEST(FrsrRoaringSmoke, PublicContainerTypesAreDirectlyUsable) {
     frsr::roaring::run<std::uint16_t> const segment{ 100U, 140U };
     EXPECT_EQ( segment.begin, 100U );
