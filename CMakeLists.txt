@@ -319,6 +319,10 @@ if(FRSR_ROARING_BUILD_TESTS)
         tests/interop.cpp
         tests/view_operands.cpp
         tests/upstream_parity_queries.cpp
+        tests/upstream_cases.cpp
+        tests/upstream_cases_64.cpp
+        tests/upstream_serialization_cases.cpp
+        tests/upstream_container_cases.cpp
         tests/symmetric_difference.cpp
         tests/noexcept_policy.cpp
         tests/ranked_view.cpp
@@ -334,6 +338,8 @@ if(FRSR_ROARING_BUILD_TESTS)
             GTest::gtest_main
     )
     frsr_roaring_see_definitions(frsr_roaring_tests)
+    # data files the reference's test suite shares with the Java and Go implementations
+    target_compile_definitions(frsr_roaring_tests PRIVATE FRSR_ROARING_TEST_DATA_DIR="${PROJECT_SOURCE_DIR}/tests/data")
     set_target_properties(frsr_roaring_tests PROPERTIES
         CXX_STANDARD 26
         CXX_STANDARD_REQUIRED ON
@@ -384,6 +390,8 @@ if(FRSR_ROARING_BUILD_TESTS)
             tests/ranked_view_crosscheck.cpp
             tests/andnot_runs_crosscheck.cpp
             tests/optimize_crosscheck.cpp
+            tests/upstream_reference_crosscheck.cpp
+            tests/upstream_reference_crosscheck_64.cpp
         )
         target_link_libraries(frsr_roaring_croaring_crosscheck
             PRIVATE
@@ -392,6 +400,7 @@ if(FRSR_ROARING_BUILD_TESTS)
                 roaring
         )
         frsr_roaring_see_definitions(frsr_roaring_croaring_crosscheck)
+        target_compile_definitions(frsr_roaring_croaring_crosscheck PRIVATE FRSR_ROARING_TEST_DATA_DIR="${PROJECT_SOURCE_DIR}/tests/data")
         set_target_properties(frsr_roaring_croaring_crosscheck PROPERTIES
             CXX_STANDARD 26
             CXX_STANDARD_REQUIRED ON
