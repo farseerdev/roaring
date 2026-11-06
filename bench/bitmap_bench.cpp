@@ -1,4 +1,5 @@
 #include <frsr/roaring/bitmap.hpp>
+#include <frsr/roaring/ranked_view.hpp>
 #include <frsr/roaring/shared_bitmap.hpp>
 
 #include <algorithm>
@@ -10471,6 +10472,109 @@ static void register_benchmarks() {
 
 } // namespace kernel_bands
 
+// ---- select: the value of a given rank ------------------------------------------------------------------------
+// roaring_bitmap_select against the select of the ranked frozen image (the mutable bitmap has none). The shapes are
+// the ones CRoaring measured its container skipping and its bitset select with: a million random values below 2^23
+// (122 bitset chunks), below 2^32 (sparse arrays across every chunk) and in runs, probed at random ranks or at one
+// rank deep in the bitmap.
+namespace select_bands {
+
+using frsr::roaring::ranked_view;
+
+struct select_state {
+    std::vector<std::uint64_t>  storage;
+    ranked_view<std::uint32_t>  view;
+    roaring_bitmap_t *          reference{};
+    std::vector<std::uint32_t>  ranks;
+    ~select_state() { roaring_bitmap_free( reference ); }
+};
+
+static std::vector<std::uint32_t> select_values( std::string_view const shape ) {
+    std::vector<std::uint32_t> values;
+    values.reserve( 1'000'000 );
+    if ( shape == "runs" ) {
+        for ( std::uint32_t start{ 0 }; values.size() < 1'000'000; start += 1'000 ) {
+            for ( std::uint32_t i{ 0 }; i < 100; ++i ) {
+                values.emplace_back( start + i );
+            }
+        }
+        return values;
+    }
+    auto const universe{ shape == "universe=8M" ? std::uint64_t{ 1 } << 23 : std::uint64_t{ 1 } << 32 };
+    std::mt19937_64 rng{ 0x5E1EC7 };
+    for ( std::size_t i{ 0 }; i < 1'000'000; ++i ) {
+        values.emplace_back( static_cast<std::uint32_t>( rng() % universe ) );
+    }
+    std::ranges::sort( values );
+    auto const duplicates{ std::ranges::unique( values ) };
+    values.erase( duplicates.begin(), duplicates.end() );
+    return values;
+}
+
+static void register_select( std::string const & shape, bool const deep, bool const frsr ) {
+    Entry e;
+    e.name = std::string( "select/" ) + ( frsr ? "frsr-ranked" : "cpp" ) + "Select/" + shape + ( deep ? "/rank=deep" : "/rank=random" );
+    e.description = "Select over a million values (" + shape + "), " +
+        ( deep ? "always the rank 90% into the bitmap" : "256 random ranks" ) +
+        ( frsr ? ": ranked_view::select on the ranked frozen image." : ": roaring_bitmap_select." );
+    e.setup = [shape, deep]() -> void * {
+        auto * const s{ new select_state{} };
+        auto const values{ select_values( shape ) };
+        frsr::roaring::bitmap<std::uint32_t> table;
+        table.add_sorted_many( values );
+        table.optimize();
+        auto const size{ table.frozen_size_bytes( { .ranked = true } ) };
+        s->storage.resize( ( size + 7 ) / 8 );
+        auto const bytes{ std::span<std::byte>{ reinterpret_cast<std::byte *>( s->storage.data() ), size } };
+        table.frozen_serialize( bytes, { .ranked = true } );
+        s->view = ranked_view<std::uint32_t>::from( std::span<std::byte const>{ bytes } );
+        s->reference = roaring_bitmap_of_ptr( values.size(), values.data() );
+        roaring_bitmap_run_optimize( s->reference );
+        std::mt19937_64 rng{ 0x5E1EC7 + values.size() };
+        for ( std::size_t i{ 0 }; i < 256; ++i ) {
+            auto const rank{ deep ? values.size() * 9 / 10 : rng() % values.size() };
+            s->ranks.emplace_back( static_cast<std::uint32_t>( rank ) );
+        }
+        return s;
+    };
+    if ( frsr ) {
+        e.run = []( void * const sv ) -> int64_t {
+            auto const * const s{ static_cast<select_state const *>( sv ) };
+            std::int64_t sum{};
+            for ( auto const rank : s->ranks ) {
+                sum += s->view.select( rank );
+            }
+            return sum;
+        };
+    } else {
+        e.run = []( void * const sv ) -> int64_t {
+            auto const * const s{ static_cast<select_state const *>( sv ) };
+            std::int64_t sum{};
+            for ( auto const rank : s->ranks ) {
+                std::uint32_t value{};
+                roaring_bitmap_select( s->reference, rank, &value );
+                sum += value;
+            }
+            return sum;
+        };
+    }
+    e.teardown = []( void * const sv ) { delete static_cast<select_state *>( sv ); };
+    e.ops_per_run = 256;
+    e.reusable_state = true;
+    g_benchmarks.emplace_back( std::move( e ) );
+}
+
+static void register_benchmarks() {
+    for ( std::string const shape : { "universe=8M", "universe=4G", "runs" } ) {
+        for ( auto const deep : { false, true } ) {
+            register_select( shape, deep, true );
+            register_select( shape, deep, false );
+        }
+    }
+}
+
+} // namespace select_bands
+
 #endif // FRSR_ROARING_HAS_CROARING
 
 } // namespace
@@ -10486,6 +10590,7 @@ int main(int argc, char *argv[]) {
     set_ops::register_benchmarks();
     chunk_probe::register_benchmarks();
     kernel_bands::register_benchmarks();
+    select_bands::register_benchmarks();
 #endif
 
     std::string filter;
