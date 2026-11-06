@@ -56,9 +56,26 @@ inline constexpr std::size_t lazy_union_array_bound{ FRSR_ROARING_LAZY_UNION_ARR
 inline constexpr std::size_t lazy_xor_array_bound{ 1024 };
 
 // Two sorted arrays this many times apart in length are crossed by searching the longer one for each value of the
-// shorter one instead of walking both in step: the array intersection and the sorted batch added to an array.
+// shorter one instead of walking both in step: the array intersection, the nonempty-intersection test and the sorted
+// batch removed from an array (a batch of adjacent values, the usual removal, loses at a lower ratio).
 // [croaring-ref] deps/croaring/src/containers/array.c:array_container_intersection (`const int threshold = 64;`)
 inline constexpr std::size_t kSkewedIntersectRatioThreshold{ 64 };
+
+// The scalar array merges (union, intersection, difference, symmetric difference) place each value of one side in the
+// other by galloping, instead of stepping through both, when that side is this many times shorter: from the start,
+// or once fewer than four values remain on one side (array_ops.hpp, union_sorted_scalar and its siblings); the
+// sorted batch added to an array, and with it the scalar in-place array union, likewise.
+// [croaring-ref] deps/croaring/include/roaring/array_util.h:CROARING_SKEWED_MERGE_RATIO
+inline constexpr std::size_t kSkewedMergeRatio{ 8 };
+
+// The vectorized array union and symmetric difference move several values per cycle, so they give way to the
+// galloping scalar merge only when the sides differ by more than this.
+// [croaring-ref] deps/croaring/include/roaring/array_util.h:CROARING_SKEWED_VECTOR_MERGE_RATIO
+inline constexpr std::size_t kSkewedVectorMergeRatio{ 32 };
+
+// The vectorized array difference gives way to the galloping scalar merge when the sides differ by more than this.
+// [croaring-ref] deps/croaring/src/containers/array.c:array_container_andnot (`card_min * 128 < card_max`)
+inline constexpr std::size_t kSkewedVectorDifferenceRatio{ 128 };
 
 // Route the in-place bitset combine through the Harley-Seal carry-save kernel
 // (fused_combine_inplace_popcount) instead of the naive per-word loop in

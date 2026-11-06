@@ -406,6 +406,21 @@ template <typename Layout, typename CowPolicy = cow_value_semantics>
             std::same_as<left_type, array_cref<Layout, CowPolicy>> &&
             std::same_as<right_type, array_cref<Layout, CowPolicy>>
         ) {
+            // An array many times shorter than the other is looked up in it value by value, by galloping.
+            // [croaring-ref] deps/croaring/src/containers/array.c:array_container_intersect
+            auto const left_shorter{ left.values.size() <= right.values.size() };
+            auto const & shorter{ left_shorter ? left.values : right.values };
+            auto const & longer { left_shorter ? right.values : left.values };
+            if ( shorter_by( kSkewedIntersectRatioThreshold, shorter.size(), longer.size() ) ) {
+                std::size_t at{ 0 };
+                for ( auto const value : shorter ) {
+                    at = gallop_forward<false>( longer.data(), at, longer.size(), value );
+                    if ( at != longer.size() && longer.data()[ at ] == value ) {
+                        return true;
+                    }
+                }
+                return false;
+            }
             auto li{ left.values.begin() };
             auto ri{ right.values.begin() };
             while ( li != left.values.end() && ri != right.values.end() ) {

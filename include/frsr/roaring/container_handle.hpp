@@ -1185,6 +1185,74 @@ public:
     payload_vector_const_view<Layout, low_type, CowPolicy> values;
 };
 
+// The few incoming values of union_sorted_inplace placed by galloping: the held values above each one move up as one
+// block, found by galloping down from the last one placed. Out of line, so the merge form stays small enough to be
+// inlined into the loops that union one chunk's few values after another.
+template <typename T>
+[[ gnu::noinline ]] inline void place_few_sorted_inplace( T * const data, std::ptrdiff_t & held, std::ptrdiff_t & out, T const * const incoming, std::ptrdiff_t next ) noexcept {
+    for ( ; next != 0; --next ) {
+        auto const value{ incoming[ next - 1 ] };
+        // The first held position whose value is above `value`: data[ above, held ) moves up.
+        auto above{ held };
+        if ( above != 0 && value < data[ above - 1 ] ) {
+            auto known_above{ above - 1 };
+            auto step       { std::ptrdiff_t{ 1 } };
+            auto probe      { known_above - step };
+            while ( probe >= 0 && value < data[ probe ] ) {
+                known_above = probe;
+                step       *= 2;
+                probe       = known_above - step;
+            }
+            above = std::upper_bound( data + std::max( probe + 1, std::ptrdiff_t{ 0 } ), data + known_above, value ) - data;
+        }
+        auto const block{ held - above };
+        out -= block;
+        std::memmove( data + out, data + above, static_cast<std::size_t>( block ) * sizeof( T ) );
+        held = above;
+        if ( held != 0 && data[ held - 1 ] == value ) {
+            --held;
+        }
+        data[ --out ] = value;
+    }
+}
+
+// In-place union of the `held` sorted values at data[ 0, held ) with the `n` sorted `incoming` ones, into the room
+// the caller has made at data[ 0, held + n ): one backward pass, in which a value both sides hold is placed once and
+// the room such values leave unused is closed by one move at the end. Returns how many incoming values were new.
+// When the incoming values are few against the held ones (kSkewedMergeRatio, as in the array merges), they are
+// placed by galloping (place_few_sorted_inplace).
+// [croaring-ref] deps/croaring/src/array_util.c:union_uint16_inplace
+template <typename T>
+[[ gnu::hot ]] inline std::size_t union_sorted_inplace( T * const data, std::size_t const held_count, T const * const incoming, std::size_t const n ) noexcept {
+    auto held{ static_cast<std::ptrdiff_t>( held_count ) };       // data[ 0, held ) not yet moved
+    auto out { static_cast<std::ptrdiff_t>( held_count + n ) };   // data[ out, held_count + n ) merged
+    auto next{ static_cast<std::ptrdiff_t>( n ) };
+    if ( n * kSkewedMergeRatio < held_count ) {
+        place_few_sorted_inplace( data, held, out, incoming, next );
+    } else {
+        while ( held != 0 && next != 0 ) {
+            auto const value{ incoming[ next - 1 ] };
+            if ( data[ held - 1 ] > value ) {
+                data[ --out ] = data[ --held ];
+            } else if ( value > data[ held - 1 ] ) {
+                data[ --out ] = value;
+                --next;
+            } else {
+                data[ --out ] = data[ --held ];
+                --next;
+            }
+        }
+        while ( next != 0 ) {
+            data[ --out ] = incoming[ --next ];
+        }
+    }
+    auto const added{ n - static_cast<std::size_t>( out - held ) };
+    if ( out != held ) {
+        std::memmove( data + held, data + out, static_cast<std::size_t>( static_cast<std::ptrdiff_t>( held_count + n ) - out ) * sizeof( T ) );
+    }
+    return added;
+}
+
 template <typename Layout, typename CowPolicy>
 class array_ref {
 public:
@@ -1282,8 +1350,7 @@ public:
     // The append-only case - every incoming value above the container's maximum,
     // which is what inserting a batch of ascending table rows looks like - is a
     // single resize and memcpy. Otherwise the group is merged in place, backward
-    // from the end (both sources are read above the write cursor, so no scratch
-    // buffer is needed).
+    // from the end (union_sorted_inplace).
     // [croaring-ref] deps/croaring/src/containers/array.c:array_container_append
     std::size_t add_sorted( std::span<low_type const> const sorted_values ) {
         if ( sorted_values.empty() ) {
@@ -1301,49 +1368,10 @@ public:
             return sorted_values.size();
         }
 
-        // One pass into room for every incoming value: values already held leave room unused at the bottom,
-        // closed by one move of the merged part at the end. When the incoming values are few against the held
-        // ones (the reference's skew ratio), the held values above each incoming one move up as one block, found
-        // by galloping down from the last one placed.
         auto const incoming{ sorted_values.size() };
-        auto const skewed  { incoming * kSkewedIntersectRatioThreshold < cardinality };
         values.resize_uninitialized( static_cast<std::uint32_t>( cardinality + incoming ) );
-        auto * const data{ values.data() };
-        auto held{ static_cast<std::ptrdiff_t>( cardinality ) };              // data[ 0, held ) not yet moved
-        auto out { static_cast<std::ptrdiff_t>( cardinality + incoming ) };   // data[ out, end ) merged
-        for ( auto next{ incoming }; next != 0; --next ) {
-            auto const value{ sorted_values[ next - 1U ] };
-            if ( skewed ) {
-                // The first held position whose value is above `value`: data[ above, held ) moves up.
-                auto above{ held };
-                if ( above != 0 && value < data[ above - 1 ] ) {
-                    auto known_above{ above - 1 };
-                    auto step       { std::ptrdiff_t{ 1 } };
-                    auto probe      { known_above - step };
-                    while ( probe >= 0 && value < data[ probe ] ) {
-                        known_above = probe;
-                        step       *= 2;
-                        probe       = known_above - step;
-                    }
-                    above = std::upper_bound( data + std::max( probe + 1, std::ptrdiff_t{ 0 } ), data + known_above, value ) - data;
-                }
-                auto const block{ held - above };
-                out -= block;
-                std::memmove( data + out, data + above, static_cast<std::size_t>( block ) * sizeof( low_type ) );
-                held = above;
-            } else {
-                while ( held != 0 && value < data[ held - 1 ] ) {
-                    data[ --out ] = data[ --held ];
-                }
-            }
-            if ( held != 0 && data[ held - 1 ] == value ) {
-                --held;
-            }
-            data[ --out ] = value;
-        }
-        auto const added{ incoming - static_cast<std::size_t>( out - held ) };
-        if ( out != held ) {
-            std::memmove( data + held, data + out, static_cast<std::size_t>( static_cast<std::ptrdiff_t>( cardinality + incoming ) - out ) * sizeof( low_type ) );
+        auto const added{ union_sorted_inplace( values.data(), cardinality, sorted_values.data(), incoming ) };
+        if ( added != incoming ) {
             values.resize_uninitialized( static_cast<std::uint32_t>( cardinality + added ) );
         }
         sync_header();
@@ -1427,7 +1455,8 @@ public:
     // Restores the header invariants (cardinality == count, endpoints ==
     // front/back) after any direct mutation of `values`. Every raw-payload
     // write site (resize_uninitialized + fill, assign, …) must end with this.
-    void sync_header() noexcept {
+    // Three stores, inlined into every array mutation that ends with it, whatever that mutation's own size.
+    [[ gnu::always_inline ]] void sync_header() noexcept {
         auto const n{ values.size() };
         handle_->set_cardinality( n );
         if ( n != 0 ) {
