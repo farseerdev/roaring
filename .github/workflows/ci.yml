@@ -11,7 +11,7 @@ concurrency:
 
 env:
   BOOST_VERSION: 1.92.0
-  CROARING_REF: v5.3.0
+  CROARING_REF: v5.5.5
   # the dependencies the headers include, at the commits the library is developed against
   PSIHA_PINS: >-
     build=fc1bc9c2bfa157f1eb2537881d124afb039bd20a
