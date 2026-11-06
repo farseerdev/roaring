@@ -273,6 +273,9 @@ static constexpr uint64_t kBitmasks[] = {
     0x5DBFC83E00000000ULL, 0x0000493B189604B6ULL, 0x493B189604B60000ULL,
     0x420C684950A2D088ULL};
 
+// The lookups a measured run of the contains bands makes (see FAMILY 1).
+static constexpr std::int64_t kContainsBatch{ 1000 };
+
 // CRoaring microbench uses 2^20 preload. Keep a lower default here so the full
 // cross-backend suite remains runnable in one session while preserving behavior.
 static constexpr std::size_t kRandomPreload = (1U << 16);
@@ -295,6 +298,11 @@ static std::string fmt_params(size_t count, uint64_t step) {
 
 // ====== FAMILY 1: ContainsHit / ContainsMiss (r64, cpp, set) ===================
 // ported from deps/croaring/benchmarks/benchmark.cpp:3233-3423
+//
+// Upstream's google-benchmark loop reads the clock around the whole run of lookups, not around each one, so a measured
+// run here is a batch of lookups. Reading the clock around each lookup would add more than the lookup costs and keep
+// one lookup from overlapping the next: it would measure the latency of a lookup, where upstream measures how many
+// lookups a loop gets through.
 
 #if FRSR_ROARING_HAS_CROARING
 
@@ -348,13 +356,17 @@ struct synthetic_frsr_ContainsHit_registrar {
             };
             e.run = [](void *sv) -> int64_t {
                 auto *s = static_cast<frsrHitState<Arm> *>(sv);
-                uint64_t v = s->i * s->step;
-                s->i = (s->i + 1) % s->count;
-                return s->r.contains(v) ? 1 : 0;
+                std::int64_t found{ 0 };
+                for (std::int64_t k{ 0 }; k < kContainsBatch; ++k) {
+                    uint64_t v = s->i * s->step;
+                    s->i = (s->i + 1) % s->count;
+                    found += s->r.contains(v) ? 1 : 0;
+                }
+                return found;
             };
             e.teardown = [](void *sv) { delete static_cast<frsrHitState<Arm> *>(sv); };
-            e.ops_per_run = 1;
-            e.inner_reps = 10000;
+            e.ops_per_run = kContainsBatch;
+            e.inner_reps = 10000 / kContainsBatch;
             e.reusable_state = true;
             g_benchmarks.push_back(std::move(e));
         }
@@ -382,13 +394,17 @@ struct synthetic_frsr_ContainsMiss_registrar {
             };
             e.run = [](void *sv) -> int64_t {
                 auto *s = static_cast<frsrHitState<Arm> *>(sv);
-                uint64_t v = ( ( s->i + 1 ) * s->step ) - 1;
-                s->i = (s->i + 1) % s->count;
-                return s->r.contains(v) ? 1 : 0;
+                std::int64_t found{ 0 };
+                for (std::int64_t k{ 0 }; k < kContainsBatch; ++k) {
+                    uint64_t v = ( ( s->i + 1 ) * s->step ) - 1;
+                    s->i = (s->i + 1) % s->count;
+                    found += s->r.contains(v) ? 1 : 0;
+                }
+                return found;
             };
             e.teardown = [](void *sv) { delete static_cast<frsrHitState<Arm> *>(sv); };
-            e.ops_per_run = 1;
-            e.inner_reps = 10000;
+            e.ops_per_run = kContainsBatch;
+            e.inner_reps = 10000 / kContainsBatch;
             e.reusable_state = true;
             g_benchmarks.push_back(std::move(e));
         }
@@ -410,9 +426,9 @@ static void register_contains_variants() {
                     "synthetic_bench.cpp r64ContainsHit: preload a "
                     "roaring64_bitmap_t with `count` values at positions "
                     "{0, step, 2*step, ..., (count-1)*step}; each "
-                    "measured call does one roaring64_bitmap_contains() "
-                    "for a value guaranteed to be present, cycling "
-                    "through the stored values.";
+                    "measured call does a batch of "
+                    "roaring64_bitmap_contains() for values guaranteed "
+                    "to be present, cycling through the stored values.";
                 e.setup = [count, step]() -> void * {
                     auto *s = new r64HitState{roaring64_bitmap_create(), count,
                                               step, 0};
@@ -422,17 +438,21 @@ static void register_contains_variants() {
                 };
                 e.run = [](void *sv) -> int64_t {
                     auto *s = static_cast<r64HitState *>(sv);
-                    uint64_t v = s->i * s->step;
-                    s->i = (s->i + 1) % s->count;
-                    return roaring64_bitmap_contains(s->r, v) ? 1 : 0;
+                    std::int64_t found{ 0 };
+                    for (std::int64_t k{ 0 }; k < kContainsBatch; ++k) {
+                        uint64_t v = s->i * s->step;
+                        s->i = (s->i + 1) % s->count;
+                        found += roaring64_bitmap_contains(s->r, v) ? 1 : 0;
+                    }
+                    return found;
                 };
                 e.teardown = [](void *sv) {
                     auto *s = static_cast<r64HitState *>(sv);
                     roaring64_bitmap_free(s->r);
                     delete s;
                 };
-                e.ops_per_run = 1;
-                e.inner_reps = 10000;
+                e.ops_per_run = kContainsBatch;
+                e.inner_reps = 10000 / kContainsBatch;
                 e.reusable_state = true;
                 g_benchmarks.push_back(std::move(e));
             }
@@ -448,7 +468,7 @@ static void register_contains_variants() {
                 e.description =
                     "synthetic_bench.cpp cppContainsHit: same as "
                     "r64ContainsHit but through the Roaring64Map C++ "
-                    "wrapper (one .contains(v) per measured call).";
+                    "wrapper (.contains(v) for each lookup).";
                 e.setup = [count, step]() -> void * {
                     auto *s =
                         new cppHitState{new Roaring64Map(), count, step, 0};
@@ -457,17 +477,21 @@ static void register_contains_variants() {
                 };
                 e.run = [](void *sv) -> int64_t {
                     auto *s = static_cast<cppHitState *>(sv);
-                    uint64_t v = s->i * s->step;
-                    s->i = (s->i + 1) % s->count;
-                    return s->r->contains(v) ? 1 : 0;
+                    std::int64_t found{ 0 };
+                    for (std::int64_t k{ 0 }; k < kContainsBatch; ++k) {
+                        uint64_t v = s->i * s->step;
+                        s->i = (s->i + 1) % s->count;
+                        found += s->r->contains(v) ? 1 : 0;
+                    }
+                    return found;
                 };
                 e.teardown = [](void *sv) {
                     auto *s = static_cast<cppHitState *>(sv);
                     delete s->r;
                     delete s;
                 };
-                e.ops_per_run = 1;
-                e.inner_reps = 10000;
+                e.ops_per_run = kContainsBatch;
+                e.inner_reps = 10000 / kContainsBatch;
                 e.reusable_state = true;
                 g_benchmarks.push_back(std::move(e));
             }
@@ -480,7 +504,7 @@ static void register_contains_variants() {
                 e.description =
                     "synthetic_bench.cpp setContainsHit: std::set<uint64_t> "
                     "baseline for the same count×step cycling-hit query "
-                    "pattern. Each call is `set.find(v) != set.end()`.";
+                    "pattern. Each lookup is `set.find(v) != set.end()`.";
                 e.setup = [count, step]() -> void * {
                     auto *s = new setHitState{new std::set<uint64_t>(), count,
                                               step, 0};
@@ -489,17 +513,21 @@ static void register_contains_variants() {
                 };
                 e.run = [](void *sv) -> int64_t {
                     auto *s = static_cast<setHitState *>(sv);
-                    uint64_t v = s->i * s->step;
-                    s->i = (s->i + 1) % s->count;
-                    return s->s->find(v) != s->s->end() ? 1 : 0;
+                    std::int64_t found{ 0 };
+                    for (std::int64_t k{ 0 }; k < kContainsBatch; ++k) {
+                        uint64_t v = s->i * s->step;
+                        s->i = (s->i + 1) % s->count;
+                        found += s->s->find(v) != s->s->end() ? 1 : 0;
+                    }
+                    return found;
                 };
                 e.teardown = [](void *sv) {
                     auto *s = static_cast<setHitState *>(sv);
                     delete s->s;
                     delete s;
                 };
-                e.ops_per_run = 1;
-                e.inner_reps = 10000;
+                e.ops_per_run = kContainsBatch;
+                e.inner_reps = 10000 / kContainsBatch;
                 e.reusable_state = true;
                 g_benchmarks.push_back(std::move(e));
             }
@@ -523,17 +551,21 @@ static void register_contains_variants() {
                 };
                 e.run = [](void *sv) -> int64_t {
                     auto *s = static_cast<r64HitState *>(sv);
-                    uint64_t v = (s->i + 1) * s->step - 1;
-                    s->i = (s->i + 1) % s->count;
-                    return roaring64_bitmap_contains(s->r, v) ? 1 : 0;
+                    std::int64_t found{ 0 };
+                    for (std::int64_t k{ 0 }; k < kContainsBatch; ++k) {
+                        uint64_t v = (s->i + 1) * s->step - 1;
+                        s->i = (s->i + 1) % s->count;
+                        found += roaring64_bitmap_contains(s->r, v) ? 1 : 0;
+                    }
+                    return found;
                 };
                 e.teardown = [](void *sv) {
                     auto *s = static_cast<r64HitState *>(sv);
                     roaring64_bitmap_free(s->r);
                     delete s;
                 };
-                e.ops_per_run = 1;
-                e.inner_reps = 10000;
+                e.ops_per_run = kContainsBatch;
+                e.inner_reps = 10000 / kContainsBatch;
                 e.reusable_state = true;
                 g_benchmarks.push_back(std::move(e));
             }
@@ -557,17 +589,21 @@ static void register_contains_variants() {
                 };
                 e.run = [](void *sv) -> int64_t {
                     auto *s = static_cast<cppHitState *>(sv);
-                    uint64_t v = (s->i + 1) * s->step - 1;
-                    s->i = (s->i + 1) % s->count;
-                    return s->r->contains(v) ? 1 : 0;
+                    std::int64_t found{ 0 };
+                    for (std::int64_t k{ 0 }; k < kContainsBatch; ++k) {
+                        uint64_t v = (s->i + 1) * s->step - 1;
+                        s->i = (s->i + 1) % s->count;
+                        found += s->r->contains(v) ? 1 : 0;
+                    }
+                    return found;
                 };
                 e.teardown = [](void *sv) {
                     auto *s = static_cast<cppHitState *>(sv);
                     delete s->r;
                     delete s;
                 };
-                e.ops_per_run = 1;
-                e.inner_reps = 10000;
+                e.ops_per_run = kContainsBatch;
+                e.inner_reps = 10000 / kContainsBatch;
                 e.reusable_state = true;
                 g_benchmarks.push_back(std::move(e));
             }
@@ -588,17 +624,21 @@ static void register_contains_variants() {
                 };
                 e.run = [](void *sv) -> int64_t {
                     auto *s = static_cast<setHitState *>(sv);
-                    uint64_t v = (s->i + 1) * s->step - 1;
-                    s->i = (s->i + 1) % s->count;
-                    return s->s->find(v) != s->s->end() ? 1 : 0;
+                    std::int64_t found{ 0 };
+                    for (std::int64_t k{ 0 }; k < kContainsBatch; ++k) {
+                        uint64_t v = (s->i + 1) * s->step - 1;
+                        s->i = (s->i + 1) % s->count;
+                        found += s->s->find(v) != s->s->end() ? 1 : 0;
+                    }
+                    return found;
                 };
                 e.teardown = [](void *sv) {
                     auto *s = static_cast<setHitState *>(sv);
                     delete s->s;
                     delete s;
                 };
-                e.ops_per_run = 1;
-                e.inner_reps = 10000;
+                e.ops_per_run = kContainsBatch;
+                e.inner_reps = 10000 / kContainsBatch;
                 e.reusable_state = true;
                 g_benchmarks.push_back(std::move(e));
             }
