@@ -120,6 +120,45 @@ are the same either way. `byte_size()` counts a shared table in full for each bi
 Copying a bitmap is a read of it: under the atomic policy any number of threads may copy a bitmap that others read, and
 each copy is its holder's own to change.
 
+### Shared handles
+
+`frsr::roaring::shared_bitmap<Bitmap>` (`<frsr/roaring/shared_bitmap.hpp>`) is a counted handle to a bitmap of any
+policy, for keeping many bitmaps that copies of a structure share (one per indexed value, say) without copying them:
+
+```cpp
+using bitmap = frsr::roaring::bitmap<std::uint32_t>;
+frsr::roaring::shared_bitmap<bitmap> rows{ bitmap{ std::vector<std::uint32_t>{ 1, 5, 9 } } };
+
+auto snapshot{ rows };                      // one count, whatever the bitmap holds
+bool const removed{ snapshot.remove( 2 ) }; // 2 is absent: the bitmap stays shared, nothing is copied
+bool const added{ rows.add( 70000 ) };      // copies the bitmap first: `snapshot` keeps what it held
+{
+    auto editor{ rows.edit() };             // anything else: the bitmap made the handle's own
+    editor->add_closed_range( 100, 200 );
+    editor->optimize();
+}
+bool const alone{ rows.is_unique() };
+```
+
+- A copy of a handle takes one count on the bitmap and shares it; a dropped handle gives the count back. The first change
+  through a handle that shares its bitmap copies the bitmap first (as a copy of the bitmap would), unless the change
+  would leave it as it is: `add` of a held key, `remove` of an absent one, `|=` with a subset (an empty operand, a
+  handle that shares the same bitmap), `&=` with a superset, `-=` of a disjoint bitmap. A change that empties the handle
+  (`&=` with an empty operand, `-=` / `^=` with a handle that shares the same bitmap) gives the bitmap up without
+  copying it, as `clear()` does, and a handle that holds nothing takes the bitmap of the handle it is united or
+  exclusive-ored with. An operand may be the handle's own bitmap.
+- `edit()` makes the bitmap the handle's own and hands out an editor for any other change. While an editor is alive the
+  handle is not copied, and the edit leaves no lazy fold unfinished.
+- `get()`, `*` and `->` read the bitmap; `size()` and `empty()` read the cardinality the handle holds next to its
+  pointer (a shared bitmap does not change, and a handle refreshes it when it changes its own); `container_count()`,
+  `is_unique()` and `shares_storage_with()` tell about the bitmap and its sharing.
+- The count is atomic, unless the bitmap's policy is `cow_unsynchronized_refcount` (one thread at a time): then threads
+  may copy, read, change and drop handles that share a bitmap, each using its own handle objects.
+- A change that copies the bitmap and fails to leaves the handle as it was, still sharing; past the copy the bitmap's own
+  guarantees apply. A default-constructed or moved-from handle reads as an empty bitmap and allocates nothing.
+- A handle is two words (the pointer and the cardinality), and copying one costs one count, whether the bitmap's chunk
+  table is shared (above) or not.
+
 ### Sharing knobs
 
 The parts of the sharing that trade one cost for another are compile-time knobs, all in

@@ -1,4 +1,5 @@
 #include <frsr/roaring/bitmap.hpp>
+#include <frsr/roaring/shared_bitmap.hpp>
 
 #include <algorithm>
 #include <array>
@@ -6929,6 +6930,98 @@ struct register_cpp_copy_then_registrar {
 };
 #endif
 
+// ---- SharedCopyAndDrop / SharedCopyThenFirstWrite / SharedCopyThenNoOpMutate --
+// The CopyAndDrop and CopyThen bands through a shared_bitmap handle: a copy of the
+// handle takes one count on its bitmap whatever the bitmap holds, its first change
+// copies the bitmap (what CopyAndDrop costs) and takes one value, and a change that
+// changes nothing (the subtraction of a value it lacks, of a bitmap it does not
+// intersect) leaves it shared. Same fixture and repeat count as CopyAndDrop.
+// Checksum = cardinality sum.
+enum class SharedCopy { drop, first_write, no_op_mutate };
+
+[[nodiscard]] inline char const * shared_copy_label( SharedCopy const kind ) {
+    switch (kind) {
+        case SharedCopy::drop:        return "SharedCopyAndDrop";
+        case SharedCopy::first_write: return "SharedCopyThenFirstWrite";
+        default:                      return "SharedCopyThenNoOpMutate";
+    }
+}
+
+template <class Arm>
+struct register_frsr_shared_copy_registrar {
+    using TestBitmap32 = typename Arm::bitmap;
+    using Handle       = frsr::roaring::shared_bitmap<TestBitmap32>;
+    struct S { Handle src; TestBitmap32 absent; };
+    static void run(CopyShape const &shape, SharedCopy const kind) {
+        Entry e;
+        char buf[160];
+        snprintf(buf, sizeof(buf), "set_ops/%s%s/shape=%s", Arm::label(), shared_copy_label(kind), shape.label);
+        e.name        = buf;
+        e.description = kind == SharedCopy::drop
+            ? "frsr::roaring::shared_bitmap copy + cardinality read + destroy, 64 times."
+            : kind == SharedCopy::first_write
+            ? "frsr::roaring::shared_bitmap copy + add() of one absent value into an existing chunk + destroy, 64 times."
+            : "frsr::roaring::shared_bitmap copy + remove() of an absent value + -= of a bitmap the copy does not "
+              "intersect + destroy, 64 times.";
+        e.setup = [shape]() -> void * {
+            auto *s = new S;
+            TestBitmap32 source;
+            for (std::size_t c = 0; c < shape.chunks; ++c) {
+                auto const base = static_cast<std::uint32_t>(c * 65536u);
+                for (std::size_t i = 0; i < shape.per_chunk; ++i) {
+                    std::ignore = source.add(base + static_cast<std::uint32_t>(i * 7u));
+                }
+            }
+            s->src = Handle{ std::move(source) };
+            std::ignore = s->absent.add(kCopyAbsentValue);
+            return s;
+        };
+        switch (kind) {
+            case SharedCopy::drop:
+                e.run = [](void *sv) -> int64_t {
+                    auto *s = static_cast<S *>(sv);
+                    std::int64_t sum = 0;
+                    for (std::size_t i = 0; i < kCopyReps; ++i) {
+                        Handle const copy{ s->src };
+                        sum += static_cast<std::int64_t>(copy.size());
+                    }
+                    return sum;
+                };
+                break;
+            case SharedCopy::first_write:
+                e.run = [](void *sv) -> int64_t {
+                    auto *s = static_cast<S *>(sv);
+                    std::int64_t sum = 0;
+                    for (std::size_t i = 0; i < kCopyReps; ++i) {
+                        Handle copy{ s->src };
+                        std::ignore = copy.add(kCopyAbsentValue);
+                        sum += static_cast<std::int64_t>(copy.size());
+                    }
+                    return sum;
+                };
+                break;
+            default:
+                e.run = [](void *sv) -> int64_t {
+                    auto *s = static_cast<S *>(sv);
+                    std::int64_t sum = 0;
+                    for (std::size_t i = 0; i < kCopyReps; ++i) {
+                        Handle copy{ s->src };
+                        std::ignore = copy.remove(kCopyAbsentValue);
+                        copy -= s->absent;
+                        sum += static_cast<std::int64_t>(copy.size());
+                    }
+                    return sum;
+                };
+                break;
+        }
+        e.teardown       = [](void *sv) { delete static_cast<S *>(sv); };
+        e.ops_per_run    = 1;
+        e.inner_reps     = kBinaryInnerReps;
+        e.reusable_state = true;
+        g_benchmarks.push_back(std::move(e));
+    }
+};
+
 // ---- BulkAddRowsGrouped: the same insert, handed over in per-value groups -----
 // A bitmap index's insert batch is already grouped by indexed value with the rows
 // ascending inside a group, so the row ids of one group can be handed over as one
@@ -7713,6 +7806,9 @@ void register_benchmarks() {
 #if FRSR_ROARING_HAS_CROARING
                     arms::for_each_croaring<register_cpp_copy_then_registrar>(shape, kind);
 #endif
+                }
+                for (auto const kind : { SharedCopy::drop, SharedCopy::first_write, SharedCopy::no_op_mutate }) {
+                    arms::for_each_frsr<register_frsr_shared_copy_registrar>(shape, kind);
                 }
             }
             for (auto const &shape : kRunBatchShapes) {

@@ -487,6 +487,11 @@ public:
     template <typename Self>
     [[nodiscard]] bool shares_storage_with( this Self const & self, bitmap const & other ) noexcept { return self.chunks_.shares_storage_with( other.chunks_ ); }
 
+    // How many chunks (containers) the bitmap holds. (A template, so that the compiled instantiations hold no code
+    // for it.)
+    template <typename Self>
+    [[nodiscard]] size_type container_count( this Self const & self ) noexcept { return self.chunks_.size(); }
+
     [[nodiscard]] bool test( key_type const value ) const noexcept { return contains( value ); }
     // Not meaningful while the bitmap is in the middle of a lazy fold (see bulk_or_intermediate).
     [[nodiscard]] size_type size() const noexcept { assert( !counts_deferred() ); return size_; }

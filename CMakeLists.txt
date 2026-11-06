@@ -326,6 +326,7 @@ if(FRSR_ROARING_BUILD_TESTS)
         tests/bitmap_iteration.cpp
         tests/in_place_allocation_failure.cpp
         tests/table_sharing.cpp
+        tests/shared_bitmap.cpp
     )
     target_link_libraries(frsr_roaring_tests
         PRIVATE
