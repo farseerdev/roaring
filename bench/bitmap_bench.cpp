@@ -7253,7 +7253,10 @@ struct register_cpp_index_build_registrar {
 // the rows that came to it added, both handed over as one ascending list per value. The rows of a batch are
 // drawn at random or are one block of consecutive rows. The reference removes and adds a value's list chunk by
 // chunk: a merge into the array, the bits set or cleared in a bitset, a value at a time into a run, and a new
-// chunk in the form its count calls for. Checksum = values held after the batch.
+// chunk in the form its count calls for. Both copy the whole index first and let it go after the batch, so every
+// container the batch changes is cloned into a block of its own that lives until the end, as in the copy the
+// index's user keeps; a copy released value by value would hand each value's clones the blocks the previous
+// value's clones just freed, still in cache. Checksum = values held after the batch.
 struct IndexUpdateShape { char const *label; std::uint32_t values; std::uint32_t rows; bool block; };
 static constexpr IndexUpdateShape kIndexUpdateShapes[]{
     { "values=200/rows=64/random"  , 200, 64  , false },
@@ -7514,13 +7517,15 @@ struct register_cpp_index_update_registrar {
         e.run = []( void *sv ) -> int64_t {
             auto const *s = static_cast<S const *>( sv );
             std::int64_t held{ 0 };
-            for ( std::size_t v{ 0 }; v < s->index.size(); ++v ) {
-                auto *const copy{ Arm::copy( s->index[ v ] ) };
-                croaring_remove_sorted( copy, { s->d.removed[ v ].data(), s->d.removed[ v ].size() } );
-                croaring_add_sorted   ( copy, { s->d.added  [ v ].data(), s->d.added  [ v ].size() } );
-                held += static_cast<std::int64_t>( roaring_bitmap_get_cardinality( copy ) );
-                roaring_bitmap_free( copy );
+            std::vector<roaring_bitmap_t *> copy;
+            copy.reserve( s->index.size() );
+            for ( auto const *const bm : s->index ) { copy.emplace_back( Arm::copy( bm ) ); }
+            for ( std::size_t v{ 0 }; v < copy.size(); ++v ) {
+                croaring_remove_sorted( copy[ v ], { s->d.removed[ v ].data(), s->d.removed[ v ].size() } );
+                croaring_add_sorted   ( copy[ v ], { s->d.added  [ v ].data(), s->d.added  [ v ].size() } );
+                held += static_cast<std::int64_t>( roaring_bitmap_get_cardinality( copy[ v ] ) );
             }
+            for ( auto *const bm : copy ) { roaring_bitmap_free( bm ); }
             return held;
         };
         e.teardown       = []( void *sv ) { delete static_cast<S *>( sv ); };
