@@ -532,8 +532,11 @@ template <typename Layout>
 // [croaring-ref] deps/croaring/src/containers/mixed_andnot.c:run_bitset_container_andnot
 
 // Calls sink.word( index, survivors ) for every word with survivors that is not part of a longer stretch and
-// sink.ones( first index, count ) for the stretches of words that are all survivors, in index order. A sink call
-// returns false to stop the scan, which then returns false too. The words that are not reported have no survivors.
+// sink.ones( first index, count ) for the stretches of words that are all survivors, in index order. A sink that
+// has mixed( first index, bitset words, end index ) takes the stretches inside a run whose words hold survivors and
+// holes alike itself (the survivors are the zero bits of those words) and returns where it stopped; the others get
+// those words one by one. A sink call returns false to stop the scan, which then returns false too. The words
+// that are not reported have no survivors.
 template <typename Layout, typename CowPolicy, typename Sink>
 [[ gnu::always_inline ]] inline bool scan_run_bitset_difference(
     run_cref<Layout, CowPolicy> const lhs,
@@ -578,10 +581,20 @@ template <typename Layout, typename CowPolicy, typename Sink>
         while ( index < last_word ) {
             auto const word{ bits[ index ] };
             if ( word != 0 && word != all ) {
-                if ( !flush() || !sink.word( index, ~word ) ) {
+                if ( !flush() ) {
                     return false;
                 }
-                ++index;
+                if constexpr ( requires { sink.mixed( index, bits.data(), last_word ); } ) {
+                    index = sink.mixed( index, bits.data(), last_word );
+                    if ( index == 0 ) {
+                        return false;
+                    }
+                } else {
+                    if ( !sink.word( index, ~word ) ) {
+                        return false;
+                    }
+                    ++index;
+                }
                 continue;
             }
             auto end{ index + 1U };
@@ -630,6 +643,29 @@ struct run_survivor_counter {
         last_index = index;
         last_top   = survivors >> 63U;
         return runs <= run_limit;
+    }
+    // Takes the words from `first_index` on that hold survivors and holes alike, up to `end_index` at most, and
+    // returns the index of the first word it did not take, or 0 once the runs are more than the limit. The counts are
+    // kept in locals over the stretch, so the loop carries them in registers.
+    [[nodiscard]] std::size_t mixed( std::size_t const first_index, std::uint64_t const * const bits, std::size_t const end_index ) noexcept {
+        assert( first_index != 0 && first_index < end_index && runs <= run_limit );
+        constexpr auto all{ ~std::uint64_t{ 0 } };
+        auto counted_runs{ runs };
+        auto counted     { cardinality };
+        auto carry       { carry_into( first_index ) };
+        auto index       { first_index };
+        do {
+            auto const survivors{ ~bits[ index ] };
+            counted_runs += static_cast<std::size_t>( std::popcount( survivors & ~( ( survivors << 1U ) | carry ) ) );
+            counted      += static_cast<std::size_t>( std::popcount( survivors ) );
+            carry         = survivors >> 63U;
+            ++index;
+        } while ( index < end_index && bits[ index ] != 0 && bits[ index ] != all && counted_runs <= run_limit );
+        runs        = counted_runs;
+        cardinality = counted;
+        last_index  = index - 1U;
+        last_top    = carry;
+        return runs <= run_limit ? index : 0U;
     }
     [[nodiscard]] bool ones( std::size_t const first_index, std::size_t const count ) noexcept {
         runs        += carry_into( first_index ) == 0 ? 1U : 0U;

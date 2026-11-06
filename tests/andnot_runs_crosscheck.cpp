@@ -11,8 +11,10 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <iterator>
 #include <random>
 #include <span>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -99,11 +101,33 @@ void subtraction_trials( std::uint64_t const seed ) {
         auto const chunks{ 1U + static_cast<unsigned>( rng() % 3 ) };
         auto const receiver_values{ random_runs( rng, 2, chunks, 1U + static_cast<std::uint32_t>( rng() % 30'000 ), 1U + static_cast<std::uint32_t>( rng() % 3'000 ) ) };
         values_t operand_values;
-        switch ( rng() % 5 ) {
+        switch ( rng() % 6 ) {
             case 0: operand_values = random_values( rng, 2, chunks + 1, rng() % 40 ); break;
             case 1: operand_values = random_values( rng, 2, chunks + 1, 300 + rng() % 6'000 ); break;
             case 2: operand_values = random_runs( rng, 2, chunks + 1, 1U + static_cast<std::uint32_t>( rng() % 5'000 ), 1U + static_cast<std::uint32_t>( rng() % 5'000 ) ); break;
             case 3: operand_values = almost_everything( rng, receiver_values, 2 + chunks, static_cast<unsigned>( rng() % 20 ) ); break;
+            case 4: {
+                // Every period-th value of the receiver survives: as many runs as survivors, around the count at
+                // which runs stop being smaller than a bitset. Two windows inside the runs break the pattern, one
+                // taken out whole and one left whole, so that stretches of such words also end mid-run.
+                constexpr std::uint32_t periods[]{ 2U, 3U, 16U, 20U, 31U, 32U, 33U, 64U };
+                auto const period{ periods[ rng() % std::size( periods ) ] };
+                auto const window{ [ & ]() {
+                    auto const begin{ receiver_values[ rng() % receiver_values.size() ] };
+                    return std::pair{ begin, begin + 64U + static_cast<std::uint32_t>( rng() % 1'000 ) };
+                } };
+                auto const [ taken_begin, taken_end ]{ window() };
+                auto const [ left_begin, left_end ]{ window() };
+                for ( auto const value : receiver_values ) {
+                    auto const taken{ value >= taken_begin && value < taken_end };
+                    auto const left { value >= left_begin && value < left_end };
+                    if ( taken || ( !left && value % period != 0U ) ) {
+                        operand_values.emplace_back( value );
+                    }
+                }
+                operand_values = almost_everything( rng, std::move( operand_values ), 2 + chunks, 0U );
+                break;
+            }
             default: operand_values = random_values( rng, 2, chunks + 1, 20'000 + rng() % 40'000 ); break;
         }
         bool const operand_runs{ rng() % 3 == 0 };
