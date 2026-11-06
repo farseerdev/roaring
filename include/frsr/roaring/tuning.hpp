@@ -55,6 +55,11 @@ inline constexpr std::size_t lazy_union_array_bound{ FRSR_ROARING_LAZY_UNION_ARR
 // [croaring-ref] deps/croaring/src/containers/perfparameters.h:ARRAY_LAZY_LOWERBOUND
 inline constexpr std::size_t lazy_xor_array_bound{ 1024 };
 
+// Two sorted arrays this many times apart in length are crossed by searching the longer one for each value of the
+// shorter one instead of walking both in step: the array intersection and the sorted batch added to an array.
+// [croaring-ref] deps/croaring/src/containers/array.c:array_container_intersection (`const int threshold = 64;`)
+inline constexpr std::size_t kSkewedIntersectRatioThreshold{ 64 };
+
 // Route the in-place bitset combine through the Harley-Seal carry-save kernel
 // (fused_combine_inplace_popcount) instead of the naive per-word loop in
 // combine_bitset_bitset_inplace (bitset_ops.hpp).

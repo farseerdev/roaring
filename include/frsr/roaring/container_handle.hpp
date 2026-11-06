@@ -1271,8 +1271,7 @@ public:
     //
     // The append-only case - every incoming value above the container's maximum,
     // which is what inserting a batch of ascending table rows looks like - is a
-    // single resize and memcpy. Otherwise the group is merged in place: one pass
-    // counts the additions so the payload grows once, a second merges backward
+    // single resize and memcpy. Otherwise the group is merged in place, backward
     // from the end (both sources are read above the write cursor, so no scratch
     // buffer is needed).
     // [croaring-ref] deps/croaring/src/containers/array.c:array_container_append
@@ -1292,40 +1291,53 @@ public:
             return sorted_values.size();
         }
 
-        std::size_t additions{ 0 };
-        {
-            auto const *       a    { values.data() };
-            auto const * const a_end{ a + cardinality };
-            auto const *       b    { sorted_values.data() };
-            auto const * const b_end{ b + sorted_values.size() };
-            while ( a != a_end && b != b_end ) {
-                if      ( *a < *b ) { ++a; }
-                else if ( *b < *a ) { ++additions; ++b; }
-                else                { ++a; ++b; }
-            }
-            additions += static_cast<std::size_t>( b_end - b );
-        }
-        if ( additions == 0 ) {
-            return 0;
-        }
-
-        values.resize_uninitialized( static_cast<std::uint32_t>( cardinality + additions ) );
+        // One pass into room for every incoming value: values already held leave room unused at the bottom,
+        // closed by one move of the merged part at the end. When the incoming values are few against the held
+        // ones (the reference's skew ratio), the held values above each incoming one move up as one block, found
+        // by galloping down from the last one placed.
+        auto const incoming{ sorted_values.size() };
+        auto const skewed  { incoming * kSkewedIntersectRatioThreshold < cardinality };
+        values.resize_uninitialized( static_cast<std::uint32_t>( cardinality + incoming ) );
         auto * const data{ values.data() };
-        auto a  { static_cast<std::ptrdiff_t>( cardinality             ) - 1 };
-        auto b  { static_cast<std::ptrdiff_t>( sorted_values.size()    ) - 1 };
-        auto out{ static_cast<std::ptrdiff_t>( cardinality + additions ) - 1 };
-        while ( b >= 0 ) {
-            if ( a >= 0 && sorted_values[ static_cast<std::size_t>( b ) ] < data[ a ] ) {
-                data[ out-- ] = data[ a-- ];
-            } else if ( a >= 0 && data[ a ] == sorted_values[ static_cast<std::size_t>( b ) ] ) {
-                data[ out-- ] = data[ a-- ];
-                --b;
+        auto held{ static_cast<std::ptrdiff_t>( cardinality ) };              // data[ 0, held ) not yet moved
+        auto out { static_cast<std::ptrdiff_t>( cardinality + incoming ) };   // data[ out, end ) merged
+        for ( auto next{ incoming }; next != 0; --next ) {
+            auto const value{ sorted_values[ next - 1U ] };
+            if ( skewed ) {
+                // The first held position whose value is above `value`: data[ above, held ) moves up.
+                auto above{ held };
+                if ( above != 0 && value < data[ above - 1 ] ) {
+                    auto known_above{ above - 1 };
+                    auto step       { std::ptrdiff_t{ 1 } };
+                    auto probe      { known_above - step };
+                    while ( probe >= 0 && value < data[ probe ] ) {
+                        known_above = probe;
+                        step       *= 2;
+                        probe       = known_above - step;
+                    }
+                    above = std::upper_bound( data + std::max( probe + 1, std::ptrdiff_t{ 0 } ), data + known_above, value ) - data;
+                }
+                auto const block{ held - above };
+                out -= block;
+                std::memmove( data + out, data + above, static_cast<std::size_t>( block ) * sizeof( low_type ) );
+                held = above;
             } else {
-                data[ out-- ] = sorted_values[ static_cast<std::size_t>( b-- ) ];
+                while ( held != 0 && value < data[ held - 1 ] ) {
+                    data[ --out ] = data[ --held ];
+                }
             }
+            if ( held != 0 && data[ held - 1 ] == value ) {
+                --held;
+            }
+            data[ --out ] = value;
+        }
+        auto const added{ incoming - static_cast<std::size_t>( out - held ) };
+        if ( out != held ) {
+            std::memmove( data + held, data + out, static_cast<std::size_t>( static_cast<std::ptrdiff_t>( cardinality + incoming ) - out ) * sizeof( low_type ) );
+            values.resize_uninitialized( static_cast<std::uint32_t>( cardinality + added ) );
         }
         sync_header();
-        return additions;
+        return added;
     }
 
     // Removes every value of the sorted, duplicate-free `sorted_values` that is
@@ -1343,11 +1355,37 @@ public:
         auto       * dst{ src };
         auto const * rm    { sorted_values.data() };
         auto const * rm_end{ rm + sorted_values.size() };
-        // Line-aligned: under one cache line long, but on Zen it runs slower when it straddles a 64-byte boundary.
-        FRSR_ROARING_LOOP_ALIGN while ( src != end && rm != rm_end ) {
-            if      ( *src < *rm ) { *dst++ = *src++; }
-            else if ( *src == *rm ) { ++src; ++rm; }
-            else                   { ++rm; }  // removal value not present
+        if ( sorted_values.size() * kSkewedIntersectRatioThreshold < cardinality ) {
+            // Few removals against many values (as in add_sorted): the values below each removal move down as one
+            // block, found by galloping up from the last one kept.
+            for ( ; rm != rm_end && src != end; ++rm ) {
+                auto const value{ *rm };
+                auto * at{ src };
+                if ( *at < value ) {
+                    auto known_below{ at };
+                    auto step{ std::ptrdiff_t{ 1 } };
+                    while ( end - known_below > step && known_below[ step ] < value ) {
+                        known_below += step;
+                        step        *= 2;
+                    }
+                    at = std::lower_bound( known_below + 1, known_below + std::min( step, static_cast<std::ptrdiff_t>( end - known_below ) ), value );
+                }
+                if ( dst != src ) {
+                    std::memmove( dst, src, static_cast<std::size_t>( at - src ) * sizeof( low_type ) );
+                }
+                dst += at - src;
+                src  = at;
+                if ( src != end && *src == value ) {
+                    ++src;
+                }
+            }
+        } else {
+            // Line-aligned: under one cache line long, but on Zen it runs slower when it straddles a 64-byte boundary.
+            FRSR_ROARING_LOOP_ALIGN while ( src != end && rm != rm_end ) {
+                if      ( *src < *rm ) { *dst++ = *src++; }
+                else if ( *src == *rm ) { ++src; ++rm; }
+                else                   { ++rm; }  // removal value not present
+            }
         }
         auto const removed{ static_cast<std::size_t>( src - dst ) };
         if ( removed != 0 ) {

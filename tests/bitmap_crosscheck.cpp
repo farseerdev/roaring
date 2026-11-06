@@ -874,6 +874,55 @@ TEST(FrsrRoaringCrosscheck, AddManySortedGroupsMatchCRoaring) {
     }
 }
 
+// A few values added to and removed from array chunks that hold many, as an index update does: each value
+// is placed by a search of the held ones rather than a walk over all of them. The groups hold values already
+// there, values below the first and above the last, repeats (add), and values that are absent (remove).
+TEST(FrsrRoaringCrosscheck, FewValuesInAndOutOfLargeArraysMatchCRoaring) {
+    std::mt19937 rng{ 0x5EED'A77AU };
+    for ( int round{ 0 }; round < 300; ++round ) {
+        std::vector<std::uint32_t> base;
+        for ( std::uint32_t chunk{ 0U }; chunk < 3U; ++chunk ) {
+            auto const held{ 1'000U + rng() % 3'000U };
+            for ( std::uint32_t i{ 0U }; i < held; ++i ) { base.push_back( ( chunk << 16U ) | ( rng() & 0xFFFFU ) ); }
+        }
+        std::ranges::sort( base );
+        base.erase( std::unique( base.begin(), base.end() ), base.end() );
+
+        TestBitmap mine{ std::span<std::uint32_t const>{ base } };
+        auto       theirs{ make_roaring( base ) };
+        ASSERT_EQ( mine.statistics().array_containers, 3U );
+
+        auto const group{ [&]( bool const with_repeats ) {
+            std::vector<std::uint32_t> values;
+            auto const count{ 1U + rng() % 40U };
+            for ( std::uint32_t i{ 0U }; i < count; ++i ) {
+                auto const chunk{ static_cast<std::uint32_t>( rng() % 3U ) };
+                switch ( rng() % 4U ) {
+                    case 0U: values.push_back( base[ rng() % base.size() ] ); break;            // held
+                    case 1U: values.push_back( chunk << 16U ); break;                           // the chunk's first value
+                    case 2U: values.push_back( ( chunk << 16U ) | 0xFFFFU ); break;             // the chunk's last value
+                    default: values.push_back( ( chunk << 16U ) | ( rng() & 0xFFFFU ) ); break;
+                }
+            }
+            std::ranges::sort( values );
+            if ( !with_repeats ) { values.erase( std::unique( values.begin(), values.end() ), values.end() ); }
+            return values;
+        } };
+
+        auto const added{ group( round % 2 == 0 ) };
+        mine.add_many_sorted( { added.data(), added.size() } );
+        roaring_bitmap_add_many( theirs.bitmap, added.size(), added.data() );
+        ASSERT_EQ( mine.to_vector(), to_vector( theirs.bitmap ) ) << "add, round " << round;
+        ASSERT_EQ( mine.size(), roaring_bitmap_get_cardinality( theirs.bitmap ) ) << "add, round " << round;
+
+        auto const removed{ group( false ) };
+        mine.remove_many_sorted( { removed.data(), removed.size() } );
+        roaring_bitmap_remove_many( theirs.bitmap, removed.size(), removed.data() );
+        ASSERT_EQ( mine.to_vector(), to_vector( theirs.bitmap ) ) << "remove, round " << round;
+        ASSERT_EQ( mine.size(), roaring_bitmap_get_cardinality( theirs.bitmap ) ) << "remove, round " << round;
+    }
+}
+
 // contains() on every chunk-table length from empty to a few hundred entries, probing each held
 // chunk (first, last and between), the chunks around them and the key-space edges.
 TEST(FrsrRoaringCrosscheck, ContainsMatchesCRoaringAcrossChunkTableLengths) {

@@ -652,11 +652,6 @@ inline std::size_t intersect_sorted_uint16(
 } // namespace x86_vp2
 #endif // FRSR_ROARING_VP2
 
-// Below this ratio, the linear two-pointer / SSE4.2 merge is used instead of the
-// skewed binary-search path — matches CRoaring's threshold exactly (`const int
-// threshold = 64;` in array_container_intersection).
-inline constexpr std::size_t kSkewedIntersectRatioThreshold{ 64 };
-
 // Hybrid branchless scalar merges of two sorted arrays. A branch per value mispredicts about once per value
 // on sets that interleave unpredictably, so while four values remain on each side the merge first looks for a
 // block of four to handle at once (all below the other side's current value, or equal to the other side's next
