@@ -10454,6 +10454,197 @@ static void register_run_density_sweeps() {
     }
 }
 
+// ---- array with array of very different sizes -------------------------------------------------
+// The reference's array merge microbenchmark: a small and a large array in one chunk, the small one holding 1 to 128
+// values (and two balanced pairs, which guard the regular merge), the large one 256 to 3500. Every timed run cycles
+// through the same 64 distinct pairs, so the branch predictor cannot learn a single input; the cost is reported per
+// pair. The pairs are drawn in each entry's setup, not at registration, so every other band skips the shuffles.
+// [croaring-ref] microbenchmarks/array_merge_bench.cpp
+namespace array_skew {
+
+constexpr std::size_t pairs = 64;
+
+enum class op : std::uint8_t {
+    or_op,                       // small | large
+    or_inplace,                  // large |= small, the small one a subset of the large one: the large one never changes
+    andnot_large_minus_small,
+    andnot_small_minus_large,
+    xor_op,                      // small ^ large
+    and_op,                      // small & large
+    intersects,                  // small.intersects( large )
+};
+
+struct band {
+    std::string op_name;
+    op o;
+    std::size_t small, large;
+};
+
+struct pair_values {
+    values32 small, large;
+};
+
+// The reference's Pairs: `count` values of a shuffle of the whole chunk, sorted; the small side is a subset of the
+// large one for the in-place union.
+[[nodiscard]] static std::vector<pair_values> make_pairs( band const & b ) {
+    std::mt19937 gen{ static_cast<std::uint32_t>( 1234 + b.small * 7919 + b.large ) };
+    auto const random_values = [ &gen ]( std::size_t const count ) {
+        values32 all( 65536 );
+        std::iota( all.begin(), all.end(), 0U );
+        std::shuffle( all.begin(), all.end(), gen );
+        all.resize( count );
+        std::ranges::sort( all );
+        return all;
+    };
+    std::vector<pair_values> result;
+    result.reserve( pairs );
+    for ( std::size_t p = 0; p < pairs; ++p ) {
+        auto large = random_values( b.large );
+        values32 small;
+        if ( b.o == op::or_inplace ) {
+            small = large;
+            std::shuffle( small.begin(), small.end(), gen );
+            small.resize( b.small );
+            std::ranges::sort( small );
+        } else {
+            small = random_values( b.small );
+        }
+        result.emplace_back( std::move( small ), std::move( large ) );
+    }
+    return result;
+}
+
+[[nodiscard]] static std::string band_name( char const * const label, band const & b ) {
+    return "kernel/" + std::string( label ) + "ArraySkew" + b.op_name + "/small=" + std::to_string( b.small ) + "/large=" + std::to_string( b.large );
+}
+
+[[nodiscard]] static std::string band_description( band const & b ) {
+    return b.op_name + " of a " + std::to_string( b.small ) + "-value and a " + std::to_string( b.large ) + "-value array chunk, cycling through " +
+        std::to_string( pairs ) + " distinct pairs; cost per pair.";
+}
+
+template <class Arm>
+struct frsr_registrar {
+    using Bitmap = typename Arm::bitmap;
+    struct state {
+        std::vector<Bitmap> small, large;
+    };
+
+    static void run( band const & b ) {
+        Entry e;
+        e.name        = band_name( Arm::label(), b );
+        e.description = "frsr::roaring::bitmap<uint32_t>: " + band_description( b );
+        e.setup       = [b]() -> void * {
+            auto * const s = new state;
+            for ( auto const & p : make_pairs( b ) ) {
+                s->small.emplace_back().add_many( p.small );
+                s->large.emplace_back().add_many( p.large );
+            }
+            return s;
+        };
+        e.run = [b]( void * sv ) -> int64_t {
+            auto * const s = static_cast<state *>( sv );
+            std::int64_t checksum = 0;
+            for ( std::size_t p = 0; p < pairs; ++p ) {
+                auto & small = s->small[ p ];
+                auto & large = s->large[ p ];
+                switch ( b.o ) {
+                    case op::or_op:                    { Bitmap const r{ small | large }; checksum += static_cast<std::int64_t>( r.size() ); break; }
+                    case op::or_inplace:               { large |= small; checksum += static_cast<std::int64_t>( large.size() ); break; }
+                    case op::andnot_large_minus_small: { Bitmap const r{ large - small }; checksum += static_cast<std::int64_t>( r.size() ); break; }
+                    case op::andnot_small_minus_large: { Bitmap const r{ small - large }; checksum += static_cast<std::int64_t>( r.size() ); break; }
+                    case op::xor_op:                   { Bitmap const r{ small ^ large }; checksum += static_cast<std::int64_t>( r.size() ); break; }
+                    case op::and_op:                   { Bitmap const r{ small & large }; checksum += static_cast<std::int64_t>( r.size() ); break; }
+                    case op::intersects:               { checksum += small.intersects( large ); break; }
+                }
+            }
+            return checksum;
+        };
+        e.teardown       = []( void * sv ) { delete static_cast<state *>( sv ); };
+        e.ops_per_run    = static_cast<std::int64_t>( pairs );
+        e.inner_reps     = 20;
+        e.reusable_state = true;
+        g_benchmarks.push_back( std::move( e ) );
+    }
+};
+
+template <class Arm>
+struct cpp_registrar {
+    struct state {
+        std::vector<std::unique_ptr<croaring_handle>> small, large;
+    };
+
+    static void run( band const & b ) {
+        Entry e;
+        e.name        = band_name( Arm::label(), b );
+        e.description = "CRoaring roaring_bitmap_t counterpart: " + band_description( b );
+        e.setup       = [b]() -> void * {
+            auto * const s = new state;
+            for ( auto const & p : make_pairs( b ) ) {
+                auto const & small = s->small.emplace_back( std::make_unique<croaring_handle>( Arm::create() ) );
+                roaring_bitmap_add_many( small->r, p.small.size(), p.small.data() );
+                auto const & large = s->large.emplace_back( std::make_unique<croaring_handle>( Arm::create() ) );
+                roaring_bitmap_add_many( large->r, p.large.size(), p.large.data() );
+            }
+            return s;
+        };
+        e.run = [b]( void * sv ) -> int64_t {
+            auto * const s = static_cast<state *>( sv );
+            std::int64_t checksum = 0;
+            for ( std::size_t p = 0; p < pairs; ++p ) {
+                auto * const small = s->small[ p ]->r;
+                auto * const large = s->large[ p ]->r;
+                switch ( b.o ) {
+                    case op::or_op:                    { croaring_handle const r{ roaring_bitmap_or( small, large ) };     checksum += static_cast<std::int64_t>( roaring_bitmap_get_cardinality( r.r ) ); break; }
+                    case op::or_inplace:               { roaring_bitmap_or_inplace( large, small ); checksum += static_cast<std::int64_t>( roaring_bitmap_get_cardinality( large ) ); break; }
+                    case op::andnot_large_minus_small: { croaring_handle const r{ roaring_bitmap_andnot( large, small ) }; checksum += static_cast<std::int64_t>( roaring_bitmap_get_cardinality( r.r ) ); break; }
+                    case op::andnot_small_minus_large: { croaring_handle const r{ roaring_bitmap_andnot( small, large ) }; checksum += static_cast<std::int64_t>( roaring_bitmap_get_cardinality( r.r ) ); break; }
+                    case op::xor_op:                   { croaring_handle const r{ roaring_bitmap_xor( small, large ) };    checksum += static_cast<std::int64_t>( roaring_bitmap_get_cardinality( r.r ) ); break; }
+                    case op::and_op:                   { croaring_handle const r{ roaring_bitmap_and( small, large ) };    checksum += static_cast<std::int64_t>( roaring_bitmap_get_cardinality( r.r ) ); break; }
+                    case op::intersects:               { checksum += roaring_bitmap_intersect( small, large ); break; }
+                }
+            }
+            return checksum;
+        };
+        e.teardown       = []( void * sv ) { delete static_cast<state *>( sv ); };
+        e.ops_per_run    = static_cast<std::int64_t>( pairs );
+        e.inner_reps     = 20;
+        e.reusable_state = true;
+        g_benchmarks.push_back( std::move( e ) );
+    }
+};
+
+static void register_array_skew() {
+    std::vector<std::pair<std::size_t, std::size_t>> sizes;
+    for ( std::size_t const large : { 256, 2000, 3500 } ) {
+        for ( std::size_t const small : { 1, 2, 3, 8, 32, 128 } ) {
+            if ( small < large ) {
+                sizes.emplace_back( small, large );
+            }
+        }
+    }
+    sizes.emplace_back( 500, 2000 );
+    sizes.emplace_back( 2000, 2000 );
+    constexpr std::pair<op, char const *> ops[]{
+        { op::or_op, "Or" },
+        { op::or_inplace, "OrInplace" },
+        { op::andnot_large_minus_small, "AndnotLargeMinusSmall" },
+        { op::andnot_small_minus_large, "AndnotSmallMinusLarge" },
+        { op::xor_op, "Xor" },
+        { op::and_op, "And" },
+        { op::intersects, "Intersects" },
+    };
+    for ( auto const [o, name] : ops ) {
+        for ( auto const [small, large] : sizes ) {
+            band const b{ name, o, small, large };
+            arms::for_each_frsr<frsr_registrar>( b );
+            arms::for_each_croaring<cpp_registrar>( b );
+        }
+    }
+}
+
+} // namespace array_skew
+
 static void register_benchmarks() {
     register_run_shaped_listed();
     register_array_run();
@@ -10468,6 +10659,7 @@ static void register_benchmarks() {
     keep_runs::register_keep_runs_rounds();
     optimize_bands::register_optimize_bands();
     register_random_contains_bands();
+    array_skew::register_array_skew();
 }
 
 } // namespace kernel_bands
