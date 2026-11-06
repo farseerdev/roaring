@@ -21,6 +21,7 @@
 #include <cstring>
 #include <functional>
 #include <random>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -253,6 +254,13 @@ void run_mutation_bands( config const & cfg, pattern const p, std::size_t const 
         if ( selected( cfg, "and", "frsr" ) ) { report( "and", "frsr", p, n, best_ns_per_op( cfg.reps, n, [&] { return ( fa & fb ).size(); } ) ); }
         if ( selected( cfg, "andnot", "frsr" ) ) { report( "andnot", "frsr", p, n, best_ns_per_op( cfg.reps, n, [&] { return ( fa - fb ).size(); } ) ); }
         if ( selected( cfg, "orInplace", "frsr" ) ) { report( "orInplace", "frsr", p, n, best_ns_per_op( cfg.reps, n, [&] { auto c{ fa }; c |= fb; return c.size(); } ) ); }
+        // the in-place forms that rewrite the chunk table as they walk it (a copy, then the operation)
+        if ( selected( cfg, "andInplace", "frsr" ) ) { report( "andInplace", "frsr", p, n, best_ns_per_op( cfg.reps, n, [&] { auto c{ fa }; c &= fb; return c.size(); } ) ); }
+        if ( selected( cfg, "andnotInplace", "frsr" ) ) { report( "andnotInplace", "frsr", p, n, best_ns_per_op( cfg.reps, n, [&] { auto c{ fa }; c -= fb; return c.size(); } ) ); }
+        if ( selected( cfg, "xorInplace", "frsr" ) ) { report( "xorInplace", "frsr", p, n, best_ns_per_op( cfg.reps, n, [&] { auto c{ fa }; c ^= fb; return c.size(); } ) ); }
+        if ( selected( cfg, "andWithKeys", "frsr" ) ) { report( "andWithKeys", "frsr", p, n, best_ns_per_op( cfg.reps, n, [&] { auto c{ fa }; c.and_with( std::span<u64 const>{ b } ); return c.size(); } ) ); }
+        if ( selected( cfg, "andnotWithKeys", "frsr" ) ) { report( "andnotWithKeys", "frsr", p, n, best_ns_per_op( cfg.reps, n, [&] { auto c{ fa }; c.andnot_with( std::span<u64 const>{ b } ); return c.size(); } ) ); }
+        if ( selected( cfg, "xorWithKeys", "frsr" ) ) { report( "xorWithKeys", "frsr", p, n, best_ns_per_op( cfg.reps, n, [&] { auto c{ fa }; c.xor_with( std::span<u64 const>{ b } ); return c.size(); } ) ); }
 #if FRSR_ROARING_HAS_CROARING
         auto * ra{ roaring64_bitmap_create() }; auto * rb{ roaring64_bitmap_create() };
         roaring64_bitmap_add_many( ra, a.size(), a.data() ); roaring64_bitmap_add_many( rb, b.size(), b.data() );
@@ -260,6 +268,9 @@ void run_mutation_bands( config const & cfg, pattern const p, std::size_t const 
         if ( selected( cfg, "and", "r64" ) ) { report( "and", "r64", p, n, best_ns_per_op( cfg.reps, n, [&] { auto * r{ roaring64_bitmap_and( ra, rb ) }; auto c{ roaring64_bitmap_get_cardinality( r ) }; roaring64_bitmap_free( r ); return c; } ) ); }
         if ( selected( cfg, "andnot", "r64" ) ) { report( "andnot", "r64", p, n, best_ns_per_op( cfg.reps, n, [&] { auto * r{ roaring64_bitmap_andnot( ra, rb ) }; auto c{ roaring64_bitmap_get_cardinality( r ) }; roaring64_bitmap_free( r ); return c; } ) ); }
         if ( selected( cfg, "orInplace", "r64" ) ) { report( "orInplace", "r64", p, n, best_ns_per_op( cfg.reps, n, [&] { auto * c{ roaring64_bitmap_copy( ra ) }; roaring64_bitmap_or_inplace( c, rb ); auto k{ roaring64_bitmap_get_cardinality( c ) }; roaring64_bitmap_free( c ); return k; } ) ); }
+        if ( selected( cfg, "andInplace", "r64" ) ) { report( "andInplace", "r64", p, n, best_ns_per_op( cfg.reps, n, [&] { auto * c{ roaring64_bitmap_copy( ra ) }; roaring64_bitmap_and_inplace( c, rb ); auto k{ roaring64_bitmap_get_cardinality( c ) }; roaring64_bitmap_free( c ); return k; } ) ); }
+        if ( selected( cfg, "andnotInplace", "r64" ) ) { report( "andnotInplace", "r64", p, n, best_ns_per_op( cfg.reps, n, [&] { auto * c{ roaring64_bitmap_copy( ra ) }; roaring64_bitmap_andnot_inplace( c, rb ); auto k{ roaring64_bitmap_get_cardinality( c ) }; roaring64_bitmap_free( c ); return k; } ) ); }
+        if ( selected( cfg, "xorInplace", "r64" ) ) { report( "xorInplace", "r64", p, n, best_ns_per_op( cfg.reps, n, [&] { auto * c{ roaring64_bitmap_copy( ra ) }; roaring64_bitmap_xor_inplace( c, rb ); auto k{ roaring64_bitmap_get_cardinality( c ) }; roaring64_bitmap_free( c ); return k; } ) ); }
         roaring64_bitmap_free( ra ); roaring64_bitmap_free( rb );
 #endif
     }
