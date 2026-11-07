@@ -2312,9 +2312,11 @@ private:
     // chained folds run array kernels instead of full word loops; doing the
     // demotion inside the kernel instead destroyed the adopted scratch bitset
     // (breaking the chunk_store scratch cycle) and regressed the fold-heavy
-    // witness up to +14% — hence spine-side, with retirement.
+    // witness up to +14% — hence spine-side, with retirement. The container is
+    // demoted where it lies, so a result already in its slot (an in-place
+    // kernel's) is neither moved out nor back when it stays a bitset.
     template <typename Store>
-    [[nodiscard]] static handle_type demote_sparse_bitset( handle_type && container, Store & store ) {
+    static void demote_sparse_bitset( handle_type & container, Store & store ) {
         if ( container.holds_bitset() ) {
             auto const cardinality{ container.cardinality() };
             if ( cardinality < array_to_bitset_threshold ) {
@@ -2323,10 +2325,9 @@ private:
                     cardinality
                 ) };
                 store.retire( std::move( container ) );
-                return array;
+                container = std::move( array );
             }
         }
-        return std::move( container );
     }
 
     [[nodiscard]] static handle_type combine_bitset_bitset_for_policy(

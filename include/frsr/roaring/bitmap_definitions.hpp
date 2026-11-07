@@ -399,6 +399,16 @@ FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::difference_into( bitmap
     scratch.clear_keep_capacity();
     scratch.chunks_.reserve( chunks_.size() );
 
+    // A result of a pair that may be a bitset is demoted when an array can hold it (the rule of combine()'s emit),
+    // then kept unless empty. The array-left arms build arrays directly.
+    auto const push_result{ [ &scratch ]( auto const key, handle_type && container ) {
+        demote_sparse_bitset( container, scratch.chunks_ );
+        if ( auto const count{ detail::container_size( container ) }; count != 0 ) {
+            scratch.size_ += count;
+            scratch.chunks_.push_back( key, std::move( container ) );
+        }
+    } };
+
     auto left{ chunks_.begin() };
     auto right{ other.chunks_.begin() };
     while ( left != chunks_.end() ) {
@@ -436,16 +446,12 @@ FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::difference_into( bitmap
                 continue;
             }
             if ( left_container.holds_bitset() && right_container.holds_bitset() ) {
-                auto container{ demote_sparse_bitset( combine_bitset_bitset_for_policy(
+                push_result( left_key, combine_bitset_bitset_for_policy(
                     left_container.as_bitset(),
                     right_container.as_bitset(),
                     detail::set_operation::bit_andnot,
                     scratch.chunks_.take_retired( detail::container_kind::bitset )
-                ), scratch.chunks_ ) };
-                if ( auto const bitset_size{ detail::container_size( container ) }; bitset_size != 0 ) {
-                    scratch.size_ += bitset_size;
-                    scratch.chunks_.push_back( left_key, std::move( container ) );
-                }
+                ) );
                 ++left;
                 continue;
             }
@@ -470,16 +476,11 @@ FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::difference_into( bitmap
                 ++left;
                 continue;
             }
-            auto container{ combine_containers_for_policy(
+            push_result( left_key, combine_containers_for_policy(
                 left_container,
                 right_container,
                 detail::set_operation::bit_andnot
-            ) };
-            auto const container_size{ detail::container_size( container ) };
-            if ( container_size != 0 ) {
-                scratch.size_ += container_size;
-                scratch.chunks_.push_back( left_key, std::move( container ) );
-            }
+            ) );
         }
         ++left;
     }
@@ -796,10 +797,27 @@ FRSR_ROARING_DEFINITION_INLINE auto FRSR_ROARING_BITMAP::combine( bitmap const &
         // which must not relocate.
         result_chunks.reserve( std::min( chunks_.size(), other.chunks_.size() ) );
     }
+    // The walk's one rule for the kind of a result: a difference leaves no bitset
+    // an array can hold (the reference's rule — its andnot kernels return an
+    // array below the limit), demoted spine-side so the vacated payload is
+    // retired for take_retired reuse. An intersection's bitsets are NOT demoted
+    // (measured): the in-place fold walk is where the run-heavy witness's
+    // AND-fold accumulator lives — demoting it to array cost ~12% regardless of
+    // threshold or run∩bitset exemption (the demoted accumulator loses the dense
+    // arms for every subsequent fold pair). Subtraction traffic is not
+    // fold-accumulator traffic. emit() applies it to every result it stores;
+    // an arm that changes the left container where it lies applies it before
+    // keeping the slot.
+    auto const settle{ [&]( handle_type & container ) {
+        if constexpr ( op == detail::set_operation::bit_andnot ) {
+            demote_sparse_bitset( container, result_chunks );
+        }
+    } };
     // Store a finished result container for the current left_key. In-place mode
     // rewrites the already-consumed prefix of our own chunk table; materializing
     // mode appends to the (pre-reserved) destination.
     auto const emit{ [&]( auto const key, handle_type && container, size_type const count ) {
+        settle( container );
 #if FRSR_ROARING_COMBINE_STATS
         detail::combine_stats().record_result( container );
 #endif
@@ -972,8 +990,9 @@ FRSR_ROARING_DEFINITION_INLINE auto FRSR_ROARING_BITMAP::combine( bitmap const &
                 if ( mutate_left ) {
                     auto left_bitset{ left_container.as_bitset() };
                     detail::combine_bitset_bitset_inplace<layout_type>( left_bitset, right_container.as_bitset(), op );
-                    if ( left_bitset.size() != 0 ) {
-                        size_ += left_bitset.size();
+                    if ( auto const count{ left_bitset.size() }; count != 0 ) {
+                        settle( left_container );
+                        size_ += count;
                         rewrite.keep( left );
                     }
                 } else {
@@ -1008,15 +1027,6 @@ FRSR_ROARING_DEFINITION_INLINE auto FRSR_ROARING_BITMAP::combine( bitmap const &
                             result_chunks.take_retired( detail::container_kind::bitset )
                         );
                     }() };
-                    // AND results NOT demoted (measured): the in-place fold walk is
-                    // where the run-heavy witness's AND-fold accumulator lives —
-                    // demoting it to array cost ~12% regardless of threshold or
-                    // run∩bitset exemption (the demoted accumulator loses the dense
-                    // arms for every subsequent fold pair). ANDNOT results are
-                    // demoted: subtraction traffic is not fold-accumulator traffic.
-                    if ( op == detail::set_operation::bit_andnot ) {
-                        container = demote_sparse_bitset( std::move( container ), result_chunks );
-                    }
                     if ( auto const bitset_size{ detail::container_size( container ) }; bitset_size != 0 ) {
                         emit( left_key, std::move( container ), bitset_size );
                     }
@@ -1237,8 +1247,9 @@ FRSR_ROARING_DEFINITION_INLINE auto FRSR_ROARING_BITMAP::combine( bitmap const &
                 [ & ] [[ gnu::noinline ]] () {   // outlined: see the array∩run arm above
                     auto left_bitset{ left_container.as_bitset() };
                     detail::difference_bitset_array_inplace<layout_type>( left_bitset, right_container.as_array() );
-                    if ( left_bitset.size() != 0 ) {
-                        size_ += left_bitset.size();
+                    if ( auto const count{ left_bitset.size() }; count != 0 ) {
+                        settle( left_container );
+                        size_ += count;
                         rewrite.keep( left );
                     }
                 }();
@@ -2400,10 +2411,9 @@ FRSR_ROARING_DEFINITION_INLINE auto FRSR_ROARING_BITMAP::make_array_union_contai
     }
     if constexpr ( supports_bitset_container ) {
         // The union may still fall below the limit (shared values): demote, as the reference does.
-        return demote_sparse_bitset(
-            detail::bitset_handle_from_array_union<layout_type, CowPolicy>( lhs, rhs, store.take_retired( detail::container_kind::bitset ) ),
-            store
-        );
+        auto result{ detail::bitset_handle_from_array_union<layout_type, CowPolicy>( lhs, rhs, store.take_retired( detail::container_kind::bitset ) ) };
+        demote_sparse_bitset( result, store );
+        return result;
     } else {
         detail::union_array_array_to_vector<layout_type>( lhs, rhs, scratch );
         return make_fast_container_from_scratch_reusing( store, scratch );

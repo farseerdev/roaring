@@ -1111,13 +1111,13 @@ void operand_updating_every_form_case() {
                     ASSERT_TRUE( matches( bm, expected ) );
                     ASSERT_EQ( bm.size(), expected.size() );
                     ASSERT_EQ( bm.validate( false ), nullptr );
-                    // a bitset that runs are taken from is an array again below the array limit
-                    if ( difference && operand.name.starts_with( "runs/" ) && expected.size() < Bitmap::array_to_bitset_threshold ) { ASSERT_EQ( bm.statistics().bitset_containers, 0U ); }
+                    // a bitset that a difference leaves below the array limit is an array again, whatever the operand
+                    if ( difference && expected.size() < Bitmap::array_to_bitset_threshold ) { ASSERT_EQ( bm.statistics().bitset_containers, 0U ); }
                     if ( keep_a_copy ) { ASSERT_TRUE( matches( copy, received ) ); }
                 }
             } };
             check( [ & ]( Bitmap & bm ) { bm |= operand_bitmap; }, united, "|=" );
-            check( [ & ]( Bitmap & bm ) { bm -= operand_bitmap; }, differed, "-=" );
+            check( [ & ]( Bitmap & bm ) { bm -= operand_bitmap; }, differed, "-=", true );
             check( [ & ]( Bitmap & bm ) { bm.or_with( view_of( operand_bitmap ) ); }, united, "or_with( view )" );
             check( [ & ]( Bitmap & bm ) { bm.andnot_with( view_of( operand_bitmap ) ); }, differed, "andnot_with( view )", true );
             if ( ::testing::Test::HasFatalFailure() ) { return; }

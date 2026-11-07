@@ -1786,7 +1786,6 @@ TYPED_TEST( UpstreamCases, test_andnot_inplace_bitset_to_array_then_serialize ) 
 // tests/toplevel_unit.c: test_andnot_inplace_bitset_to_array_then_serialize, the kind of the result: a bitset that a
 // subtraction leaves with no more values than the array limit becomes an array, as in the reference
 TYPED_TEST( UpstreamCases, subtraction_leaves_a_sparse_bitset_an_array ) {
-    GTEST_SKIP() << "bitset minus run in place, and bitset minus array in and out of place, keep a bitset of any size";
     using Bitmap = TypeParam;
     auto bm{ one_by_one<Bitmap>( 0, 8192 ) };
     auto const subtrahend{ from_range<Bitmap>( 128, 8192, 1 ) };
