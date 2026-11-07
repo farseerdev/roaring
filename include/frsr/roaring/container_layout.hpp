@@ -16,6 +16,10 @@ struct default_layout {
     static constexpr unsigned low_bits{ key_bits < 16 ? key_bits : 16 };
     static constexpr std::size_t low_domain_size{ std::size_t{ 1 } << low_bits };
     static constexpr std::size_t word_count{ low_domain_size / 64 };
+    // The largest cardinality a chunk holds as an array; one more is a bitset. For 16-bit lows one more is the
+    // byte-parity point (two bytes a value against a bit a value), where both forms take the same bytes and the
+    // bitset's kernels are the faster; a smaller domain makes a bitset from 64 values.
+    static constexpr std::size_t array_max_cardinality{ ( low_domain_size >= 1024 ? low_domain_size / 16 : 64 ) - 1 };
     static constexpr Key low_mask{
         low_bits == key_bits
             ? std::numeric_limits<Key>::max()

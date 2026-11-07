@@ -308,12 +308,10 @@ private:
 
 public:
 
-    // The first cardinality a chunk holds as a bitset; every decision of a container's kind compares against it (a
-    // bitset from it, an array below it). For 16-bit lows it is the byte-parity point, where both forms take the same
-    // bytes and the bitset's kernels are the faster (the reference keeps an array there, DEFAULT_MAX_SIZE).
-    static constexpr size_type array_to_bitset_threshold{
-        layout_type::low_domain_size >= 1024 ? layout_type::low_domain_size / 16 : 64
-    };
+    // The first cardinality a chunk holds as a bitset, one past the largest array (layout_type::array_max_cardinality);
+    // every decision of a container's kind compares against it (a bitset from it, an array below it). For 16-bit lows
+    // it is the byte-parity point (the reference keeps an array there, DEFAULT_MAX_SIZE).
+    static constexpr size_type array_to_bitset_threshold{ layout_type::array_max_cardinality + 1 };
 
     struct container_statistics {
         size_type array_containers{};
@@ -1323,7 +1321,7 @@ public:
     //
     // Unlike the other set operations the result can lose a chunk the operands hold (two equal containers cancel)
     // and gains the chunks only the other operand holds, so the walks are the union's with empty results dropped.
-    // A result is an array up to array_to_bitset_threshold values and a bitset above, as the reference has it.
+    // A result is an array below array_to_bitset_threshold values and a bitset from it, as the reference has it.
     // [croaring-ref] deps/croaring/src/roaring.c:roaring_bitmap_xor, roaring_bitmap_xor_inplace
 
     [[nodiscard]] static handle_type xor_result_for_policy( handle_type container );
