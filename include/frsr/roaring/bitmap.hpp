@@ -308,6 +308,9 @@ private:
 
 public:
 
+    // The first cardinality a chunk holds as a bitset; every decision of a container's kind compares against it (a
+    // bitset from it, an array below it). For 16-bit lows it is the byte-parity point, where both forms take the same
+    // bytes and the bitset's kernels are the faster (the reference keeps an array there, DEFAULT_MAX_SIZE).
     static constexpr size_type array_to_bitset_threshold{
         layout_type::low_domain_size >= 1024 ? layout_type::low_domain_size / 16 : 64
     };

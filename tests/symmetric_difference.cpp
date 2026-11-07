@@ -112,7 +112,7 @@ void expect_settled_form( Bitmap const & result, form const & a, form const & b 
         EXPECT_EQ( s.run_containers, 0U ) << "an exclusive-or of non-run operands minted a run";
     }
     if ( s.run_containers == 0 ) {
-        EXPECT_EQ( s.array_containers != 0, result.size() <= Bitmap::array_to_bitset_threshold ) << "size " << result.size();
+        EXPECT_EQ( s.array_containers != 0, result.size() < Bitmap::array_to_bitset_threshold ) << "size " << result.size();
     }
 }
 
@@ -259,8 +259,8 @@ TEST( SymmetricDifference, ResultFormAtTheArrayLimit ) {
             c ^= b;
             for ( Bitmap32 const * const r : std::array<Bitmap32 const *, 2>{ &result, &c } ) {
                 ASSERT_EQ( r->size(), left + right );
-                EXPECT_EQ( r->statistics().array_containers, left + right <= 4096 ? 1U : 0U ) << left << " ^ " << right;
-                EXPECT_EQ( r->statistics().bitset_containers, left + right <= 4096 ? 0U : 1U ) << left << " ^ " << right;
+                EXPECT_EQ( r->statistics().array_containers, left + right < Bitmap32::array_to_bitset_threshold ? 1U : 0U ) << left << " ^ " << right;
+                EXPECT_EQ( r->statistics().bitset_containers, left + right < Bitmap32::array_to_bitset_threshold ? 0U : 1U ) << left << " ^ " << right;
                 EXPECT_EQ( r->validate( true ), nullptr );
             }
         }

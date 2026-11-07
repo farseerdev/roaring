@@ -771,10 +771,8 @@ struct interop_engine {
     // is flipped in one pass over the chunks it covers, whatever the chunks hold.
     [[nodiscard]] static handle_type flip_piece( handle_type && container, handle_type const & piece ) {
         auto const run{ piece.as_run().runs.front() };
-        // an array may hold as many values as the bitmap's own limit: the flip kernels take the first cardinality
-        // that is a bitset
         auto result{ apply_range_to_container<layout_type, cow_policy, typename Bitmap::run_selection_policy>(
-            std::move( container ), run.begin, run.end, range_operation::flip, Bitmap::array_to_bitset_threshold + 1U ) };
+            std::move( container ), run.begin, run.end, range_operation::flip, Bitmap::array_to_bitset_threshold ) };
         if constexpr ( !Bitmap::uses_default_container_set ) { result = Bitmap::optimize_container_for_policy( std::move( result ) ); }
         return result;
     }

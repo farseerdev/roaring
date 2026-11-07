@@ -205,23 +205,23 @@ template <typename Layout, typename CowPolicy>
 
 // ---- symmetric difference ---------------------------------------------------------------------------------
 //
-// The result of an exclusive-or lands in the form the reference gives it: an array when it holds no more values
-// than `array_limit`, a bitset above, and runs only where an operand was run-encoded and they are the smallest of
+// The result of an exclusive-or lands in the form the reference gives it: an array below `bitset_threshold`, a
+// bitset from it, and runs only where an operand was run-encoded and they are the smallest of
 // the three. The rules the union and difference kernels use for minting a run encoding do not apply: an
 // exclusive-or of two arrays never produces one.
 
-// A bitset result in its final form: empty, an array when it fell to the limit or below, else itself.
+// A bitset result in its final form: empty, an array when it fell below the threshold, else itself.
 template <typename Layout, typename CowPolicy, typename Retire>
 [[nodiscard]] inline container_handle<Layout, CowPolicy> settle_xor_bitset(
     container_handle<Layout, CowPolicy> && result,
-    std::size_t const array_limit,
+    std::size_t const bitset_threshold,
     Retire && retire
 ) {
     auto const cardinality{ result.cardinality() };
     if ( cardinality == 0 ) {
         return container_handle<Layout, CowPolicy>{};
     }
-    if ( cardinality <= array_limit ) {
+    if ( cardinality < bitset_threshold ) {
         auto array{ array_from_bitset<Layout, CowPolicy>( std::as_const( result ).as_bitset(), cardinality ) };
         retire( std::move( result ) );
         return array;
@@ -232,9 +232,9 @@ template <typename Layout, typename CowPolicy, typename Retire>
 template <typename Layout, typename CowPolicy>
 [[nodiscard]] inline container_handle<Layout, CowPolicy> settle_xor_bitset(
     container_handle<Layout, CowPolicy> && result,
-    std::size_t const array_limit
+    std::size_t const bitset_threshold
 ) {
-    return settle_xor_bitset<Layout, CowPolicy>( std::move( result ), array_limit, []( auto && ) noexcept {} );
+    return settle_xor_bitset<Layout, CowPolicy>( std::move( result ), bitset_threshold, []( auto && ) noexcept {} );
 }
 
 // [croaring-ref] deps/croaring/src/containers/mixed_xor.c:array_array_container_xor
@@ -242,10 +242,10 @@ template <typename Layout, typename CowPolicy>
 [[nodiscard]] inline container_handle<Layout, CowPolicy> xor_array_array(
     array_cref<Layout, CowPolicy> const lhs,
     array_cref<Layout, CowPolicy> const rhs,
-    std::size_t const array_limit
+    std::size_t const bitset_threshold
 ) {
     using handle_type = container_handle<Layout, CowPolicy>;
-    if ( lhs.values.size() + rhs.values.size() <= array_limit ) {
+    if ( lhs.values.size() + rhs.values.size() < bitset_threshold ) {
         handle_type result;
         auto result_array{ result.as_array() };
         xor_array_array_to_vector<Layout>( lhs, rhs, result_array.values );
@@ -258,7 +258,7 @@ template <typename Layout, typename CowPolicy>
     // The result may be larger than an array can be: one side scattered into a bitset, the other flipped in.
     auto result{ bitset_handle_from_sorted_values<Layout, CowPolicy>( { lhs.values.data(), lhs.values.size() } ) };
     xor_array_into_bitset_inplace<false, Layout, CowPolicy>( result.as_bitset(), rhs );
-    return settle_xor_bitset<Layout, CowPolicy>( std::move( result ), array_limit );
+    return settle_xor_bitset<Layout, CowPolicy>( std::move( result ), bitset_threshold );
 }
 
 // [croaring-ref] deps/croaring/src/containers/mixed_xor.c:array_bitset_container_xor
@@ -266,11 +266,11 @@ template <typename Layout, typename CowPolicy>
 [[nodiscard]] inline container_handle<Layout, CowPolicy> xor_array_bitset(
     array_cref<Layout, CowPolicy> const array,
     bitset_cref<Layout, CowPolicy> const bitset,
-    std::size_t const array_limit
+    std::size_t const bitset_threshold
 ) {
     auto result{ clone_bitset_words<Layout, CowPolicy>( bitset ) };
     xor_array_into_bitset_inplace<false, Layout, CowPolicy>( result.as_bitset(), array );
-    return settle_xor_bitset<Layout, CowPolicy>( std::move( result ), array_limit );
+    return settle_xor_bitset<Layout, CowPolicy>( std::move( result ), bitset_threshold );
 }
 
 // [croaring-ref] deps/croaring/src/containers/mixed_xor.c:run_bitset_container_xor
@@ -278,18 +278,18 @@ template <typename Layout, typename CowPolicy>
 [[nodiscard]] inline container_handle<Layout, CowPolicy> xor_run_bitset(
     run_cref<Layout, CowPolicy> const runs,
     bitset_cref<Layout, CowPolicy> const bitset,
-    std::size_t const array_limit
+    std::size_t const bitset_threshold
 ) {
     auto result{ clone_bitset_words<Layout, CowPolicy>( bitset ) };
     xor_runs_into_bitset_inplace<false, Layout, CowPolicy>( result.as_bitset(), runs );
-    return settle_xor_bitset<Layout, CowPolicy>( std::move( result ), array_limit );
+    return settle_xor_bitset<Layout, CowPolicy>( std::move( result ), bitset_threshold );
 }
 
 // A run container of `capacity` runs filled by `fill` (which returns how many it wrote), in its smallest form.
 template <typename Layout, typename CowPolicy, typename Fill>
 [[nodiscard]] inline container_handle<Layout, CowPolicy> xor_into_run_result(
     std::size_t const capacity,
-    std::size_t const array_limit,
+    std::size_t const bitset_threshold,
     Fill && fill
 ) {
     using handle_type = container_handle<Layout, CowPolicy>;
@@ -302,7 +302,7 @@ template <typename Layout, typename CowPolicy, typename Fill>
     }
     ref.runs.resize_uninitialized( static_cast<std::uint32_t>( n ) );
     ref.sync_header();
-    return settle_run_result<Layout, CowPolicy>( std::move( result ), array_limit + 1U );
+    return settle_run_result<Layout, CowPolicy>( std::move( result ), bitset_threshold );
 }
 
 // [croaring-ref] deps/croaring/src/containers/mixed_xor.c:run_run_container_xor
@@ -310,9 +310,9 @@ template <typename Layout, typename CowPolicy>
 [[nodiscard]] inline container_handle<Layout, CowPolicy> xor_run_run(
     run_cref<Layout, CowPolicy> const lhs,
     run_cref<Layout, CowPolicy> const rhs,
-    std::size_t const array_limit
+    std::size_t const bitset_threshold
 ) {
-    return xor_into_run_result<Layout, CowPolicy>( lhs.runs.size() + rhs.runs.size(), array_limit, [ & ]( auto * const out ) noexcept {
+    return xor_into_run_result<Layout, CowPolicy>( lhs.runs.size() + rhs.runs.size(), bitset_threshold, [ & ]( auto * const out ) noexcept {
         return xor_runs<Layout>( lhs.runs.data(), lhs.runs.size(), rhs.runs.data(), rhs.runs.size(), out );
     } );
 }
@@ -324,18 +324,18 @@ template <typename Layout, typename CowPolicy>
 [[nodiscard]] inline container_handle<Layout, CowPolicy> xor_array_run(
     array_cref<Layout, CowPolicy> const array,
     container_handle<Layout, CowPolicy> const & run_handle,
-    std::size_t const array_limit
+    std::size_t const bitset_threshold
 ) {
     constexpr std::size_t few_values{ 32 };
     auto const runs{ run_handle.as_run() };
     if ( array.values.size() < few_values ) {
-        return xor_into_run_result<Layout, CowPolicy>( array.values.size() + runs.runs.size(), array_limit, [ & ]( auto * const out ) noexcept {
+        return xor_into_run_result<Layout, CowPolicy>( array.values.size() + runs.runs.size(), bitset_threshold, [ & ]( auto * const out ) noexcept {
             return xor_values_runs<Layout>( array.values.data(), array.values.size(), runs.runs.data(), runs.runs.size(), out );
         } );
     }
-    if ( run_handle.cardinality() <= array_limit ) {
+    if ( run_handle.cardinality() < bitset_threshold ) {
         auto const expanded{ array_handle_from_container<Layout, CowPolicy>( run_handle ) };
-        return xor_array_array<Layout, CowPolicy>( expanded.as_array(), array, array_limit );
+        return xor_array_array<Layout, CowPolicy>( expanded.as_array(), array, bitset_threshold );
     }
     auto result{ container_handle<Layout, CowPolicy>::make_bitset_zeroed() };
     {
@@ -347,15 +347,15 @@ template <typename Layout, typename CowPolicy>
     }
     result.set_cardinality( run_handle.cardinality() );
     xor_array_into_bitset_inplace<false, Layout, CowPolicy>( result.as_bitset(), array );
-    return settle_xor_bitset<Layout, CowPolicy>( std::move( result ), array_limit );
+    return settle_xor_bitset<Layout, CowPolicy>( std::move( result ), bitset_threshold );
 }
 
-// lhs ^ rhs as a legal container. `array_limit` is the largest cardinality an array may have.
+// lhs ^ rhs as a legal container. `bitset_threshold` is the first cardinality held as a bitset.
 template <typename Layout, typename CowPolicy = cow_value_semantics>
 [[nodiscard]] inline container_handle<Layout, CowPolicy> xor_containers(
     container_handle<Layout, CowPolicy> const & lhs,
     container_handle<Layout, CowPolicy> const & rhs,
-    std::size_t const array_limit
+    std::size_t const bitset_threshold
 ) {
     using handle_type = container_handle<Layout, CowPolicy>;
     if ( lhs.cardinality() == 0 ) { return handle_type{ rhs }; }
@@ -370,25 +370,25 @@ template <typename Layout, typename CowPolicy = cow_value_semantics>
         constexpr bool left_bitset { std::same_as<left_type , bitset_cref<Layout, CowPolicy>> };
         constexpr bool right_bitset{ std::same_as<right_type, bitset_cref<Layout, CowPolicy>> };
         if constexpr ( left_array && right_array ) {
-            return xor_array_array<Layout, CowPolicy>( left, right, array_limit );
+            return xor_array_array<Layout, CowPolicy>( left, right, bitset_threshold );
         } else if constexpr ( left_array && right_bitset ) {
-            return xor_array_bitset<Layout, CowPolicy>( left, right, array_limit );
+            return xor_array_bitset<Layout, CowPolicy>( left, right, bitset_threshold );
         } else if constexpr ( left_bitset && right_array ) {
-            return xor_array_bitset<Layout, CowPolicy>( right, left, array_limit );
+            return xor_array_bitset<Layout, CowPolicy>( right, left, bitset_threshold );
         } else if constexpr ( left_run && right_bitset ) {
-            return xor_run_bitset<Layout, CowPolicy>( left, right, array_limit );
+            return xor_run_bitset<Layout, CowPolicy>( left, right, bitset_threshold );
         } else if constexpr ( left_bitset && right_run ) {
-            return xor_run_bitset<Layout, CowPolicy>( right, left, array_limit );
+            return xor_run_bitset<Layout, CowPolicy>( right, left, bitset_threshold );
         } else if constexpr ( left_array && right_run ) {
-            return xor_array_run<Layout, CowPolicy>( left, rhs, array_limit );
+            return xor_array_run<Layout, CowPolicy>( left, rhs, bitset_threshold );
         } else if constexpr ( left_run && right_array ) {
-            return xor_array_run<Layout, CowPolicy>( right, lhs, array_limit );
+            return xor_array_run<Layout, CowPolicy>( right, lhs, bitset_threshold );
         } else if constexpr ( left_run && right_run ) {
-            return xor_run_run<Layout, CowPolicy>( left, right, array_limit );
+            return xor_run_run<Layout, CowPolicy>( left, right, bitset_threshold );
         } else {
             static_assert( left_bitset && right_bitset );
             return settle_xor_bitset<Layout, CowPolicy>(
-                combine_bitset_bitset<Layout, CowPolicy>( left, right, set_operation::bit_xor ), array_limit );
+                combine_bitset_bitset<Layout, CowPolicy>( left, right, set_operation::bit_xor ), bitset_threshold );
         }
     }, lhs, rhs );
 }
