@@ -346,13 +346,15 @@ typedef std::uint32_t setbit_decode_lane_block
     return out;
 }
 
-// Extract a low-cardinality bitset result into a fresh array handle.
+// Extract a low-cardinality bitset result into an array handle: a retired array handle's payload when one is
+// offered (the reuse contract of intersect_bitset_bitset_to_array), else a fresh one.
 template <typename Layout, typename CowPolicy = cow_value_semantics>
 [[nodiscard]] inline container_handle<Layout, CowPolicy> array_from_bitset(
     bitset_cref<Layout, CowPolicy> const bitset,
-    std::uint32_t const cardinality
+    std::uint32_t const cardinality,
+    container_handle<Layout, CowPolicy> && reuse = {}
 ) {
-    container_handle<Layout, CowPolicy> result;
+    auto result{ reuse.holds_array() ? std::move( reuse ) : container_handle<Layout, CowPolicy>{} };
     auto array{ result.as_array() };
     auto const & words{ bitset.words.as_array() };
     // Below the vector decoder's break-even the plain trailing-zero loop is the fastest, as in the reference: the

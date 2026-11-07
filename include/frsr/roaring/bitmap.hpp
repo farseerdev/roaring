@@ -2304,28 +2304,26 @@ private:
         detail::set_operation const op
     );
 
-    // Same-key bitset×bitset materialized combine, bypassing the 2-D std::visit in
-    // combine_containers (whose bitset×bitset arm just forwards to combine_bitset_bitset
-    // with no array-downgrade, so this is identical minus the dispatch). The dense
-    // count=100k scenarios are bitset×bitset, so this is the hot materialized arm —
-    // the materialized analog of the in-place fast path in union_merge/operator&=/-=.
-    // Demote a low-cardinality bitset combine result to an array container,
-    // retiring the vacated 8 KB payload for take_retired reuse. CRoaring
-    // converts AND/ANDNOT bitset results to array below DEFAULT_MAX_SIZE so
-    // chained folds run array kernels instead of full word loops; doing the
-    // demotion inside the kernel instead destroyed the adopted scratch bitset
-    // (breaking the chunk_store scratch cycle) and regressed the fold-heavy
-    // witness up to +14% — hence spine-side, with retirement. The container is
-    // demoted where it lies, so a result already in its slot (an in-place
-    // kernel's) is neither moved out nor back when it stays a bitset.
-    template <typename Store>
-    static void demote_sparse_bitset( handle_type & container, Store & store ) {
+    // Demote a bitset result that falls below the threshold to an array (an empty one to an
+    // empty container), retiring the vacated 8 KB payload for take_retired reuse and filling
+    // a retired array payload when one is offered. The reference leaves a difference's bitset
+    // an array up to DEFAULT_MAX_SIZE values, so chained operations run array kernels instead
+    // of full word loops; doing the demotion inside the kernel instead destroyed the adopted
+    // scratch bitset (breaking the chunk_store scratch cycle) and regressed the fold-heavy
+    // witness up to +14% — hence spine-side, with retirement. The container is demoted where
+    // it lies, so a result already in its slot (an in-place kernel's) is neither moved out nor
+    // back when it stays a bitset.
+    static void demote_sparse_bitset( handle_type & container, chunk_store_type & store ) {
         if ( container.holds_bitset() ) {
             auto const cardinality{ container.cardinality() };
-            if ( cardinality < array_to_bitset_threshold ) {
+            if ( cardinality == 0 ) {
+                store.retire( std::move( container ) );
+                container = handle_type{};
+            } else if ( cardinality < array_to_bitset_threshold ) {
                 auto array{ detail::array_from_bitset<layout_type, CowPolicy>(
                     std::as_const( container ).as_bitset(),
-                    cardinality
+                    cardinality,
+                    store.take_retired( detail::container_kind::array )
                 ) };
                 store.retire( std::move( container ) );
                 container = std::move( array );
@@ -2333,6 +2331,11 @@ private:
         }
     }
 
+    // Same-key bitset×bitset materialized combine, bypassing the 2-D std::visit in
+    // combine_containers (whose bitset×bitset arm just forwards to combine_bitset_bitset
+    // with no array-downgrade, so this is identical minus the dispatch). The dense
+    // count=100k scenarios are bitset×bitset, so this is the hot materialized arm —
+    // the materialized analog of the in-place fast path in union_merge/operator&=/-=.
     [[nodiscard]] static handle_type combine_bitset_bitset_for_policy(
         detail::bitset_cref<layout_type, CowPolicy> const lhs,
         detail::bitset_cref<layout_type, CowPolicy> const rhs,

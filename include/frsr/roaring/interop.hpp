@@ -341,19 +341,20 @@ struct interop_engine {
         if constexpr ( Bitmap::uses_default_container_set ) {
             if ( slot.payload_is_unshared() ) {
                 if ( slot.holds_bitset() ) {
+                    // the bitset lessened where it lies (by a bitset, or for a difference by an array or runs), then the
+                    // demotion the operation's rule asks for
+                    bool lessened{ true };
                     if ( piece.holds_bitset() ) {
                         combine_bitset_bitset_inplace<layout_type, cow_policy>( slot.as_bitset(), piece.as_bitset(), op );
-                        if ( demotes_sparse_result( op, and_demotes ) ) { Bitmap::demote_sparse_bitset( slot, self.chunks_ ); }
-                        return;
-                    }
-                    if ( op == set_operation::bit_andnot && piece.holds_array() ) {
+                    } else if ( op == set_operation::bit_andnot && piece.holds_array() ) {
                         difference_bitset_array_inplace<layout_type, cow_policy>( slot.as_bitset(), piece.as_array() );
-                        Bitmap::demote_sparse_bitset( slot, self.chunks_ );
-                        return;
-                    }
-                    if ( op == set_operation::bit_andnot && piece.holds_run() ) {
+                    } else if ( op == set_operation::bit_andnot && piece.holds_run() ) {
                         apply_runs_to_bitset_inplace<false, layout_type, cow_policy>( slot.as_bitset(), piece.as_run() );
-                        Bitmap::demote_sparse_bitset( slot, self.chunks_ );
+                    } else {
+                        lessened = false;
+                    }
+                    if ( lessened ) {
+                        if ( demotes_sparse_result( op, and_demotes ) ) { Bitmap::demote_sparse_bitset( slot, self.chunks_ ); }
                         return;
                     }
                 } else if ( slot.holds_array() ) {
