@@ -652,14 +652,9 @@ inline std::size_t intersect_sorted_uint16(
 } // namespace x86_vp2
 #endif // FRSR_ROARING_VP2
 
-// Exponential (galloping) forward search: first index in [lo, hi) whose key is
-// >= limit (Greater == false) or > limit (Greater == true). Two probes settle a
-// skip of 0-1 elements (the tiny-skip shapes the linear walk was chosen for),
-// while a long skip costs O(log skip) — HW instruction counters on the
-// production fold showed the pure linear walk retiring ~7x the instructions of
-// a downstream engine's binary-search-per-run kernel on real model shapes,
-// whose skew the ArrayRunAndFold bench (which settled the linear walk) does
-// not reproduce.
+// Exponential (galloping) forward search: first index in [lo, hi) whose key is >= limit (Greater == false) or > limit
+// (Greater == true). Up to four probes settle a skip of up to three elements with predictable compares; a longer skip
+// costs O(log skip).
 //
 // The elements need not be bare keys: `key_of` projects the compared key out of an element (the run
 // lists are searched by their end), so the run kernels share this search rather than carry their own.
@@ -709,15 +704,6 @@ template <bool Greater, typename Element, typename Key, typename KeyOf = identit
     return static_cast<std::size_t>( found - keys );
 }
 
-// Hybrid branchless scalar merges of two sorted arrays. A branch per value mispredicts about once per value
-// on sets that interleave unpredictably, so while four values remain on each side the merge first looks for a
-// block of four to handle at once (all below the other side's current value, or equal to the other side's next
-// four), which is common and well predicted on clustered data; otherwise it takes four branchless steps.
-// The branchless steps carry a dependency from one value to the next, so they cost several cycles per value: when
-// one side is kSkewedMergeRatio times shorter than the other, from the start or once fewer than four values remain
-// on one side, each value of the short side is instead placed in the long one by galloping, and the long side's
-// values between two of them are handled as one block.
-// [croaring-ref] deps/croaring/src/array_util.c:intersect_uint16, union_uint16, difference_uint16, xor_uint16
 // A tail copy: both pointers may be null for an empty tail, which memmove does not allow.
 template <typename T>
 [[ gnu::always_inline ]] inline void move_tail( T * const to, T const * const from, std::size_t const count ) noexcept {
@@ -729,24 +715,15 @@ template <typename T>
     return std::memcmp( a, b, 4 * sizeof( T ) ) == 0;
 }
 
-// Whether `shorter` is more than `ratio` times shorter than `longer`.
-// [croaring-ref] deps/croaring/include/roaring/array_util.h:croaring_skewed_sizes
-[[nodiscard]] constexpr bool shorter_by( std::size_t const ratio, std::size_t const shorter, std::size_t const longer ) noexcept {
-    return shorter * ratio < longer;
-}
-
-// Whether either of two lengths is more than `ratio` times the other.
-[[nodiscard]] constexpr bool lengths_apart( std::size_t const ratio, std::size_t const x, std::size_t const y ) noexcept {
-    return shorter_by( ratio, x, y ) || shorter_by( ratio, y, x );
-}
-
 // What a merge that keeps the long side's values does with a value of the short side: the union writes it, the
 // symmetric difference writes it when the long side lacks it, the long side minus the short one never writes it.
 enum class short_value_kept : std::uint8_t { always, when_absent, never };
 
 // The skewed form of a merge that keeps the long side's values. The long side's values below the next short-side
-// value move as one block; every write lands at out[ k ] with k at most the values read from both sides, so `out`
-// may start up to `ss` values before `large` (the in-place union layout) or be `large` (the in-place difference).
+// value move as one block. Every write lands at out[ k ] with k at most the values read from both sides, so `out`
+// may start `ss` or more values before `large`, or `sl` or more values before `small` (the two in-place union
+// layouts); it may be `large` itself only when no short-side value is written (short_value_kept::never, the in-place
+// difference).
 // [croaring-ref] deps/croaring/src/array_util.c:union_skewed_uint16, xor_skewed_uint16, difference_skewed_small_a2_uint16
 template <short_value_kept Kept, typename T>
 [[ gnu::hot ]] inline std::size_t merge_skewed_keeping_long(
@@ -787,16 +764,49 @@ template <bool Held, typename T>
 ) noexcept {
     std::size_t j{ 0 };
     std::size_t k{ 0 };
-    for ( std::size_t i{ 0 }; i < ss; ++i ) {
+    std::size_t i{ 0 };
+    for ( ; i < ss && j < sl; ++i ) {
         auto const value{ small[ i ] };
         j = gallop_forward<false>( large, j, sl, value );
         if ( ( j < sl && large[ j ] == value ) == Held ) {
             out[ k++ ] = value;
         }
     }
+    // Past the end of the long side every short-side value is absent from it.
+    if constexpr ( !Held ) {
+        move_tail( out + k, small + i, ss - i );
+        k += ss - i;
+    }
     return k;
 }
 
+// Whether a short and a long sorted array share a value: each short-side value is looked up in the long side by
+// galloping on from the last one.
+// [croaring-ref] deps/croaring/src/array_util.c:intersect_skewed_uint16_nonempty
+template <typename T>
+[[ nodiscard ]] inline bool intersects_skewed(
+    T const * const small, std::size_t const ss,
+    T const * const large, std::size_t const sl
+) noexcept {
+    std::size_t j{ 0 };
+    for ( std::size_t i{ 0 }; i < ss && j < sl; ++i ) {
+        j = gallop_forward<false>( large, j, sl, small[ i ] );
+        if ( j < sl && large[ j ] == small[ i ] ) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Hybrid branchless scalar merges of two sorted arrays. A branch per value mispredicts about once per value
+// on sets that interleave unpredictably, so while four values remain on each side the merge first looks for a
+// block of four to handle at once (all below the other side's current value, or equal to the other side's next
+// four), which is common and well predicted on clustered data; otherwise it takes four branchless steps.
+// The branchless steps carry a dependency from one value to the next, so they cost several cycles per value: when
+// one side is kSkewedMergeRatio times shorter than the other, from the start or once fewer than four values remain
+// on one side, each value of the short side is instead placed in the long one by galloping, and the long side's
+// values between two of them are handled as one block.
+// [croaring-ref] deps/croaring/src/array_util.c:intersect_uint16, union_uint16, difference_uint16, xor_uint16
 // Every write goes to out[ k.. ] with k <= i, so `out` may be `a`, but not `b`.
 template <typename T>
 [[ gnu::hot ]] inline std::size_t intersect_sorted_scalar(
@@ -806,26 +816,25 @@ template <typename T>
 ) noexcept {
     assert( out != b || a == b );
     std::size_t i{ 0 }, j{ 0 }, k{ 0 };
-    // A side this much shorter than the other goes straight to the galloping form below.
-    if ( !lengths_apart( kSkewedMergeRatio, sa, sb ) ) {
-        while ( i + 4 <= sa && j + 4 <= sb ) {
-            if ( a[ i + 3 ] < b[ j ] ) {
-                i += 4;
-            } else if ( b[ j + 3 ] < a[ i ] ) {
-                j += 4;
-            } else if ( equal_blocks4( a + i, b + j ) ) {
-                std::memmove( out + k, a + i, 4 * sizeof( T ) );
-                k += 4;
-                i += 4;
-                j += 4;
-            } else {
-                for ( int step{ 0 }; step < 4; ++step ) {
-                    T const x{ a[ i ] }, y{ b[ j ] };
-                    out[ k ] = x;
-                    k += ( x == y );
-                    i += ( x <= y );
-                    j += ( x >= y );
-                }
+    // Arrays kSkewedIntersectRatioThreshold times apart take the skewed intersection before they get here, so, as in
+    // the reference, only the tail below gallops.
+    while ( i + 4 <= sa && j + 4 <= sb ) {
+        if ( a[ i + 3 ] < b[ j ] ) {
+            i += 4;
+        } else if ( b[ j + 3 ] < a[ i ] ) {
+            j += 4;
+        } else if ( equal_blocks4( a + i, b + j ) ) {
+            std::memmove( out + k, a + i, 4 * sizeof( T ) );
+            k += 4;
+            i += 4;
+            j += 4;
+        } else {
+            for ( int step{ 0 }; step < 4; ++step ) {
+                T const x{ a[ i ] }, y{ b[ j ] };
+                out[ k ] = x;
+                k += ( x == y );
+                i += ( x <= y );
+                j += ( x >= y );
             }
         }
     }
@@ -845,8 +854,8 @@ template <typename T>
     return k;
 }
 
-// `out` has sa + sb slots; it may start up to sb values before `a` (the in-place union layout): every write
-// lands before out + i + sb.
+// `out` has sa + sb slots. Every write lands before out + i + j + 1, so `out` may start `sb` or more values before
+// `a`, or `sa` or more values before `b` (the in-place union layouts).
 template <typename T>
 [[ gnu::hot ]] inline std::size_t union_sorted_scalar(
     T const * const a, std::size_t const sa,
@@ -1047,8 +1056,8 @@ template <typename Layout, typename CowPolicy = cow_value_semantics>
     return result;
 }
 
-// Scalar forward merge of two sorted uint16 arrays into `out` (which must not
-// alias the inputs' unread parts and has sa + sb slots). Returns the count.
+// Scalar forward merge of two sorted uint16 arrays into `out` (sa + sb slots, with union_sorted_scalar's aliasing:
+// the vector union's in-place tail writes below the unread part of `b`). Returns the count.
 // [croaring-ref] deps/croaring/src/array_util.c:union_uint16
 [[ gnu::hot ]] inline std::size_t union_sorted_uint16_scalar(
     std::uint16_t const * const a, std::size_t const sa,
@@ -1217,8 +1226,8 @@ inline constexpr std::size_t decode_array_min_count{ 64 };
 
 // True in-place union: one backward pass into room for every value of rhs (union_sorted_inplace, the sorted-group
 // add's merge), the values above each rhs value moved up as one block when rhs is short against lhs, and the room
-// the values both hold leave unused closed at the end.
-// [croaring-ref] deps/croaring/src/containers/array.c:array_array_container_inplace_union
+// the values both hold leave unused closed at the end; either side is galloped through the other when it is few.
+// [croaring-ref] deps/croaring/src/containers/mixed_union.c:array_array_container_inplace_union
 template <typename Layout, typename CowPolicy = cow_value_semantics>
 [[ gnu::hot ]] inline void union_array_array_inplace(
     array_ref<Layout, CowPolicy> lhs,
@@ -1533,7 +1542,7 @@ inline constexpr std::size_t sse42_xor_min_side{ 8 };
     std::size_t count{ static_cast<std::size_t>( cursor - out ) };
 
     // The running tail, deduplicated, plus the remainder of the array whose blocks ran out, sorted: a handful of
-    // values, which the scalar exclusive-or then merges with the blocks of the other array that were not taken.
+    // values, which the scalar exclusive-or then merges with the values of the other array they can meet.
     std::uint16_t pending[ 2 * vl + 1 ];
     std::size_t pending_count{ static_cast<std::size_t>( store_unique_xor_sse( last, high, pending ) ) };
     std::uint16_t const tail_top{ static_cast<std::uint16_t>( _mm_extract_epi16( high, 7 ) ) };
@@ -1653,17 +1662,6 @@ template <typename Layout, typename OutVector, typename CowPolicy = cow_value_se
     ) ) );
 }
 
-// array∩run written directly into caller-supplied output (same OutVector
-// contract as filter_array_bitset_into: reusable scratch or, on the hot combine
-// path, the result container's own payload). Per-RUN slice copies over a
-// monotone cursor: for each run, scan the (sorted) array forward past values
-// below the run, then past the values it covers, and block-copy the covered
-// slice in one memcpy. Same total element walk as a per-value merge, but the
-// match span is emitted as a bulk copy instead of one compare+append per value,
-// and both scans are perfectly predictable forward loops (a binary-search-per-
-// run variant measured SLOWER on the ArrayRunAndFold bench — mispredicted
-// probes beat its O(runs·log n) on real shapes). [croaring-ref: the block-copy
-// shape of a downstream engine's run∩array kernel.]
 // The first run at or after `index` (< `size`) whose end is not below `value` (`size` if none). The run the
 // previous value landed in usually still reaches this one: one compare. A value a few runs ahead is reached by
 // predictable linear steps (a gallop over such a skip mispredicts more than it saves); a value further ahead
@@ -1748,6 +1746,18 @@ template <typename Run, typename Value>
     return index;
 }
 
+// array∩run written directly into caller-supplied output (same OutVector
+// contract as filter_array_bitset_into: reusable scratch or, on the hot combine
+// path, the result container's own payload). Per-RUN slice copies over a
+// monotone cursor: for each run, scan the (sorted) array forward past values
+// below the run, then past the values it covers, and block-copy the covered
+// slice in one memcpy. Same total element walk as a per-value merge, but the
+// match span is emitted as a bulk copy instead of one compare+append per value,
+// and both scans are perfectly predictable forward loops (a binary-search-per-
+// run variant measured SLOWER on the ArrayRunAndFold bench — mispredicted
+// probes beat its O(runs·log n) on real shapes). [croaring-ref: the block-copy
+// shape of a downstream engine's run∩array kernel.]
+//
 // With a few array values to a run the kept values come one by one, and the loop or copy that moves the stretch of
 // values at once only adds an exit test or a call to each (a mispredicted one when the stretches vary): the whole
 // stretch form is the intersection's instantiation for lists with at least values_per_run_for_stretch_copy values to a
