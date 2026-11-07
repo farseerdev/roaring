@@ -406,31 +406,7 @@ template <typename Layout, typename CowPolicy = cow_value_semantics>
             std::same_as<left_type, array_cref<Layout, CowPolicy>> &&
             std::same_as<right_type, array_cref<Layout, CowPolicy>>
         ) {
-            // An array many times shorter than the other is looked up in it value by value.
-            // [croaring-ref] deps/croaring/src/containers/array.c:array_container_intersect
-            if ( lengths_apart( kSkewedIntersectRatioThreshold, left.values.size(), right.values.size() ) ) {
-                auto const * shorter{ left.values.data() };
-                auto const * longer{ right.values.data() };
-                auto ss{ static_cast<std::size_t>( left.values.size() ) };
-                auto sl{ static_cast<std::size_t>( right.values.size() ) };
-                if ( sl < ss ) {
-                    std::swap( shorter, longer );
-                    std::swap( ss, sl );
-                }
-                return intersects_skewed( shorter, ss, longer, sl );
-            }
-            auto li{ left.values.begin() };
-            auto ri{ right.values.begin() };
-            while ( li != left.values.end() && ri != right.values.end() ) {
-                if ( *li < *ri ) {
-                    ++li;
-                } else if ( *ri < *li ) {
-                    ++ri;
-                } else {
-                    return true;
-                }
-            }
-            return false;
+            return sorted_arrays_intersect( left.values.data(), left.values.size(), right.values.data(), right.values.size() );
         } else if constexpr ( std::same_as<left_type, array_cref<Layout, CowPolicy>> ) {
             for ( auto const value : left.values ) {
                 if ( right.contains( value ) ) {

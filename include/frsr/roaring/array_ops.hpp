@@ -780,18 +780,38 @@ template <bool Held, typename T>
     return k;
 }
 
-// Whether a short and a long sorted array share a value: each short-side value is looked up in the long side by
-// galloping on from the last one.
-// [croaring-ref] deps/croaring/src/array_util.c:intersect_skewed_uint16_nonempty
+// Whether two sorted arrays share a value. Arrays many times apart in length look each value of the shorter one up
+// in the longer by galloping on from the last one; otherwise the two are walked in step. A function of its own, so the
+// walk is compiled apart from the container dispatch that calls it.
+// [croaring-ref] deps/croaring/src/containers/array.c:array_container_intersect
 template <typename T>
-[[ nodiscard ]] inline bool intersects_skewed(
-    T const * const small, std::size_t const ss,
-    T const * const large, std::size_t const sl
+[[ nodiscard, gnu::noinline ]] inline bool sorted_arrays_intersect(
+    T const * a, std::size_t sa,
+    T const * b, std::size_t sb
 ) noexcept {
+    if ( sb < sa ) {
+        std::swap( a, b );
+        std::swap( sa, sb );
+    }
+    if ( shorter_by( kSkewedIntersectRatioThreshold, sa, sb ) ) {
+        // [croaring-ref] deps/croaring/src/array_util.c:intersect_skewed_uint16_nonempty
+        std::size_t j{ 0 };
+        for ( std::size_t i{ 0 }; i < sa && j < sb; ++i ) {
+            j = gallop_forward<false>( b, j, sb, a[ i ] );
+            if ( j < sb && b[ j ] == a[ i ] ) {
+                return true;
+            }
+        }
+        return false;
+    }
+    std::size_t i{ 0 };
     std::size_t j{ 0 };
-    for ( std::size_t i{ 0 }; i < ss && j < sl; ++i ) {
-        j = gallop_forward<false>( large, j, sl, small[ i ] );
-        if ( j < sl && large[ j ] == small[ i ] ) {
+    while ( i != sa && j != sb ) {
+        if ( a[ i ] < b[ j ] ) {
+            ++i;
+        } else if ( b[ j ] < a[ i ] ) {
+            ++j;
+        } else {
             return true;
         }
     }
