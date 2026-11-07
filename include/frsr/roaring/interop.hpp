@@ -254,12 +254,10 @@ struct interop_engine {
 
     [[nodiscard]] static bool is_full( handle_type const & piece ) noexcept { return piece.cardinality() == chunk_capacity; }
 
-    // Whether a bitset that an operation leaves below the array limit becomes an array: a difference does; an
-    // intersection does against every operand but a bitmap's chunks, where it does not unless tuning.hpp says so (the rule
-    // of the walk of bitmap against bitmap: an intersection is the accumulator of a fold, and an array accumulator loses
-    // the dense kernels of every later pair).
-    // against the chunks of a bitmap, as the walk of bitmap against bitmap leaves them; the other operands (bit words, keys,
-    // a key range) leave an array, as the reference does.
+    // Whether a bitset that an operation leaves below the array limit becomes an array. A difference's always does. An
+    // intersection's does against bit words, keys or a key range, as the reference leaves it; against the chunks of a
+    // bitmap it does not unless tuning.hpp says so (the rule of the walk of bitmap against bitmap: an intersection is the
+    // accumulator of a fold, and an array accumulator loses the dense kernels of every later pair).
     template <typename Source>
     static constexpr bool and_demotes_sparse_bitsets{ kAndDemotesSparseBitsets || !is_store_source_v<Source> };
 

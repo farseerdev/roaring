@@ -638,6 +638,9 @@ inline constexpr std::uint32_t portable_no_offset_threshold{ 4U };
 // A non-run container is an array up to and including this cardinality, a bitset above it:
 // the reader derives the kind from the descriptive header alone.
 inline constexpr std::uint32_t portable_array_max_cardinality{ 4096U };
+// The format keeps one value more an array than the bitmap does: a chunk of the bitmap's threshold is a bitset in
+// memory and an array on the wire (the writer re-encodes it, the reader brings it back as an array).
+static_assert( portable_array_max_cardinality == default_layout<std::uint32_t>::array_max_cardinality + 1, "the format's array limit is one past the bitmap's" );
 inline constexpr std::size_t   portable_bitset_bytes{ 8192U };
 
 static_assert( std::endian::native == std::endian::little, "the portable format is little-endian; no byte swapping is implemented" );

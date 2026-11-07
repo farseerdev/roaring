@@ -260,21 +260,46 @@ TEST(FrsrRoaringSmoke, SortedBulkConstructionHonorsAnExplicitBitsetThreshold) {
 }
 
 // A chunk holds an array below the threshold and a bitset from it (for 16-bit lows the byte-parity point, 4096
-// values). One rule, whichever operation leaves the chunk there.
-TEST(FrsrRoaringSmoke, AChunkAtTheArrayLimitIsAnArrayAndOnePastItABitset) {
-    constexpr std::uint32_t limit{ TestBitmap::array_to_bitset_threshold - 1U };
-    ASSERT_EQ( limit, 4'095U );
+// values). One rule, whichever operation leaves the chunk there, for every width of key (an 8-bit key's chunk is 256
+// values, with a threshold of 64).
+template <typename Bitmap>
+class ArrayLimitTyped : public ::testing::Test {};
+using ArrayLimitBitmaps = ::testing::Types<
+    frsr::roaring::bitmap<std::uint32_t>,
+    frsr::roaring::bitmap<std::uint64_t>,
+    frsr::roaring::bitmap<std::uint8_t>
+>;
+TYPED_TEST_SUITE( ArrayLimitTyped, ArrayLimitBitmaps );
+
+TYPED_TEST( ArrayLimitTyped, AChunkAtTheArrayLimitIsAnArrayAndOnePastItABitset ) {
+    using Bitmap = TypeParam;
+    using key_type = typename Bitmap::key_type;
+    constexpr std::size_t limit{ Bitmap::array_to_bitset_threshold - 1U };
+    constexpr std::size_t domain{ std::size_t{ std::numeric_limits<key_type>::max() } < 65'535U ? std::size_t{ std::numeric_limits<key_type>::max() } + 1U : 65'536U };
+    if constexpr ( domain == 65'536U ) {
+        ASSERT_EQ( limit, 4'095U );
+    } else {
+        ASSERT_EQ( limit, 63U );
+    }
+    constexpr std::size_t surplus_count{ limit / 8U };   // fits between the spaced values below
     // isolated values (every third), so no run form competes
-    auto const spaced{ []( std::uint32_t const first, std::uint32_t const count ) {
-        std::vector<std::uint32_t> values;
-        for ( std::uint32_t i{ 0 }; i < count; ++i ) {
-            values.push_back( first + 3U * i );
+    auto const spaced{ []( std::size_t const first, std::size_t const count ) {
+        std::vector<key_type> values;
+        for ( std::size_t i{ 0 }; i < count; ++i ) {
+            values.push_back( static_cast<key_type>( first + 3U * i ) );
         }
         return values;
     } };
-    for ( std::uint32_t const count : { limit, limit + 1U } ) {
+    auto const range_of{ []( std::size_t const first, std::size_t const count ) {
+        std::vector<key_type> values;
+        for ( std::size_t i{ 0 }; i < count; ++i ) {
+            values.push_back( static_cast<key_type>( first + i ) );
+        }
+        return values;
+    } };
+    for ( std::size_t const count : { limit, limit + 1U } ) {
         bool const bitset{ count > limit };
-        auto const check{ [ & ]( TestBitmap const & bm, char const * const what ) {
+        auto const check{ [ & ]( Bitmap const & bm, char const * const what ) {
             SCOPED_TRACE( ::testing::Message() << what << ", " << count << " values" );
             EXPECT_EQ( bm.size(), count );
             EXPECT_EQ( bm.validate( true ), nullptr );
@@ -282,61 +307,89 @@ TEST(FrsrRoaringSmoke, AChunkAtTheArrayLimitIsAnArrayAndOnePastItABitset) {
             EXPECT_EQ( bm.statistics().array_containers , bitset ? 0U : 1U );
         } };
         auto const values{ spaced( 0U, count ) };
-        check( TestBitmap{ values }, "construction" );
-        TestBitmap sorted;
+        check( Bitmap{ values }, "construction" );
+        Bitmap sorted;
         sorted.add_sorted_many( values );
         check( sorted, "sorted construction" );
-        TestBitmap one_by_one;
+        Bitmap one_by_one;
         for ( auto const value : values ) {
             std::ignore = one_by_one.add( value );
         }
         check( one_by_one, "one value at a time" );
 
         // a union of two disjoint halves
-        auto const half{ count / 2U };
-        TestBitmap const low { std::vector<std::uint32_t>( values.begin(), values.begin() + half ) };
-        TestBitmap const high{ std::vector<std::uint32_t>( values.begin() + half, values.end() ) };
+        auto const half{ static_cast<std::ptrdiff_t>( count / 2U ) };
+        Bitmap const low { std::vector<key_type>( values.begin(), values.begin() + half ) };
+        Bitmap const high{ std::vector<key_type>( values.begin() + half, values.end() ) };
         check( low | high, "union" );
         auto united{ low };
         united |= high;
         check( united, "union in place" );
-        TestBitmap lazily;
-        std::array<TestBitmap const *, 2> const halves{ &low, &high };
+        Bitmap lazily;
+        std::array<Bitmap const *, 2> const halves{ &low, &high };
         lazily.or_many_in_place( halves );
         check( lazily, "union of many" );
         check( low ^ high, "exclusive-or" );
-        TestBitmap exclusively;
+        Bitmap exclusively;
         exclusively.xor_many_in_place( halves );
         check( exclusively, "exclusive-or of many" );
 
-        // the difference with a bitset of 500 values more: a bitset less an array
-        auto const extra{ spaced( 1U, 500U ) };
+        // the difference with a bitset of a few values more: a bitset less an array, by a bitmap, a view of one, the
+        // keys themselves and the chunk of their stream
+        auto const extra{ spaced( 1U, surplus_count ) };
         auto more{ values };
         more.insert( more.end(), extra.begin(), extra.end() );
         std::ranges::sort( more );
-        TestBitmap const larger{ more };
-        TestBitmap const surplus{ extra };
+        Bitmap const larger{ more };
+        Bitmap const surplus{ extra };
         check( larger - surplus, "difference" );
+        check( larger - view_of( surplus ), "difference with a view" );
         auto lessened{ larger };
         lessened -= surplus;
         check( lessened, "difference in place" );
-        TestBitmap const exact{ values };
-        std::array<TestBitmap const *, 2> const both{ &larger, &exact };
-        check( TestBitmap::and_many( both ), "intersection of many" );
+        auto by_keys{ larger };
+        by_keys.andnot_with( extra );
+        check( by_keys, "difference with keys" );
+        Bitmap const exact{ values };
+        std::array<Bitmap const *, 2> const both{ &larger, &exact };
+        check( Bitmap::and_many( both ), "intersection of many" );
 
-        // a range of 500 values past the others removed, and one value flipped away
+        // a range past the others removed (by the bitmap's own call and as a key range), and an interval of one value
+        // flipped away (by the bitmap's own call and as a key range)
+        auto const range_first{ domain - 2U * surplus_count };
         auto ranged{ values };
-        for ( std::uint32_t value{ 60'000U }; value < 60'500U; ++value ) {
-            ranged.push_back( value );
-        }
-        TestBitmap removed{ ranged };
-        removed.remove_closed_range( 60'000U, 60'499U );
+        auto const tail{ range_of( range_first, surplus_count ) };
+        ranged.insert( ranged.end(), tail.begin(), tail.end() );
+        Bitmap removed{ ranged };
+        removed.remove_closed_range( static_cast<key_type>( range_first ), static_cast<key_type>( range_first + surplus_count - 1U ) );
         check( removed, "range removal" );
+        Bitmap without_range{ ranged };
+        without_range.andnot_with( frsr::roaring::key_range::closed( range_first, range_first + surplus_count - 1U ) );
+        check( without_range, "difference with a key range" );
+        auto const last{ static_cast<key_type>( domain - 1U ) };
         auto plus_one{ values };
-        plus_one.push_back( 65'000U );
-        TestBitmap flipped{ plus_one };
-        flipped.flip_closed_range( 65'000U, 65'000U );
+        plus_one.push_back( last );
+        Bitmap flipped{ plus_one };
+        flipped.flip_closed_range( last, last );
         check( flipped, "flip" );
+        Bitmap flipped_by_range{ plus_one };
+        flipped_by_range.xor_with( frsr::roaring::key_range::closed( last, last ) );
+        check( flipped_by_range, "exclusive-or with a key range" );
+
+        // an intersection of many whose first operand is one run of exactly `count` values
+        Bitmap run_of{ range_of( 0U, count ) };
+        run_of.optimize();
+        ASSERT_EQ( run_of.statistics().run_containers, 1U );
+        auto superset_values{ range_of( 0U, count ) };
+        auto const spread{ spaced( count + 1U, surplus_count ) };
+        superset_values.insert( superset_values.end(), spread.begin(), spread.end() );
+        Bitmap const superset{ superset_values };
+        std::array<Bitmap const *, 2> const run_first{ &run_of, &superset };
+        auto const intersected{ Bitmap::and_many( run_first ) };
+        SCOPED_TRACE( "intersection of many over a run" );
+        EXPECT_EQ( intersected.size(), count );
+        EXPECT_EQ( intersected.validate( true ), nullptr );
+        EXPECT_EQ( intersected.statistics().bitset_containers, bitset ? 1U : 0U );
     }
 }
 

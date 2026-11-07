@@ -85,10 +85,11 @@ static_assert( noexcept( std::declval<frsr::roaring::bitmap<std::uint64_t> const
 static_assert( noexcept( std::declval<frsr::roaring::bitmap<std::uint32_t> &>().and_with( std::declval<frsr::roaring::typed_view<frsr::roaring::bitmap<std::uint32_t>>>() ) )
                == frsr::roaring::detail::allocation_failure_terminates );
 
+// `canonical`: the kinds are the reference's too (a difference leaves no bitset an array can hold).
 template <typename Bitmap>
-void expect_holds( Bitmap const & bitmap, oracle_set const & expected, std::string const & what ) {
+void expect_holds( Bitmap const & bitmap, oracle_set const & expected, std::string const & what, bool const canonical = false ) {
     using key_type = typename Bitmap::key_type;
-    ASSERT_EQ( bitmap.validate(), nullptr ) << what << ": " << ( bitmap.validate() ? bitmap.validate() : "" );
+    ASSERT_EQ( bitmap.validate( canonical ), nullptr ) << what << ": " << ( bitmap.validate( canonical ) ? bitmap.validate( canonical ) : "" );
     ASSERT_EQ( bitmap.size(), expected.size() ) << what;
     std::vector<key_type> expected_vector;
     expected_vector.reserve( expected.size() );
@@ -117,7 +118,7 @@ void check_operand( Bitmap const & bitmap, oracle_set const & content, Operand c
     {
         Bitmap b{ bitmap };
         b.andnot_with( operand );
-        expect_holds( b, difference( content, members ), what + " andnot_with" );
+        expect_holds( b, difference( content, members ), what + " andnot_with", true );
         if ( ::testing::Test::HasFatalFailure() ) { return; }
     }
     {
@@ -135,7 +136,7 @@ void check_operand( Bitmap const & bitmap, oracle_set const & content, Operand c
         expect_holds( b, unite( content, representable ), what + " |=" );
         b = bitmap;
         b -= operand;
-        expect_holds( b, difference( content, members ), what + " -=" );
+        expect_holds( b, difference( content, members ), what + " -=", true );
         b = bitmap;
         b ^= operand;
         expect_holds( b, symmetric_difference( content, representable ), what + " ^=" );

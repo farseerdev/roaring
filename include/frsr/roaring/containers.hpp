@@ -482,9 +482,9 @@ template <typename Layout, typename CowPolicy = cow_value_semantics>
 // handle without a second allocation). Assumes sorted_values is non-empty.
 //
 // bitset_threshold is the cardinality from which the caller wants a bitset: the
-// bitmap's default (array_to_bitset_threshold) sits exactly at the byte-parity
-// point (a bitset is never larger than the array from there on), so the default
-// decision is the pure smallest-form rule. A caller passing a LOWER threshold is
+// bitmap's default (array_to_bitset_threshold) sits, for 16-bit lows, exactly at the
+// byte-parity point (a bitset is never larger than the array from there on), so the
+// default decision there is the pure smallest-form rule. A caller passing a LOWER threshold is
 // asking for bitsets before they pay off in bytes — dense chunks whose consumers
 // are intersection kernels (array∩bitset probes and word-parallel bitset∩bitset
 // are far cheaper than merging two multi-thousand-element arrays) — so the
