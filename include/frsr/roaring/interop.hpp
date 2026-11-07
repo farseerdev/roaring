@@ -327,7 +327,7 @@ struct interop_engine {
         if ( op == set_operation::bit_or || !combine_with_kernel( self, lhs, rhs, op, result ) ) {
             result = Bitmap::combine_containers_for_policy( lhs, rhs, op );
         }
-        if ( demotes_sparse_result( op, and_demotes ) ) { result = Bitmap::demote_sparse_bitset( std::move( result ), self.chunks_ ); }
+        if ( demotes_sparse_result( op, and_demotes ) ) { Bitmap::demote_sparse_bitset( result, self.chunks_ ); }
         assert( result.payload_is_unshared() && !result.shares_payload_with( lhs ) && !result.shares_payload_with( rhs ) && "a combine result aliases its operand" );
         return result;
     }
@@ -343,16 +343,17 @@ struct interop_engine {
                 if ( slot.holds_bitset() ) {
                     if ( piece.holds_bitset() ) {
                         combine_bitset_bitset_inplace<layout_type, cow_policy>( slot.as_bitset(), piece.as_bitset(), op );
-                        if ( demotes_sparse_result( op, and_demotes ) ) { slot = Bitmap::demote_sparse_bitset( std::move( slot ), self.chunks_ ); }
+                        if ( demotes_sparse_result( op, and_demotes ) ) { Bitmap::demote_sparse_bitset( slot, self.chunks_ ); }
                         return;
                     }
                     if ( op == set_operation::bit_andnot && piece.holds_array() ) {
                         difference_bitset_array_inplace<layout_type, cow_policy>( slot.as_bitset(), piece.as_array() );
+                        Bitmap::demote_sparse_bitset( slot, self.chunks_ );
                         return;
                     }
                     if ( op == set_operation::bit_andnot && piece.holds_run() ) {
                         apply_runs_to_bitset_inplace<false, layout_type, cow_policy>( slot.as_bitset(), piece.as_run() );
-                        if ( demotes_sparse_result( op, and_demotes ) ) { slot = Bitmap::demote_sparse_bitset( std::move( slot ), self.chunks_ ); }
+                        Bitmap::demote_sparse_bitset( slot, self.chunks_ );
                         return;
                     }
                 } else if ( slot.holds_array() ) {
