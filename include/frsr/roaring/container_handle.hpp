@@ -1185,70 +1185,103 @@ public:
     payload_vector_const_view<Layout, low_type, CowPolicy> values;
 };
 
-// The few incoming values of union_sorted_inplace placed by galloping: the held values above each one move up as one
-// block, found by galloping down from the last one placed. Out of line, so the merge form stays small enough to be
-// inlined into the loops that union one chunk's few values after another.
+// Where a backward in-place merge stands: data[ 0, held ) not yet moved, data[ out, end ) merged.
+struct backward_merge_cursor {
+    std::ptrdiff_t held;
+    std::ptrdiff_t out;
+};
+
+// The first index in [ 0, hi ) from which every value of the sorted `keys` is above `value`, found by galloping down
+// from `hi`.
 template <typename T>
-[[ gnu::noinline ]] inline void place_few_sorted_inplace( T * const data, std::ptrdiff_t & held, std::ptrdiff_t & out, T const * const incoming, std::ptrdiff_t next ) noexcept {
-    for ( ; next != 0; --next ) {
-        auto const value{ incoming[ next - 1 ] };
-        // The first held position whose value is above `value`: data[ above, held ) moves up.
-        auto above{ held };
-        if ( above != 0 && value < data[ above - 1 ] ) {
-            auto known_above{ above - 1 };
-            auto step       { std::ptrdiff_t{ 1 } };
-            auto probe      { known_above - step };
-            while ( probe >= 0 && value < data[ probe ] ) {
-                known_above = probe;
-                step       *= 2;
-                probe       = known_above - step;
-            }
-            above = std::upper_bound( data + std::max( probe + 1, std::ptrdiff_t{ 0 } ), data + known_above, value ) - data;
-        }
-        auto const block{ held - above };
-        out -= block;
-        std::memmove( data + out, data + above, static_cast<std::size_t>( block ) * sizeof( T ) );
-        held = above;
-        if ( held != 0 && data[ held - 1 ] == value ) {
-            --held;
-        }
-        data[ --out ] = value;
+[[ nodiscard ]] inline std::ptrdiff_t first_above_galloping_down( T const * const keys, std::ptrdiff_t const hi, T const value ) noexcept {
+    if ( hi == 0 || !( value < keys[ hi - 1 ] ) ) {
+        return hi;
     }
+    auto known_above{ hi - 1 };
+    auto step{ std::ptrdiff_t{ 1 } };
+    auto probe{ known_above - step };
+    while ( probe >= 0 && value < keys[ probe ] ) {
+        known_above = probe;
+        step *= 2;
+        probe = known_above - step;
+    }
+    return std::upper_bound( keys + std::max( probe + 1, std::ptrdiff_t{ 0 } ), keys + known_above, value ) - keys;
 }
 
-// In-place union of the `held` sorted values at data[ 0, held ) with the `n` sorted `incoming` ones, into the room
-// the caller has made at data[ 0, held + n ): one backward pass, in which a value both sides hold is placed once and
-// the room such values leave unused is closed by one move at the end. Returns how many incoming values were new.
-// When the incoming values are few against the held ones (kSkewedMergeRatio, as in the array merges), they are
-// placed by galloping (place_few_sorted_inplace).
-// [croaring-ref] deps/croaring/src/array_util.c:union_uint16_inplace
+// The skewed forms of union_sorted_inplace, out of line so that its merge form stays small enough to be inlined into
+// the loops that union one chunk's few values after another. Few incoming values: the held values above each one
+// move up as one block.
+template <typename T>
+[[ gnu::noinline ]] inline backward_merge_cursor place_few_incoming( T * const data, backward_merge_cursor at, T const * const incoming, std::ptrdiff_t next ) noexcept {
+    for ( ; next != 0; --next ) {
+        auto const value{ incoming[ next - 1 ] };
+        auto const above{ first_above_galloping_down( data, at.held, value ) };
+        at.out -= at.held - above;
+        std::memmove( data + at.out, data + above, static_cast<std::size_t>( at.held - above ) * sizeof( T ) );
+        at.held = above;
+        if ( at.held != 0 && data[ at.held - 1 ] == value ) {
+            --at.held;
+        }
+        data[ --at.out ] = value;
+    }
+    return at;
+}
+
+// Few held values: the incoming values above each one are copied in as one block. The room between the merged part
+// and the unmoved held values is at least the count of incoming values still to place, so a block never reaches them.
+template <typename T>
+[[ gnu::noinline ]] inline backward_merge_cursor place_few_held( T * const data, backward_merge_cursor at, T const * const incoming, std::ptrdiff_t next ) noexcept {
+    for ( ; at.held != 0; --at.held ) {
+        auto const value{ data[ at.held - 1 ] };
+        auto const above{ first_above_galloping_down( incoming, next, value ) };
+        at.out -= next - above;
+        std::memcpy( data + at.out, incoming + above, static_cast<std::size_t>( next - above ) * sizeof( T ) );
+        next = above;
+        if ( next != 0 && incoming[ next - 1 ] == value ) {
+            --next;
+        }
+        data[ --at.out ] = value;
+    }
+    at.out -= next;
+    std::memcpy( data + at.out, incoming, static_cast<std::size_t>( next ) * sizeof( T ) );
+    return at;
+}
+
+// In-place union of the `held_count` sorted values at data[ 0, held_count ) with the `n` sorted `incoming` ones, into
+// the room the caller has made at data[ 0, held_count + n ): one backward pass, in which a value both sides hold is
+// placed once and the room such values leave unused is closed by one move at the end. Returns how many incoming
+// values were new. When either side is few against the other (kSkewedMergeRatio, as in the array merges), its values
+// are placed by galloping through the other side, whose values between two of them move as one block.
+// [croaring-ref] deps/croaring/src/containers/mixed_union.c:array_array_container_inplace_union
 template <typename T>
 [[ gnu::hot ]] inline std::size_t union_sorted_inplace( T * const data, std::size_t const held_count, T const * const incoming, std::size_t const n ) noexcept {
-    auto held{ static_cast<std::ptrdiff_t>( held_count ) };       // data[ 0, held ) not yet moved
-    auto out { static_cast<std::ptrdiff_t>( held_count + n ) };   // data[ out, held_count + n ) merged
+    backward_merge_cursor at{ static_cast<std::ptrdiff_t>( held_count ), static_cast<std::ptrdiff_t>( held_count + n ) };
     auto next{ static_cast<std::ptrdiff_t>( n ) };
-    if ( n * kSkewedMergeRatio < held_count ) {
-        place_few_sorted_inplace( data, held, out, incoming, next );
+    if ( shorter_by( kSkewedMergeRatio, n, held_count ) ) {
+        at = place_few_incoming( data, at, incoming, next );
+    } else if ( shorter_by( kSkewedMergeRatio, held_count, n ) ) {
+        at = place_few_held( data, at, incoming, next );
     } else {
-        while ( held != 0 && next != 0 ) {
+        while ( at.held != 0 && next != 0 ) {
             auto const value{ incoming[ next - 1 ] };
-            if ( data[ held - 1 ] > value ) {
-                data[ --out ] = data[ --held ];
-            } else if ( value > data[ held - 1 ] ) {
-                data[ --out ] = value;
+            if ( data[ at.held - 1 ] > value ) {
+                data[ --at.out ] = data[ --at.held ];
+            } else if ( value > data[ at.held - 1 ] ) {
+                data[ --at.out ] = value;
                 --next;
             } else {
-                data[ --out ] = data[ --held ];
+                data[ --at.out ] = data[ --at.held ];
                 --next;
             }
         }
         while ( next != 0 ) {
-            data[ --out ] = incoming[ --next ];
+            data[ --at.out ] = incoming[ --next ];
         }
     }
-    auto const added{ n - static_cast<std::size_t>( out - held ) };
-    if ( out != held ) {
-        std::memmove( data + held, data + out, static_cast<std::size_t>( static_cast<std::ptrdiff_t>( held_count + n ) - out ) * sizeof( T ) );
+    auto const added{ n - static_cast<std::size_t>( at.out - at.held ) };
+    if ( at.out != at.held ) {
+        std::memmove( data + at.held, data + at.out, static_cast<std::size_t>( static_cast<std::ptrdiff_t>( held_count + n ) - at.out ) * sizeof( T ) );
     }
     return added;
 }

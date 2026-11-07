@@ -77,6 +77,17 @@ inline constexpr std::size_t kSkewedVectorMergeRatio{ 32 };
 // [croaring-ref] deps/croaring/src/containers/array.c:array_container_andnot (`card_min * 128 < card_max`)
 inline constexpr std::size_t kSkewedVectorDifferenceRatio{ 128 };
 
+// Whether `shorter` is more than `ratio` times shorter than `longer`.
+// [croaring-ref] deps/croaring/include/roaring/array_util.h:croaring_skewed_sizes
+[[nodiscard]] constexpr bool shorter_by( std::size_t const ratio, std::size_t const shorter, std::size_t const longer ) noexcept {
+    return shorter * ratio < longer;
+}
+
+// Whether either of two lengths is more than `ratio` times the other.
+[[nodiscard]] constexpr bool lengths_apart( std::size_t const ratio, std::size_t const x, std::size_t const y ) noexcept {
+    return shorter_by( ratio, x, y ) || shorter_by( ratio, y, x );
+}
+
 // Route the in-place bitset combine through the Harley-Seal carry-save kernel
 // (fused_combine_inplace_popcount) instead of the naive per-word loop in
 // combine_bitset_bitset_inplace (bitset_ops.hpp).
