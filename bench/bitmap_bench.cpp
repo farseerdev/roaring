@@ -10455,7 +10455,8 @@ static void register_run_density_sweeps() {
 
 // ---- array with array of very different sizes -------------------------------------------------
 // The reference's array merge microbenchmark: a small and a large array in one chunk, the small one holding 1 to 128
-// values (and two balanced pairs, which guard the regular merge), the large one 256 to 3500. Every timed run cycles
+// values (and two balanced pairs, which guard the regular merge), the large one 256 to 3500. OrInplaceIntoSmall, the
+// in-place union the other way round (a copy of the small one |= the large one), is not the reference's. Every timed run cycles
 // through the same 64 distinct pairs, so the branch predictor cannot learn a single input; the cost is reported per
 // pair. The pairs are drawn in each entry's setup, not at registration, so every other band skips the shuffles.
 // [croaring-ref] microbenchmarks/array_merge_bench.cpp
@@ -10466,6 +10467,7 @@ constexpr std::size_t pairs = 64;
 enum class op : std::uint8_t {
     or_op,                       // small | large
     or_inplace,                  // large |= small, the small one a subset of the large one: the large one never changes
+    or_inplace_into_small,       // a copy of small |= large
     andnot_large_minus_small,
     andnot_small_minus_large,
     xor_op,                      // small ^ large
@@ -10550,6 +10552,7 @@ struct frsr_registrar {
                 switch ( b.o ) {
                     case op::or_op:                    { Bitmap const r{ small | large }; checksum += static_cast<std::int64_t>( r.size() ); break; }
                     case op::or_inplace:               { large |= small; checksum += static_cast<std::int64_t>( large.size() ); break; }
+                    case op::or_inplace_into_small:    { Bitmap t{ small }; t |= large; checksum += static_cast<std::int64_t>( t.size() ); break; }
                     case op::andnot_large_minus_small: { Bitmap const r{ large - small }; checksum += static_cast<std::int64_t>( r.size() ); break; }
                     case op::andnot_small_minus_large: { Bitmap const r{ small - large }; checksum += static_cast<std::int64_t>( r.size() ); break; }
                     case op::xor_op:                   { Bitmap const r{ small ^ large }; checksum += static_cast<std::int64_t>( r.size() ); break; }
@@ -10596,6 +10599,7 @@ struct cpp_registrar {
                 switch ( b.o ) {
                     case op::or_op:                    { croaring_handle const r{ roaring_bitmap_or( small, large ) };     checksum += static_cast<std::int64_t>( roaring_bitmap_get_cardinality( r.r ) ); break; }
                     case op::or_inplace:               { roaring_bitmap_or_inplace( large, small ); checksum += static_cast<std::int64_t>( roaring_bitmap_get_cardinality( large ) ); break; }
+                    case op::or_inplace_into_small:    { croaring_handle const t{ Arm::copy( small ) }; roaring_bitmap_or_inplace( t.r, large ); checksum += static_cast<std::int64_t>( roaring_bitmap_get_cardinality( t.r ) ); break; }
                     case op::andnot_large_minus_small: { croaring_handle const r{ roaring_bitmap_andnot( large, small ) }; checksum += static_cast<std::int64_t>( roaring_bitmap_get_cardinality( r.r ) ); break; }
                     case op::andnot_small_minus_large: { croaring_handle const r{ roaring_bitmap_andnot( small, large ) }; checksum += static_cast<std::int64_t>( roaring_bitmap_get_cardinality( r.r ) ); break; }
                     case op::xor_op:                   { croaring_handle const r{ roaring_bitmap_xor( small, large ) };    checksum += static_cast<std::int64_t>( roaring_bitmap_get_cardinality( r.r ) ); break; }
@@ -10627,6 +10631,7 @@ static void register_array_skew() {
     constexpr std::pair<op, char const *> ops[]{
         { op::or_op, "Or" },
         { op::or_inplace, "OrInplace" },
+        { op::or_inplace_into_small, "OrInplaceIntoSmall" },
         { op::andnot_large_minus_small, "AndnotLargeMinusSmall" },
         { op::andnot_small_minus_large, "AndnotSmallMinusLarge" },
         { op::xor_op, "Xor" },
