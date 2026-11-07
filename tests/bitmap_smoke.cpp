@@ -259,6 +259,87 @@ TEST(FrsrRoaringSmoke, SortedBulkConstructionHonorsAnExplicitBitsetThreshold) {
     EXPECT_EQ( under_threshold.statistics().array_containers, 1U );
 }
 
+// A chunk holds an array below the threshold and a bitset from it (for 16-bit lows the byte-parity point, 4096
+// values). One rule, whichever operation leaves the chunk there.
+TEST(FrsrRoaringSmoke, AChunkAtTheArrayLimitIsAnArrayAndOnePastItABitset) {
+    constexpr std::uint32_t limit{ TestBitmap::array_to_bitset_threshold - 1U };
+    ASSERT_EQ( limit, 4'095U );
+    // isolated values (every third), so no run form competes
+    auto const spaced{ []( std::uint32_t const first, std::uint32_t const count ) {
+        std::vector<std::uint32_t> values;
+        for ( std::uint32_t i{ 0 }; i < count; ++i ) {
+            values.push_back( first + 3U * i );
+        }
+        return values;
+    } };
+    for ( std::uint32_t const count : { limit, limit + 1U } ) {
+        bool const bitset{ count > limit };
+        auto const check{ [ & ]( TestBitmap const & bm, char const * const what ) {
+            SCOPED_TRACE( ::testing::Message() << what << ", " << count << " values" );
+            EXPECT_EQ( bm.size(), count );
+            EXPECT_EQ( bm.validate( true ), nullptr );
+            EXPECT_EQ( bm.statistics().bitset_containers, bitset ? 1U : 0U );
+            EXPECT_EQ( bm.statistics().array_containers , bitset ? 0U : 1U );
+        } };
+        auto const values{ spaced( 0U, count ) };
+        check( TestBitmap{ values }, "construction" );
+        TestBitmap sorted;
+        sorted.add_sorted_many( values );
+        check( sorted, "sorted construction" );
+        TestBitmap one_by_one;
+        for ( auto const value : values ) {
+            std::ignore = one_by_one.add( value );
+        }
+        check( one_by_one, "one value at a time" );
+
+        // a union of two disjoint halves
+        auto const half{ count / 2U };
+        TestBitmap const low { std::vector<std::uint32_t>( values.begin(), values.begin() + half ) };
+        TestBitmap const high{ std::vector<std::uint32_t>( values.begin() + half, values.end() ) };
+        check( low | high, "union" );
+        auto united{ low };
+        united |= high;
+        check( united, "union in place" );
+        TestBitmap lazily;
+        std::array<TestBitmap const *, 2> const halves{ &low, &high };
+        lazily.or_many_in_place( halves );
+        check( lazily, "union of many" );
+        check( low ^ high, "exclusive-or" );
+        TestBitmap exclusively;
+        exclusively.xor_many_in_place( halves );
+        check( exclusively, "exclusive-or of many" );
+
+        // the difference with a bitset of 500 values more: a bitset less an array
+        auto const extra{ spaced( 1U, 500U ) };
+        auto more{ values };
+        more.insert( more.end(), extra.begin(), extra.end() );
+        std::ranges::sort( more );
+        TestBitmap const larger{ more };
+        TestBitmap const surplus{ extra };
+        check( larger - surplus, "difference" );
+        auto lessened{ larger };
+        lessened -= surplus;
+        check( lessened, "difference in place" );
+        TestBitmap const exact{ values };
+        std::array<TestBitmap const *, 2> const both{ &larger, &exact };
+        check( TestBitmap::and_many( both ), "intersection of many" );
+
+        // a range of 500 values past the others removed, and one value flipped away
+        auto ranged{ values };
+        for ( std::uint32_t value{ 60'000U }; value < 60'500U; ++value ) {
+            ranged.push_back( value );
+        }
+        TestBitmap removed{ ranged };
+        removed.remove_closed_range( 60'000U, 60'499U );
+        check( removed, "range removal" );
+        auto plus_one{ values };
+        plus_one.push_back( 65'000U );
+        TestBitmap flipped{ plus_one };
+        flipped.flip_closed_range( 65'000U, 65'000U );
+        check( flipped, "flip" );
+    }
+}
+
 TEST(FrsrRoaringSmoke, SortedBulkConstructionAppendedChunkByChunkMatchesOneCall) {
     // An index is built a window of chunks at a time: values past the bitmap's last chunk are appended with the
     // caller's threshold, exactly as if all of them had been given in one call.

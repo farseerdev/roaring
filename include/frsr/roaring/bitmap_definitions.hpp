@@ -87,7 +87,9 @@ FRSR_ROARING_DEFINITION_INLINE char const * FRSR_ROARING_BITMAP::validate( bool 
             case detail::container_kind::array: {
                 auto const & values{ slot.as_array().values };
                 if ( static_cast<size_type>( values.size() ) != cardinality ) { return "an array's cardinality header differs from its length"; }
+                // an image in the portable format brings an array of the threshold itself (the reference's limit)
                 if ( supports_bitset_container && cardinality > array_to_bitset_threshold ) { return "an array holds more values than the array limit"; }
+                if ( canonical_kinds && supports_bitset_container && cardinality >= array_to_bitset_threshold ) { return "an array holds as many values as a bitset"; }
                 for ( size_type i{ 1 }; i < cardinality; ++i ) {
                     if ( !( values[ i - 1 ] < values[ i ] ) ) { return "an array's values are not strictly ascending"; }
                 }
@@ -98,7 +100,7 @@ FRSR_ROARING_DEFINITION_INLINE char const * FRSR_ROARING_BITMAP::validate( bool 
                 size_type bits{ 0 };
                 for ( size_type w{ 0 }; w < layout_type::word_count; ++w ) { bits += static_cast<size_type>( std::popcount( words[ w ] ) ); }
                 if ( bits != cardinality ) { return "a bitset's cardinality header differs from its popcount"; }
-                if ( canonical_kinds && cardinality <= array_to_bitset_threshold ) { return "a bitset holds no more values than the array limit"; }
+                if ( canonical_kinds && cardinality < array_to_bitset_threshold ) { return "a bitset holds no more values than the array limit"; }
                 break;
             }
             case detail::container_kind::run: {
@@ -1336,9 +1338,10 @@ FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::bulk_or_inplace( bitmap
         }
         // A small array pair merges in place (lazy_union_array_bound, tuning.hpp:
         // the reference converts unconditionally; the bound is where that
-        // measurably loses).
+        // measurably loses), while the merge stays below the threshold: the
+        // repair leaves arrays as they are.
         if ( left_container.holds_array() && right_container.holds_array() &&
-             ( static_cast<std::size_t>( left_container.count() ) + right_container.count() ) <= detail::lazy_union_array_bound ) {
+             ( static_cast<std::size_t>( left_container.count() ) + right_container.count() ) <= std::min<std::size_t>( detail::lazy_union_array_bound, array_to_bitset_threshold - 1U ) ) {
             detail::union_array_array_inplace<layout_type>( left_container.as_array(), right_container.as_array() );
             ++pos1;
             ++pos2;
@@ -1442,7 +1445,7 @@ FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::bulk_or_repair_after_la
     }
     repair_cardinality();
     for ( auto & slot : chunks_.slots() ) {
-        if ( slot.holds_bitset() && slot.cardinality() <= array_to_bitset_threshold ) {
+        if ( slot.holds_bitset() && slot.cardinality() < array_to_bitset_threshold ) {
             auto array{ detail::array_from_bitset<layout_type, CowPolicy>(
                 std::as_const( slot ).as_bitset(),
                 slot.cardinality()
@@ -1760,7 +1763,7 @@ FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::bulk_xor_repair_after_l
     repair_cardinality();
     bool any_empty{ false };
     for ( auto & slot : chunks_.slots() ) {
-        if ( slot.holds_bitset() && slot.cardinality() <= array_to_bitset_threshold ) {
+        if ( slot.holds_bitset() && slot.cardinality() < array_to_bitset_threshold ) {
             slot = settle_xor_bitset( std::move( slot ), chunks_ );
         } else if ( slot.holds_run() ) {
             slot = optimize_container_for_policy<detail::run_selection_eager>( std::move( slot ) );
@@ -1909,7 +1912,7 @@ FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::and_many_into( std::spa
             // the only operand: a copy of its container that shares nothing with it (a counted copy would write the
             // operand's reference count)
             result.chunks_.push_back( key, detail::interop_engine<bitmap>::own( *acc ) );
-        } else if ( auto & mine{ const_cast<handle_type &>( *acc ) }; mine.holds_bitset() && count <= array_to_bitset_threshold ) {
+        } else if ( auto & mine{ const_cast<handle_type &>( *acc ) }; mine.holds_bitset() && count < array_to_bitset_threshold ) {
             result.chunks_.push_back( key, detail::array_handle_from_container<layout_type, CowPolicy>( mine ) );
         } else {
             // the accumulator moves into the result; it carries on with a payload the result's table retired when it was
@@ -2075,7 +2078,7 @@ FRSR_ROARING_DEFINITION_INLINE auto FRSR_ROARING_BITMAP::and_many_settle_run( ha
 FRSR_ROARING_BITMAP_TEMPLATE
 FRSR_ROARING_DEFINITION_INLINE auto FRSR_ROARING_BITMAP::and_many_expand_run( handle_type const & run, and_many_scratch & scratch ) -> handle_type * {
     auto const runs{ run.as_run() };
-    if ( run.cardinality() <= array_to_bitset_threshold ) {
+    if ( run.cardinality() < array_to_bitset_threshold ) {
         auto target{ scratch.array_acc.as_array() };
         detail::resize_uninitialized( target.values, run.cardinality() );
         auto * out{ target.values.data() };

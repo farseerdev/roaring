@@ -514,7 +514,7 @@ public:
     using low_type    = typename Layout::low_type;
     using handle_type = container_handle<Layout, CowPolicy>;
 
-    static constexpr std::size_t array_limit{ Layout::low_domain_size >= 1024 ? Layout::low_domain_size / 16 : 64 };
+    static constexpr std::size_t array_limit{ ( Layout::low_domain_size >= 1024 ? Layout::low_domain_size / 16 : 64 ) - 1 };
 
     keys_source( It first, Sent last ) : cur_{ std::move( first ) }, end_{ std::move( last ) }, group_end_{ cur_ } { refresh(); }
     keys_source( keys_source const & ) = delete;
@@ -635,7 +635,7 @@ public:
     using low_type    = typename Layout::low_type;
 
     static constexpr std::uint64_t chunk_bits{ Layout::low_domain_size };
-    static constexpr std::size_t   array_limit{ Layout::low_domain_size >= 1024 ? Layout::low_domain_size / 16 : 64 };
+    static constexpr std::size_t   array_limit{ ( Layout::low_domain_size >= 1024 ? Layout::low_domain_size / 16 : 64 ) - 1 };
 
     bits_source( void const * const data, std::uint64_t const bit_count, std::uint64_t const base ) noexcept
         : bytes_{ static_cast<unsigned char const *>( data ) }, byte_count_{ ( bit_count + 7 ) / 8 }, bit_count_{ bit_count }, base_{ base }
