@@ -643,9 +643,12 @@ public:
         if ( !detail::container_remove( chunks_.slot( at ), low ) ) { return false; }
 
         --size_;
-        if ( detail::container_size( chunks_.slot( at ) ) == 0 ) {
+        auto & slot{ chunks_.slot( at ) };
+        if ( detail::container_size( slot ) == 0 ) {
             // [croaring-ref] deps/croaring/src/roaring_array.c:ra_remove_at_index
             chunks_.erase( at );
+        } else {
+            demote_if_needed( slot );
         }
         return true;
     }
@@ -2671,6 +2674,17 @@ private:
         if ( slot.holds_array() && slot.count() >= array_to_bitset_threshold ) [[unlikely]] {
             promote_array( slot );
         }
+    }
+    // remove()'s mirror of promote_if_needed: a bitset that falls below the threshold is an array again, as the
+    // reference's container_remove leaves it. Freed, not parked: a single removal has no next result to take it.
+    // [croaring-ref] deps/croaring/include/roaring/containers/containers.h:container_remove
+    [[gnu::always_inline]] static void demote_if_needed( handle_type & slot ) {
+        if ( slot.holds_bitset() && slot.cardinality() < array_to_bitset_threshold ) [[unlikely]] {
+            demote_bitset( slot );
+        }
+    }
+    [[gnu::cold, gnu::noinline]] static void demote_bitset( handle_type & slot ) {
+        slot = detail::array_from_bitset<layout_type, CowPolicy>( std::as_const( slot ).as_bitset(), slot.cardinality() );
     }
     [[gnu::cold, gnu::noinline]] void promote_array( handle_type & slot ) {
         if constexpr ( supports_bitset_container ) {

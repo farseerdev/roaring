@@ -123,20 +123,22 @@ void expect_bounds_of_copies( Bitmap const & bitmap, values_type const & values,
     return values;
 }
 
-// A bitset holding only `values` (below 5000): the chunk is filled past the array limit, which makes it a bitset, and
-// everything else is removed again, which leaves it one.
+// A bitset holding only `values` (below 5000), with its bounds left to be found: a chunk filled past the array limit
+// intersected in place with a bitset of `values` and of keys past 5000, an intersection that keeps a bitset of any size
+// (a subtraction or a removal would leave an array).
 template <typename Bitmap>
-[[nodiscard]] Bitmap emptied_bitset( values_type const & values ) {
+[[nodiscard]] Bitmap small_bitset( values_type const & values ) {
     using key_type = typename Bitmap::key_type;
     Bitmap result;
+    Bitmap mask;
     for ( key_type value{ 0 }; value < 5000; ++value ) {
         std::ignore = result.add( value );
+        std::ignore = mask.add( static_cast<key_type>( value + 5000 ) );
     }
-    for ( key_type value{ 0 }; value < 5000; ++value ) {
-        if ( !std::ranges::binary_search( values, static_cast<std::uint64_t>( value ) ) ) {
-            std::ignore = result.remove( value );
-        }
+    for ( auto const value : values ) {
+        std::ignore = mask.add( static_cast<key_type>( value ) );
     }
+    result &= mask;
     return result;
 }
 
@@ -200,7 +202,7 @@ TYPED_TEST( BitmapBounds, SmallBitsetsOfTheFirstWord ) {
     for ( values_type const & values : std::vector<values_type>{
         { 0 }, { 0, 1 }, { 3 }, { 3, 5 }, { 63 }, { 62, 63 }, { 0, 63 }, { 7, 9, 1000 }, { 4999 }, { 64, 4000 }
     } ) {
-        auto const bitmap{ emptied_bitset<Bitmap>( values ) };
+        auto const bitmap{ small_bitset<Bitmap>( values ) };
         EXPECT_EQ( bitmap.statistics().bitset_containers, 1U ) << "the scenario holds a bitset";
         expect_bounds_of_copies( bitmap, values, "small bitset from " + std::to_string( values.front() ) + " to " + std::to_string( values.back() ) );
     }

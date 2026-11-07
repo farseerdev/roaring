@@ -354,8 +354,8 @@ TYPED_TEST( ArrayLimitTyped, AChunkAtTheArrayLimitIsAnArrayAndOnePastItABitset )
         std::array<Bitmap const *, 2> const both{ &larger, &exact };
         check( Bitmap::and_many( both ), "intersection of many" );
 
-        // a range past the others removed (by the bitmap's own call and as a key range), and an interval of one value
-        // flipped away (by the bitmap's own call and as a key range)
+        // a range past the others removed (by the bitmap's own call and as a key range), an interval of one value
+        // flipped away (by the bitmap's own call and as a key range), and one value removed
         auto const range_first{ domain - 2U * surplus_count };
         auto ranged{ values };
         auto const tail{ range_of( range_first, surplus_count ) };
@@ -375,6 +375,9 @@ TYPED_TEST( ArrayLimitTyped, AChunkAtTheArrayLimitIsAnArrayAndOnePastItABitset )
         Bitmap flipped_by_range{ plus_one };
         flipped_by_range.xor_with( frsr::roaring::key_range::closed( last, last ) );
         check( flipped_by_range, "exclusive-or with a key range" );
+        Bitmap shortened{ plus_one };
+        ASSERT_TRUE( shortened.remove( last ) );
+        check( shortened, "one value removed" );
 
         // an intersection of many whose first operand is one run of exactly `count` values
         Bitmap run_of{ range_of( 0U, count ) };
