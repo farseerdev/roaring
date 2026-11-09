@@ -681,7 +681,7 @@ template <bool Greater, typename Element, typename Key, typename KeyOf = identit
     if ( lo == hi || !below( keys[ lo ], limit ) ) {
         return lo;
     }
-    // A skip of up to four elements settles with predictable compares and no search: the dominant
+    // A skip of up to three elements settles with predictable compares and no search: the dominant
     // outcome when the key sequence and the limits interleave closely (short runs against an array).
     // [croaring-ref] deps/croaring/include/roaring/array_util.h:advanceUntil
     for ( std::size_t offset{ 1 }; offset <= 3; ++offset ) {
@@ -823,9 +823,9 @@ template <typename T>
 // block of four to handle at once (all below the other side's current value, or equal to the other side's next
 // four), which is common and well predicted on clustered data; otherwise it takes four branchless steps.
 // The branchless steps carry a dependency from one value to the next, so they cost several cycles per value: when
-// one side is kSkewedMergeRatio times shorter than the other, from the start or once fewer than four values remain
-// on one side, each value of the short side is instead placed in the long one by galloping, and the long side's
-// values between two of them are handled as one block.
+// one side is kSkewedMergeRatio times shorter than the other, from the start (the intersection only for its tail) or
+// once fewer than four values remain on one side, each value of the short side is instead placed in the long one by
+// galloping, and the long side's values between two of them are handled as one block.
 // [croaring-ref] deps/croaring/src/array_util.c:intersect_uint16, union_uint16, difference_uint16, xor_uint16
 // Every write goes to out[ k.. ] with k <= i, so `out` may be `a`, but not `b`.
 template <typename T>

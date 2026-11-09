@@ -1501,7 +1501,7 @@ FRSR_ROARING_BITMAP_TEMPLATE
 FRSR_ROARING_DEFINITION_INLINE auto FRSR_ROARING_BITMAP::settle_xor_bitset( handle_type && container, detail::chunk_store<layout_type, CowPolicy> & store ) -> handle_type {
     return detail::settle_xor_bitset<layout_type, CowPolicy>(
         std::move( container ), array_to_bitset_threshold, [ &store ]( handle_type && vacated ) noexcept {
-            try { store.retire( std::move( vacated ) ); } catch ( std::bad_alloc const & ) {}
+            store.try_retire( std::move( vacated ) );
         } );
 }
 

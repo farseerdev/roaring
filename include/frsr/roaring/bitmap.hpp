@@ -2315,7 +2315,7 @@ private:
         if ( container.holds_bitset() ) {
             auto const cardinality{ container.cardinality() };
             if ( cardinality == 0 ) {
-                store.retire( std::move( container ) );
+                store.try_retire( std::move( container ) );
                 container = handle_type{};
             } else if ( cardinality < array_to_bitset_threshold ) {
                 auto array{ detail::array_from_bitset<layout_type, CowPolicy>(
@@ -2323,7 +2323,7 @@ private:
                     cardinality,
                     store.take_retired( detail::container_kind::array )
                 ) };
-                store.retire( std::move( container ) );
+                store.try_retire( std::move( container ) );
                 container = std::move( array );
             }
         }

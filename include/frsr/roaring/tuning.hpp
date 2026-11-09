@@ -61,9 +61,10 @@ inline constexpr std::size_t lazy_xor_array_bound{ 1024 };
 // [croaring-ref] deps/croaring/src/containers/array.c:array_container_intersection (`const int threshold = 64;`)
 inline constexpr std::size_t kSkewedIntersectRatioThreshold{ 64 };
 
-// The scalar array merges (union, intersection, difference, symmetric difference) place each value of one side in the
-// other by galloping, instead of stepping through both, when that side is this many times shorter: from the start,
-// or once fewer than four values remain on one side (array_ops.hpp, union_sorted_scalar and its siblings); the
+// The scalar array merges (union, difference, symmetric difference from the start; these and the intersection once
+// fewer than four values remain on one side) place each value of one side in the other by galloping, instead of
+// stepping through both, when that side is this many times shorter (array_ops.hpp, union_sorted_scalar and its
+// siblings; a longer pair's intersection is decided earlier, by kSkewedIntersectRatioThreshold); the
 // sorted batch added to an array, and with it the scalar in-place array union, likewise.
 // [croaring-ref] deps/croaring/include/roaring/array_util.h:CROARING_SKEWED_MERGE_RATIO
 inline constexpr std::size_t kSkewedMergeRatio{ 8 };
