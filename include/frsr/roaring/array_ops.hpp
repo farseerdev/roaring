@@ -163,7 +163,7 @@ inline constexpr std::size_t sse42_intersect_min_side{ 8 };
 // and the loop runs the implicit-length compare throughout. B's sub-vector remainder is
 // applied to the last pending A block through a zero-padded, explicit-length compare.
 // [croaring-ref] deps/croaring/src/array_util.c:difference_vector16
-[[ gnu::hot ]] inline std::size_t difference_array_array_sse42(
+[[ gnu::hot, gnu::noinline ]] inline std::size_t difference_array_array_sse42(
     std::uint16_t const * const a, std::size_t const sa,
     std::uint16_t const * const b, std::size_t const sb,
     std::uint16_t       * const out
