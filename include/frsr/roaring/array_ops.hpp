@@ -1153,14 +1153,16 @@ template <typename Layout, typename CowPolicy = cow_value_semantics>
 }
 
 // Scalar forward merge of two sorted uint16 arrays into `out` (sa + sb slots, with union_sorted_scalar's aliasing:
-// the vector union's in-place tail writes below the unread part of `b`). Returns the count.
+// the vector union's in-place tail writes below the unread part of `b`). Returns the count. The vector union's tail is
+// a few values against the rest of the longer array: the walk stops when the few run out and copies the rest, so there
+// is nothing for a gallop to save and this merge is compiled without one.
 // [croaring-ref] deps/croaring/src/array_util.c:union_uint16
 [[ gnu::hot ]] inline std::size_t union_sorted_uint16_scalar(
     std::uint16_t const * const a, std::size_t const sa,
     std::uint16_t const * const b, std::size_t const sb,
     std::uint16_t * const out
 ) noexcept {
-    return union_sorted_scalar( a, sa, b, sb, out );
+    return union_sorted_merge<false>( a, sa, b, sb, out );
 }
 
 #if FRSR_ROARING_X86_V4
@@ -1276,16 +1278,8 @@ inline std::size_t union_sorted_uint16(
 
     std::uint16_t merged[ 2 * W ];  // <= W pending + (W−1) leftovers
     std::size_t const nmerged{ union_sorted_uint16_scalar( pending, npending, rest_short, nshort, merged ) };
-    // Enough values for a gallop to pay: the merged values meet only the values of the other side up to their
-    // maximum, so that prefix is merged and the rest copied. (Merged with the whole other side, the few values would
-    // be galloped through it.)
-    std::size_t met{ nlong };
-    if ( nmerged + nlong >= kSkewedMergeMinTotal && nmerged != 0 ) {
-        met = gallop_forward<true>( rest_long, 0, nlong, merged[ nmerged - 1 ] );
-    }
-    o += union_sorted_uint16_scalar( merged, nmerged, rest_long, met, o );
-    move_tail( o, rest_long + met, nlong - met );   // in place, rest_long may lie above `o`
-    return static_cast<std::size_t>( o - out ) + ( nlong - met );
+    o += union_sorted_uint16_scalar( merged, nmerged, rest_long, nlong, o );
+    return static_cast<std::size_t>( o - out );
 }
 
 // Extra output slots the kernel's full-vector stores need past sa + sb.
@@ -1694,15 +1688,7 @@ inline constexpr std::size_t sse42_xor_min_side{ 8 };
     for ( std::size_t i{ 0 }; i < pending_count; ++i ) {
         if ( kept != 0 && pending[ kept - 1 ] == pending[ i ] ) { --kept; } else { pending[ kept++ ] = pending[ i ]; }
     }
-    // Enough values for a gallop to pay: the pending values meet only the values of `rest` up to their maximum, so
-    // that prefix is merged and the rest copied.
-    std::size_t met{ rest_count };
-    if ( kept + rest_count >= kSkewedMergeMinTotal && kept != 0 ) {
-        met = gallop_forward<true>( rest, 0, rest_count, pending[ kept - 1 ] );
-    }
-    count += xor_sorted_scalar( static_cast<std::uint16_t const *>( pending ), kept, rest, met, out + count );
-    std::memcpy( out + count, rest + met, ( rest_count - met ) * sizeof( std::uint16_t ) );
-    return count + ( rest_count - met );
+    return count + xor_sorted_merge<false>( static_cast<std::uint16_t const *>( pending ), kept, rest, rest_count, out + count );
 }
 
 // How many values two sorted arrays share: the intersection kernel above with the stores replaced by a count of the
