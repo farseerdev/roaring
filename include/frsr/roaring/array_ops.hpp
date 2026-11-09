@@ -825,11 +825,12 @@ template <typename T>
 // The branchless steps carry a dependency from one value to the next, so they cost several cycles per value: when
 // one side is kSkewedMergeRatio times shorter than the other, from the start (the intersection only for its tail) or
 // once fewer than four values remain on one side, each value of the short side is instead placed in the long one by
-// galloping, and the long side's values between two of them are handled as one block.
+// galloping, and the long side's values between two of them are handled as one block. Pairs of fewer than
+// kSkewedMergeMinTotal values in all do not gallop.
 // [croaring-ref] deps/croaring/src/array_util.c:intersect_uint16, union_uint16, difference_uint16, xor_uint16
 // Every write goes to out[ k.. ] with k <= i, so `out` may be `a`, but not `b`.
-template <typename T>
-[[ gnu::hot ]] inline std::size_t intersect_sorted_scalar(
+template <bool MayGallop, typename T>
+[[ gnu::always_inline ]] inline std::size_t intersect_sorted_merge(
     T const * const a, std::size_t const sa,
     T const * const b, std::size_t const sb,
     T * const out
@@ -858,11 +859,13 @@ template <typename T>
             }
         }
     }
-    if ( shorter_by( kSkewedMergeRatio, sa - i, sb - j ) ) {
-        return k + filter_skewed_short<true>( a + i, sa - i, b + j, sb - j, out + k );
-    }
-    if ( shorter_by( kSkewedMergeRatio, sb - j, sa - i ) ) {
-        return k + filter_skewed_short<true>( b + j, sb - j, a + i, sa - i, out + k );
+    if constexpr ( MayGallop ) {
+        if ( shorter_by( kSkewedMergeRatio, sa - i, sb - j ) ) {
+            return k + filter_skewed_short<true>( a + i, sa - i, b + j, sb - j, out + k );
+        }
+        if ( shorter_by( kSkewedMergeRatio, sb - j, sa - i ) ) {
+            return k + filter_skewed_short<true>( b + j, sb - j, a + i, sa - i, out + k );
+        }
     }
     while ( i < sa && j < sb ) {
         T const x{ a[ i ] }, y{ b[ j ] };
@@ -874,17 +877,40 @@ template <typename T>
     return k;
 }
 
+// The galloping form of the merge above, out of line, for pairs that can take it.
+template <typename T>
+[[ nodiscard, gnu::noinline ]] inline std::size_t intersect_sorted_scalar_long(
+    T const * const a, std::size_t const sa,
+    T const * const b, std::size_t const sb,
+    T * const out
+) noexcept {
+    return intersect_sorted_merge<true>( a, sa, b, sb, out );
+}
+
+// Pairs too small to gallop pay only this test, and run the merge compiled without the galloping branches.
+template <typename T>
+[[ gnu::hot ]] inline std::size_t intersect_sorted_scalar(
+    T const * const a, std::size_t const sa,
+    T const * const b, std::size_t const sb,
+    T * const out
+) noexcept {
+    if ( sa + sb >= kSkewedMergeMinTotal ) [[unlikely]] {
+        return intersect_sorted_scalar_long( a, sa, b, sb, out );
+    }
+    return intersect_sorted_merge<false>( a, sa, b, sb, out );
+}
+
 // `out` has sa + sb slots. Every write lands before out + i + j + 1, so `out` may start `sb` or more values before
 // `a`, or `sa` or more values before `b` (the in-place union layouts).
-template <typename T>
-[[ gnu::hot ]] inline std::size_t union_sorted_scalar(
+template <bool MayGallop, typename T>
+[[ gnu::always_inline ]] inline std::size_t union_sorted_merge(
     T const * const a, std::size_t const sa,
     T const * const b, std::size_t const sb,
     T * const out
 ) noexcept {
     std::size_t i{ 0 }, j{ 0 }, k{ 0 };
     // A side this much shorter than the other goes straight to the galloping form below.
-    if ( !lengths_apart( kSkewedMergeRatio, sa, sb ) ) {
+    if ( !MayGallop || !lengths_apart( kSkewedMergeRatio, sa, sb ) ) {
         while ( i + 4 <= sa && j + 4 <= sb ) {
             if ( a[ i + 3 ] < b[ j ] ) {
                 std::memmove( out + k, a + i, 4 * sizeof( T ) );
@@ -909,11 +935,13 @@ template <typename T>
             }
         }
     }
-    if ( shorter_by( kSkewedMergeRatio, sa - i, sb - j ) ) {
-        return k + merge_skewed_keeping_long<short_value_kept::always>( a + i, sa - i, b + j, sb - j, out + k );
-    }
-    if ( shorter_by( kSkewedMergeRatio, sb - j, sa - i ) ) {
-        return k + merge_skewed_keeping_long<short_value_kept::always>( b + j, sb - j, a + i, sa - i, out + k );
+    if constexpr ( MayGallop ) {
+        if ( shorter_by( kSkewedMergeRatio, sa - i, sb - j ) ) {
+            return k + merge_skewed_keeping_long<short_value_kept::always>( a + i, sa - i, b + j, sb - j, out + k );
+        }
+        if ( shorter_by( kSkewedMergeRatio, sb - j, sa - i ) ) {
+            return k + merge_skewed_keeping_long<short_value_kept::always>( b + j, sb - j, a + i, sa - i, out + k );
+        }
     }
     while ( i < sa && j < sb ) {
         T const x{ a[ i ] }, y{ b[ j ] };
@@ -927,16 +955,39 @@ template <typename T>
     return k + ( sb - j );
 }
 
-// Every write goes to out[ k.. ] with k <= i, so `out` may be `a`.
+// The galloping form of the merge above, out of line, for pairs that can take it.
 template <typename T>
-[[ gnu::hot ]] inline std::size_t difference_sorted_scalar(
+[[ nodiscard, gnu::noinline ]] inline std::size_t union_sorted_scalar_long(
+    T const * const a, std::size_t const sa,
+    T const * const b, std::size_t const sb,
+    T * const out
+) noexcept {
+    return union_sorted_merge<true>( a, sa, b, sb, out );
+}
+
+// Pairs too small to gallop pay only this test, and run the merge compiled without the galloping branches.
+template <typename T>
+[[ gnu::hot ]] inline std::size_t union_sorted_scalar(
+    T const * const a, std::size_t const sa,
+    T const * const b, std::size_t const sb,
+    T * const out
+) noexcept {
+    if ( sa + sb >= kSkewedMergeMinTotal ) [[unlikely]] {
+        return union_sorted_scalar_long( a, sa, b, sb, out );
+    }
+    return union_sorted_merge<false>( a, sa, b, sb, out );
+}
+
+// Every write goes to out[ k.. ] with k <= i, so `out` may be `a`.
+template <bool MayGallop, typename T>
+[[ gnu::always_inline ]] inline std::size_t difference_sorted_merge(
     T const * const a, std::size_t const sa,
     T const * const b, std::size_t const sb,
     T * const out
 ) noexcept {
     std::size_t i{ 0 }, j{ 0 }, k{ 0 };
     // A side this much shorter than the other goes straight to the galloping form below.
-    if ( !lengths_apart( kSkewedMergeRatio, sa, sb ) ) {
+    if ( !MayGallop || !lengths_apart( kSkewedMergeRatio, sa, sb ) ) {
         while ( i + 4 <= sa && j + 4 <= sb ) {
             if ( a[ i + 3 ] < b[ j ] ) {
                 std::memmove( out + k, a + i, 4 * sizeof( T ) );
@@ -958,11 +1009,13 @@ template <typename T>
             }
         }
     }
-    if ( shorter_by( kSkewedMergeRatio, sb - j, sa - i ) ) {
-        return k + merge_skewed_keeping_long<short_value_kept::never>( b + j, sb - j, a + i, sa - i, out + k );
-    }
-    if ( shorter_by( kSkewedMergeRatio, sa - i, sb - j ) ) {
-        return k + filter_skewed_short<false>( a + i, sa - i, b + j, sb - j, out + k );
+    if constexpr ( MayGallop ) {
+        if ( shorter_by( kSkewedMergeRatio, sb - j, sa - i ) ) {
+            return k + merge_skewed_keeping_long<short_value_kept::never>( b + j, sb - j, a + i, sa - i, out + k );
+        }
+        if ( shorter_by( kSkewedMergeRatio, sa - i, sb - j ) ) {
+            return k + filter_skewed_short<false>( a + i, sa - i, b + j, sb - j, out + k );
+        }
     }
     while ( i < sa && j < sb ) {
         T const x{ a[ i ] }, y{ b[ j ] };
@@ -973,6 +1026,29 @@ template <typename T>
     }
     move_tail( out + k, a + i, sa - i );
     return k + ( sa - i );
+}
+
+// The galloping form of the merge above, out of line, for pairs that can take it.
+template <typename T>
+[[ nodiscard, gnu::noinline ]] inline std::size_t difference_sorted_scalar_long(
+    T const * const a, std::size_t const sa,
+    T const * const b, std::size_t const sb,
+    T * const out
+) noexcept {
+    return difference_sorted_merge<true>( a, sa, b, sb, out );
+}
+
+// Pairs too small to gallop pay only this test, and run the merge compiled without the galloping branches.
+template <typename T>
+[[ gnu::hot ]] inline std::size_t difference_sorted_scalar(
+    T const * const a, std::size_t const sa,
+    T const * const b, std::size_t const sb,
+    T * const out
+) noexcept {
+    if ( sa + sb >= kSkewedMergeMinTotal ) [[unlikely]] {
+        return difference_sorted_scalar_long( a, sa, b, sb, out );
+    }
+    return difference_sorted_merge<false>( a, sa, b, sb, out );
 }
 
 // OutVector: a small_array_values scratch or a handle's payload_vector (direct write).
@@ -1200,9 +1276,13 @@ inline std::size_t union_sorted_uint16(
 
     std::uint16_t merged[ 2 * W ];  // <= W pending + (W−1) leftovers
     std::size_t const nmerged{ union_sorted_uint16_scalar( pending, npending, rest_short, nshort, merged ) };
-    // The merged values meet only the values of the other side up to their maximum: that prefix is merged, the
-    // rest copied. (Merged with the whole other side, the few values would be galloped through it.)
-    std::size_t const met{ nmerged == 0 ? 0 : gallop_forward<true>( rest_long, 0, nlong, merged[ nmerged - 1 ] ) };
+    // Enough values for a gallop to pay: the merged values meet only the values of the other side up to their
+    // maximum, so that prefix is merged and the rest copied. (Merged with the whole other side, the few values would
+    // be galloped through it.)
+    std::size_t met{ nlong };
+    if ( nmerged + nlong >= kSkewedMergeMinTotal && nmerged != 0 ) {
+        met = gallop_forward<true>( rest_long, 0, nlong, merged[ nmerged - 1 ] );
+    }
     o += union_sorted_uint16_scalar( merged, nmerged, rest_long, met, o );
     move_tail( o, rest_long + met, nlong - met );   // in place, rest_long may lie above `o`
     return static_cast<std::size_t>( o - out ) + ( nlong - met );
@@ -1428,15 +1508,15 @@ template <typename Layout, typename OutVector, typename CowPolicy = cow_value_se
 // to the other side's next four, which cancel), otherwise four branchless steps. `out` has sa + sb slots and
 // may not alias either input.
 // [croaring-ref] deps/croaring/src/array_util.c:xor_uint16
-template <typename T>
-[[ gnu::hot ]] inline std::size_t xor_sorted_scalar(
+template <bool MayGallop, typename T>
+[[ gnu::always_inline ]] inline std::size_t xor_sorted_merge(
     T const * const a, std::size_t const sa,
     T const * const b, std::size_t const sb,
     T * const out
 ) noexcept {
     std::size_t i{ 0 }, j{ 0 }, k{ 0 };
     // A side this much shorter than the other goes straight to the galloping form below.
-    if ( !lengths_apart( kSkewedMergeRatio, sa, sb ) ) {
+    if ( !MayGallop || !lengths_apart( kSkewedMergeRatio, sa, sb ) ) {
         while ( i + 4 <= sa && j + 4 <= sb ) {
             if ( a[ i + 3 ] < b[ j ] ) {
                 std::memcpy( out + k, a + i, 4 * sizeof( T ) );
@@ -1460,11 +1540,13 @@ template <typename T>
             }
         }
     }
-    if ( shorter_by( kSkewedMergeRatio, sa - i, sb - j ) ) {
-        return k + merge_skewed_keeping_long<short_value_kept::when_absent>( a + i, sa - i, b + j, sb - j, out + k );
-    }
-    if ( shorter_by( kSkewedMergeRatio, sb - j, sa - i ) ) {
-        return k + merge_skewed_keeping_long<short_value_kept::when_absent>( b + j, sb - j, a + i, sa - i, out + k );
+    if constexpr ( MayGallop ) {
+        if ( shorter_by( kSkewedMergeRatio, sa - i, sb - j ) ) {
+            return k + merge_skewed_keeping_long<short_value_kept::when_absent>( a + i, sa - i, b + j, sb - j, out + k );
+        }
+        if ( shorter_by( kSkewedMergeRatio, sb - j, sa - i ) ) {
+            return k + merge_skewed_keeping_long<short_value_kept::when_absent>( b + j, sb - j, a + i, sa - i, out + k );
+        }
     }
     while ( i < sa && j < sb ) {
         T const x{ a[ i ] }, y{ b[ j ] };
@@ -1477,6 +1559,29 @@ template <typename T>
     k += sa - i;
     move_tail( out + k, b + j, sb - j );
     return k + ( sb - j );
+}
+
+// The galloping form of the merge above, out of line, for pairs that can take it.
+template <typename T>
+[[ nodiscard, gnu::noinline ]] inline std::size_t xor_sorted_scalar_long(
+    T const * const a, std::size_t const sa,
+    T const * const b, std::size_t const sb,
+    T * const out
+) noexcept {
+    return xor_sorted_merge<true>( a, sa, b, sb, out );
+}
+
+// Pairs too small to gallop pay only this test, and run the merge compiled without the galloping branches.
+template <typename T>
+[[ gnu::hot ]] inline std::size_t xor_sorted_scalar(
+    T const * const a, std::size_t const sa,
+    T const * const b, std::size_t const sb,
+    T * const out
+) noexcept {
+    if ( sa + sb >= kSkewedMergeMinTotal ) [[unlikely]] {
+        return xor_sorted_scalar_long( a, sa, b, sb, out );
+    }
+    return xor_sorted_merge<false>( a, sa, b, sb, out );
 }
 
 #if defined( __SSE4_2__ )
@@ -1589,8 +1694,12 @@ inline constexpr std::size_t sse42_xor_min_side{ 8 };
     for ( std::size_t i{ 0 }; i < pending_count; ++i ) {
         if ( kept != 0 && pending[ kept - 1 ] == pending[ i ] ) { --kept; } else { pending[ kept++ ] = pending[ i ]; }
     }
-    // The pending values meet only the values of `rest` up to their maximum: that prefix is merged, the rest copied.
-    std::size_t const met{ kept == 0 ? 0 : gallop_forward<true>( rest, 0, rest_count, pending[ kept - 1 ] ) };
+    // Enough values for a gallop to pay: the pending values meet only the values of `rest` up to their maximum, so
+    // that prefix is merged and the rest copied.
+    std::size_t met{ rest_count };
+    if ( kept + rest_count >= kSkewedMergeMinTotal && kept != 0 ) {
+        met = gallop_forward<true>( rest, 0, rest_count, pending[ kept - 1 ] );
+    }
     count += xor_sorted_scalar( static_cast<std::uint16_t const *>( pending ), kept, rest, met, out + count );
     std::memcpy( out + count, rest + met, ( rest_count - met ) * sizeof( std::uint16_t ) );
     return count + ( rest_count - met );

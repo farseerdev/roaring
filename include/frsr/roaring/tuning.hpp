@@ -84,6 +84,10 @@ inline constexpr std::size_t kSkewedVectorDifferenceRatio{ 128 };
     return shorter * ratio < longer;
 }
 
+// The scalar array merges consider galloping only when the two arrays together hold at least this many values; the
+// many merges of smaller arrays pay one compare and never reach the galloping form.
+inline constexpr std::size_t kSkewedMergeMinTotal{ 64 };
+
 // Whether either of two lengths is more than `ratio` times the other.
 [[nodiscard]] constexpr bool lengths_apart( std::size_t const ratio, std::size_t const x, std::size_t const y ) noexcept {
     return shorter_by( ratio, x, y ) || shorter_by( ratio, y, x );
