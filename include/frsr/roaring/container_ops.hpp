@@ -662,14 +662,9 @@ template <typename Layout, typename CowPolicy>
             auto const & words{ container.as_bitset().words.as_array() };
             if constexpr ( std::is_same_v<key_type, std::uint32_t> ) {
                 return extract_setbits_uint32( words.data(), words.size(), out, out_end, base );
+            } else if constexpr ( std::is_same_v<key_type, std::uint64_t> ) {
+                return extract_setbits_uint64( words.data(), words.size(), out, container.cardinality(), base );
             } else {
-#if FRSR_ROARING_X86_V4
-                if constexpr ( std::is_same_v<key_type, std::uint64_t> && std::is_same_v<typename Layout::low_type, std::uint16_t> ) {
-                    if ( have_x86_v4() ) [[likely]] {
-                        return x86_v4::extract_setbits_uint64( words.data(), words.size(), out, container.cardinality(), base );
-                    }
-                }
-#endif
                 for ( std::size_t index{ 0 }; index < words.size(); ++index ) {
                     auto word{ words[ index ] };
                     auto const word_base{ base + static_cast<key_type>( index << 6U ) };

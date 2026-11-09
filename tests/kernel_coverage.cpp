@@ -331,17 +331,30 @@ using block_words = std::array<std::uint64_t, 1024>;
 
 // About `card` set bits: at random over the block, at random over its first card * 4 bits, in runs of 16 at
 // 16-aligned starts, packed into every other word with the words between them zero, or at random within some
-// groups of eight words, the other groups zero.
+// groups of eight words, the other groups zero, or as whole words of 64 set bits.
 [[nodiscard]] block_words sparse_block( std::mt19937_64 & rng, std::size_t const card, unsigned const shape ) {
     block_words words{};
     auto const set{ [ & ]( std::size_t const bit ) { words[ bit / 64 ] |= std::uint64_t{ 1 } << ( bit % 64 ); } };
     for ( std::size_t k{ 0 }; k < card; ++k ) {
         switch ( shape ) {
-            case 0: set( rng() % 65536 ); break;
-            case 1: set( rng() % std::min<std::size_t>( 65536, card * 4 ) ); break;
-            case 2: set( ( rng() % 4096 ) * 16 + k % 16 ); break;
-            case 3: set( ( rng() % 512 ) * 128 + rng() % 64 ); break;
-            default: set( ( rng() % 16 ) * 4096 + rng() % 512 ); break;
+            case 0:
+                set( rng() % 65536 );
+                break;
+            case 1:
+                set( rng() % std::min<std::size_t>( 65536, card * 4 ) );
+                break;
+            case 2:
+                set( ( rng() % 4096 ) * 16 + k % 16 );
+                break;
+            case 3:
+                set( ( rng() % 512 ) * 128 + rng() % 64 );
+                break;
+            case 4:
+                set( ( rng() % 16 ) * 4096 + rng() % 512 );
+                break;
+            default:
+                words[ rng() % 1024 ] = ~std::uint64_t{ 0 };
+                break;
         }
     }
     return words;
@@ -350,7 +363,9 @@ using block_words = std::array<std::uint64_t, 1024>;
 void expect_setbits_extracted( block_words const & words, std::size_t const n ) {
     std::vector<std::uint16_t> expected;
     for ( std::size_t i{ 0 }; i < n; ++i ) {
-        for ( auto w{ words[ i ] }; w != 0; w &= w - 1 ) { expected.emplace_back( static_cast<std::uint16_t>( i * 64 + std::countr_zero( w ) ) ); }
+        for ( auto w{ words[ i ] }; w != 0; w &= w - 1 ) {
+            expected.emplace_back( static_cast<std::uint16_t>( i * 64 + std::countr_zero( w ) ) );
+        }
     }
     constexpr std::size_t guard{ 8 };
     constexpr std::uint16_t canary{ 0xCAFE };
@@ -361,13 +376,52 @@ void expect_setbits_extracted( block_words const & words, std::size_t const n ) 
     EXPECT_TRUE( std::all_of( storage.begin() + static_cast<std::ptrdiff_t>( guard + expected.size() ), storage.end(), [ & ]( auto const v ) { return v == canary; } ) ) << "wrote past the output";
 }
 
+TEST( KernelCoverage, BitsetExtractionUint64SparsePrefix ) {
+    if ( !detail::have_x86_v4() ) {
+        GTEST_SKIP() << "no AVX-512 VBMI2";
+    }
+    block_words words{};
+    words[ 900 ]  = std::uint64_t{ 1 } << 5U;
+    words[ 1021 ] = ( std::uint64_t{ 1 } << 63U ) | 1U;
+    words[ 1023 ] = std::uint64_t{ 1 } << 63U;
+    std::uint64_t const base{ std::uint64_t{ 7 } << 32U };
+    std::array const expected{ base + 900 * 64 + 5, base + 1021 * 64, base + 1021 * 64 + 63, base + 1023 * 64 + 63 };
+    constexpr std::uint64_t canary{ 0xCAFE'F00D'CAFE'F00DULL };
+    std::array<std::uint64_t, 12> storage;
+    storage.fill( canary );
+    auto const * const end{ detail::x86_v4::extract_setbits_uint64( words.data(), words.size(), storage.data() + 4, expected.size(), base ) };
+    ASSERT_EQ( end, storage.data() + 4 + expected.size() );
+    EXPECT_TRUE( std::equal( expected.begin(), expected.end(), storage.begin() + 4 ) );
+    EXPECT_EQ( storage[ 3 ], canary );
+    EXPECT_EQ( storage[ 8 ], canary );
+}
+
+// An intersection of two bitsets that leaves one value keeps the bitset, and to_vector() scans past its zero words.
+TEST( KernelCoverage, Uint64ToVectorOfSparseIntersection ) {
+    std::uint64_t const base{ std::uint64_t{ 3 } << 40U };
+    Bitmap64 even_and_last;
+    Bitmap64 odd;
+    for ( std::uint64_t low{ 0 }; low < 65536; ++low ) {
+        if ( low % 2 == 0 || low == 65535 ) {
+            std::ignore = even_and_last.add( base + low );
+        }
+        if ( low % 2 == 1 ) {
+            std::ignore = odd.add( base + low );
+        }
+    }
+    even_and_last &= odd;
+    auto const values{ even_and_last.to_vector() };
+    ASSERT_EQ( values.size(), 1U );
+    EXPECT_EQ( values[ 0 ], base + 65535 );
+}
+
 TEST( KernelCoverage, BitsetExtractionSparse ) {
     if ( !detail::have_x86_v4() ) {
         GTEST_SKIP() << "no AVX-512 VBMI2";
     }
     std::mt19937_64 rng{ 0x5E7B175 };
     for ( std::size_t const card : { 1, 16, 100, 1000, 1024, 2047, 2048, 2049, 3000, 4096, 6000 } ) {
-        for ( unsigned shape{ 0 }; shape < 5; ++shape ) {
+        for ( unsigned shape{ 0 }; shape < 6; ++shape ) {
             for ( int trial{ 0 }; trial < 8; ++trial ) {
                 auto const words{ sparse_block( rng, card, shape ) };
                 for ( std::size_t const n : { std::size_t{ 1024 }, std::size_t{ 1021 }, std::size_t{ 13 }, std::size_t{ 8 }, std::size_t{ 5 } } ) {
@@ -388,10 +442,20 @@ TEST( KernelCoverage, BitsetExtractionUint64 ) {
         block_words words{};
         for ( auto & word : words ) {
             switch ( rng() % 6 ) {
-                case 0: break;
-                case 1: word = ~std::uint64_t{ 0 }; break;
-                case 2: word = rng() & rng() & rng(); break;
-                default: word = rng(); for ( auto thin{ trial % 4 }; thin > 0; --thin ) { word &= rng() | rng(); } break;
+                case 0:
+                    break;
+                case 1:
+                    word = ~std::uint64_t{ 0 };
+                    break;
+                case 2:
+                    word = rng() & rng() & rng();
+                    break;
+                default:
+                    word = rng();
+                    for ( auto thin{ trial % 4 }; thin > 0; --thin ) {
+                        word &= rng() | rng();
+                    }
+                    break;
             }
         }
         auto const base{ ( std::uint64_t{ 0xABCDE } << 32 ) | ( ( rng() & 0xFFFF ) << 16 ) };
@@ -399,7 +463,9 @@ TEST( KernelCoverage, BitsetExtractionUint64 ) {
             SCOPED_TRACE( ::testing::Message() << "trial " << trial << " n " << n );
             std::vector<std::uint64_t> expected;
             for ( std::size_t i{ 0 }; i < n; ++i ) {
-                for ( auto w{ words[ i ] }; w != 0; w &= w - 1 ) { expected.emplace_back( base + i * 64 + static_cast<std::uint64_t>( std::countr_zero( w ) ) ); }
+                for ( auto w{ words[ i ] }; w != 0; w &= w - 1 ) {
+                    expected.emplace_back( base + i * 64 + static_cast<std::uint64_t>( std::countr_zero( w ) ) );
+                }
             }
             constexpr std::size_t guard{ 8 };
             constexpr std::uint64_t canary{ 0xCAFE'F00D'CAFE'F00DULL };
