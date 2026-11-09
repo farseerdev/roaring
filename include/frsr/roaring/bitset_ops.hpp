@@ -267,49 +267,67 @@ inline std::uint32_t * extract_setbits_uint32(
     return out;
 }
 
-// Writes the set-bit positions of `word`, plus `base`, to `out` and returns the end of them: the byte-index compress
-// widened to 64 bits and masked-stored eight values at a time, only as many stores as the values need. A zero word
-// writes nothing.
+// Writes the 16 byte values of `bytes` the low 16 bits of `lanes` select, plus the 64-bit lanes of `base`, to `out`:
+// two stores of 8. The second is made whether or not it holds a value, sparing a branch on a word's count, unless
+// it could lie past `end`.
 FRSR_ROARING_X86_V4_HELPER
-inline std::uint64_t * decode_word_uint64( std::uint64_t const word, std::uint64_t const base, __m512i const indices, std::uint64_t * const out ) noexcept {
-    if ( word == 0 ) {
-        return out;
+inline void decode_block_uint64( __m128i const bytes, std::uint64_t const lanes, __m512i const base, std::uint64_t * const out, std::uint64_t const * const end ) noexcept {
+    _mm512_mask_storeu_epi64( out, static_cast<__mmask8>( lanes ), _mm512_add_epi64( base, _mm512_cvtepu8_epi64( bytes ) ) );
+    if ( out + 16 <= end || ( lanes & 0xFF00U ) != 0 ) {
+        _mm512_mask_storeu_epi64( out + 8, static_cast<__mmask8>( lanes >> 8U ),
+            _mm512_add_epi64( base, _mm512_cvtepu8_epi64( _mm_unpackhi_epi64( bytes, bytes ) ) ) );
     }
+}
+
+// Writes the set-bit positions of `word`, plus the lanes of `base_lanes`, to `out` and returns the end of them: the
+// byte-index compress widened to 64 bits and masked-stored, only the blocks of 16 that carry a value computed.
+FRSR_ROARING_X86_V4_HELPER
+inline std::uint64_t * decode_word_uint64( std::uint64_t const word, __m512i const base_lanes, __m512i const indices, std::uint64_t * const out, std::uint64_t const * const end ) noexcept {
     auto const added{ static_cast<unsigned>( std::popcount( word ) ) };
-    __m512i const base_lanes{ _mm512_set1_epi64( static_cast<long long>( base ) ) };
-    auto bytes{ _mm512_maskz_compress_epi8( static_cast<__mmask64>( word ), indices ) };
-    auto lanes{ low_lanes( added ) };
-    auto * block{ out };
-    do {
-        _mm512_mask_storeu_epi64( block, static_cast<__mmask8>( lanes ), _mm512_add_epi64( base_lanes, _mm512_cvtepu8_epi64( _mm512_castsi512_si128( bytes ) ) ) );
-        bytes = _mm512_alignr_epi64( _mm512_setzero_si512(), bytes, 1 );
-        lanes >>= 8U;
-        block += 8;
-    } while ( lanes != 0 );
+    __m512i const packed{ _mm512_maskz_compress_epi8( static_cast<__mmask64>( word ), indices ) };
+    auto const lanes{ low_lanes( added ) };
+    decode_block_uint64( _mm512_castsi512_si128( packed ), lanes, base_lanes, out, end );
+    if ( added > 16U ) {
+        decode_block_uint64( _mm512_extracti32x4_epi32( packed, 1 ), lanes >> 16U, base_lanes, out + 16, end );
+        if ( added > 32U ) {
+            decode_block_uint64( _mm512_extracti32x4_epi32( packed, 2 ), lanes >> 32U, base_lanes, out + 32, end );
+            if ( added > 48U ) {
+                decode_block_uint64( _mm512_extracti32x4_epi32( packed, 3 ), lanes >> 48U, base_lanes, out + 48, end );
+            }
+        }
+    }
     return out + added;
 }
 
 // AVX-512 VBMI2 set-bit decoder into 64-bit values, `base` plus each position, for the `count` values the words
-// hold. A bitset container can be sparse here (an intersection does not demote it), so the words are taken as in
-// the 16-bit decoder: a group of eight zero words is passed over by one VPTESTMQ, a zero word of the others by its
-// own test, and it stops once `count` values are written, no store touching the memory past them.
+// hold. A bitset container can be sparse here (an intersection does not demote it), so a group of eight zero words
+// is passed over by one VPTESTMQ; the words of the others are decoded without a test, a zero word writing nothing
+// and advancing by zero, since a container's bitset is usually dense. It stops once `count` values are written,
+// so that no store touches the memory past them.
 FRSR_ROARING_X86_V4_KERNEL
 inline std::uint64_t * extract_setbits_uint64(
     std::uint64_t const * const words, std::size_t const n, std::uint64_t * out, std::size_t const count, std::uint64_t const base
 ) noexcept {
     auto const * const end{ out + count };
     __m512i const indices{ _mm512_load_si512( byte_indices ) };
+    __m512i const inc64  { _mm512_set1_epi64( 64 ) };
+    __m512i const inc512 { _mm512_set1_epi64( 512 ) };
+    __m512i       base_lanes{ _mm512_set1_epi64( static_cast<long long>( base ) ) };
     std::size_t i{ 0 };
     FRSR_ROARING_LOOP_ALIGN for ( ; i + 8 <= n && out < end; i += 8 ) {
         __m512i const group{ _mm512_loadu_si512( words + i ) };
         if ( _mm512_test_epi64_mask( group, group ) != 0 ) {
-            for ( std::size_t j{ 0 }; j < 8; ++j ) {
-                out = decode_word_uint64( words[ i + j ], base + ( i + j ) * 64, indices, out );
+            auto word_base{ base_lanes };
+            for ( std::size_t j{ 0 }; j < 8 && out < end; ++j ) {
+                out = decode_word_uint64( words[ i + j ], word_base, indices, out, end );
+                word_base = _mm512_add_epi64( word_base, inc64 );
             }
         }
+        base_lanes = _mm512_add_epi64( base_lanes, inc512 );
     }
     for ( ; i < n && out < end; ++i ) {
-        out = decode_word_uint64( words[ i ], base + i * 64, indices, out );
+        out = decode_word_uint64( words[ i ], base_lanes, indices, out, end );
+        base_lanes = _mm512_add_epi64( base_lanes, inc64 );
     }
     return out;
 }
