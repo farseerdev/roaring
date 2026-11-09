@@ -399,8 +399,9 @@ public:
         }
     }
 
-    // Destroys every entry; the capacity stays. The block must not be shared.
-    void destroy_all() noexcept {
+    // Destroys every entry; the capacity stays. The block must not be shared. Flattened so that a table that goes away
+    // pays each handle's release in this loop, not through whatever out-of-line copy of it the compiler made.
+    [[ gnu::flatten ]] void destroy_all() noexcept {
         assert( !shared() );
         for ( index_type i{ 0 }; i < size_; ++i ) {
             slots_[ i ].~handle_type();
