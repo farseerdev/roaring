@@ -137,7 +137,7 @@ template <set_operation Op, typename V>
 // _MM_PERM_ENUM where clang takes a plain int, which is why those four call sites
 // name the enum; clang declares it as well.
 #if ( defined( __x86_64__ ) || defined( _M_X64 ) ) && ( defined( __clang__ ) || defined( __GNUC__ ) )
-#   if defined( __AVX512VPOPCNTDQ__ ) && defined( __AVX512VBMI2__ ) && defined( __AVX512BW__ ) && defined( __AVX512VL__ )
+#   if defined( __AVX512VPOPCNTDQ__ ) && defined( __AVX512VBMI2__ ) && defined( __AVX512BW__ ) && defined( __AVX512VL__ ) && defined( __AVX512CD__ ) && defined( __AVX512DQ__ )
 #       define FRSR_ROARING_X86_V4_NATIVE   1
 #       define FRSR_ROARING_X86_V4_DISPATCH 0
 #   else

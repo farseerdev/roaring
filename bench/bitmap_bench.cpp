@@ -6613,14 +6613,16 @@ struct register_cpp_to_array_registrar {
 // A million values drawn at random from a universe of 8M (bitset containers of about 8000 values), 2M (bitset
 // containers of about 30000) or 100M (array containers of about 650), or a thousand runs of a thousand
 // consecutive values (run containers after optimize()), or the sparse bitsets an intersection leaves: 64 chunks of
-// two bitsets, the even low values and the odd ones, sharing only the last value of the chunk.
-struct ToArray64Shape { char const *label; std::uint64_t universe; };
+// two bitsets, the even low values and the odd ones, sharing only the last value of the chunk. The reference's
+// in-place intersection demotes such a container to an array, so its arm decodes an array where frsr scans a bitset.
+enum class ToArray64Kind { random, runs, sparse_bitsets };
+struct ToArray64Shape { char const *label; ToArray64Kind kind; std::uint64_t universe; };
 static constexpr ToArray64Shape kToArray64Shapes[]{
-    { "universe=8M"  ,   8'000'000 },
-    { "universe=2M"  ,   2'000'000 },
-    { "universe=100M", 100'000'000 },
-    { "runs"         , 0           },
-    { "sparse_bitsets", 1          },
+    { "universe=8M", ToArray64Kind::random, 8'000'000 },
+    { "universe=2M", ToArray64Kind::random, 2'000'000 },
+    { "universe=100M", ToArray64Kind::random, 100'000'000 },
+    { "runs", ToArray64Kind::runs, 0 },
+    { "sparse_bitsets", ToArray64Kind::sparse_bitsets, 0 },
 };
 static constexpr std::size_t kToArray64Values{ 1'000'000 };
 static constexpr std::uint64_t kToArray64SparseChunks{ 64 };
@@ -6641,7 +6643,7 @@ static std::vector<std::uint64_t> to_array64_values(ToArray64Shape const &shape)
     std::mt19937_64 rng{ 0x64A7 + shape.universe };
     std::vector<std::uint64_t> values;
     values.reserve(kToArray64Values);
-    if (shape.universe == 0) {
+    if (shape.kind == ToArray64Kind::runs) {
         constexpr std::uint64_t run_length{ 1'000 };
         for (std::uint64_t run = 0; run < kToArray64Values / run_length; ++run) {
             auto const first{ run * 100'000 + rng() % ( 100'000 - run_length ) };
@@ -6664,14 +6666,14 @@ struct register_frsr_to_array64_registrar {
                         "owns. Checksum = decoded count.";
         e.setup = [shape]() -> void * {
             auto *s = new S;
-            if (shape.universe == 1) {
+            if (shape.kind == ToArray64Kind::sparse_bitsets) {
                 Bitmap other;
                 to_array64_sparse_operand(false, [&](std::uint64_t const value) { std::ignore = s->bm.add(value); });
                 to_array64_sparse_operand(true, [&](std::uint64_t const value) { std::ignore = other.add(value); });
                 s->bm &= other;
             } else {
                 for (auto const value : to_array64_values(shape)) { std::ignore = s->bm.add(value); }
-                if (shape.universe == 0) { s->bm.optimize(); }
+                if (shape.kind == ToArray64Kind::runs) { s->bm.optimize(); }
             }
             s->out.resize(s->bm.size());
             return s;
@@ -6697,7 +6699,7 @@ static void register_r64_to_array64(ToArray64Shape const &shape) {
                     "[croaring-ref] deps/croaring/src/roaring64.c:roaring64_bitmap_to_uint64_array";
     e.setup = [shape]() -> void * {
         auto *s = new S;
-        if (shape.universe == 1) {
+        if (shape.kind == ToArray64Kind::sparse_bitsets) {
             auto *const other{ roaring64_bitmap_create() };
             to_array64_sparse_operand(false, [&](std::uint64_t const value) { roaring64_bitmap_add(s->bm, value); });
             to_array64_sparse_operand(true, [&](std::uint64_t const value) { roaring64_bitmap_add(other, value); });
@@ -6705,7 +6707,7 @@ static void register_r64_to_array64(ToArray64Shape const &shape) {
             roaring64_bitmap_free(other);
         } else {
             for (auto const value : to_array64_values(shape)) { roaring64_bitmap_add(s->bm, value); }
-            if (shape.universe == 0) { roaring64_bitmap_run_optimize(s->bm); }
+            if (shape.kind == ToArray64Kind::runs) { roaring64_bitmap_run_optimize(s->bm); }
         }
         s->out.resize(roaring64_bitmap_get_cardinality(s->bm));
         return s;

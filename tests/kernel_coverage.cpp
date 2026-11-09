@@ -346,12 +346,18 @@ using block_words = std::array<std::uint64_t, 1024>;
             case 2:
                 set( ( rng() % 4096 ) * 16 + k % 16 );
                 break;
-            case 3:
-                set( ( rng() % 512 ) * 128 + rng() % 64 );
+            case 3: {
+                auto const every_other_word{ rng() % 512 };
+                auto const bit{ rng() % 64 };
+                set( every_other_word * 128 + bit );
                 break;
-            case 4:
-                set( ( rng() % 16 ) * 4096 + rng() % 512 );
+            }
+            case 4: {
+                auto const group{ rng() % 16 };
+                auto const bit{ rng() % 512 };
+                set( group * 4096 + bit );
                 break;
+            }
             default:
                 words[ rng() % 1024 ] = ~std::uint64_t{ 0 };
                 break;
@@ -393,7 +399,65 @@ TEST( KernelCoverage, BitsetExtractionUint64SparsePrefix ) {
     ASSERT_EQ( end, storage.data() + 4 + expected.size() );
     EXPECT_TRUE( std::equal( expected.begin(), expected.end(), storage.begin() + 4 ) );
     EXPECT_EQ( storage[ 3 ], canary );
-    EXPECT_EQ( storage[ 8 ], canary );
+    EXPECT_TRUE( std::all_of( storage.begin() + 8, storage.end(), [ & ]( auto const v ) { return v == canary; } ) ) << "wrote past the output";
+}
+
+// The last words of a block holding 50 and 57 values: the block of 16 that ends the output is written in full, its
+// second store included, and nothing lands past it.
+TEST( KernelCoverage, BitsetExtractionUint64LastWord ) {
+    if ( !detail::have_x86_v4() ) {
+        GTEST_SKIP() << "no AVX-512 VBMI2";
+    }
+    for ( unsigned const bits : { 50U, 57U } ) {
+        SCOPED_TRACE( ::testing::Message() << "bits " << bits );
+        block_words words{};
+        words[ 1023 ] = ( std::uint64_t{ 1 } << bits ) - 1U;
+        std::uint64_t const base{ std::uint64_t{ 5 } << 32U };
+        constexpr std::size_t guard{ 8 };
+        constexpr std::uint64_t canary{ 0xCAFE'F00D'CAFE'F00DULL };
+        std::vector<std::uint64_t> storage( guard + bits + guard, canary );
+        auto * const first{ storage.data() + guard };
+        auto const * const end{ detail::x86_v4::extract_setbits_uint64( words.data(), words.size(), first, bits, base ) };
+        ASSERT_EQ( end, first + bits );
+        for ( unsigned bit{ 0 }; bit < bits; ++bit ) {
+            EXPECT_EQ( first[ bit ], base + 1023 * 64 + bit );
+        }
+        EXPECT_TRUE( std::all_of( storage.begin(), storage.begin() + guard, [ & ]( auto const v ) { return v == canary; } ) ) << "wrote before the output";
+        EXPECT_TRUE( std::all_of( storage.end() - guard, storage.end(), [ & ]( auto const v ) { return v == canary; } ) ) << "wrote past the output";
+    }
+}
+
+// A group of eight words in which no word holds more than one value: every lane nonzero, and zero words around the
+// largest value of a block.
+TEST( KernelCoverage, BitsetExtractionSingleValueGroups ) {
+    if ( !detail::have_x86_v4() ) {
+        GTEST_SKIP() << "no AVX-512 VBMI2";
+    }
+    block_words last_value{};
+    last_value[ 1017 ] = 1U;
+    last_value[ 1023 ] = std::uint64_t{ 1 } << 63U;
+    expect_setbits_extracted( last_value, last_value.size() );
+    block_words all_lanes{};
+    for ( std::size_t i{ 0 }; i < 8; ++i ) {
+        all_lanes[ i ] = std::uint64_t{ 1 } << ( i * 7 );
+    }
+    expect_setbits_extracted( all_lanes, all_lanes.size() );
+}
+
+// A bitset in the last chunk of the key space, up to the largest key.
+TEST( KernelCoverage, Uint64ToVectorOfBitsetInLastChunk ) {
+    std::uint64_t const base{ 0xFFFF'FFFF'FFFF'0000ULL };
+    Bitmap64 bitmap;
+    for ( std::uint64_t low{ 0 }; low < 65536; low += 2 ) {
+        std::ignore = bitmap.add( base + low );
+    }
+    std::ignore = bitmap.add( ~std::uint64_t{ 0 } );
+    ASSERT_EQ( bitmap.statistics().bitset_containers, 1U );
+    auto const values{ bitmap.to_vector() };
+    ASSERT_EQ( values.size(), 32769U );
+    EXPECT_EQ( values[ 0 ], base );
+    EXPECT_EQ( values[ 1 ], base + 2 );
+    EXPECT_EQ( values[ 32768 ], ~std::uint64_t{ 0 } );
 }
 
 // An intersection of two bitsets that leaves one value keeps the bitset, and to_vector() scans past its zero words.
@@ -410,6 +474,7 @@ TEST( KernelCoverage, Uint64ToVectorOfSparseIntersection ) {
         }
     }
     even_and_last &= odd;
+    ASSERT_EQ( even_and_last.statistics().bitset_containers, 1U );
     auto const values{ even_and_last.to_vector() };
     ASSERT_EQ( values.size(), 1U );
     EXPECT_EQ( values[ 0 ], base + 65535 );
