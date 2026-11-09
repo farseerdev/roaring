@@ -2090,8 +2090,10 @@ template <typename Layout, typename CowPolicy = cow_value_semantics>
 // arr's own payload, no allocation, stays an array). The walk is
 // filter_array_run_into's array-driven shape, the reference's: each array value
 // is tested against the current run, the run cursor moves only when a value has
-// passed it, a kept value is written on its own, and a stretch the filter drops
-// (the gap before a run for ∩, the run's cover for \) is crossed by a gallop. A
+// passed it, and a stretch the filter drops (the gap before a run for ∩, the
+// run's cover for \) is crossed by a gallop. A kept value is written on its own,
+// or, in the LongStretches form, the values it keeps with it are bounded by a
+// gallop and moved as one block. A
 // value is never written ahead of where it was read, so the compaction needs no
 // scratch.
 // [croaring-ref] deps/croaring/src/containers/mixed_intersection.c:array_run_container_intersection
@@ -2135,10 +2137,12 @@ template <typename Layout, typename CowPolicy, bool LongStretches>
         if ( in_run == keep_matches ) {
             // the kept stretch: the values up to the end of the run (intersection) or to the start of the next run (difference)
             if constexpr ( LongStretches ) {
-                auto const stretch_end{ keep_matches ? static_cast<std::size_t>( run.end ) + 1U : static_cast<std::size_t>( run.begin ) };
-                do {
-                    base[ out++ ] = base[ in++ ];
-                } while ( in < card && base[ in ] < stretch_end );
+                auto const stretch_end{ keep_matches
+                    ? gallop_forward<true >( base, in, card, static_cast<low_type>( run.end ) )
+                    : gallop_forward<false>( base, in, card, static_cast<low_type>( run.begin ) ) };
+                std::memmove( base + out, base + in, ( stretch_end - in ) * sizeof( *base ) );
+                out += stretch_end - in;
+                in = stretch_end;
             } else {
                 base[ out++ ] = value;
                 ++in;
