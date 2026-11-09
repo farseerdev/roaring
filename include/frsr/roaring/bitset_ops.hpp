@@ -162,13 +162,30 @@ inline void decode_word_uint16( std::uint64_t const word, unsigned const count, 
     }
 }
 
+// Decodes the eight words at `words` into values from `word_base` up and returns the end of those written; a zero
+// word writes nothing.
+FRSR_ROARING_X86_V4_HELPER
+inline std::uint16_t * decode_eight_words_uint16( std::uint64_t const * const words, __m512i word_base, __m512i const inc64, __m512i const indices, std::uint16_t * out ) noexcept {
+    for ( std::size_t j{ 0 }; j < 8; ++j ) {
+        auto const word{ words[ j ] };
+        if ( word != 0 ) {
+            auto const added{ static_cast<unsigned>( std::popcount( word ) ) };
+            decode_word_uint16( word, added, word_base, indices, out );
+            out += added;
+        }
+        word_base = _mm512_add_epi16( word_base, inc64 );
+    }
+    return out;
+}
+
 // AVX-512 VBMI2 set-bit decoder for one 8 KB block into the `count` 16-bit values its first `n` words hold (the
-// array conversion passes the cardinality). The words are taken eight at a time. A group of zero words, one
-// VPTESTMQ, is passed over. A group in which no word holds more than one value is decoded in one step, the
-// leading-zero count of each word giving its position and VPCOMPRESSQ dropping the zero words, so sparse values
-// cost neither a test nor a byte compress per word. The words of the others are decoded one by one, a zero word
-// skipped by its own test. Once `count` values are written it stops, instead of scanning the words past the last
-// value: a few values clustered at the start of a block cost a few groups.
+// array conversion passes the cardinality). The words are taken eight at a time, and a group of zero words, one
+// VPTESTMQ, is passed over. With fewer values than words, a group in which no word holds more than one value is
+// decoded in one step, the leading-zero count of each word giving its position and VPCOMPRESSQ dropping the zero
+// words, so sparse values cost neither a test nor a byte compress per word; with at least a value per word a group
+// is rarely of that form, so its words are always decoded one by one. Either way it stops once `count` values are
+// written, instead of scanning the words past the last value: a few values clustered at the start of a block cost
+// a few groups.
 // [croaring-ref] deps/croaring/src/bitset_util.c:bitset_extract_setbits_avx512_uint16
 FRSR_ROARING_X86_V4_KERNEL
 inline void extract_setbits_uint16(
@@ -182,32 +199,33 @@ inline void extract_setbits_uint16(
     auto const minus_one{ _mm512_set1_epi64( -1 ) };
     auto base{ _mm512_setzero_si512() };
     std::size_t i{ 0 };
-    for ( ; i + 8 <= n && out < end; i += 8 ) {
-        auto const group{ _mm512_loadu_si512( words + i ) };
-        auto const nonzero{ _mm512_test_epi64_mask( group, group ) };
-        if ( nonzero != 0 ) {
-            if ( _mm512_test_epi64_mask( group, _mm512_add_epi64( group, minus_one ) ) == 0 ) {
-                auto const added{ static_cast<unsigned>( std::popcount( nonzero ) ) };
-                auto const tops{ _mm512_add_epi64( word_tops, _mm512_set1_epi64( static_cast<long long>( i * 64 ) ) ) };
-                auto const positions{ _mm512_sub_epi64( tops, _mm512_lzcnt_epi64( group ) ) };
-                auto const narrowed{ _mm512_cvtepi64_epi16( _mm512_maskz_compress_epi64( nonzero, positions ) ) };
-                auto const lanes{ static_cast<__mmask8>( low_lanes( added ) ) };
-                _mm_mask_storeu_epi16( out, lanes, narrowed );
-                out += added;
-            } else {
-                auto word_base{ base };
-                for ( std::size_t j{ 0 }; j < 8; ++j ) {
-                    auto const word{ words[ i + j ] };
-                    if ( word != 0 ) {
-                        auto const added{ static_cast<unsigned>( std::popcount( word ) ) };
-                        decode_word_uint16( word, added, word_base, indices, out );
-                        out += added;
-                    }
-                    word_base = _mm512_add_epi16( word_base, inc64 );
+    if ( count >= n ) {
+        for ( ; i + 8 <= n && out < end; i += 8 ) {
+            auto const group{ _mm512_loadu_si512( words + i ) };
+            if ( _mm512_test_epi64_mask( group, group ) != 0 ) {
+                out = decode_eight_words_uint16( words + i, base, inc64, indices, out );
+            }
+            base = _mm512_add_epi16( base, inc512 );
+        }
+    } else {
+        for ( ; i + 8 <= n && out < end; i += 8 ) {
+            auto const group{ _mm512_loadu_si512( words + i ) };
+            auto const nonzero{ _mm512_test_epi64_mask( group, group ) };
+            if ( nonzero != 0 ) {
+                if ( _mm512_test_epi64_mask( group, _mm512_add_epi64( group, minus_one ) ) == 0 ) {
+                    auto const added{ static_cast<unsigned>( std::popcount( nonzero ) ) };
+                    auto const tops{ _mm512_add_epi64( word_tops, _mm512_set1_epi64( static_cast<long long>( i * 64 ) ) ) };
+                    auto const positions{ _mm512_sub_epi64( tops, _mm512_lzcnt_epi64( group ) ) };
+                    auto const narrowed{ _mm512_cvtepi64_epi16( _mm512_maskz_compress_epi64( nonzero, positions ) ) };
+                    auto const lanes{ static_cast<__mmask8>( low_lanes( added ) ) };
+                    _mm_mask_storeu_epi16( out, lanes, narrowed );
+                    out += added;
+                } else {
+                    out = decode_eight_words_uint16( words + i, base, inc64, indices, out );
                 }
             }
+            base = _mm512_add_epi16( base, inc512 );
         }
-        base = _mm512_add_epi16( base, inc512 );
     }
     for ( auto value_base{ static_cast<std::uint32_t>( i * 64 ) }; i < n && out < end; ++i, value_base += 64 ) {
         for ( auto word{ words[ i ] }; word != 0; word &= word - 1 ) {
