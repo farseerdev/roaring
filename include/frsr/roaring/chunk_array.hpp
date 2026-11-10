@@ -399,14 +399,13 @@ public:
         }
     }
 
-    // Destroys every entry; the capacity stays. The block must not be shared. Flattened so that a table that goes away
-    // pays each handle's release in this loop, not through whatever out-of-line copy of it the compiler made.
-    [[ gnu::flatten ]] void destroy_all() noexcept {
+    // Destroys every entry; the capacity stays. The block must not be shared. An empty table (as a store's table of
+    // retired payloads mostly is) costs no call.
+    void destroy_all() noexcept {
         assert( !shared() );
-        for ( index_type i{ 0 }; i < size_; ++i ) {
-            slots_[ i ].~handle_type();
+        if ( size_ != 0 ) {
+            destroy_entries();
         }
-        size_ = 0;
     }
 
     // Lets go of the block: the last table that holds it destroys the entries and frees it.
@@ -662,6 +661,15 @@ private:
     // The count of the tables that hold the block, the word right before the first handle.
     [[nodiscard]] std::byte * rc_slot() const noexcept {
         return reinterpret_cast<std::byte *>( slots_ ) - handle_type::rc_prefix_bytes;
+    }
+
+    // destroy_all() of a table that holds entries. Flattened so that a table that goes away pays each handle's release
+    // in this loop, not through whatever out-of-line copy of it the compiler made.
+    [[ gnu::flatten ]] void destroy_entries() noexcept {
+        for ( index_type i{ 0 }; i < size_; ++i ) {
+            slots_[ i ].~handle_type();
+        }
+        size_ = 0;
     }
 
     // Gives up this table's count on its block (which it holds); the last holder (the only one, of a block that
