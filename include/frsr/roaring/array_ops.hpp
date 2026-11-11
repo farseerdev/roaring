@@ -1837,6 +1837,10 @@ inline constexpr std::size_t strides_before_doubling{ 2 };
 // (see filter_array_run_into) instead of being tested one by one.
 inline constexpr std::size_t values_per_run_for_stretch_copy{ 16 };
 
+// The values from a kept one to the end of its run from which the in-place intersection bounds the stretch by a
+// gallop and moves it as one block instead of copying it value by value (filter_array_run_inplace_with).
+inline constexpr std::size_t run_span_for_block_move{ 64 };
+
 // How filter_array_run_into crosses a stretch of array values that lies before a run or inside it:
 //  - per_value: each value on its own, tested against the run list (a few values to a run);
 //  - stepped:   the difference only; a loop steps over the stretch (the values a run covers up to
@@ -2229,10 +2233,13 @@ template <typename Layout, typename CowPolicy = cow_value_semantics>
 // is tested against the current run, the run cursor moves only when a value has
 // passed it, and a stretch the filter drops (the gap before a run for ∩, the
 // run's cover for \) is crossed by a gallop. A kept value is written on its own,
-// or, in the LongStretches form, the values it keeps with it are bounded by a
-// gallop and moved as one block. A
-// value is never written ahead of where it was read, so the compaction needs no
-// scratch.
+// or, in the LongStretches form, with the values it keeps with it, bounded by
+// a gallop and moved as one block: the values up to the end of the run for the
+// intersection, before the next run for the difference. The intersection copies
+// a stretch whose run ends within run_span_for_block_move values one value at a
+// time instead (a gallop and a libc call per stretch lose on the short runs of
+// many). A value is never written ahead of where it was read, so the compaction
+// needs no scratch.
 // [croaring-ref] deps/croaring/src/containers/mixed_intersection.c:array_run_container_intersection
 // [croaring-ref] deps/croaring/src/containers/mixed_andnot.c:array_run_container_andnot
 template <typename Layout, typename CowPolicy, bool LongStretches>
@@ -2274,12 +2281,19 @@ template <typename Layout, typename CowPolicy, bool LongStretches>
         if ( in_run == keep_matches ) {
             // the kept stretch: the values up to the end of the run (intersection) or to the start of the next run (difference)
             if constexpr ( LongStretches ) {
-                auto const stretch_end{ keep_matches
-                    ? gallop_forward<true >( base, in, card, static_cast<low_type>( run.end ) )
-                    : gallop_forward<false>( base, in, card, static_cast<low_type>( run.begin ) ) };
-                std::memmove( base + out, base + in, ( stretch_end - in ) * sizeof( *base ) );
-                out += stretch_end - in;
-                in = stretch_end;
+                if ( keep_matches && static_cast<std::size_t>( run.end ) - value < run_span_for_block_move ) {
+                    auto const stretch_end{ static_cast<std::size_t>( run.end ) + 1U };
+                    do {
+                        base[ out++ ] = base[ in++ ];
+                    } while ( in < card && base[ in ] < stretch_end );
+                } else {
+                    auto const stretch_end{ keep_matches
+                        ? gallop_forward<true >( base, in, card, static_cast<low_type>( run.end ) )
+                        : gallop_forward<false>( base, in, card, static_cast<low_type>( run.begin ) ) };
+                    std::memmove( base + out, base + in, ( stretch_end - in ) * sizeof( *base ) );
+                    out += stretch_end - in;
+                    in = stretch_end;
+                }
             } else {
                 base[ out++ ] = value;
                 ++in;
