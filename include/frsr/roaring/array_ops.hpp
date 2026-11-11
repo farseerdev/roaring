@@ -163,7 +163,7 @@ inline constexpr std::size_t sse42_intersect_min_side{ 8 };
 // and the loop runs the implicit-length compare throughout. B's sub-vector remainder is
 // applied to the last pending A block through a zero-padded, explicit-length compare.
 // [croaring-ref] deps/croaring/src/array_util.c:difference_vector16
-[[ gnu::hot, gnu::noinline ]] inline std::size_t difference_array_array_sse42(
+[[ gnu::hot ]] inline std::size_t difference_array_array_sse42(
     std::uint16_t const * const a, std::size_t const sa,
     std::uint16_t const * const b, std::size_t const sb,
     std::uint16_t       * const out
@@ -1487,6 +1487,38 @@ template <typename Layout, typename CowPolicy = cow_value_semantics>
     lhs.sync_header();
 }
 
+#if defined( __SSE4_2__ )
+// The vectorized difference into `out`. Same over-allocate-by-one-vector contract as the intersection: the kernel's
+// stores write a full vector past the true count.
+template <typename Layout, typename OutVector, typename CowPolicy>
+[[ gnu::hot, gnu::noinline ]] inline void difference_array_array_to_vector_sse42(
+    array_cref<Layout, CowPolicy> const lhs,
+    array_cref<Layout, CowPolicy> const rhs,
+    OutVector & out
+) {
+    auto const sa{ lhs.values.size() };
+    resize_uninitialized( out, sa + 8U );
+    auto const count{ difference_array_array_sse42( lhs.values.data(), sa, rhs.values.data(), rhs.values.size(), out.data() ) };
+    out.resize( static_cast<std::uint32_t>( count ) );
+}
+#endif
+
+// The scalar merge into `out`, which it sizes exactly.
+template <typename Layout, typename OutVector, typename CowPolicy>
+[[ gnu::hot, gnu::noinline ]] inline void difference_array_array_to_vector_scalar(
+    array_cref<Layout, CowPolicy> const lhs,
+    array_cref<Layout, CowPolicy> const rhs,
+    OutVector & out
+) {
+    resize_uninitialized( out, lhs.values.size() );
+    out.resize( static_cast<std::uint32_t>( difference_sorted_scalar(
+        lhs.values.data(), lhs.values.size(), rhs.values.data(), rhs.values.size(), out.data()
+    ) ) );
+}
+
+// Routes a pair to one of the two forms above. Each is a function of its own, so the kernels compile as they do
+// without the routing test, and the routing pays no frame of its own.
+// [croaring-ref] deps/croaring/src/containers/array.c:array_container_andnot
 template <typename Layout, typename OutVector, typename CowPolicy = cow_value_semantics>
 [[ gnu::hot ]] inline void difference_array_array_to_vector(
     array_cref<Layout, CowPolicy> const lhs,
@@ -1494,25 +1526,17 @@ template <typename Layout, typename OutVector, typename CowPolicy = cow_value_se
     OutVector & out
 ) {
 #if defined( __SSE4_2__ )
-    // Same over-allocate-by-one-vector contract as the intersection: the kernel's
-    // stores write a full vector past the true count.
     // Below one vector on either side the kernel is all setup (and the +8 slots are
     // an over-allocation of the whole result), so those pairs take the scalar merge.
     if constexpr ( kSimdArrayIntersect && std::is_same_v<typename Layout::low_type, std::uint16_t> ) {
         auto const sa{ lhs.values.size() };
         auto const sb{ rhs.values.size() };
         if ( sa >= 8U && sb >= 8U && !lengths_apart( kSkewedVectorDifferenceRatio, sa, sb ) ) {
-            resize_uninitialized( out, sa + 8U );
-            auto const count{ difference_array_array_sse42( lhs.values.data(), sa, rhs.values.data(), sb, out.data() ) };
-            out.resize( static_cast<std::uint32_t>( count ) );
-            return;
+            return difference_array_array_to_vector_sse42( lhs, rhs, out );
         }
     }
 #endif
-    resize_uninitialized( out, lhs.values.size() );
-    out.resize( static_cast<std::uint32_t>( difference_sorted_scalar(
-        lhs.values.data(), lhs.values.size(), rhs.values.data(), rhs.values.size(), out.data()
-    ) ) );
+    difference_array_array_to_vector_scalar( lhs, rhs, out );
 }
 
 // The values in exactly one of two sorted arrays. Same hybrid merge as the others: while four values remain on
