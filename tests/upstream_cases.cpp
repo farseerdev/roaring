@@ -1512,6 +1512,141 @@ TYPED_TEST( UpstreamCases, test_lazy_or_inplace_then_repair ) {
     }
 }
 
+// tests/toplevel_unit.c: test_lazy_or_inplace_then_repair, for the operand kind it leaves out: a run container folded
+// lazily into an accumulator chunk that is a bitset (container_lazy_ior, bitset with run). The accumulator is two
+// strided arrays whose merge is a bitset; the operand is a bitmap of closed ranges.
+template <typename Bitmap>
+[[nodiscard]] Bitmap lazy_bitset_accumulator( std::initializer_list<std::uint32_t> const keys = { 0U } ) {
+    Bitmap accumulator;
+    Bitmap first;
+    Bitmap second;
+    for ( auto const key : keys ) {
+        for ( std::uint32_t i{ 0 }; i < 2'500; ++i ) {
+            std::ignore = first .add( key * chunk + i * 3 );
+            std::ignore = second.add( key * chunk + i * 3 + 1 );
+        }
+    }
+    accumulator.bulk_or_intermediate( first );
+    accumulator.bulk_or_intermediate( second );
+    return accumulator;
+}
+
+using closed_ranges = std::vector<std::pair<std::uint32_t, std::uint32_t>>;
+
+template <typename Bitmap>
+[[nodiscard]] Bitmap runs_of( closed_ranges const & ranges ) {
+    Bitmap result;
+    for ( auto const & [ first, last ] : ranges ) {
+        result.add_closed_range( first, last );
+    }
+    result.optimize();
+    return result;
+}
+
+// The values lazy_bitset_accumulator holds, which a bitmap in the middle of a fold cannot be read for.
+[[nodiscard]] values lazy_accumulator_values( std::initializer_list<std::uint32_t> const keys = { 0U } ) {
+    values held;
+    for ( auto const key : keys ) {
+        for ( std::uint32_t i{ 0 }; i < 2'500; ++i ) {
+            held.push_back( key * chunk + i * 3 );
+            held.push_back( key * chunk + i * 3 + 1 );
+        }
+    }
+    return held;
+}
+
+template <typename Bitmap>
+[[nodiscard]] values union_values( values const & held, Bitmap const & operand ) {
+    std::set<std::uint32_t> expected( held.begin(), held.end() );
+    for ( auto const value : values_of( operand ) ) { expected.insert( value ); }
+    return values( expected.begin(), expected.end() );
+}
+
+TYPED_TEST( UpstreamCases, test_lazy_or_inplace_bitset_with_run_operand ) {
+    using Bitmap = TypeParam;
+    struct scenario {
+        char const *  name;
+        closed_ranges ranges;
+    };
+    scenario const scenarios[]{
+        { "full range",                 { { 0, chunk - 1 } } },
+        { "word boundaries",            { { 60, 70 }, { 128, 191 }, { 192, 192 + 63 }, { 1'000, 1'063 } } },
+        { "first and last word",        { { 0, 63 }, { chunk - 64, chunk - 1 } } },
+        { "inside one word",            { { 130, 140 }, { 700, 712 } } },
+        { "adjacent to the accumulator", { { 7'499, 7'600 } } },
+        { "many runs",                  { { 10, 70 }, { 200, 205 }, { 4'096, 8'191 }, { 65'000, 65'535 } } },
+    };
+    for ( auto const & each : scenarios ) {
+        auto accumulator{ lazy_bitset_accumulator<Bitmap>() };
+        auto const operand{ runs_of<Bitmap>( each.ranges ) };
+        ASSERT_EQ( operand.statistics().run_containers, 1U ) << each.name;
+        auto const expected{ union_values( lazy_accumulator_values(), operand ) };
+        accumulator.bulk_or_intermediate( operand );
+        accumulator.bulk_or_repair_after_lazy();
+        EXPECT_EQ( accumulator.statistics().bitset_containers + accumulator.statistics().run_containers, 1U ) << each.name;
+        EXPECT_EQ( values_of( accumulator ), expected ) << each.name;
+        EXPECT_EQ( accumulator.size(), expected.size() ) << each.name;
+        EXPECT_EQ( accumulator.container_count(), 1U ) << each.name;
+        expect_valid( accumulator );
+    }
+}
+
+// A run folded twice, runs that overlap, and an array after them leave an exact count after the repair.
+TYPED_TEST( UpstreamCases, test_lazy_or_inplace_bitset_with_run_operands_in_sequence ) {
+    using Bitmap = TypeParam;
+    auto accumulator{ lazy_bitset_accumulator<Bitmap>() };
+    auto const first  { runs_of<Bitmap>( { { 100, 4'000 } } ) };
+    auto const second { runs_of<Bitmap>( { { 3'000, 9'000 }, { 20'000, 20'063 } } ) };
+    auto const array  { of<Bitmap>( { 7, 9'001, 40'000 } ) };
+    ASSERT_EQ( first.statistics().run_containers, 1U );
+    ASSERT_EQ( second.statistics().run_containers, 1U );
+    accumulator.bulk_or_intermediate( first   );
+    accumulator.bulk_or_intermediate( first   );
+    accumulator.bulk_or_intermediate( second  );
+    accumulator.bulk_or_intermediate( array   );
+    accumulator.bulk_or_repair_after_lazy();
+    auto const base{ lazy_accumulator_values() };
+    std::set<std::uint32_t> all( base.begin(), base.end() );
+    for ( auto const & operand : { first, second, array } ) {
+        for ( auto const value : values_of( operand ) ) { all.insert( value ); }
+    }
+    EXPECT_EQ( values_of( accumulator ), values( all.begin(), all.end() ) );
+    EXPECT_EQ( accumulator.size(), all.size() );
+    expect_valid( accumulator );
+}
+
+// The run lands in the accumulator's chunks by key: chunks that only one side holds are kept or copied, and a chunk
+// whose accumulator is a bitset takes the runs in place.
+TYPED_TEST( UpstreamCases, test_lazy_or_inplace_bitset_with_run_operand_across_chunks ) {
+    using Bitmap = TypeParam;
+    auto accumulator{ lazy_bitset_accumulator<Bitmap>( { 0U, 2U } ) };
+    auto const operand{ runs_of<Bitmap>( { { 10, 5'000 }, { chunk + 10, chunk + 99 }, { 2 * chunk + 4'000, 2 * chunk + 9'000 }, { 3 * chunk, 3 * chunk + 8 } } ) };
+    auto const expected{ union_values( lazy_accumulator_values( { 0U, 2U } ), operand ) };
+    accumulator.bulk_or_intermediate( operand );
+    accumulator.bulk_or_repair_after_lazy();
+    EXPECT_EQ( values_of( accumulator ), expected );
+    EXPECT_EQ( accumulator.size(), expected.size() );
+    expect_valid( accumulator );
+}
+
+// A bitset chunk that another bitmap shares stays as it was in that bitmap: the fold clones it first.
+TYPED_TEST( UpstreamCases, test_lazy_or_inplace_bitset_with_run_operand_leaves_a_shared_accumulator_untouched ) {
+    using Bitmap = TypeParam;
+    auto accumulator{ lazy_bitset_accumulator<Bitmap>() };
+    accumulator.bulk_or_repair_after_lazy();
+    ASSERT_EQ( accumulator.statistics().bitset_containers, 1U );
+    auto const owner{ accumulator };
+    auto const owner_values{ values_of( owner ) };
+    auto const operand{ runs_of<Bitmap>( { { 0, chunk - 1 } } ) };
+    accumulator.bulk_or_intermediate( operand );
+    accumulator.bulk_or_repair_after_lazy();
+    EXPECT_EQ( accumulator.size(), chunk );
+    expect_valid( accumulator );
+    EXPECT_EQ( values_of( owner ), owner_values );
+    EXPECT_EQ( owner.size(), owner_values.size() );
+    expect_valid( owner );
+}
+
 // tests/toplevel_unit.c: test_issue330_wide_or_with_runs (Go TestIssue330)
 TYPED_TEST( UpstreamCases, test_issue330_wide_or_with_runs ) {
     using Bitmap = TypeParam;

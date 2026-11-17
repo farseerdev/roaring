@@ -4268,6 +4268,118 @@ struct register_cpp_lazy_union_accum_registrar {
 }};
 template <class Arm> static void register_cpp_lazy_union_accum(std::size_t band) { register_cpp_lazy_union_accum_registrar<Arm>::run(band); }
 
+// Lazy union of run containers into a bitset accumulator: a dense seed makes every accumulator chunk a bitset,
+// then kRunOperands operands, each holding kRunsPerChunk runs per chunk, are OR-ed into it. The other band_fold
+// shapes keep every operand an array or a bitset; here the operands are runs, the pair that the reference
+// (container_lazy_ior, bitset with run) folds into the accumulator's own block.
+namespace band_fold {
+static constexpr std::size_t kRunOperands  { 16 };
+static constexpr std::size_t kRunsPerChunk {  4 };
+static constexpr std::uint32_t kRunLength  { 1024 };
+
+static std::uint32_t run_begin(std::size_t operand, std::size_t run) {
+    return static_cast<std::uint32_t>((operand * 4099U + run * 16411U) % (65536U - kRunLength));
+}
+} // namespace band_fold
+
+template <class Arm>
+struct register_frsr_lazy_union_runs_registrar {
+    using TestBitmap32 = typename Arm::bitmap;
+    static void run(std::size_t band) {
+    using namespace band_fold;
+    Entry e;
+    char buf[128];
+    snprintf(buf, sizeof(buf), "set_ops/%sLazyUnionRuns/band=%zu", Arm::label(), band);
+    e.name        = buf;
+    e.description = "frsr lazy union (bulk_or_intermediate + bulk_or_finish_keep_bitsets) of " + std::to_string(kRunOperands) +
+                    " run-container operands into an accumulator whose chunks are bitsets of cardinality " + std::to_string(band) + ".";
+    e.setup       = [band]() -> void * {
+        auto *s = new FrsrState<Arm>;
+        s->sources.resize(1 + kRunOperands);
+        for (std::size_t c = 0; c < kChunks; ++c) {
+            for (std::size_t i = 0; i < band; ++i) {
+                std::ignore = s->sources[0].add(band_value(c, band, i));
+            }
+        }
+        for (std::size_t k = 0; k < kRunOperands; ++k) {
+            for (std::size_t c = 0; c < kChunks; ++c) {
+                for (std::size_t r = 0; r < kRunsPerChunk; ++r) {
+                    auto const begin = static_cast<std::uint32_t>(c * 65536U) + run_begin(k, r);
+                    s->sources[1 + k].add_closed_range(begin, begin + kRunLength - 1);
+                }
+            }
+            s->sources[1 + k].optimize();
+        }
+        return s;
+    };
+    e.run         = [](void *sv) -> int64_t {
+        auto *s = static_cast<FrsrState<Arm> *>(sv);
+        TestBitmap32 acc;
+        for (auto const &src : s->sources) {
+            acc.bulk_or_intermediate(src);
+        }
+        acc.bulk_or_finish_keep_bitsets();
+        return static_cast<int64_t>(acc.size());
+    };
+    e.teardown       = [](void *sv) { delete static_cast<FrsrState<Arm> *>(sv); };
+    e.ops_per_run    = static_cast<int64_t>((1 + kRunOperands) * kChunks);
+    e.inner_reps     = kInnerReps;
+    e.reusable_state = true;
+    g_benchmarks.push_back(std::move(e));
+}};
+template <class Arm> static void register_frsr_lazy_union_runs(std::size_t band) { register_frsr_lazy_union_runs_registrar<Arm>::run(band); }
+
+template <class Arm>
+struct register_cpp_lazy_union_runs_registrar {
+    static void run(std::size_t band) {
+    using namespace band_fold;
+    Entry e;
+    char buf[128];
+    snprintf(buf, sizeof(buf), "set_ops/%sLazyUnionRuns/band=%zu", Arm::label(), band);
+    e.name        = buf;
+    e.description = "CRoaring lazy union (roaring_bitmap_lazy_or_inplace + roaring_bitmap_repair_after_lazy) of " +
+                    std::to_string(kRunOperands) + " run-container operands into an accumulator whose chunks are bitsets of cardinality " +
+                    std::to_string(band) + ".";
+    e.setup       = [band]() -> void * {
+        auto *s = new CppBandState<Arm>;
+        s->sources.resize(1 + kRunOperands);
+        s->sources[0] = Arm::create();
+        for (std::size_t c = 0; c < kChunks; ++c) {
+            for (std::size_t i = 0; i < band; ++i) {
+                roaring_bitmap_add(s->sources[0], band_value(c, band, i));
+            }
+        }
+        for (std::size_t k = 0; k < kRunOperands; ++k) {
+            s->sources[1 + k] = Arm::create();
+            for (std::size_t c = 0; c < kChunks; ++c) {
+                for (std::size_t r = 0; r < kRunsPerChunk; ++r) {
+                    auto const begin = static_cast<std::uint32_t>(c * 65536U) + run_begin(k, r);
+                    roaring_bitmap_add_range_closed(s->sources[1 + k], begin, begin + kRunLength - 1);
+                }
+            }
+            roaring_bitmap_run_optimize(s->sources[1 + k]);
+        }
+        return s;
+    };
+    e.run         = [](void *sv) -> int64_t {
+        auto *s   = static_cast<CppBandState<Arm> *>(sv);
+        auto *acc = Arm::create();
+        for (auto *src : s->sources) {
+            roaring_bitmap_lazy_or_inplace(acc, src, true /* bitset conversion */);
+        }
+        roaring_bitmap_repair_after_lazy(acc);
+        int64_t const checksum = static_cast<int64_t>(roaring_bitmap_get_cardinality(acc));
+        roaring_bitmap_free(acc);
+        return checksum;
+    };
+    e.teardown       = [](void *sv) { delete static_cast<CppBandState<Arm> *>(sv); };
+    e.ops_per_run    = static_cast<int64_t>((1 + kRunOperands) * kChunks);
+    e.inner_reps     = kInnerReps;
+    e.reusable_state = true;
+    g_benchmarks.push_back(std::move(e));
+}};
+template <class Arm> static void register_cpp_lazy_union_runs(std::size_t band) { register_cpp_lazy_union_runs_registrar<Arm>::run(band); }
+
 template <class Arm>
 struct register_cpp_lazy_fold_only_registrar {
     static void run(std::size_t band) {
@@ -8124,6 +8236,10 @@ void register_benchmarks() {
 #endif
 #endif
     }
+    arms::for_each_frsr<register_frsr_lazy_union_runs_registrar>(std::size_t{16384});
+#if FRSR_ROARING_HAS_CROARING
+    arms::for_each_croaring<register_cpp_lazy_union_runs_registrar>(std::size_t{16384});
+#endif
 
     register_run_accum_and(20'000);
     arms::for_each_frsr<register_frsr_array_run_and_fold_registrar>(20'000);

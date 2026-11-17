@@ -1356,6 +1356,22 @@ FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::bulk_or_inplace( bitmap
             ++pos2;
             continue;
         }
+        // Bitset accumulator, run operand: the run ranges are set in the accumulator's own
+        // block, and its count and endpoints stay stale until the repair. The mutable
+        // as_bitset() write barrier clones a shared block first, as for an array operand.
+        // [croaring-ref] include/roaring/containers/containers.h:container_lazy_ior (bitset, run)
+        if ( left_container.holds_bitset() && right_container.holds_run() ) {
+            auto left_bitset{ left_container.as_bitset() };
+            auto & words{ left_bitset.words.as_array() };
+            for ( auto const & current : right_container.as_run().runs ) {
+                detail::apply_range_to_words<layout_type>( words, current.begin, current.end, detail::range_operation::add );
+            }
+            left_bitset.mark_cardinality_stale();
+            left_bitset.mark_endpoints_stale();
+            ++pos1;
+            ++pos2;
+            continue;
+        }
         // Array/bitset pairs: the accumulator becomes a bitset on its first
         // same-key fold, whatever its size, and every operand is then OR'd into
         // that block in place. That is the reference's in-place lazy union with
