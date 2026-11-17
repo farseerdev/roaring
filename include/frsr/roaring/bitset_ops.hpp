@@ -1301,9 +1301,13 @@ inline constexpr std::size_t kScatterGroupingSpanRatio{ 16 };
 // i-cache/layout effect confirmed by fine-bisect (b88dd79 still 0.95×,
 // 1ddde6e alone 1.30×). Keep the scatter out of line and in .text.unlikely
 // so it does not sit next to the materializing AND merge.
+//
+// `lhs` is taken by reference: a proxy of three pointers passed by value is built in the caller's frame with 8-byte
+// stores and copied into the argument area with one 16-byte load, which cannot be forwarded from those stores and
+// stalls every call. Through a reference the callee loads each pointer with the load that matches its store.
 template <bool Lazy, typename Layout, typename CowPolicy = cow_value_semantics>
 [[ gnu::noinline, gnu::cold ]] void or_array_into_bitset_inplace(
-    bitset_ref<Layout, CowPolicy> lhs,
+    bitset_ref<Layout, CowPolicy> & lhs,
     array_cref<Layout, CowPolicy> const rhs
 ) noexcept {
     auto       & words { lhs.words.as_array() };
