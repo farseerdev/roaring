@@ -300,7 +300,7 @@ FRSR_ROARING_DEFINITION_INLINE void FRSR_ROARING_BITMAP::union_into( bitmap cons
     }
 
 
-    scratch.clear_keep_capacity();
+    scratch.clear_keep_capacity_in_place();
     scratch.chunks_.reserve( chunks_.size() + other.chunks_.size() );
     detail::small_array_values<low_type> array_union_scratch;
 #if FRSR_ROARING_COMBINE_STATS

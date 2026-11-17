@@ -408,6 +408,15 @@ public:
         }
     }
 
+    // destroy_all() with the walk of the entries in the caller, for the retired table of a scratch bitmap, which every
+    // operation into it empties: the walk is not a call of its own.
+    [[ gnu::always_inline ]] void destroy_all_in_place() noexcept {
+        assert( !shared() );
+        if ( size_ != 0 ) {
+            destroy_walk();
+        }
+    }
+
     // Lets go of the block: the last table that holds it destroys the entries and frees it.
     void release() noexcept {
         if constexpr ( shareable ) {
@@ -666,6 +675,11 @@ private:
     // destroy_all() of a table that holds entries. Flattened so that a table that goes away pays each handle's release
     // in this loop, not through whatever out-of-line copy of it the compiler made.
     [[ gnu::flatten ]] void destroy_entries() noexcept {
+        destroy_walk();
+    }
+
+    // The walk that destroys the entries, with every handle's release inlined into it.
+    [[ gnu::flatten, gnu::always_inline ]] void destroy_walk() noexcept {
         for ( index_type i{ 0 }; i < size_; ++i ) {
             slots_[ i ].~handle_type();
         }

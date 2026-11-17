@@ -282,6 +282,18 @@ public:
     // the emptied pool becomes the live table.
     void clear_retiring_slots() noexcept {
         retired_.destroy_all();
+        park_live_slots();
+    }
+
+    // clear_retiring_slots() with the walk that destroys the previous pass's retired payloads in the caller.
+    [[ gnu::always_inline ]] void clear_retiring_slots_in_place() noexcept {
+        retired_.destroy_all_in_place();
+        park_live_slots();
+    }
+
+private:
+    // The second half of clear_retiring_slots(): the live table is parked as the retired one.
+    void park_live_slots() noexcept {
         // An empty live table has nothing to park, and keeps its capacity: the
         // fresh result of every materializing operator arrives here empty.
         if ( live_.size() != 0 ) {
@@ -304,6 +316,7 @@ public:
         ++generation_;
     }
 
+public:
     // Hands back a retired sole-owned spilled payload of `kind` (header reset
     // for an in-place rebuild), or an empty handle when none is left. A claimed
     // slot becomes an empty inline array (not spilled), so the other kind's

@@ -547,6 +547,11 @@ public:
         chunks_.clear_retiring_slots();
         size_ = 0;
     }
+    // clear_keep_capacity() for the operation that fills the scratch afresh on every call (union_into).
+    [[ gnu::always_inline ]] void clear_keep_capacity_in_place() noexcept {
+        chunks_.clear_retiring_slots_in_place();
+        size_ = 0;
+    }
 
 public:
 
